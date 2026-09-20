@@ -19,3 +19,7 @@ monitor
 *.bak
 *~
 .DS_Store
+
+# Nested targets and static libs
+**/target/
+**/*.a
