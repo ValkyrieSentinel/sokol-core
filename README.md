@@ -22,30 +22,40 @@ The program intercepts and drops garbage (attacks, malicious traffic) right at t
 
 Clone the repository:
 
-```bash
-git clone [https://github.com/ValkyrieSentinel/sokol-core.git](https://github.com/ValkyrieSentinel/sokol-core.git)
+```shell
+git clone https://github.com/ValkyrieSentinel/sokol-core.git
 cd sokol-core
+```
+
 Build the database in Zig (sntl_db):
 
-Bash
+```shell
 cd sntl_db && zig build -O ReleaseFast && cd ..
+```
+
 Build eBPF and the orchestrator in Rust:
 
-Bash
+```shell
 cargo +nightly build --release
+```
+
 Run (must be run with sudo, as root privileges are required to work with XDP maps and network interfaces):
 
-Bash
+```shell
 sudo ./target/release/orchestrator
-Project Structure
-ebpf/ — kernel space code (Rust XDP program).
+```
 
-orchestrator/ — main user-space daemon managing maps and logic.
+# Project Structure
 
-sntl_db/ — fast Zig database for events and metrics.
+`ebpf/` — kernel space code (Rust XDP program).
+
+`orchestrator/` — main user-space daemon managing maps and logic.
+
+`sntl_db/` — fast Zig database for events and metrics.
 
 common/ — shared data structures and protocol definitions.
 
-License
+# License
+
 Copyright © Sokol-Core Contributors. All rights reserved.
 Unauthorized copying, distribution, or use of this code is strictly prohibited without permission from the author.
