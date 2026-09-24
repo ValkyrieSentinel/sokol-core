@@ -11,7 +11,8 @@ fn ipc_socket_path() -> String {
     std::env::var("SOKOL_IPC_SOCKET").unwrap_or_else(|_| "/run/sokol.sock".to_string())
 }
 
-/// Ports that decoy services listen on. 8080 is left out: it is the orchestrator's P2P port.
+/// Ports that decoy services listen on. 8080 is left out: local services such as the CrowdSec
+/// Local API use it, and a trap there would ban their clients.
 const DEFAULT_TRAP_PORTS: [u16; 6] = [22, 80, 443, 3306, 6379, 8443];
 /// The XDP program always passes this port as the operator's real SSH (ADMIN_SSH_PORT).
 const ADMIN_SSH_PORT: u16 = 2222;
@@ -662,7 +663,7 @@ mod tests {
         let config = TrapConfig::parse(None, None).unwrap();
         assert!(
             !config.ports.contains(&8080),
-            "8080 is the orchestrator P2P port"
+            "8080 is left to local services such as the CrowdSec Local API"
         );
         assert!(!config.ports.contains(&ADMIN_SSH_PORT));
         assert!(

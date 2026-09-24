@@ -102,7 +102,7 @@ Collect the keys into a peers file on every node:
 ```
 
 ```shell
-sudo ./target/release/orchestrator -i eth0 --node-id 1 --peers-file /etc/sokol/peers.json --seed-peer 10.0.0.2:8080
+sudo ./target/release/orchestrator -i eth0 --node-id 1 --peers-file /etc/sokol/peers.json --seed-peer 10.0.0.2:7946
 ```
 
 To rotate a node's key without downtime:
@@ -202,8 +202,8 @@ on an interface the orchestrator already uses. It refuses to start without `SOKO
 `trident_trap` listens on decoy ports and asks the orchestrator to block every source that
 connects, so run it on a decoy host or only on ports with no real service.
 
-- `SOKOL_TRAP_PORTS` — comma-separated ports (default `22,80,443,3306,6379,8443`; `8080` is the
-  orchestrator's P2P port and `2222` the operator SSH port, which is refused)
+- `SOKOL_TRAP_PORTS` — comma-separated ports (default `22,80,443,3306,6379,8443`; `2222`, the
+  operator SSH port, is refused)
 - `SOKOL_JAIL_ADDR` — optional external interactive jail for SSH attackers; without it an
   embedded mock jail answers. It must not be the operator SSH port.
 

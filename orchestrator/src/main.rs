@@ -167,7 +167,9 @@ struct Args {
     #[arg(long, default_value = "1")]
     node_id: u64,
 
-    #[arg(long, default_value = "[::]:8080")]
+    /// Mesh listener. The default avoids 8080, which the CrowdSec Local API and many local
+    /// services use.
+    #[arg(long, default_value = "[::]:7946")]
     p2p_bind: String,
 
     #[arg(long, value_name = "PEER")]
