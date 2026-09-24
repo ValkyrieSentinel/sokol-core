@@ -10,7 +10,9 @@ pub struct Snapshot {
     pub dropped_packets: u64,
     pub drops_by_reason: [u64; DROP_REASON_SLOTS],
     pub events_suppressed: u64,
-    pub blocks_active: usize,
+    pub blocks_active_v4: usize,
+    pub blocks_active_v6: usize,
+    pub blocks_capacity: usize,
     pub p2p_peers: usize,
     pub audit_queue_overflow: u64,
 }
@@ -69,9 +71,25 @@ pub fn render(s: &Snapshot) -> String {
         &mut out,
         "sokol_blocks_active",
         "gauge",
-        "Addresses currently blocked (static and dynamic).",
+        "Addresses currently blocked (static and dynamic), per blocklist map.",
     );
-    let _ = writeln!(out, "sokol_blocks_active {}", s.blocks_active);
+    let _ = writeln!(
+        out,
+        "sokol_blocks_active{{family=\"ipv4\"}} {}",
+        s.blocks_active_v4
+    );
+    let _ = writeln!(
+        out,
+        "sokol_blocks_active{{family=\"ipv6\"}} {}",
+        s.blocks_active_v6
+    );
+    family(
+        &mut out,
+        "sokol_blocks_capacity",
+        "gauge",
+        "Entries each blocklist map can hold.",
+    );
+    let _ = writeln!(out, "sokol_blocks_capacity {}", s.blocks_capacity);
     family(
         &mut out,
         "sokol_p2p_active_peers",
@@ -105,7 +123,9 @@ mod tests {
             rx_bytes: 1000,
             dropped_packets: 3,
             events_suppressed: 7,
-            blocks_active: 2,
+            blocks_active_v4: 2,
+            blocks_active_v6: 1,
+            blocks_capacity: 65536,
             p2p_peers: 1,
             audit_queue_overflow: 0,
             ..Default::default()
@@ -118,7 +138,8 @@ mod tests {
         assert!(text.contains("sokol_xdp_dropped_packets_total{reason=\"blocklist\"} 2\n"));
         assert!(text.contains("sokol_xdp_dropped_packets_total{reason=\"fragment_blocked\"} 1\n"));
         assert!(text.contains("sokol_xdp_events_suppressed_total 7\n"));
-        assert!(text.contains("sokol_blocks_active 2\n"));
+        assert!(text.contains("sokol_blocks_active{family=\"ipv4\"} 2\n"));
+        assert!(text.contains("sokol_blocks_capacity 65536\n"));
         assert!(text.contains("sokol_p2p_active_peers 1\n"));
         // Every sample line belongs to a declared family.
         for line in text.lines().filter(|l| !l.starts_with('#')) {

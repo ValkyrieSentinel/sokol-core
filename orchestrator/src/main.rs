@@ -10,7 +10,7 @@ mod p2p;
 mod sokol;
 
 use aya::maps::{Array, LpmTrie, MapData, PerCpuArray, RingBuf};
-use aya::programs::Xdp;
+use aya::programs::{Xdp, XdpFlags};
 use aya::{include_bytes_aligned, Bpf, Pod};
 use clap::Parser;
 use sokol::SokolEngine;
@@ -28,7 +28,7 @@ use common::canonical::CanonicalParser;
 use common::{DropEvent, NodeTelemetry};
 
 use crate::block_policy::BlockPolicy;
-use crate::block_table::{BlockTable, Lifetime, TtlPolicy};
+use crate::block_table::{BlockTable, Lifetime, TtlPolicy, Watermark};
 use crate::cluster_state::BirdEyeView;
 use crate::p2p::{connect_to_peer, DagTracker, NodeCrypto, P2PNetwork, PeerRegistry, TrustStore};
 
@@ -227,6 +227,28 @@ struct Args {
     /// Group allowed to use the control socket (0660); without it root-only (0600).
     #[arg(long)]
     control_group: Option<String>,
+
+    /// XDP attach mode: `native` (driver, fastest; fails if the NIC driver lacks XDP),
+    /// `generic` (SKB mode, works everywhere, much slower), or `auto` (kernel's choice).
+    #[arg(long, value_enum, default_value = "auto")]
+    xdp_mode: XdpMode,
+}
+
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum XdpMode {
+    Auto,
+    Native,
+    Generic,
+}
+
+impl XdpMode {
+    fn flags(self) -> XdpFlags {
+        match self {
+            XdpMode::Auto => XdpFlags::default(),
+            XdpMode::Native => XdpFlags::DRV_MODE,
+            XdpMode::Generic => XdpFlags::SKB_MODE,
+        }
+    }
 }
 
 const MAX_IPC_LINE: u64 = 4096;
@@ -499,10 +521,20 @@ async fn main() -> Result<(), anyhow::Error> {
         .program_mut("sentinel_vfr_filter")
         .ok_or_else(|| anyhow::anyhow!("Critical: Program sentinel_vfr_filter not found in ELF"))?;
     let program: &mut Xdp = prog_mut.try_into()?;
-    let _link = program.attach(&args.interface, Default::default())?;
+    let _link = program
+        .attach(&args.interface, args.xdp_mode.flags())
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "XDP attach to {} in {:?} mode failed: {}",
+                args.interface,
+                args.xdp_mode,
+                e
+            )
+        })?;
     log::info!(
-        "XDP program successfully locked and attached to interface: {}",
-        args.interface
+        "XDP program successfully locked and attached to interface: {} (mode: {:?})",
+        args.interface,
+        args.xdp_mode
     );
 
     let blocklist_v4_data = bpf
@@ -1121,6 +1153,7 @@ async fn main() -> Result<(), anyhow::Error> {
     let node_id_hb = args.node_id;
     let p2p_bind_hb = args.p2p_bind.clone();
     let control_socket_hb = args.control_socket.clone();
+    let mut watermark = Watermark::default();
 
     loop {
         tokio::select! {
@@ -1167,7 +1200,14 @@ async fn main() -> Result<(), anyhow::Error> {
                 snapshot.rx_packets = total_rx_packets;
                 snapshot.rx_bytes = total_rx_bytes;
                 snapshot.dropped_packets = total_dropped;
-                snapshot.blocks_active = blocks.lock().await.active();
+                let (v4_active, v6_active) = blocks.lock().await.active_by_family();
+                snapshot.blocks_active_v4 = v4_active;
+                snapshot.blocks_active_v6 = v6_active;
+                snapshot.blocks_capacity = common::BLOCKLIST_CAPACITY as usize;
+                for message in watermark.update((v4_active, v6_active), common::BLOCKLIST_CAPACITY as usize) {
+                    log::warn!("[BlockTable] {}", message);
+                    sntl_db.append(format!("BLOCKLIST_WATERMARK|{}", message));
+                }
                 snapshot.p2p_peers = peer_registry.peer_count().await;
                 snapshot.audit_queue_overflow = sntl_db.overflow_total();
                 *metrics_snapshot.write().unwrap_or_else(|p| p.into_inner()) = snapshot;

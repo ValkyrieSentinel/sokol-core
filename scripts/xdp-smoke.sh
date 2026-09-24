@@ -104,6 +104,8 @@ metric() {
     curl -s http://127.0.0.1:9469/metrics | awk -v m="$1" '$1 == m { print $2 }'
 }
 sleep 1.2
+check "metrics: static block counted in the IPv4 blocklist gauge" \
+    test "$(metric 'sokol_blocks_active{family="ipv4"}')" -ge 1
 check "metrics: blocklist drops are counted" bash -c "test \"\$(curl -s http://127.0.0.1:9469/metrics | awk '\$1 == \"sokol_xdp_dropped_packets_total{reason=\\\"blocklist\\\"}\" { print \$2 }')\" -ge 2"
 
 # Scanner probes with impossible TCP flag combinations are dropped in XDP.
@@ -203,6 +205,14 @@ check "audit log from the first run is re-verified on restart" \
     grep -qE "Audit log .* opened: [1-9][0-9]* records verified" "$LOG"
 check "strict mode: unfragmented traffic from $ALLOWED_IP passes" ping_from "$ALLOWED_IP"
 check "strict mode: fragmented IPv4 is dropped" bash -c "! ip netns exec $NS ping -c 2 -W 1 -s 3000 -I $ALLOWED_IP $HOST_IP >/dev/null 2>&1"
+
+stop_orchestrator
+start_orchestrator --xdp-mode generic
+check "--xdp-mode generic attaches in SKB mode" bash -c "ip -d link show $HOST_IF | grep -q xdpgeneric"
+stop_orchestrator
+start_orchestrator --xdp-mode native
+check "--xdp-mode native attaches in driver mode (veth supports it)" bash -c "ip -d link show $HOST_IF | grep -qw xdp && ! ip -d link show $HOST_IF | grep -q xdpgeneric"
+check "native mode: blocked source is dropped" bash -c "! ip netns exec $NS ping -c 1 -W 1 -I $BLOCKED_IP $HOST_IP >/dev/null 2>&1"
 
 stop_orchestrator
 start_orchestrator --block-ttl 2

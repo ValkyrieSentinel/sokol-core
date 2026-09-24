@@ -76,7 +76,7 @@ graph TD
   - Реалізувати два режими:
     1. *Strict Anti-Frag:* дроп фрагментів із явним кодом події `drop_reason::FRAGMENT_BLOCKED` (для серверів, де фрагментація заборонена політикою).
     2. *Permissive First-Frag:* перевірка L4-портів у нульовому фрагменті (`frag_off == 0`) та облік подальших фрагментів через короткоживучий LRU-хеш.
-- [~] **1.2. Захист від переповнення та DoS на карти eBPF:** — *RingBuf: бюджет 64 події/с на CPU + лічильник придушених; переповнення мап пом'якшує TTL блоків (4.2); watermark-алертів ще немає*
+- [x] **1.2. Захист від переповнення та DoS на карти eBPF:** — *RingBuf: бюджет 64 події/с на CPU + лічильник придушених; TTL блоків (4.2); `sokol_blocks_active{family}` / `sokol_blocks_capacity` і попередження при перетині 80% (лог + журнал аудиту)*
   - `BLOCKLIST_V4` та `BLOCKLIST_V6` (`LpmTrie`): реалізувати ліміти та моніторинг наповнення карт (watermark alerts).
   - Оптимізувати `RingBuf` подій дропу: адаптивний семплінг при високому pps (packet per second), щоб не забивати чергу подій у ядра під час DDoS-атак.
 - [x] **1.3. Безпека типів та пам'яті в eBPF:** — *`to_ne_bytes()` — **не баг** (байти зберігають мережевий порядок); NULL/XMAS/FIN/SYN-FIN/SYN-RST/FIN-RST дропаються в XDP (`invalid_tcp_flags`), перевірено сирими пакетами в smoke-тесті*
@@ -164,7 +164,7 @@ graph TD
     - `CAP_NET_ADMIN` (маніпуляції з XDP та мережевими інтерфейсами);
     - `CAP_BPF` (завантаження та маніпуляція BPF-картами);
     - `CAP_NET_RAW` (робота з сирими сокетами пасток).
-- [~] **6.3. Systemd Unit та документація розгортання:** — *`deploy/sokol-orchestrator.service` (verify OK, security 3.7); гайду по драйверах NIC ще немає*
+- [x] **6.3. Systemd Unit та документація розгортання:** — *`deploy/sokol-orchestrator.service` (verify OK, security 3.7); `--xdp-mode auto|native|generic` і гайд по драйверах NIC у README; обидва режими перевірено в smoke-тесті*
   - Підготувати перевірені service-файли systemd з `ProtectSystem=strict`, `MemoryDenyWriteExecute=true`, `PrivateTmp=true`.
   - Створити покроковий гайд налаштування драйверів мережевих карт (драйверний режим `XDP_DRV` vs емульований `XDP_SKB`).
 

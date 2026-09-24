@@ -53,6 +53,33 @@ Run as root for a quick test (for production use the systemd unit below, which r
 sudo ./target/release/orchestrator
 ```
 
+## XDP modes and NIC drivers
+
+`--xdp-mode` chooses how the filter attaches:
+
+- `native` — runs in the NIC driver before any socket buffer is allocated. This is the mode that
+  sustains line-rate drops. Attach fails if the driver has no XDP support.
+- `generic` — runs after the kernel built an skb. Works on any interface but costs roughly as
+  much per packet as iptables; use it for testing or unsupported NICs.
+- `auto` (default) — the kernel uses native if the driver supports it, otherwise generic.
+
+Check what you got:
+
+```shell
+ip -d link show dev eth0 | grep -o 'xdp[a-z]*'   # "xdp" = native, "xdpgeneric" = generic
+ethtool -i eth0 | grep driver                    # driver name
+```
+
+Drivers with native XDP include `mlx5_core`, `mlx4_en`, `i40e`, `ice`, `ixgbe`, `igb`/`igc`
+(recent kernels), `bnxt_en`, `nfp`, `ena`, `virtio_net`, `veth`, `tun`. Some need a driver-specific
+setting: `virtio_net` needs enough queues (`ethtool -L eth0 combined <n>`), `ena` needs an MTU
+at or below its XDP limit, and several drivers refuse XDP with jumbo frames or LRO enabled
+(`ethtool -K eth0 lro off`). Start the service with `--xdp-mode native` in production so a
+driver problem fails loudly instead of silently falling back to generic mode.
+
+`sokol_blocks_active{family=...}` and `sokol_blocks_capacity` (65 536 per family) show map
+usage; crossing 80% is logged and recorded in the audit log.
+
 ## Mesh peers
 
 Nodes accept mesh commands (e.g. `BlockIp`) only from peers whose public key is pinned in a

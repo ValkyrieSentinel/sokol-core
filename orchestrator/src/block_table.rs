@@ -141,6 +141,55 @@ impl ExpiryTracker {
             .filter(|e| e.state != State::Expired)
             .count()
     }
+
+    /// Active blocks as (IPv4, IPv6) — each family has its own kernel map.
+    pub fn active_by_family(&self) -> (usize, usize) {
+        let active = self
+            .entries
+            .iter()
+            .filter(|(_, e)| e.state != State::Expired);
+        active.fold((0, 0), |(v4, v6), (ip, _)| match ip {
+            IpAddr::V4(_) => (v4 + 1, v6),
+            IpAddr::V6(_) => (v4, v6 + 1),
+        })
+    }
+}
+
+/// Share of a blocklist map in use at which the operator is warned.
+pub const WATERMARK: f64 = 0.8;
+
+/// Tracks whether each family is above the watermark, reporting only crossings.
+#[derive(Default)]
+pub struct Watermark {
+    above: [bool; 2],
+}
+
+impl Watermark {
+    /// Returns a message when a family crosses the watermark in either direction.
+    pub fn update(&mut self, (v4, v6): (usize, usize), capacity: usize) -> Vec<String> {
+        let mut messages = Vec::new();
+        for (i, (name, used)) in [("IPv4", v4), ("IPv6", v6)].into_iter().enumerate() {
+            let above = used as f64 >= capacity as f64 * WATERMARK;
+            if above != self.above[i] {
+                self.above[i] = above;
+                messages.push(if above {
+                    format!(
+                        "{} blocklist is {}/{} full; new blocks will fail at capacity",
+                        name, used, capacity
+                    )
+                } else {
+                    format!(
+                        "{} blocklist back below {:.0}% ({}/{})",
+                        name,
+                        WATERMARK * 100.0,
+                        used,
+                        capacity
+                    )
+                });
+            }
+        }
+        messages
+    }
 }
 
 pub struct BlockTable {
@@ -233,6 +282,10 @@ impl BlockTable {
 
     pub fn active(&self) -> usize {
         self.expiry.active()
+    }
+
+    pub fn active_by_family(&self) -> (usize, usize) {
+        self.expiry.active_by_family()
     }
 }
 
@@ -375,6 +428,29 @@ mod tests {
         assert_eq!(
             tracker.record(dynamic, Lifetime::Dynamic, t0),
             Some(Duration::from_secs(120))
+        );
+    }
+
+    #[test]
+    fn counts_by_family_and_reports_watermark_crossings_once() {
+        let t0 = Instant::now();
+        let mut tracker = ExpiryTracker::new(POLICY);
+        tracker.record(ip("203.0.113.1"), Lifetime::Dynamic, t0);
+        tracker.record(ip("203.0.113.2"), Lifetime::Permanent, t0);
+        tracker.record(ip("2001:db8::1"), Lifetime::Dynamic, t0);
+        assert_eq!(tracker.active_by_family(), (2, 1));
+
+        let mut mark = Watermark::default();
+        assert!(mark.update((7, 0), 10).is_empty());
+        assert_eq!(mark.update((8, 0), 10).len(), 1, "crossing up is reported");
+        assert!(
+            mark.update((9, 0), 10).is_empty(),
+            "staying above is not repeated"
+        );
+        assert_eq!(
+            mark.update((7, 9), 10).len(),
+            2,
+            "v4 back below, v6 crossing up"
         );
     }
 

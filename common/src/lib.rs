@@ -28,6 +28,8 @@ pub struct PacketStats {
 }
 
 pub const DROP_REASON_SLOTS: usize = 16;
+/// Entries per blocklist map (IPv4 and IPv6 each).
+pub const BLOCKLIST_CAPACITY: u32 = 65_536;
 /// Ring-buffer events allowed per CPU per second; the rest are only counted.
 pub const MAX_EVENTS_PER_CPU_PER_SEC: u64 = 64;
 

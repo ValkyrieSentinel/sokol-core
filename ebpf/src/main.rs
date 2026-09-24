@@ -10,7 +10,7 @@ use aya_ebpf::{
 use core::mem;
 
 use common::{
-    config_flags, drop_reason, DropEvent, PacketStats, DROP_REASON_SLOTS,
+    config_flags, drop_reason, DropEvent, PacketStats, BLOCKLIST_CAPACITY, DROP_REASON_SLOTS,
     MAX_EVENTS_PER_CPU_PER_SEC,
 };
 
@@ -105,10 +105,12 @@ pub struct TcpHdr {
 }
 
 #[map]
-static BLOCKLIST_V4: LpmTrie<[u8; 4], u32> = LpmTrie::with_max_entries(65536, BPF_F_NO_PREALLOC);
+static BLOCKLIST_V4: LpmTrie<[u8; 4], u32> =
+    LpmTrie::with_max_entries(BLOCKLIST_CAPACITY, BPF_F_NO_PREALLOC);
 
 #[map]
-static BLOCKLIST_V6: LpmTrie<[u8; 16], u32> = LpmTrie::with_max_entries(65536, BPF_F_NO_PREALLOC);
+static BLOCKLIST_V6: LpmTrie<[u8; 16], u32> =
+    LpmTrie::with_max_entries(BLOCKLIST_CAPACITY, BPF_F_NO_PREALLOC);
 
 #[map]
 static STATS: PerCpuArray<PacketStats> = PerCpuArray::with_max_entries(1, 0);
