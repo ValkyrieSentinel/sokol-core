@@ -5,6 +5,10 @@
 # The mesh's own ML-DSA/Dilithium signatures authenticate every command; WireGuard adds the
 # confidentiality the mesh protocol does not have. Bind the orchestrator's P2P listener to the
 # tunnel address only (--p2p-bind 10.99.0.1:7946) so mesh traffic never leaves the tunnel.
+#
+# XDP sees the tunnel from outside: protect each peer's Endpoint address as well as its tunnel
+# address, e.g. --never-block 10.99.0.2 --never-block 198.51.100.2. A block of the endpoint drops
+# the WireGuard packets and takes the mesh link down.
 
 [Interface]
 Address = 10.99.0.1/24
