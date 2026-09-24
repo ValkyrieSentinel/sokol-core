@@ -32,7 +32,8 @@ use common::{DropEvent, NodeTelemetry};
 
 use crate::block_policy::BlockPolicy;
 use crate::block_table::{
-    family_tag, host, parse_target, show, BlockTable, Lifetime, TtlPolicy, Watermark,
+    family_tag, host, parse_target, show, Adoption, BlockTable, ClaimKind, LiftError, Persisted,
+    TtlPolicy, Watermark,
 };
 use crate::cluster_state::BirdEyeView;
 use crate::p2p::{
@@ -341,6 +342,11 @@ struct Args {
     #[arg(long, default_value = "/var/lib/sokol/audit.log")]
     db_path: String,
 
+    /// This node's own block decisions and operator lifts, restored on start
+    /// (default: <db-path>.blocks.json). Peers' blocks come back through the mesh.
+    #[arg(long)]
+    state_file: Option<std::path::PathBuf>,
+
     #[arg(long, default_value = "1")]
     node_id: u64,
 
@@ -526,6 +532,24 @@ struct ControlCtx {
     sntl_db: Arc<SentinelDb>,
     registry: PeerRegistry,
     peers_file: Option<std::path::PathBuf>,
+    node_id: u64,
+    crypto: Arc<NodeCrypto>,
+    dag: Arc<tokio::sync::Mutex<DagTracker>>,
+}
+
+/// Tells the mesh that this node takes back its own claims.
+async fn broadcast_retraction(ctx: &ControlCtx, ids: Vec<block_table::ClaimId>) {
+    if ids.is_empty() {
+        return;
+    }
+    let cmd = MeshCommand::Retract {
+        issuer: ctx.node_id,
+        claims: ids,
+    };
+    let _ = ctx
+        .registry
+        .broadcast(&cmd, ctx.node_id, &ctx.crypto, &ctx.dag)
+        .await;
 }
 
 async fn execute_control(cmd: control::ControlCommand, ctx: &ControlCtx) -> String {
@@ -537,37 +561,59 @@ async fn execute_control(cmd: control::ControlCommand, ctx: &ControlCtx) -> Stri
             if let Err(why) = policy.check_net(ip) {
                 return format!("ERR {} is protected ({})", shown, why);
             }
-            let result =
+            let added =
                 blocks
                     .lock()
                     .await
-                    .insert(ip, Lifetime::Permanent, std::time::Instant::now());
-            match result {
-                Ok(_) => {
+                    .add_local(ip, ClaimKind::Operator, "operator", now_ms());
+            sntl_db.append(format!("OPERATOR_BAN_{}|IP:{}", ip_tag(ip), shown));
+            match added.applied {
+                Ok(()) => {
                     log::warn!("[Control] Operator ban for {}", shown);
-                    sntl_db.append(format!("OPERATOR_BAN_{}|IP:{}", ip_tag(ip), shown));
                     format!("OK banned {}", shown)
                 }
-                Err(e) => format!("ERR kernel map update failed: {:?}", e),
+                Err(e) => format!(
+                    "ERR kernel map update failed: {:?}; the ban is kept and retried every second",
+                    e
+                ),
             }
         }
         ControlCommand::Unban(ip) => {
             let shown = show(&ip);
-            let result = blocks.lock().await.remove(ip, std::time::Instant::now());
+            let (result, still_blocked) = {
+                let mut table = blocks.lock().await;
+                let result = table.lift(ip, now_ms());
+                (result, table.is_blocked(ip))
+            };
             match result {
-                Ok(()) => {
+                Ok(lifted) => {
                     log::warn!("[Control] Operator unban for {}", shown);
-                    sntl_db.append(format!("OPERATOR_UNBAN_{}|IP:{}", ip_tag(ip), shown));
-                    format!("OK unbanned {}", shown)
+                    sntl_db.append(format!(
+                        "OPERATOR_UNBAN_{}|IP:{}|Claims:{}",
+                        ip_tag(ip),
+                        shown,
+                        lifted.claims
+                    ));
+                    broadcast_retraction(ctx, lifted.retracted).await;
+                    if still_blocked {
+                        format!(
+                            "OK unbanned {} (kernel removal pending, retried every second)",
+                            shown
+                        )
+                    } else {
+                        format!("OK unbanned {}", shown)
+                    }
                 }
-                Err(e) => format!(
-                    "ERR {} was not blocked or could not be removed: {:?}",
-                    shown, e
+                Err(LiftError::Static) => format!(
+                    "ERR {} is blocked by --block; change the configuration to lift it",
+                    shown
                 ),
+                Err(LiftError::NotBlocked) => format!("ERR {} was not blocked", shown),
             }
         }
         ControlCommand::FlushDynamic => {
-            let released = blocks.lock().await.flush_dynamic(std::time::Instant::now());
+            let (released, lifted) = blocks.lock().await.flush_detector(now_ms());
+            broadcast_retraction(ctx, lifted.retracted).await;
             log::warn!(
                 "[Control] Operator flushed {} dynamic blocks",
                 released.len()
@@ -605,6 +651,59 @@ fn resolve_group(name: &str) -> anyhow::Result<u32> {
         anyhow::bail!("--ipc-group '{}' does not exist", name);
     }
     Ok(unsafe { (*group).gr_gid })
+}
+
+/// Sends this node's shared mesh state to one peer (catch-up on connect, anti-entropy).
+async fn send_snapshot(
+    addr: std::net::SocketAddr,
+    blocks: &SharedBlockTable,
+    registry: &PeerRegistry,
+    node_id: u64,
+    crypto: &Arc<NodeCrypto>,
+    dag: &Arc<tokio::sync::Mutex<DagTracker>>,
+) {
+    let (claims, mut retracted) = blocks.lock().await.snapshot(now_ms());
+    let total = claims.len();
+    // Always at least one message, so a peer learns about retractions even with no claims.
+    let mut chunks: Vec<Vec<block_table::Claim>> = claims
+        .chunks(mesh_sync::SYNC_CHUNK)
+        .map(|c| c.to_vec())
+        .collect();
+    if chunks.is_empty() {
+        chunks.push(Vec::new());
+    }
+    for (i, chunk) in chunks.into_iter().enumerate() {
+        let cmd = MeshCommand::BlockSync {
+            issuer: node_id,
+            claims: chunk,
+            retracted: if i == 0 {
+                std::mem::take(&mut retracted)
+            } else {
+                Vec::new()
+            },
+        };
+        if let Err(e) = registry.send_to(addr, &cmd, node_id, crypto, dag).await {
+            log::warn!("[Mesh] Block sync to {} failed: {:#}", addr, e);
+            return;
+        }
+    }
+    log::info!("[Mesh] Sent {} shared blocks to {}", total, addr);
+}
+
+/// Writes the durable part of the table atomically (temp file + rename, mode 0600).
+fn save_state(path: &std::path::Path, state: &Persisted) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let tmp = path.with_extension("tmp");
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&tmp)?;
+    f.write_all(&serde_json::to_vec(state).map_err(std::io::Error::other)?)?;
+    f.sync_all()?;
+    std::fs::rename(&tmp, path)
 }
 
 async fn push_telemetry(msg: &str) {
@@ -674,12 +773,18 @@ async fn enforce_block_local(
         ));
         return Enforcement::Refused;
     }
-    let result = blocks
+    let added = blocks
         .lock()
         .await
-        .insert(ip, Lifetime::Dynamic, std::time::Instant::now());
-    match result {
-        Ok(ttl) => {
+        .add_local(ip, ClaimKind::Detector, reason, now_ms());
+    let ttl = added.ttl;
+    // The claim is shared either way: peers can enforce it even if this node's map is full.
+    let broadcast_cmd = MeshCommand::Claim { claim: added.claim };
+    let _ = registry
+        .broadcast(&broadcast_cmd, node_id, node_crypto, dag_tracker)
+        .await;
+    match added.applied {
+        Ok(()) => {
             log::warn!(
                 "[Local Security] Dynamic block enforced in XDP: {} for {} | Reason: {}",
                 shown,
@@ -711,7 +816,7 @@ async fn enforce_block_local(
         }
         Err(e) => {
             log::error!(
-                "[Local Security] Failed to insert {} into eBPF: {:?}",
+                "[Local Security] Failed to insert {} into eBPF: {:?}; retried every second",
                 shown,
                 e
             );
@@ -837,7 +942,12 @@ async fn main() -> Result<(), anyhow::Error> {
         blocklist_v4_trie,
         blocklist_v6_trie,
         ttl_policy,
+        args.node_id,
     )));
+    let state_file = args
+        .state_file
+        .clone()
+        .unwrap_or_else(|| std::path::PathBuf::from(format!("{}.blocks.json", args.db_path)));
 
     let stats_map_data = bpf
         .take_map("STATS")
@@ -914,7 +1024,8 @@ async fn main() -> Result<(), anyhow::Error> {
             blocks
                 .lock()
                 .await
-                .insert(ip, Lifetime::Permanent, std::time::Instant::now())?;
+                .add_local(ip, ClaimKind::Static, "--block", now_ms())
+                .applied?;
             sntl_db.append(format!(
                 "STATIC_BLOCK_{}|IP:{}|Action:XDP_DROP",
                 ip_tag(ip),
@@ -930,6 +1041,35 @@ async fn main() -> Result<(), anyhow::Error> {
                 ip_str
             );
         }
+    }
+
+    match std::fs::read(&state_file) {
+        Ok(bytes) => match serde_json::from_slice::<Persisted>(&bytes) {
+            Ok(state) => {
+                let (restored, refused) = blocks.lock().await.restore(
+                    state,
+                    |net| block_policy.check_net(net).is_ok(),
+                    now_ms(),
+                );
+                log::warn!(
+                    "[State] Restored {} of this node's blocks from {} ({} refused)",
+                    restored,
+                    state_file.display(),
+                    refused
+                );
+                sntl_db.append(format!(
+                    "STATE_RESTORED|Blocks:{}|Refused:{}",
+                    restored, refused
+                ));
+            }
+            Err(e) => log::error!(
+                "[State] {} is not a valid state file ({}); starting without it",
+                state_file.display(),
+                e
+            ),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => log::error!("[State] Cannot read {}: {}", state_file.display(), e),
     }
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -1006,46 +1146,61 @@ async fn main() -> Result<(), anyhow::Error> {
         let node_id = args.node_id;
         tokio::spawn(async move {
             while let Some(addr) = peer_up_rx.recv().await {
-                let snapshot = blocks
-                    .lock()
-                    .await
-                    .dynamic_snapshot(std::time::Instant::now());
-                if snapshot.is_empty() {
-                    continue;
-                }
-                for chunk in snapshot.chunks(mesh_sync::SYNC_CHUNK) {
-                    let cmd = MeshCommand::BlockSync {
-                        blocks: chunk
-                            .iter()
-                            .map(|(ip, left)| mesh_sync::SyncedBlock {
-                                ip: show(ip),
-                                remaining_secs: left.as_secs().max(1),
-                            })
-                            .collect(),
-                    };
-                    if let Err(e) = registry.send_to(addr, &cmd, node_id, &crypto, &dag).await {
-                        log::warn!("[Mesh] Block sync to {} failed: {:#}", addr, e);
-                        break;
-                    }
-                }
-                log::info!("[Mesh] Sent {} running blocks to {}", snapshot.len(), addr);
+                send_snapshot(addr, &blocks, &registry, node_id, &crypto, &dag).await;
             }
         });
     }
     let sntl_db_mesh = sntl_db.clone();
     let node_id_mesh = args.node_id;
     let policy_mesh = block_policy.clone();
+    let (registry_mesh, crypto_mesh, dag_mesh) = (
+        peer_registry.clone(),
+        node_crypto.clone(),
+        dag_tracker.clone(),
+    );
 
     tokio::spawn(async move {
         while let Some(cmd) = mesh_cmd_rx.recv().await {
             match cmd {
-                MeshCommand::BlockIp { ip, reason } => {
-                    let clean_ip = ip.trim();
-                    if let Some(ip_addr) = parse_target(clean_ip) {
-                        let shown = show(&ip_addr);
-                        if let Err(why) = policy_mesh.check_net(ip_addr) {
+                MeshCommand::Claim { claim } => {
+                    let shown = claim.target.clone();
+                    let reason = claim.reason.clone();
+                    let issuer = claim.issuer;
+                    let expires = claim.expires_ms;
+                    let refusal = claim.net().and_then(|n| policy_mesh.check_net(n).err());
+                    let now = now_ms();
+                    let result = blocks_mesh
+                        .lock()
+                        .await
+                        .adopt(claim, refusal.is_none(), now);
+                    match (result, refusal) {
+                        (Adoption::Enforced, _) => {
+                            let left =
+                                expires.map(|e| Duration::from_millis(e.saturating_sub(now)));
+                            log::warn!(
+                                "[Mesh] Synchronized block for {} from node {} ({}): {}",
+                                shown,
+                                issuer,
+                                ttl_label(left),
+                                reason
+                            );
+                            let tag = parse_target(&shown).map(ip_tag).unwrap_or("V4");
+                            sntl_db_mesh.append(format!(
+                                "MESH_BLOCK_{}|IP:{}|TTL:{}|Reason:{}",
+                                tag,
+                                shown,
+                                ttl_label(left),
+                                reason
+                            ));
+                            let telemetry_msg = format!(
+                                "DB_LOG:NODE={}|TIER=MeshBlock|IP={}|VEC={}\n",
+                                node_id_mesh, shown, reason
+                            );
+                            push_telemetry(&telemetry_msg).await;
+                        }
+                        (Adoption::Held, Some(why)) => {
                             log::error!(
-                                "[Mesh] Refusing mesh BlockIp for protected {} ({}): {}",
+                                "[Mesh] Refusing mesh block for protected {} ({}): {}",
                                 shown,
                                 why,
                                 reason
@@ -1054,104 +1209,113 @@ async fn main() -> Result<(), anyhow::Error> {
                                 "MESH_BLOCK_REFUSED|IP:{}|Protected:{}|Reason:{}",
                                 shown, why, reason
                             ));
-                            continue;
                         }
-                        let result = blocks_mesh.lock().await.insert(
-                            ip_addr,
-                            Lifetime::Dynamic,
-                            std::time::Instant::now(),
-                        );
-                        match result {
-                            Err(e) => {
-                                log::error!("[Mesh] Failed to insert {} into eBPF: {:?}", shown, e)
-                            }
-                            Ok(ttl) => {
-                                log::warn!(
-                                    "[Mesh] Synchronized block for {} ({}) across mesh: {}",
-                                    shown,
-                                    ttl_label(ttl),
-                                    reason
-                                );
-                                sntl_db_mesh.append(format!(
-                                    "MESH_BLOCK_{}|IP:{}|TTL:{}|Reason:{}",
-                                    ip_tag(ip_addr),
-                                    shown,
-                                    ttl_label(ttl),
-                                    reason
-                                ));
-
-                                let telemetry_msg = format!(
-                                    "DB_LOG:NODE={}|TIER=MeshBlock|IP={}|VEC={}\n",
-                                    node_id_mesh, shown, reason
-                                );
-                                push_telemetry(&telemetry_msg).await;
-                            }
+                        (Adoption::Refused(why), _) => {
+                            log::warn!(
+                                "[Mesh] Ignoring claim for {} from node {}: {}",
+                                shown,
+                                issuer,
+                                why
+                            )
                         }
-                    } else {
-                        log::error!(
-                            "[Mesh] Received unparseable IP in BlockIp command: '{}'",
-                            ip
-                        );
+                        _ => {}
                     }
                 }
-                MeshCommand::BlockSync { blocks } => {
-                    let now = std::time::Instant::now();
+                MeshCommand::Retract { issuer, claims } => {
+                    let lifted = blocks_mesh.lock().await.retract(issuer, &claims, now_ms());
+                    for net in lifted {
+                        log::info!(
+                            "[Mesh] Unblocked {}: node {} took back its block",
+                            show(&net),
+                            issuer
+                        );
+                        sntl_db_mesh.append(format!(
+                            "MESH_UNBLOCK|IP:{}|Issuer:{}",
+                            show(&net),
+                            issuer
+                        ));
+                    }
+                }
+                MeshCommand::BlockSync {
+                    issuer,
+                    claims,
+                    retracted,
+                } => {
+                    let now = now_ms();
                     let mut adopted = 0;
-                    for entry in blocks {
-                        let Some(ip_addr) = parse_target(&entry.ip) else {
-                            continue;
-                        };
-                        if policy_mesh.check_net(ip_addr).is_err() {
-                            continue;
-                        }
-                        let remaining = Duration::from_secs(entry.remaining_secs);
-                        let result = blocks_mesh
+                    for claim in claims {
+                        let refusal = claim.net().and_then(|n| policy_mesh.check_net(n).err());
+                        let (shown, secs) = (
+                            claim.target.clone(),
+                            claim.expires_ms.map(|e| e.saturating_sub(now) / 1000),
+                        );
+                        let tag = parse_target(&shown).map(ip_tag).unwrap_or("V4");
+                        if blocks_mesh
                             .lock()
                             .await
-                            .insert_until(ip_addr, remaining, now);
-                        match result {
-                            Ok(true) => {
-                                adopted += 1;
-                                sntl_db_mesh.append(format!(
-                                    "MESH_BLOCK_{}|IP:{}|TTL:{}s|Reason:sync from peer",
-                                    ip_tag(ip_addr),
-                                    show(&ip_addr),
-                                    entry.remaining_secs
-                                ));
-                            }
-                            Ok(false) => {}
-                            Err(e) => log::error!(
-                                "[Mesh] Failed to adopt synced block {}: {:?}",
-                                show(&ip_addr),
-                                e
-                            ),
+                            .adopt(claim, refusal.is_none(), now)
+                            == Adoption::Enforced
+                        {
+                            adopted += 1;
+                            sntl_db_mesh.append(format!(
+                                "MESH_BLOCK_{}|IP:{}|TTL:{}|Reason:sync from node {}",
+                                tag,
+                                shown,
+                                secs.map_or("permanent".into(), |s| format!("{}s", s)),
+                                issuer
+                            ));
                         }
                     }
-                    if adopted > 0 {
+                    let lifted = blocks_mesh.lock().await.retract(issuer, &retracted, now);
+                    for net in &lifted {
+                        sntl_db_mesh.append(format!(
+                            "MESH_UNBLOCK|IP:{}|Issuer:{}",
+                            show(net),
+                            issuer
+                        ));
+                    }
+                    if adopted > 0 || !lifted.is_empty() {
                         log::warn!(
-                            "[Mesh] Adopted {} blocks missed while disconnected",
-                            adopted
+                            "[Mesh] Sync from node {}: adopted {} blocks missed while disconnected, {} taken back",
+                            issuer,
+                            adopted,
+                            lifted.len()
                         );
                     }
                 }
-                MeshCommand::UnblockIp { ip } => {
-                    let clean_ip = ip.trim();
-                    if let Some(ip_addr) = parse_target(clean_ip) {
-                        let result = blocks_mesh.lock().await.remove_dynamic(ip_addr);
-                        let ip_addr = show(&ip_addr);
-                        match result {
-                            Ok(true) => {
-                                log::info!("[Mesh] Unblocked {} per mesh command", ip_addr);
-                                sntl_db_mesh.append(format!("MESH_UNBLOCK|IP:{}", ip_addr));
-                            }
-                            Ok(false) => log::warn!(
-                                "[Mesh] Ignoring mesh UnblockIp for operator block {}",
-                                ip_addr
-                            ),
-                            Err(e) => log::error!("[Mesh] Failed to unblock {}: {:?}", ip_addr, e),
+                MeshCommand::Digest { issuer, digest } => {
+                    let own = blocks_mesh.lock().await.digest(now_ms());
+                    if own != digest {
+                        if let Some(addr) = registry_mesh.addr_of(issuer).await {
+                            log::info!("[Mesh] State differs from node {}; sending ours", issuer);
+                            send_snapshot(
+                                addr,
+                                &blocks_mesh,
+                                &registry_mesh,
+                                node_id_mesh,
+                                &crypto_mesh,
+                                &dag_mesh,
+                            )
+                            .await;
                         }
-                    } else {
-                        log::error!("[Mesh] Failed to parse IP for UnblockIp: '{}'", ip);
+                    }
+                }
+                MeshCommand::LocalDetection { ip, reason } => {
+                    // The telemetry processor's own detections: enforced here and shared like
+                    // any other local decision.
+                    if let Some(net) = parse_target(&ip) {
+                        enforce_block_local(
+                            net,
+                            &reason,
+                            &blocks_mesh,
+                            &sntl_db_mesh,
+                            &registry_mesh,
+                            node_id_mesh,
+                            &crypto_mesh,
+                            &dag_mesh,
+                            &policy_mesh,
+                        )
+                        .await;
                     }
                 }
                 MeshCommand::EngageDefense => {
@@ -1277,6 +1441,9 @@ async fn main() -> Result<(), anyhow::Error> {
         sntl_db: sntl_db.clone(),
         registry: peer_registry.clone(),
         peers_file: args.peers_file.clone(),
+        node_id: args.node_id,
+        crypto: node_crypto.clone(),
+        dag: dag_tracker.clone(),
     });
     tokio::spawn(async move {
         loop {
@@ -1569,6 +1736,14 @@ async fn main() -> Result<(), anyhow::Error> {
     let p2p_bind_hb = args.p2p_bind.clone();
     let control_socket_hb = args.control_socket.clone();
     let mut watermark = Watermark::default();
+    let (registry_tick, crypto_tick, dag_tick) = (
+        peer_registry.clone(),
+        node_crypto.clone(),
+        dag_tracker.clone(),
+    );
+    let node_id_tick = args.node_id;
+    let mut last_digest = std::time::Instant::now();
+    let mut state_error = false;
     let mut telemetry_window_start = std::time::Instant::now();
     let mut window_rx = 0u64;
     let mut window_dropped = 0u64;
@@ -1624,7 +1799,7 @@ async fn main() -> Result<(), anyhow::Error> {
             _ = ticker.tick() => {
                 atp_controller.reset();
 
-                let released = blocks.lock().await.expire(std::time::Instant::now());
+                let released = blocks.lock().await.tick(now_ms());
                 for ip in released {
                     log::info!("[BlockTable] Block for {} expired; traffic allowed again", show(&ip));
                     sntl_db.append(format!("BLOCK_EXPIRED_{}|IP:{}", ip_tag(ip), show(&ip)));
@@ -1662,6 +1837,7 @@ async fn main() -> Result<(), anyhow::Error> {
                 snapshot.blocks_active_v4 = v4_active;
                 snapshot.blocks_active_v6 = v6_active;
                 snapshot.blocks_capacity = common::BLOCKLIST_CAPACITY as usize;
+                snapshot.blocks_pending = blocks.lock().await.pending();
                 for message in watermark.update((v4_active, v6_active), common::BLOCKLIST_CAPACITY as usize) {
                     log::warn!("[BlockTable] {}", message);
                     sntl_db.append(format!("BLOCKLIST_WATERMARK|{}", message));

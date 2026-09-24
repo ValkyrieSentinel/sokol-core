@@ -4,6 +4,7 @@ use std::net::Ipv6Addr;
 use std::sync::Arc;
 use tokio::sync::{mpsc, watch};
 
+use crate::block_table::{Claim, ClaimId};
 use crate::cluster_state::{BirdEyeView, StormLatch, StormTransition};
 use crate::SentinelDb;
 use common::NodeTelemetry;
@@ -17,12 +18,14 @@ pub enum AlertLevel {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum MeshCommand {
-    BlockIp {
-        ip: String,
-        reason: String,
+    /// The sender's block decision; `claim.issuer` must be the authenticated sender.
+    Claim {
+        claim: Claim,
     },
-    UnblockIp {
-        ip: String,
+    /// The sender takes back its own claims (by id).
+    Retract {
+        issuer: u64,
+        claims: Vec<ClaimId>,
     },
     EngageDefense,
     DisengageDefense,
@@ -30,10 +33,24 @@ pub enum MeshCommand {
         level: AlertLevel,
         message: String,
     },
-    /// The sender's running dynamic blocks, sent to a peer when it (re)connects so a node that
-    /// was cut off catches up on blocks it missed.
+    /// The sender's shared mesh state: live detector claims it knows (any issuer) and its own
+    /// retractions. Sent when a peer (re)connects and when digests differ, so a node that missed
+    /// messages (cut off, or its queue overflowed) converges. `issuer` is the sender.
     BlockSync {
-        blocks: Vec<SyncedBlock>,
+        issuer: u64,
+        claims: Vec<Claim>,
+        retracted: Vec<ClaimId>,
+    },
+    /// Digest of the sender's shared claim set; a peer whose digest differs answers with its
+    /// BlockSync (anti-entropy).
+    Digest {
+        issuer: u64,
+        digest: String,
+    },
+    /// A detection made on this node by the orchestrator itself; never accepted from a peer.
+    LocalDetection {
+        ip: String,
+        reason: String,
     },
     /// Periodic load report of `node_id` (must be the authenticated sender).
     Telemetry {
@@ -45,14 +62,26 @@ pub enum MeshCommand {
     },
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-pub struct SyncedBlock {
-    pub ip: String,
-    pub remaining_secs: u64,
-}
+/// Claims per BlockSync message (keeps each envelope well under the 128 KiB frame limit).
+pub const SYNC_CHUNK: usize = 250;
 
-/// Entries per BlockSync message (keeps each envelope well under the 128 KiB frame limit).
-pub const SYNC_CHUNK: usize = 1000;
+/// How often each node sends its digest to its peers.
+pub const DIGEST_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
+
+impl MeshCommand {
+    /// The node a command claims to come from, if it names one; the transport requires it to be
+    /// the authenticated sender.
+    pub fn claimed_sender(&self) -> Option<u64> {
+        match self {
+            MeshCommand::Claim { claim } => Some(claim.issuer),
+            MeshCommand::Retract { issuer, .. }
+            | MeshCommand::BlockSync { issuer, .. }
+            | MeshCommand::Digest { issuer, .. } => Some(*issuer),
+            MeshCommand::Telemetry { node_id, .. } => Some(*node_id),
+            _ => None,
+        }
+    }
+}
 
 impl MeshCommand {
     pub fn telemetry_record(&self) -> Option<NodeTelemetry> {
@@ -194,7 +223,7 @@ impl MeshOrchestrator {
 
                         self.sntl_db.append(format!("AUTO_BLOCK_IP: {}", ip_str));
 
-                        let block_cmd = MeshCommand::BlockIp {
+                        let block_cmd = MeshCommand::LocalDetection {
                             ip: ip_str,
                             reason: format!("eBPF XDP probe drop (score: {:.2})", telemetry.anomaly_score),
                         };
