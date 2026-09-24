@@ -125,6 +125,15 @@ check "strict mode: unfragmented traffic from $ALLOWED_IP passes" ping_from "$AL
 check "strict mode: fragmented IPv4 is dropped" bash -c "! ip netns exec $NS ping -c 2 -W 1 -s 3000 -I $ALLOWED_IP $HOST_IP >/dev/null 2>&1"
 
 stop_orchestrator
+start_orchestrator --block-ttl 2
+ipc "DROP_IMMEDIATE:$ALLOWED_IP"
+sleep 0.5
+check "TTL: dynamic block of $ALLOWED_IP is enforced" bash -c "! ip netns exec $NS ping -c 1 -W 1 -I $ALLOWED_IP $HOST_IP >/dev/null 2>&1"
+sleep 3
+check "TTL: dynamic block expires after --block-ttl" ping_from "$ALLOWED_IP"
+check "TTL: static --block stays in force" bash -c "! ip netns exec $NS ping -c 1 -W 1 -I $BLOCKED_IP $HOST_IP >/dev/null 2>&1"
+
+stop_orchestrator
 check "SIGINT/SIGTERM shutdown is graceful" grep -q "terminated gracefully" "$LOG"
 
 # Unprivileged run: only the capabilities the systemd unit grants.

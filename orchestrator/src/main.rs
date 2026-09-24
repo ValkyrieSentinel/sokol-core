@@ -2,11 +2,11 @@
 pub use mesh_sync::{AlertLevel, MeshCommand, MeshOrchestrator};
 pub mod cluster_state;
 mod block_policy;
+mod block_table;
 mod mesh_sync;
 mod p2p;
 mod sokol;
 
-use aya::maps::lpm_trie::Key;
 use aya::maps::{Array, LpmTrie, MapData, PerCpuArray, RingBuf};
 use aya::programs::Xdp;
 use aya::{include_bytes_aligned, Bpf, Pod};
@@ -26,6 +26,7 @@ use common::canonical::CanonicalParser;
 use common::{DropEvent, NodeTelemetry};
 
 use crate::block_policy::BlockPolicy;
+use crate::block_table::{BlockTable, Lifetime, TtlPolicy};
 use crate::cluster_state::BirdEyeView;
 use crate::p2p::{connect_to_peer, DagTracker, NodeCrypto, P2PNetwork, PeerRegistry, TrustStore};
 
@@ -186,6 +187,14 @@ struct Args {
     /// Under systemd use a RuntimeDirectory, e.g. /run/sokol/sokol.sock.
     #[arg(long, default_value = "/run/sokol.sock")]
     ipc_socket: String,
+
+    /// Lifetime of a first dynamic block (trap, IPC, mesh) in seconds; repeats within 24 h
+    /// double it up to --block-ttl-max. 0 makes dynamic blocks permanent. --block is always permanent.
+    #[arg(long, default_value = "900")]
+    block_ttl: u64,
+
+    #[arg(long, default_value = "86400")]
+    block_ttl_max: u64,
 }
 
 const MAX_IPC_LINE: u64 = 4096;
@@ -231,12 +240,24 @@ async fn push_telemetry(msg: &str) {
     }
 }
 
+type SharedBlockTable = Arc<tokio::sync::Mutex<BlockTable>>;
+
+fn ip_tag(ip: IpAddr) -> &'static str {
+    if ip.is_ipv4() { "V4" } else { "V6" }
+}
+
+fn ttl_label(ttl: Option<Duration>) -> String {
+    match ttl {
+        Some(d) => format!("{}s", d.as_secs()),
+        None => "permanent".to_string(),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn enforce_block_local(
     ip: IpAddr,
     reason: &str,
-    blocklist_v4: &Arc<tokio::sync::Mutex<LpmTrie<MapData, [u8; 4], u32>>>,
-    blocklist_v6: &Arc<tokio::sync::Mutex<LpmTrie<MapData, [u8; 16], u32>>>,
+    blocks: &SharedBlockTable,
     sntl_db: &Arc<SentinelDb>,
     registry: &PeerRegistry,
     node_id: u64,
@@ -250,58 +271,23 @@ async fn enforce_block_local(
         sntl_db.append(format!("BLOCK_REFUSED|IP:{}|Protected:{}|Reason:{}", ip, why, reason));
         return;
     }
-    match ip {
-        IpAddr::V4(v4) => {
-            let key = Key::new(32, v4.octets());
-            let insert_result = {
-                let mut map_guard = blocklist_v4.lock().await;
-                map_guard.insert(&key, 1u32, 0)
+    let result = blocks.lock().await.insert(ip, Lifetime::Dynamic, std::time::Instant::now());
+    match result {
+        Ok(ttl) => {
+            log::warn!("[Local Security] Dynamic block enforced in XDP: {} for {} | Reason: {}", ip, ttl_label(ttl), reason);
+            sntl_db.append(format!("DYNAMIC_BLOCK_{}|IP:{}|TTL:{}|Reason:{}|Enforced", ip_tag(ip), ip, ttl_label(ttl), reason));
+
+            let telemetry_msg = format!("DROP_IMMEDIATE:{}\nDB_LOG:NODE={}|TIER=Tier1BotTarpit|IP={}|VEC={}\n", ip, node_id, ip, reason);
+            push_telemetry(&telemetry_msg).await;
+
+            let broadcast_cmd = MeshCommand::BlockIp {
+                ip: ip.to_string(),
+                reason: reason.to_string(),
             };
-
-            match insert_result {
-                Ok(_) => {
-                    log::warn!("[Local Security] Dynamic IPv4 block enforced in XDP: {} | Reason: {}", v4, reason);
-                    sntl_db.append(format!("DYNAMIC_BLOCK_V4|IP:{}|Reason:{}|Enforced", v4, reason));
-                    
-                    let telemetry_msg = format!("DROP_IMMEDIATE:{}\nDB_LOG:NODE={}|TIER=Tier1BotTarpit|IP={}|VEC={}\n", v4, node_id, v4, reason);
-                    push_telemetry(&telemetry_msg).await;
-
-                    let broadcast_cmd = MeshCommand::BlockIp {
-                        ip: v4.to_string(),
-                        reason: reason.to_string(),
-                    };
-                    let _ = registry.broadcast(&broadcast_cmd, node_id, node_crypto, dag_tracker).await;
-                }
-                Err(e) => {
-                    log::error!("[Local Security] Failed to insert IPv4 {} into eBPF: {:?}", v4, e);
-                }
-            }
+            let _ = registry.broadcast(&broadcast_cmd, node_id, node_crypto, dag_tracker).await;
         }
-        IpAddr::V6(v6) => {
-            let key = Key::new(128, v6.octets());
-            let insert_result = {
-                let mut map_guard = blocklist_v6.lock().await;
-                map_guard.insert(&key, 1u32, 0)
-            };
-
-            match insert_result {
-                Ok(_) => {
-                    log::warn!("[Local Security] Dynamic IPv6 block enforced in XDP: {} | Reason: {}", v6, reason);
-                    sntl_db.append(format!("DYNAMIC_BLOCK_V6|IP:{}|Reason:{}|Enforced", v6, reason));
-
-                    let telemetry_msg = format!("DROP_IMMEDIATE:{}\nDB_LOG:NODE={}|TIER=Tier1BotTarpit|IP={}|VEC={}\n", v6, node_id, v6, reason);
-                    push_telemetry(&telemetry_msg).await;
-
-                    let broadcast_cmd = MeshCommand::BlockIp {
-                        ip: v6.to_string(),
-                        reason: reason.to_string(),
-                    };
-                    let _ = registry.broadcast(&broadcast_cmd, node_id, node_crypto, dag_tracker).await;
-                }
-                Err(e) => {
-                    log::error!("[Local Security] Failed to insert IPv6 {} into eBPF: {:?}", v6, e);
-                }
-            }
+        Err(e) => {
+            log::error!("[Local Security] Failed to insert {} into eBPF: {:?}", ip, e);
         }
     }
 }
@@ -371,11 +357,18 @@ async fn main() -> Result<(), anyhow::Error> {
 
     let blocklist_v4_data = bpf.take_map("BLOCKLIST_V4").ok_or_else(|| anyhow::anyhow!("BLOCKLIST_V4 missing"))?;
     let blocklist_v4_trie = LpmTrie::<MapData, [u8; 4], u32>::try_from(blocklist_v4_data)?;
-    let blocklist_v4_map = Arc::new(tokio::sync::Mutex::new(blocklist_v4_trie));
 
     let blocklist_v6_data = bpf.take_map("BLOCKLIST_V6").ok_or_else(|| anyhow::anyhow!("BLOCKLIST_V6 missing"))?;
     let blocklist_v6_trie = LpmTrie::<MapData, [u8; 16], u32>::try_from(blocklist_v6_data)?;
-    let blocklist_v6_map = Arc::new(tokio::sync::Mutex::new(blocklist_v6_trie));
+    let ttl_policy = TtlPolicy {
+        base: Duration::from_secs(args.block_ttl),
+        max: Duration::from_secs(args.block_ttl_max.max(args.block_ttl)),
+    };
+    let blocks: SharedBlockTable = Arc::new(tokio::sync::Mutex::new(BlockTable::new(
+        blocklist_v4_trie,
+        blocklist_v6_trie,
+        ttl_policy,
+    )));
 
     let stats_map_data = bpf.take_map("STATS").ok_or_else(|| anyhow::anyhow!("STATS map missing"))?;
     let stats_map = PerCpuArray::<MapData, BpfPacketStats>::try_from(stats_map_data)?;
@@ -435,20 +428,9 @@ async fn main() -> Result<(), anyhow::Error> {
             if let Err(why) = block_policy.check(ip) {
                 anyhow::bail!("--block {} refused: address is protected ({})", ip, why);
             }
-            match ip {
-                IpAddr::V4(v4) => {
-                    let key = Key::new(32, v4.octets());
-                    blocklist_v4_map.lock().await.insert(&key, 1u32, 0)?;
-                    sntl_db.append(format!("STATIC_BLOCK_V4|IP:{}|Action:XDP_DROP", v4));
-                    log::info!("[STATIC BLOCK] Enforced IPv4 block for CLI IP: {}", v4);
-                }
-                IpAddr::V6(v6) => {
-                    let key = Key::new(128, v6.octets());
-                    blocklist_v6_map.lock().await.insert(&key, 1u32, 0)?;
-                    sntl_db.append(format!("STATIC_BLOCK_V6|IP:{}|Action:XDP_DROP", v6));
-                    log::info!("[STATIC BLOCK] Enforced IPv6 block for CLI IP: {}", v6);
-                }
-            }
+            blocks.lock().await.insert(ip, Lifetime::Permanent, std::time::Instant::now())?;
+            sntl_db.append(format!("STATIC_BLOCK_{}|IP:{}|Action:XDP_DROP", ip_tag(ip), ip));
+            log::info!("[STATIC BLOCK] Enforced permanent block for CLI IP: {}", ip);
         } else {
             log::error!("[STATIC BLOCK] Invalid CLI --block IP argument: '{}'", ip_str);
         }
@@ -513,8 +495,7 @@ async fn main() -> Result<(), anyhow::Error> {
     let bird_eye = BirdEyeView::new(0.5, Duration::from_secs(300));
     let (_telemetry_tx, telemetry_rx) = mpsc::channel::<NodeTelemetry>(1000);
 
-    let blocklist_v4_mesh = blocklist_v4_map.clone();
-    let blocklist_v6_mesh = blocklist_v6_map.clone();
+    let blocks_mesh = blocks.clone();
     let sntl_db_mesh = sntl_db.clone();
     let node_id_mesh = args.node_id;
     let policy_mesh = block_policy.clone();
@@ -531,40 +512,15 @@ async fn main() -> Result<(), anyhow::Error> {
                             sntl_db_mesh.append(format!("MESH_BLOCK_REFUSED|IP:{}|Protected:{}|Reason:{}", ip_addr, why, reason));
                             continue;
                         }
-                        match ip_addr {
-                            IpAddr::V4(v4) => {
-                                let key = Key::new(32, v4.octets());
-                                let insert_res = {
-                                    let mut map_guard = blocklist_v4_mesh.lock().await;
-                                    map_guard.insert(&key, 1u32, 0)
-                                };
+                        let result = blocks_mesh.lock().await.insert(ip_addr, Lifetime::Dynamic, std::time::Instant::now());
+                        match result {
+                            Err(e) => log::error!("[Mesh] Failed to insert {} into eBPF: {:?}", ip_addr, e),
+                            Ok(ttl) => {
+                                log::warn!("[Mesh] Synchronized block for {} ({}) across mesh: {}", ip_addr, ttl_label(ttl), reason);
+                                sntl_db_mesh.append(format!("MESH_BLOCK_{}|IP:{}|TTL:{}|Reason:{}", ip_tag(ip_addr), ip_addr, ttl_label(ttl), reason));
 
-                                if let Err(e) = insert_res {
-                                    log::error!("[Mesh] Failed to insert IPv4 {} into eBPF: {:?}", v4, e);
-                                } else {
-                                    log::warn!("[Mesh] Synchronized IPv4 block for {} across mesh: {}", v4, reason);
-                                    sntl_db_mesh.append(format!("MESH_BLOCK_V4|IP:{}|Reason:{}", v4, reason));
-                                    
-                                    let telemetry_msg = format!("DB_LOG:NODE={}|TIER=Tier1_5Revenge|IP={}|VEC={}\n", node_id_mesh, v4, reason);
-                                    push_telemetry(&telemetry_msg).await;
-                                }
-                            }
-                            IpAddr::V6(v6) => {
-                                let key = Key::new(128, v6.octets());
-                                let insert_res = {
-                                    let mut map_guard = blocklist_v6_mesh.lock().await;
-                                    map_guard.insert(&key, 1u32, 0)
-                                };
-
-                                if let Err(e) = insert_res {
-                                    log::error!("[Mesh] Failed to insert IPv6 {} into eBPF: {:?}", v6, e);
-                                } else {
-                                    log::warn!("[Mesh] Synchronized IPv6 block for {} across mesh: {}", v6, reason);
-                                    sntl_db_mesh.append(format!("MESH_BLOCK_V6|IP:{}|Reason:{}", v6, reason));
-
-                                    let telemetry_msg = format!("DB_LOG:NODE={}|TIER=Tier1_5Revenge|IP={}|VEC={}\n", node_id_mesh, v6, reason);
-                                    push_telemetry(&telemetry_msg).await;
-                                }
+                                let telemetry_msg = format!("DB_LOG:NODE={}|TIER=Tier1_5Revenge|IP={}|VEC={}\n", node_id_mesh, ip_addr, reason);
+                                push_telemetry(&telemetry_msg).await;
                             }
                         }
                     } else {
@@ -574,21 +530,14 @@ async fn main() -> Result<(), anyhow::Error> {
                 MeshCommand::UnblockIp { ip } => {
                     let clean_ip = ip.trim();
                     if let Ok(ip_addr) = clean_ip.parse::<IpAddr>() {
-                        match ip_addr {
-                            IpAddr::V4(v4) => {
-                                let key = Key::new(32, v4.octets());
-                                let mut map_guard = blocklist_v4_mesh.lock().await;
-                                let _ = map_guard.remove(&key);
-                                drop(map_guard);
-                                log::info!("[Mesh] Unblocked IPv4 {} per mesh command", v4);
+                        let result = blocks_mesh.lock().await.remove_dynamic(ip_addr);
+                        match result {
+                            Ok(true) => {
+                                log::info!("[Mesh] Unblocked {} per mesh command", ip_addr);
+                                sntl_db_mesh.append(format!("MESH_UNBLOCK|IP:{}", ip_addr));
                             }
-                            IpAddr::V6(v6) => {
-                                let key = Key::new(128, v6.octets());
-                                let mut map_guard = blocklist_v6_mesh.lock().await;
-                                let _ = map_guard.remove(&key);
-                                drop(map_guard);
-                                log::info!("[Mesh] Unblocked IPv6 {} per mesh command", v6);
-                            }
+                            Ok(false) => log::warn!("[Mesh] Ignoring mesh UnblockIp for operator block {}", ip_addr),
+                            Err(e) => log::error!("[Mesh] Failed to unblock {}: {:?}", ip_addr, e),
                         }
                     } else {
                         log::error!("[Mesh] Failed to parse IP for UnblockIp: '{}'", ip);
@@ -626,8 +575,7 @@ async fn main() -> Result<(), anyhow::Error> {
     });
 
     for &port in &args.trap_port {
-        let blocklist_v4_trap = blocklist_v4_map.clone();
-        let blocklist_v6_trap = blocklist_v6_map.clone();
+        let blocks_trap = blocks.clone();
         let db_trap = sntl_db.clone();
         let registry_trap = peer_registry.clone();
 
@@ -652,8 +600,7 @@ async fn main() -> Result<(), anyhow::Error> {
                                 enforce_block_local(
                                     ip,
                                     &reason,
-                                    &blocklist_v4_trap,
-                                    &blocklist_v6_trap,
+                                    &blocks_trap,
                                     &db_trap,
                                     &registry_trap,
                                     node_id_trap,
@@ -696,8 +643,7 @@ async fn main() -> Result<(), anyhow::Error> {
         None => std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600))?,
     }
 
-    let blocklist_v4_unix = blocklist_v4_map.clone();
-    let blocklist_v6_unix = blocklist_v6_map.clone();
+    let blocks_unix = blocks.clone();
     let db_unix = sntl_db.clone();
     let registry_unix = peer_registry.clone();
 
@@ -712,8 +658,7 @@ async fn main() -> Result<(), anyhow::Error> {
         loop {
             match unix_listener.accept().await {
                 Ok((stream, _)) => {
-                    let blocklist_v4 = blocklist_v4_unix.clone();
-                    let blocklist_v6 = blocklist_v6_unix.clone();
+                    let blocks_stream = blocks_unix.clone();
                     let db = db_unix.clone();
                     let registry = registry_unix.clone();
 
@@ -756,8 +701,7 @@ async fn main() -> Result<(), anyhow::Error> {
                                                 enforce_block_local(
                                                     ip,
                                                     "Unix IPC DROP_IMMEDIATE trigger",
-                                                    &blocklist_v4,
-                                                    &blocklist_v6,
+                                                    &blocks_stream,
                                                     &db,
                                                     &registry,
                                                     node_id_unix,
@@ -787,8 +731,7 @@ async fn main() -> Result<(), anyhow::Error> {
                                                 enforce_block_local(
                                                     ip,
                                                     "Unix IPC APT_HIGH_PRIORITY stager",
-                                                    &blocklist_v4,
-                                                    &blocklist_v6,
+                                                    &blocks_stream,
                                                     &db,
                                                     &registry,
                                                     node_id_unix,
@@ -852,6 +795,12 @@ async fn main() -> Result<(), anyhow::Error> {
 
             _ = ticker.tick() => {
                 atp_controller.reset();
+
+                let released = blocks.lock().await.expire(std::time::Instant::now());
+                for ip in released {
+                    log::info!("[BlockTable] Block for {} expired; traffic allowed again", ip);
+                    sntl_db.append(format!("BLOCK_EXPIRED_{}|IP:{}", ip_tag(ip), ip));
+                }
 
                 let hb_msg = format!("HEARTBEAT:ID={}|NAME=Sokol-Node-{}|EP={}|MODE=NORMAL\n", node_id_hb, node_id_hb, p2p_bind_hb);
                 push_telemetry(&hb_msg).await;

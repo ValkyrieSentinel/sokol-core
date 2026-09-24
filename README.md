@@ -88,6 +88,11 @@ authenticated but not encrypted.
 It is root-only (`0600`) unless `--ipc-group <group>` is given, in which case members of that
 group may write to it (`0660`).
 
+Blocks from traps, the control socket and the mesh expire: the first lasts `--block-ttl`
+seconds (default 900), each repeat within 24 hours doubles it up to `--block-ttl-max` (default
+86400). `--block-ttl 0` makes them permanent. `--block` addresses are always permanent, and a mesh
+`UnblockIp` cannot lift them.
+
 Some addresses are never blocked, whether the request comes from `--block`, the control
 socket, a trap or the mesh: loopback, multicast, IPv6 link-local, every address of this node,
 its default gateways and its `--seed-peer`s. Add operator and bastion networks explicitly:
