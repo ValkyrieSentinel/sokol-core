@@ -42,16 +42,145 @@ use crate::p2p::{
 use ipnet::IpNet;
 
 /// Audit trail writer. Records are queued (bounded, so a flood cannot exhaust memory) and
-/// written by one thread, fsynced every 100 ms or 64 records: a crash loses at most that window.
+/// written by one thread. A record is fsynced at most `SYNC_INTERVAL` after the last successful
+/// sync (or after `SYNC_BATCH` records), whatever the pace of events.
+///
+/// ADR-5: enforcement never waits for the audit. When the log cannot be written the node keeps
+/// blocking, counts what it could not record, reports itself DEGRADED (metrics, heartbeat) and
+/// reopens the log, which drops a torn tail, until it can write again.
 enum AuditMsg {
     Record(String),
-    Flush(std::sync::mpsc::SyncSender<()>),
+    /// Acked with whether everything queued before it is written and fsynced.
+    Flush(std::sync::mpsc::SyncSender<bool>),
+}
+
+/// What the audit writer last managed; read by metrics and the heartbeat.
+#[derive(Default)]
+pub struct AuditHealth {
+    write_errors: std::sync::atomic::AtomicU64,
+    sync_errors: std::sync::atomic::AtomicU64,
+    /// Records that could not be written (log unavailable), besides queue overflow.
+    lost: std::sync::atomic::AtomicU64,
+    last_sync_ok_ms: std::sync::atomic::AtomicU64,
+    failing: std::sync::atomic::AtomicBool,
+}
+
+/// A point-in-time view of [`AuditHealth`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AuditStatus {
+    pub healthy: bool,
+    pub write_errors: u64,
+    pub sync_errors: u64,
+    pub lost: u64,
+    pub last_sync_age_ms: u64,
 }
 
 pub struct SentinelDb {
     tx: std::sync::mpsc::SyncSender<AuditMsg>,
     dropped: Arc<std::sync::atomic::AtomicU64>,
     overflow_total: std::sync::atomic::AtomicU64,
+    health: Arc<AuditHealth>,
+}
+
+struct AuditWriter {
+    log: Option<AuditLog>,
+    path: std::path::PathBuf,
+    rotation: Option<Rotation>,
+    health: Arc<AuditHealth>,
+    last_sync: std::time::Instant,
+    /// Records lost since the log was last writable; noted in the log once it is again.
+    lost_pending: u64,
+}
+
+impl AuditWriter {
+    fn fail(&self, what: &str, e: &dyn std::fmt::Display) {
+        use std::sync::atomic::Ordering;
+        if !self.health.failing.swap(true, Ordering::Relaxed) {
+            log::error!(
+                "[Audit] {} failed: {}; node is DEGRADED until the log recovers",
+                what,
+                e
+            );
+        }
+    }
+
+    /// Reopens the log after a failure (dropping the old handle first releases its lock).
+    fn ensure_open(&mut self) -> bool {
+        if self.log.is_some() {
+            return true;
+        }
+        match AuditLog::open_with(&self.path, self.rotation) {
+            Ok(log) => {
+                self.log = Some(log);
+                if self.lost_pending > 0 {
+                    let note = format!("AUDIT_LOST|Records:{}", self.lost_pending);
+                    if self.write(note).is_ok() {
+                        self.lost_pending = 0;
+                    }
+                }
+                self.log.is_some()
+            }
+            Err(e) => {
+                self.fail("reopen", &e);
+                false
+            }
+        }
+    }
+
+    fn write(&mut self, payload: String) -> Result<(), ()> {
+        use std::sync::atomic::Ordering;
+        let Some(log) = self.log.as_mut() else {
+            return Err(());
+        };
+        match log.append(payload.as_bytes()) {
+            Ok(_) => Ok(()),
+            Err(common::audit_log::AuditError::PayloadTooLarge(n)) => {
+                log::error!("[Audit] Record of {} bytes dropped: too large", n);
+                Ok(())
+            }
+            Err(e) => {
+                self.health.write_errors.fetch_add(1, Ordering::Relaxed);
+                self.fail("write", &e);
+                self.log = None;
+                Err(())
+            }
+        }
+    }
+
+    fn record(&mut self, payload: String) {
+        use std::sync::atomic::Ordering;
+        if !self.ensure_open() || self.write(payload).is_err() {
+            self.lost_pending += 1;
+            self.health.lost.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn sync(&mut self) -> bool {
+        use std::sync::atomic::Ordering;
+        self.last_sync = std::time::Instant::now();
+        if !self.ensure_open() {
+            return false;
+        }
+        let result = self.log.as_mut().map(|l| l.sync());
+        match result {
+            Some(Ok(())) => {
+                self.health
+                    .last_sync_ok_ms
+                    .store(now_ms(), Ordering::Relaxed);
+                if self.lost_pending == 0 && self.health.failing.swap(false, Ordering::Relaxed) {
+                    log::warn!("[Audit] Log writable again; node no longer DEGRADED");
+                }
+                true
+            }
+            Some(Err(e)) => {
+                self.health.sync_errors.fetch_add(1, Ordering::Relaxed);
+                self.fail("fsync", &e);
+                self.log = None;
+                false
+            }
+            None => false,
+        }
+    }
 }
 
 impl SentinelDb {
@@ -60,51 +189,56 @@ impl SentinelDb {
     const SYNC_BATCH: usize = 64;
 
     pub fn init(path: &str, rotation: Option<Rotation>) -> anyhow::Result<Self> {
-        let mut log = AuditLog::open_with(std::path::Path::new(path), rotation)
+        let log = AuditLog::open_with(std::path::Path::new(path), rotation)
             .map_err(|e| anyhow::anyhow!("{} ({})", e, path))?;
         log::info!("Audit log {} opened: {} records verified", path, log.len());
 
         let (tx, rx) = std::sync::mpsc::sync_channel::<AuditMsg>(Self::QUEUE_CAPACITY);
         let dropped = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let dropped_writer = dropped.clone();
+        let health = Arc::new(AuditHealth::default());
+        health
+            .last_sync_ok_ms
+            .store(now_ms(), std::sync::atomic::Ordering::Relaxed);
+        let mut writer = AuditWriter {
+            log: Some(log),
+            path: std::path::PathBuf::from(path),
+            rotation,
+            health: health.clone(),
+            last_sync: std::time::Instant::now(),
+            lost_pending: 0,
+        };
 
         std::thread::spawn(move || {
             use std::sync::atomic::Ordering;
             use std::sync::mpsc::RecvTimeoutError;
             loop {
-                match rx.recv_timeout(Self::SYNC_INTERVAL) {
+                let wait = Self::SYNC_INTERVAL.saturating_sub(writer.last_sync.elapsed());
+                match rx.recv_timeout(wait) {
                     Ok(AuditMsg::Flush(ack)) => {
-                        if let Err(e) = log.sync() {
-                            log::error!("[Audit] fsync failed: {}", e);
-                        }
-                        let _ = ack.send(());
+                        let ok = writer.sync();
+                        let _ = ack.send(ok);
                     }
                     Ok(AuditMsg::Record(payload)) => {
                         let lost = dropped_writer.swap(0, Ordering::Relaxed);
                         if lost > 0 {
-                            let note = format!("AUDIT_QUEUE_OVERFLOW|Dropped:{}", lost);
-                            if let Err(e) = log.append(note.as_bytes()) {
-                                log::error!("[Audit] Failed to record queue overflow: {}", e);
-                            }
+                            writer.record(format!("AUDIT_QUEUE_OVERFLOW|Dropped:{}", lost));
                         }
-                        if let Err(e) = log.append(payload.as_bytes()) {
-                            log::error!("[Audit] Failed to append record: {}", e);
-                        }
-                        if log.unsynced() >= Self::SYNC_BATCH {
-                            if let Err(e) = log.sync() {
-                                log::error!("[Audit] fsync failed: {}", e);
-                            }
+                        writer.record(payload);
+                        let unsynced = writer.log.as_ref().map_or(0, |l| l.unsynced());
+                        if unsynced >= Self::SYNC_BATCH
+                            || writer.last_sync.elapsed() >= Self::SYNC_INTERVAL
+                        {
+                            writer.sync();
                         }
                     }
                     Err(RecvTimeoutError::Timeout) => {
-                        if let Err(e) = log.sync() {
-                            log::error!("[Audit] fsync failed: {}", e);
-                        }
+                        writer.sync();
                     }
                     Err(RecvTimeoutError::Disconnected) => break,
                 }
             }
-            let _ = log.sync();
+            writer.sync();
             log::info!("SentinelDb persistence thread terminated.");
         });
 
@@ -112,6 +246,7 @@ impl SentinelDb {
             tx,
             dropped,
             overflow_total: std::sync::atomic::AtomicU64::new(0),
+            health,
         })
     }
 
@@ -120,11 +255,49 @@ impl SentinelDb {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Waits until everything queued so far is written and fsynced (used on shutdown).
-    pub fn flush(&self, wait: Duration) {
+    pub fn status(&self) -> AuditStatus {
+        use std::sync::atomic::Ordering;
+        let h = &self.health;
+        AuditStatus {
+            healthy: !h.failing.load(Ordering::Relaxed),
+            write_errors: h.write_errors.load(Ordering::Relaxed),
+            sync_errors: h.sync_errors.load(Ordering::Relaxed),
+            lost: h.lost.load(Ordering::Relaxed),
+            last_sync_age_ms: now_ms().saturating_sub(h.last_sync_ok_ms.load(Ordering::Relaxed)),
+        }
+    }
+
+    /// Waits up to `wait` in total until everything queued so far is written and fsynced (used
+    /// on shutdown). Returns whether that was confirmed.
+    pub fn flush(&self, wait: Duration) -> bool {
+        let deadline = std::time::Instant::now() + wait;
         let (ack_tx, ack_rx) = std::sync::mpsc::sync_channel(1);
-        if self.tx.send(AuditMsg::Flush(ack_tx)).is_ok() && ack_rx.recv_timeout(wait).is_err() {
-            log::error!("[Audit] Flush did not complete within {:?}", wait);
+        let mut msg = AuditMsg::Flush(ack_tx);
+        loop {
+            match self.tx.try_send(msg) {
+                Ok(()) => break,
+                Err(std::sync::mpsc::TrySendError::Full(back)) => {
+                    if std::time::Instant::now() >= deadline {
+                        log::error!("[Audit] Flush could not be queued within {:?}", wait);
+                        return false;
+                    }
+                    msg = back;
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => return false,
+            }
+        }
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        match ack_rx.recv_timeout(left) {
+            Ok(true) => true,
+            Ok(false) => {
+                log::error!("[Audit] Flush failed: the log could not be written or synced");
+                false
+            }
+            Err(_) => {
+                log::error!("[Audit] Flush did not complete within {:?}", wait);
+                false
+            }
         }
     }
 
@@ -266,6 +439,11 @@ struct Args {
     /// --flowspec-gobgp-arg=-p --flowspec-gobgp-arg=50051
     #[arg(long, value_name = "ARG", allow_hyphen_values = true)]
     flowspec_gobgp_arg: Vec<String>,
+
+    /// BGP community `asn:value` marking this node's Flowspec rules (default 64512:<node-id>).
+    /// Only rules with it are withdrawn; give every node sharing a gobgpd its own.
+    #[arg(long, value_name = "ASN:VALUE")]
+    flowspec_community: Option<String>,
 
     /// Drops per second at which this node reports itself under attack to the mesh.
     #[arg(long, default_value = "1000")]
@@ -549,6 +727,25 @@ fn ttl_label(ttl: Option<Duration>) -> String {
     }
 }
 
+/// What became of a local block request; each outcome has its own audit record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Enforcement {
+    Enforced,
+    Refused,
+    Failed,
+}
+
+impl Enforcement {
+    /// The `Action:` a trap hit records.
+    fn trap_action(self) -> &'static str {
+        match self {
+            Enforcement::Enforced => "EnforcedDrop",
+            Enforcement::Refused => "Refused",
+            Enforcement::Failed => "Failed",
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn enforce_block_local(
     target: IpNet,
@@ -560,7 +757,7 @@ async fn enforce_block_local(
     node_crypto: &Arc<NodeCrypto>,
     dag_tracker: &Arc<tokio::sync::Mutex<DagTracker>>,
     policy: &BlockPolicy,
-) {
+) -> Enforcement {
     let ip = block_table::canonical(target);
     let shown = show(&ip);
     if let Err(why) = policy.check_net(ip) {
@@ -574,7 +771,7 @@ async fn enforce_block_local(
             "BLOCK_REFUSED|IP:{}|Protected:{}|Reason:{}",
             shown, why, reason
         ));
-        return;
+        return Enforcement::Refused;
     }
     let added = blocks
         .lock()
@@ -607,6 +804,15 @@ async fn enforce_block_local(
                 shown, node_id, shown, reason
             );
             push_telemetry(&telemetry_msg).await;
+
+            let broadcast_cmd = MeshCommand::BlockIp {
+                ip: shown.clone(),
+                reason: reason.to_string(),
+            };
+            let _ = registry
+                .broadcast(&broadcast_cmd, node_id, node_crypto, dag_tracker)
+                .await;
+            Enforcement::Enforced
         }
         Err(e) => {
             log::error!(
@@ -615,9 +821,10 @@ async fn enforce_block_local(
                 e
             );
             sntl_db.append(format!(
-                "BLOCK_PENDING|IP:{}|Error:{:?}|Reason:{}",
+                "BLOCK_FAILED|IP:{}|Error:{:?}|Reason:{}",
                 shown, e, reason
             ));
+            Enforcement::Failed
         }
     }
 }
@@ -1179,7 +1386,7 @@ async fn main() -> Result<(), anyhow::Error> {
                                 );
 
                                 let reason = format!("Decoy TCP trap hit on port {}", port);
-                                enforce_block_local(
+                                let outcome = enforce_block_local(
                                     host(ip),
                                     &reason,
                                     &blocks_trap,
@@ -1192,8 +1399,10 @@ async fn main() -> Result<(), anyhow::Error> {
                                 )
                                 .await;
                                 db_trap.append(format!(
-                                    "TRAP_HIT|Port:{}|IP:{}|Action:EnforcedDrop",
-                                    port, ip
+                                    "TRAP_HIT|Port:{}|IP:{}|Action:{}",
+                                    port,
+                                    ip,
+                                    outcome.trap_action()
                                 ));
 
                                 let telemetry_msg = format!(
@@ -1353,7 +1562,7 @@ async fn main() -> Result<(), anyhow::Error> {
                                                     "[XDP_ACTION] Trap triggered ban for IP: {}",
                                                     show(&ip)
                                                 );
-                                                enforce_block_local(
+                                                let _ = enforce_block_local(
                                                     ip,
                                                     "Unix IPC DROP_IMMEDIATE trigger",
                                                     &blocks_stream,
@@ -1422,7 +1631,7 @@ async fn main() -> Result<(), anyhow::Error> {
                                                     ));
                                                     let reason =
                                                         format!("{}: {}", sig.source, sig.reason);
-                                                    enforce_block_local(
+                                                    let _ = enforce_block_local(
                                                         ip,
                                                         &reason,
                                                         &blocks_stream,
@@ -1538,11 +1747,45 @@ async fn main() -> Result<(), anyhow::Error> {
     let mut telemetry_window_start = std::time::Instant::now();
     let mut window_rx = 0u64;
     let mut window_dropped = 0u64;
-    let flowspec_cli = args.flowspec_gobgp.clone().map(|bin| flowspec::GobgpCli {
-        bin,
-        args: args.flowspec_gobgp_arg.clone(),
-    });
-    let mut flowspec_state = flowspec::Reconciler::default();
+    let flowspec_announced = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (flowspec_tx, flowspec_rx) = watch::channel(std::collections::HashSet::<IpNet>::new());
+    let flowspec_worker = match args.flowspec_gobgp.clone() {
+        Some(bin) => {
+            let community = match &args.flowspec_community {
+                Some(raw) => {
+                    let parsed = raw
+                        .split_once(':')
+                        .and_then(|(a, v)| Some((a.parse::<u16>().ok()?, v.parse::<u16>().ok()?)));
+                    parsed.ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "--flowspec-community {} is not <asn>:<value> (16-bit each)",
+                            raw
+                        )
+                    })?
+                }
+                None => (64512, (args.node_id & 0xFFFF) as u16),
+            };
+            let cli = flowspec::GobgpCli {
+                bin,
+                args: args.flowspec_gobgp_arg.clone(),
+                community,
+            };
+            log::info!(
+                "[Flowspec] Mirroring blocks upstream with community {}:{}",
+                community.0,
+                community.1
+            );
+            Some(tokio::spawn(flowspec::run_worker(
+                cli,
+                flowspec_rx,
+                shutdown_rx.clone(),
+                sntl_db.clone(),
+                flowspec_announced.clone(),
+            )))
+        }
+        None => None,
+    };
+    let mut last_tick = std::time::Instant::now();
 
     loop {
         tokio::select! {
@@ -1562,33 +1805,8 @@ async fn main() -> Result<(), anyhow::Error> {
                     sntl_db.append(format!("BLOCK_EXPIRED_{}|IP:{}", ip_tag(ip), show(&ip)));
                 }
 
-                // ADR-4: this node's decisions and lifts survive a restart.
-                let state = {
-                    let mut table = blocks.lock().await;
-                    table.dirty().then(|| table.take_persisted(now_ms()))
-                };
-                if let Some(state) = state {
-                    match save_state(&state_file, &state) {
-                        Ok(()) => state_error = false,
-                        Err(e) => {
-                            if !state_error {
-                                log::error!("[State] Cannot write {}: {}; retrying", state_file.display(), e);
-                            }
-                            state_error = true;
-                            blocks.lock().await.mark_dirty();
-                        }
-                    }
-                }
-
-                // ADR-3 anti-entropy: a peer whose digest differs answers with its state.
-                if last_digest.elapsed() >= mesh_sync::DIGEST_INTERVAL {
-                    last_digest = std::time::Instant::now();
-                    let digest = blocks.lock().await.digest(now_ms());
-                    let cmd = MeshCommand::Digest { issuer: node_id_tick, digest };
-                    let _ = registry_tick.broadcast(&cmd, node_id_tick, &crypto_tick, &dag_tick).await;
-                }
-
-                let hb_msg = format!("HEARTBEAT:ID={}|NAME=Sokol-Node-{}|EP={}|MODE=NORMAL|CTL={}\n", node_id_hb, node_id_hb, p2p_bind_hb, control_socket_hb);
+                let mode = if sntl_db.status().healthy { "NORMAL" } else { "DEGRADED" };
+                let hb_msg = format!("HEARTBEAT:ID={}|NAME=Sokol-Node-{}|EP={}|MODE={}|CTL={}\n", node_id_hb, node_id_hb, p2p_bind_hb, mode, control_socket_hb);
                 push_telemetry(&hb_msg).await;
 
                 if !atp_controller.try_consume(250) {
@@ -1626,6 +1844,11 @@ async fn main() -> Result<(), anyhow::Error> {
                 }
                 snapshot.p2p_peers = peer_registry.peer_count().await;
                 snapshot.audit_queue_overflow = sntl_db.overflow_total();
+                let audit = sntl_db.status();
+                snapshot.audit_healthy = audit.healthy;
+                snapshot.audit_write_errors = audit.write_errors + audit.sync_errors;
+                snapshot.audit_lost = audit.lost;
+                snapshot.audit_sync_age_ms = audit.last_sync_age_ms;
 
                 let reported_attacks = attack_reports
                     .lock()
@@ -1659,24 +1882,10 @@ async fn main() -> Result<(), anyhow::Error> {
                 snapshot.cluster_attacked = cluster.attacked;
                 snapshot.cluster_storm_engaged = cluster.storm_engaged;
 
-                if let Some(cli) = &flowspec_cli {
-                    let active = blocks.lock().await.active_ips();
-                    let (announce, withdraw) = flowspec_state.plan(&active);
-                    for (is_announce, ip) in withdraw.into_iter().map(|ip| (false, ip)).chain(announce.into_iter().map(|ip| (true, ip))) {
-                        match cli.apply(is_announce, ip).await {
-                            Ok(()) => {
-                                let verb = if is_announce { "announced" } else { "withdrew" };
-                                log::info!("[Flowspec] {} discard rule for {}", verb, show(&ip));
-                                sntl_db.append(format!("FLOWSPEC_{}|IP:{}", if is_announce { "ANNOUNCE" } else { "WITHDRAW" }, show(&ip)));
-                                if is_announce { flowspec_state.announced(ip) } else { flowspec_state.withdrawn(ip) }
-                            }
-                            Err(e) => {
-                                log::error!("[Flowspec] gobgp failed for {}: {}; retrying next tick", show(&ip), e);
-                                break;
-                            }
-                        }
-                    }
-                    snapshot.flowspec_announced = flowspec_state.announced_count();
+                if flowspec_worker.is_some() {
+                    let _ = flowspec_tx.send(blocks.lock().await.active_ips());
+                    snapshot.flowspec_announced =
+                        flowspec_announced.load(std::sync::atomic::Ordering::Relaxed);
                 }
                 *metrics_snapshot.write().unwrap_or_else(|p| p.into_inner()) = snapshot;
 
@@ -1684,7 +1893,9 @@ async fn main() -> Result<(), anyhow::Error> {
                 let delta_bytes = total_rx_bytes.saturating_sub(prev_bytes);
                 let delta_dropped = total_dropped.saturating_sub(prev_dropped);
 
-                let dt = 1.0;
+                // Measured, not assumed: a delayed tick must not inflate the rates.
+                let dt = last_tick.elapsed().as_secs_f64().max(0.001);
+                last_tick = std::time::Instant::now();
                 let is_anomaly = sokol_engine.detect_anomaly(
                     total_rx_packets as f64,
                     prev_packets as f64,
@@ -1722,26 +1933,62 @@ async fn main() -> Result<(), anyhow::Error> {
     }
 
     log::info!("Sokol-Core main loop terminated gracefully. Cleaning up resources...");
-    if let Some(cli) = &flowspec_cli {
-        // The node's blocks vanish with it; do not leave its rules behind upstream.
-        'withdraw_all: loop {
-            let (_, withdraw) = flowspec_state.plan(&std::collections::HashSet::new());
-            if withdraw.is_empty() {
-                break;
-            }
-            for ip in withdraw {
-                if let Err(e) = cli.apply(false, ip).await {
-                    log::error!("[Flowspec] Could not withdraw {} on shutdown: {}", ip, e);
-                    break 'withdraw_all;
-                }
-                flowspec_state.withdrawn(ip);
-            }
+    if let Some(worker) = flowspec_worker {
+        // The worker withdraws this node's rules on shutdown, within its own budget.
+        if tokio::time::timeout(flowspec::SHUTDOWN_BUDGET + Duration::from_secs(2), worker)
+            .await
+            .is_err()
+        {
+            log::error!("[Flowspec] Worker did not finish withdrawing in time");
         }
     }
     sntl_db.append("NODE_SHUTDOWN".to_string());
-    sntl_db.flush(Duration::from_secs(2));
+    if !sntl_db.flush(Duration::from_secs(2)) {
+        log::error!("[Audit] Shutdown without a confirmed final fsync");
+    }
     let _ = std::fs::remove_file(socket_path);
     let _ = std::fs::remove_file(&args.control_socket);
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_log(name: &str) -> String {
+        let dir = std::env::temp_dir().join(format!("sokol-db-{}-{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir.join("audit.log").to_string_lossy().into_owned()
+    }
+
+    /// F07: with an event every 30 ms the old writer's 100 ms receive timeout never fired and
+    /// nothing was fsynced until 64 records had piled up (about 2 s here).
+    #[test]
+    fn a_steady_stream_is_fsynced_within_the_interval() {
+        let db = SentinelDb::init(&temp_log("steady"), None).unwrap();
+        for i in 0..20 {
+            db.append(format!("EVENT|{}", i));
+            std::thread::sleep(Duration::from_millis(30));
+        }
+        let status = db.status();
+        assert!(status.healthy);
+        assert!(
+            status.last_sync_age_ms < 250,
+            "last fsync {} ms ago under a 30 ms event stream",
+            status.last_sync_age_ms
+        );
+        assert!(db.flush(Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn a_second_node_cannot_open_the_same_audit_log() {
+        let path = temp_log("twice");
+        let _first = SentinelDb::init(&path, None).unwrap();
+        let second = SentinelDb::init(&path, None);
+        assert!(
+            second.is_err(),
+            "two writers would interleave sequence numbers"
+        );
+    }
 }

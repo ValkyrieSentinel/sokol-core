@@ -16,6 +16,10 @@ pub struct Snapshot {
     pub blocks_pending: usize,
     pub p2p_peers: usize,
     pub audit_queue_overflow: u64,
+    pub audit_healthy: bool,
+    pub audit_write_errors: u64,
+    pub audit_lost: u64,
+    pub audit_sync_age_ms: u64,
     pub flowspec_announced: usize,
     pub external_attacks: usize,
     pub cluster_status: u8,
@@ -123,6 +127,42 @@ pub fn render(s: &Snapshot) -> String {
         s.audit_queue_overflow
     );
 
+    family(
+        &mut out,
+        "sokol_audit_healthy",
+        "gauge",
+        "1 while the audit log is written and fsynced; 0 while the node is DEGRADED (enforcement continues).",
+    );
+    let _ = writeln!(out, "sokol_audit_healthy {}", s.audit_healthy as u8);
+    family(
+        &mut out,
+        "sokol_audit_write_errors_total",
+        "counter",
+        "Failed audit writes and fsyncs.",
+    );
+    let _ = writeln!(
+        out,
+        "sokol_audit_write_errors_total {}",
+        s.audit_write_errors
+    );
+    family(
+        &mut out,
+        "sokol_audit_lost_total",
+        "counter",
+        "Audit records that could not be written while the log was unavailable (queue overflow is counted separately).",
+    );
+    let _ = writeln!(out, "sokol_audit_lost_total {}", s.audit_lost);
+    family(
+        &mut out,
+        "sokol_audit_last_sync_age_seconds",
+        "gauge",
+        "Time since the audit log was last fsynced successfully.",
+    );
+    let _ = writeln!(
+        out,
+        "sokol_audit_last_sync_age_seconds {:.3}",
+        s.audit_sync_age_ms as f64 / 1000.0
+    );
     family(
         &mut out,
         "sokol_flowspec_announced",

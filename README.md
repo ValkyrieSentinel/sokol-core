@@ -121,7 +121,10 @@ A peers file that fails to parse is rejected and the previous trust stays in for
 The mesh protocol authenticates but does not encrypt. Run it inside a WireGuard tunnel between
 the nodes (see `deploy/wireguard-mesh.conf.example`) and bind the P2P listener to the tunnel
 address only, e.g. `--p2p-bind 10.99.0.1:7946 --seed-peer 10.99.0.2:7946`. The smoke test runs
-two nodes this way. Add every peer's tunnel address to `--never-block`.
+two nodes this way. Add every peer's tunnel address **and its WireGuard endpoint** (the public
+address in `Endpoint =`) to `--never-block`. XDP runs on the physical interface, where a peer's
+packets carry its endpoint address: blocking that address, by a detector's mistake or a peer's
+`BlockIp`, cuts the tunnel and the mesh with it, and protecting the tunnel address does not prevent it.
 
 ### Cluster telemetry
 
@@ -299,15 +302,33 @@ A missing, reordered or edited segment makes it print `BROKEN` and exit 1. Someo
 access could rebuild the whole chain; to detect that, record the printed head somewhere the node
 cannot write (another host, a ticket, a timestamping service).
 
+Records are fsynced at most 100 ms after the last successful sync (or every 64 records), however
+steady the stream of events. One writer per log: a second process opening the same `--db-path`
+is refused (`<db-path>.lock`).
+
+If the log cannot be written (disk full, I/O error), **enforcement continues**: blocking never
+waits for the audit. The node reports itself degraded instead: `sokol_audit_healthy 0`,
+`MODE=DEGRADED` in its heartbeat to the dashboard, `sokol_audit_write_errors_total`,
+`sokol_audit_lost_total` and `sokol_audit_last_sync_age_seconds`. It keeps reopening the log (which
+drops a torn record) and, once it can write again, records how many records were lost
+(`AUDIT_LOST|Records:<n>`), so the gap is visible in the chain itself.
+
 ## BGP Flowspec (upstream drops)
 
 With `--flowspec-gobgp /usr/local/bin/gobgp` every active block is announced as an RFC 8955
 Flowspec rule `match source <ip>/32 then discard` through a local
 [GoBGP](https://github.com/osrg/gobgp) daemon, so routers that accept Flowspec drop the traffic
 before it reaches this node's link. Expired or lifted blocks are withdrawn, and all of the node's
-rules are withdrawn when it shuts down. Announcements are reconciled every second (at most 64
-changes per second), so a gobgpd outage only delays them. `sokol_flowspec_announced` shows how
-many rules are live.
+rules are withdrawn when it shuts down.
+
+Every rule carries the node's ownership community (`--flowspec-community`, default
+`64512:<node-id>`; give each node that shares a gobgpd its own). Every second a separate worker
+reads gobgpd's RIB and makes this node's rules, and only those, equal to its active blocks (at
+most 64 changes per round). So rules left behind by a crashed run are withdrawn by the next one,
+rules a restarted gobgpd lost are announced again, a gobgp call that timed out (it is killed) is
+settled by the next read, and other systems' rules or rules learned from peers are never
+touched. A slow or hung gobgpd never delays the main loop. `sokol_flowspec_announced` is the
+number of the node's rules last seen in the RIB.
 
 Run gobgpd with a neighbor for each upstream router and the `ipv4-flowspec` / `ipv6-flowspec`
 address families enabled, then point the orchestrator at its API:

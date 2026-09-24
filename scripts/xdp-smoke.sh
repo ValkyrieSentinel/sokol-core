@@ -156,6 +156,36 @@ sleep 1.2
 check "SYN, ACK and RST|ACK segments are not counted as invalid" \
     test "$(metric 'sokol_xdp_dropped_packets_total{reason="invalid_tcp_flags"}')" -eq "$AFTER"
 
+# A blocked IPv6 source is dropped even when its extension headers do not parse: a truncated
+# Hop-by-Hop header used to end the program with XDP_PASS before the blocklist hit was acted on.
+BLOCKED_V6=2001:db8:bad::66
+printf 'BAN_IP:%s\n' "$BLOCKED_V6" | nc -U -q1 "$WORK/control.sock" >/dev/null
+send_v6() {   # send_v6 <next header> <count>: bare IPv6 headers from the blocked source
+    ip netns exec "$NS" python3 - "$PEER_IF" "$BLOCKED_V6" "$1" "$2" <<'PY'
+import socket, struct, sys
+ifname, src, nh, count = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
+s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW)
+s.bind((ifname, 0))
+eth = b"\xff" * 6 + s.getsockname()[4][:6] + struct.pack("!H", 0x86DD)
+# payload length 0, hop limit 64; with next header 0 (Hop-by-Hop) the extension header is missing
+ip6 = struct.pack("!IHBB", 6 << 28, 0, nh, 64) + socket.inet_pton(socket.AF_INET6, src) \
+    + socket.inet_pton(socket.AF_INET6, "2001:db8::1")
+for _ in range(count):
+    s.send(eth + ip6)
+PY
+}
+BEFORE=$(metric 'sokol_xdp_dropped_packets_total{reason="blocklist"}')
+send_v6 59 10   # 59 = no next header: parses cleanly
+sleep 1.2
+MID=$(metric 'sokol_xdp_dropped_packets_total{reason="blocklist"}')
+check "blocked IPv6 source is dropped ($BEFORE -> $MID)" test $((MID - BEFORE)) -eq 10
+send_v6 0 10
+sleep 1.2
+AFTER=$(metric 'sokol_xdp_dropped_packets_total{reason="blocklist"}')
+check "blocked IPv6 source with a truncated extension header is dropped ($MID -> $AFTER)" \
+    test $((AFTER - MID)) -eq 10
+printf 'UNBAN_IP:%s\n' "$BLOCKED_V6" | nc -U -q1 "$WORK/control.sock" >/dev/null
+
 # SYN flood on the XDP trap port: events must be rate-limited, not one per packet.
 FLOOD_START=$SECONDS
 ip netns exec "$NS" bash -c "for i in \$(seq 1 3000); do (echo > /dev/tcp/$HOST_IP/44333) 2>/dev/null; done; true"
@@ -349,8 +379,20 @@ check "an operator ban survives a restart" \
 check "the restart reports restored blocks" grep -q "Restored .* of this node's blocks" "$LOG"
 printf 'UNBAN_IP:%s\n' "$PERSIST_IP" | nc -U -q1 "$WORK/control.sock" >/dev/null
 stop_orchestrator
-start_orchestrator --drop-ipv4-fragments
+TRAP_PROTECTED=10.231.0.8; TRAP_OPEN=10.231.0.10
+ip netns exec "$NS" ip addr add "$TRAP_PROTECTED/24" dev "$PEER_IF"
+ip netns exec "$NS" ip addr add "$TRAP_OPEN/24" dev "$PEER_IF"
+start_orchestrator --drop-ipv4-fragments --trap-port 2324 --never-block "$TRAP_PROTECTED"
 check "orchestrator restarts on the same interface" orchestrator_up
+# The built-in decoy trap audits what actually happened to its block, not a fixed EnforcedDrop.
+for src in "$TRAP_PROTECTED" "$TRAP_OPEN"; do
+    ip netns exec "$NS" nc -z -w 1 -s "$src" "$HOST_IP" 2324 >/dev/null 2>&1 || true
+done
+sleep 1
+check "a trap hit from a protected address is audited as refused, not enforced" bash -c \
+    "grep -aq 'TRAP_HIT|Port:2324|IP:$TRAP_PROTECTED|Action:Refused' '$WORK/events.sntl' && ! grep -aq 'TRAP_HIT|Port:2324|IP:$TRAP_PROTECTED|Action:EnforcedDrop' '$WORK/events.sntl'"
+check "a trap hit from an unprotected address is audited as enforced" \
+    grep -aq "TRAP_HIT|Port:2324|IP:$TRAP_OPEN|Action:EnforcedDrop" "$WORK/events.sntl"
 MONITOR_BIN="$(dirname "$BIN")/monitor"
 check "monitor --verify accepts the audit chain" bash -c "'$MONITOR_BIN' --verify '$WORK/events.sntl' | grep -q '^OK'"
 check "audit log from the first run is re-verified on restart" \
@@ -392,6 +434,9 @@ FLOWSPEC_ARGS=()
 if command -v gobgpd >/dev/null; then
     check "BGP session between node gobgpd and upstream gobgpd is established" start_gobgp_pair
     FLOWSPEC_ARGS=(--flowspec-gobgp "$(command -v gobgp)" --flowspec-gobgp-arg=-p --flowspec-gobgp-arg=50051)
+    # Another system's rule on the same gobgpd (no Sokol community): Sokol must never touch it.
+    FOREIGN_RULE=192.0.2.99/32
+    gobgp -p 50051 global rib -a ipv4-flowspec add match source "$FOREIGN_RULE" then discard
 else
     echo "SKIP  BGP Flowspec checks (gobgpd not installed)"
 fi
@@ -421,7 +466,20 @@ check "TTL: static --block stays in force" bash -c "! ip netns exec $NS ping -c 
 stop_orchestrator
 if [ ${#FLOWSPEC_ARGS[@]} -gt 0 ]; then
     sleep 1
-    check "Flowspec: shutdown withdraws the node's rules upstream" bash -c "! gobgp -p 50052 global rib -a ipv4-flowspec | grep -q source"
+    check "Flowspec: shutdown withdraws the node's rules upstream" bash -c "! gobgp -p 50052 global rib -a ipv4-flowspec | grep -q 'source: $BLOCKED_IP/32'"
+    check "Flowspec: another system's rule is left alone" bash -c "gobgp -p 50052 global rib -a ipv4-flowspec | grep -q 'source: $FOREIGN_RULE'"
+    # F03: a crashed orchestrator leaves its rules in gobgpd; the next run reads the RIB and
+    # withdraws what it no longer wants (it remembers nothing of the previous run).
+    start_orchestrator --block-ttl 3600 "${FLOWSPEC_ARGS[@]}"
+    ipc "DROP_IMMEDIATE:$ALLOWED_IP"
+    sleep 2
+    kill -9 "$ORCH_PID"; wait "$ORCH_PID" 2>/dev/null || true; ORCH_PID=""
+    check "Flowspec: a crashed node's rule stays upstream" bash -c "gobgp -p 50052 global rib -a ipv4-flowspec | grep -q 'source: $ALLOWED_IP/32'"
+    start_orchestrator "${FLOWSPEC_ARGS[@]}"
+    sleep 3
+    check "Flowspec: the next run withdraws the crashed run's stale rule" bash -c "! gobgp -p 50052 global rib -a ipv4-flowspec | grep -q 'source: $ALLOWED_IP/32'"
+    check "Flowspec: the next run keeps announcing its wanted rules" bash -c "gobgp -p 50052 global rib -a ipv4-flowspec | grep -q 'source: $BLOCKED_IP/32'"
+    stop_orchestrator
 fi
 check "SIGINT/SIGTERM shutdown is graceful" grep -q "terminated gracefully" "$LOG"
 
@@ -481,7 +539,7 @@ if command -v wg >/dev/null && ip link add sokol-wgprobe type wireguard 2>/dev/n
     ip addr add "$ATTACK_SRC/24" dev "$HOST_IF"
 
     P2P_BIND=10.99.0.1:7946 start_orchestrator --node-id 1 --peers-file "$WORK/peers-n1.json" \
-        --storm-threshold 0.4 --never-block 10.99.0.2
+        --storm-threshold 0.4 --never-block 10.99.0.2 --never-block "$ALLOWED_IP"
     ip netns exec "$NS" "$BIN" --interface "$PEER_IF" --node-id 2 --block "$ATTACK_SRC" \
         --db-path "$WORK/n2/events.log" --key-file "$WORK/n2/node.key" \
         --ipc-socket "$WORK/n2/ipc.sock" --control-socket "$WORK/n2/control.sock" \
@@ -498,6 +556,8 @@ if command -v wg >/dev/null && ip link add sokol-wgprobe type wireguard 2>/dev/n
     check "mesh over WireGuard: both nodes authenticated each other" \
         bash -c "test \"\$(curl -s http://127.0.0.1:9469/metrics | awk '\$1==\"sokol_p2p_active_peers\"{print \$2}')\" = 1"
     check "telemetry: node 1 sees both nodes in the cluster" test "$(metric sokol_cluster_nodes)" = 2
+    check "node 2's WireGuard endpoint $ALLOWED_IP is protected on node 1" \
+        bash -c "printf 'BAN_IP:$ALLOWED_IP\\n' | nc -U -q1 '$WORK/control.sock' | grep -q '^ERR $ALLOWED_IP is protected'"
     check "telemetry: cluster is stable before the attack" test "$(metric sokol_cluster_status)" = 1
 
     ipc "DROP_IMMEDIATE:203.0.113.77"

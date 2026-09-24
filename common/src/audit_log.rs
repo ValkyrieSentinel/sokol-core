@@ -49,6 +49,10 @@ pub enum AuditError {
         reason: &'static str,
     },
     PayloadTooLarge(usize),
+    /// Another writer holds the log (`<path>.lock`).
+    Locked(PathBuf),
+    /// A failed write could not be undone; the log must be reopened (which drops the torn tail).
+    Poisoned,
 }
 
 impl std::fmt::Display for AuditError {
@@ -58,6 +62,8 @@ impl std::fmt::Display for AuditError {
             Self::Corrupt { offset, reason } => {
                 write!(f, "audit log corrupt at byte {}: {}", offset, reason)
             }
+            Self::Locked(p) => write!(f, "audit log is in use by another writer ({})", p.display()),
+            Self::Poisoned => write!(f, "audit log unusable after a failed write; reopen it"),
             Self::PayloadTooLarge(n) => {
                 write!(
                     f,
@@ -251,6 +257,10 @@ pub struct AuditLog {
     rotation: Option<Rotation>,
     size: u64,
     segment_start_seq: u64,
+    /// Exclusive lock on `<path>.lock`, held while the log is open: two writers on one file
+    /// would interleave sequence numbers and break the chain.
+    _lock: File,
+    poisoned: bool,
 }
 
 fn rotated_path(path: &Path, start_seq: u64) -> PathBuf {
@@ -312,6 +322,21 @@ impl AuditLog {
                 std::fs::create_dir_all(dir)?;
             }
         }
+        let lock_path = {
+            let mut name = path.as_os_str().to_owned();
+            name.push(".lock");
+            PathBuf::from(name)
+        };
+        let lock = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)?;
+        match lock.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => return Err(AuditError::Locked(lock_path)),
+            Err(std::fs::TryLockError::Error(e)) => return Err(e.into()),
+        }
         let file = OpenOptions::new()
             .read(true)
             .append(true)
@@ -337,6 +362,8 @@ impl AuditLog {
             rotation,
             size: valid_len,
             segment_start_seq: reader.segment_start().map(|(s, _)| s).unwrap_or(0),
+            _lock: lock,
+            poisoned: false,
         };
 
         // A crash between renaming the old segment and writing the new header leaves an empty
@@ -401,6 +428,9 @@ impl AuditLog {
 
     /// Appends one record (written, not yet fsynced; see [`sync`](Self::sync)).
     pub fn append(&mut self, payload: &[u8]) -> Result<u64, AuditError> {
+        if self.poisoned {
+            return Err(AuditError::Poisoned);
+        }
         if payload.len() > MAX_PAYLOAD {
             return Err(AuditError::PayloadTooLarge(payload.len()));
         }
@@ -418,7 +448,14 @@ impl AuditLog {
         record.extend_from_slice(&header);
         record.extend_from_slice(payload);
         record.extend_from_slice(&chain);
-        self.file.write_all(&record)?;
+        if let Err(e) = self.file.write_all(&record) {
+            // A partial record would sit between this record and the next one and break the
+            // chain for every later record: cut the file back to the last whole record.
+            if self.file.set_len(self.size).is_err() {
+                self.poisoned = true;
+            }
+            return Err(e.into());
+        }
 
         self.size += record.len() as u64;
         self.next_seq += 1;
@@ -599,6 +636,41 @@ mod tests {
             std::fs::read(&path).unwrap(),
             bytes,
             "corrupt log must not be modified"
+        );
+    }
+
+    #[test]
+    fn a_second_writer_is_refused_while_the_first_holds_the_log() {
+        let path = temp_path("locked");
+        let mut first = AuditLog::open(&path).unwrap();
+        first.append(b"one").unwrap();
+        assert!(matches!(AuditLog::open(&path), Err(AuditError::Locked(_))));
+        first.append(b"two").unwrap();
+        first.sync().unwrap();
+        drop(first);
+        let mut again = AuditLog::open(&path).expect("the lock is released with the writer");
+        again.append(b"three").unwrap();
+        assert_eq!(read_all(&path).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn a_failed_write_that_cannot_be_undone_poisons_the_writer() {
+        let path = temp_path("poisoned");
+        let mut log = AuditLog::open(&path).unwrap();
+        log.append(b"kept").unwrap();
+        log.sync().unwrap();
+        // A read-only handle: the write fails and so does the truncation.
+        log.file = File::open(&path).unwrap();
+        assert!(log.append(b"lost").is_err());
+        assert!(matches!(log.append(b"after"), Err(AuditError::Poisoned)));
+        drop(log);
+        let mut reopened = AuditLog::open(&path).unwrap();
+        reopened.append(b"next").unwrap();
+        let records = read_all(&path).unwrap();
+        assert_eq!(
+            records.len(),
+            2,
+            "the chain continues after the last whole record"
         );
     }
 
