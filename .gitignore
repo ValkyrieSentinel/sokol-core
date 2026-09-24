@@ -1,7 +1,10 @@
 # Build artifacts & targets
-/target/
-/zig-out/
-/.zig-cache/
+target/
+**/target/
+**/zig-out/
+**/.zig-cache/
+zig-out/
+.zig-cache/
 
 # Libraries & binaries
 *.a

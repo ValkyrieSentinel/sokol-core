@@ -134,8 +134,9 @@ async fn main() {
         .route("/metrics/stream", get(metrics_stream))
         .with_state(state);
 
-    let listener = TcpListener::bind("0.0.0.0:3000").await.unwrap();
-    log::info!("[*] Command Center operational at http://0.0.0.0:3000");
+    let bind_addr = std::env::var("SOKOL_OPERATOR_BIND").unwrap_or_else(|_| "127.0.0.1:3000".to_string());
+    let listener = TcpListener::bind(&bind_addr).await.unwrap();
+    log::info!("[*] Command Center operational at http://{}", bind_addr);
     axum::serve(listener, app).await.unwrap();
 }
 

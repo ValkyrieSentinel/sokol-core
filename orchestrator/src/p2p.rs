@@ -106,6 +106,7 @@ pub struct PeerRegistry {
     peers: PeerMap,
     public_keys: Arc<RwLock<HashMap<u64, DilithiumPublic>>>,
     seen_nonces: Arc<RwLock<HashSet<u64>>>,
+    nonce_queue: Arc<RwLock<VecDeque<u64>>>,
 }
 
 impl PeerRegistry {
@@ -114,6 +115,7 @@ impl PeerRegistry {
             peers: Arc::new(RwLock::new(HashMap::new())),
             public_keys: Arc::new(RwLock::new(HashMap::new())),
             seen_nonces: Arc::new(RwLock::new(HashSet::new())),
+            nonce_queue: Arc::new(RwLock::new(VecDeque::new())),
         }
     }
 
@@ -160,13 +162,17 @@ impl PeerRegistry {
 
     pub async fn validate_and_register_nonce(&self, nonce: u64) -> bool {
         let mut nonces = self.seen_nonces.write().await;
+        let mut queue = self.nonce_queue.write().await;
         if nonces.contains(&nonce) {
             return false;
         }
-        if nonces.len() > 10_000 {
-            nonces.clear();
+        if queue.len() >= 10_000 {
+            if let Some(oldest) = queue.pop_front() {
+                nonces.remove(&oldest);
+            }
         }
         nonces.insert(nonce);
+        queue.push_back(nonce);
         true
     }
 
@@ -640,7 +646,17 @@ async fn handle_reader_loop(
                     continue;
                 }
 
-                registry.register_public_key(*node_id, pk).await;
+                if let Ok(existing_pk) = registry.get_peer_public_key(*node_id).await {
+                    if existing_pk.as_bytes() != pk.as_bytes() {
+                        warn!(
+                            "[SECURITY ALERT] Node ID {} attempted to overwrite registered public key from peer {}. Rejecting handshake.",
+                            node_id, peer_addr
+                        );
+                        continue;
+                    }
+                } else {
+                    registry.register_public_key(*node_id, pk).await;
+                }
                 registry
                     .add_peer(peer_addr, writer_tx.clone(), *node_id, Some(pk))
                     .await;

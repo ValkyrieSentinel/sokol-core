@@ -12,7 +12,7 @@ pub fn build(b: *std.Build) void {
     mod.pic = true;
 
     const lib = b.addLibrary(.{
-        .linkage = .dynamic,
+        .linkage = .static,
         .name = "sntl_db",
         .root_module = mod,
     });
