@@ -147,17 +147,22 @@ impl NodeCrypto {
 #[derive(Deserialize)]
 struct PeerEntry {
     node_id: u64,
-    public_key: String,
+    #[serde(default)]
+    public_key: Option<String>,
+    /// Several keys during a rotation: the node may sign with any of them.
+    #[serde(default)]
+    public_keys: Vec<String>,
 }
 
 /// Pinned `(node_id, public_key)` pairs. A peer absent from the store cannot be heard.
 #[derive(Default)]
 pub struct TrustStore {
-    keys: HashMap<u64, DilithiumPublic>,
+    keys: HashMap<u64, Vec<DilithiumPublic>>,
 }
 
 impl TrustStore {
-    /// Reads a JSON array of `{"node_id": u64, "public_key": "<hex>"}` objects.
+    /// Reads a JSON array of `{"node_id": u64, "public_key": "<hex>"}` objects; during a key
+    /// rotation an entry may list `"public_keys": ["<old>", "<new>"]` instead.
     pub fn load(path: &Path) -> Result<Self> {
         let raw = std::fs::read_to_string(path)
             .with_context(|| format!("failed to read peers file {}", path.display()))?;
@@ -165,26 +170,40 @@ impl TrustStore {
             .with_context(|| format!("peers file {} is not a valid peer list", path.display()))?;
         let mut store = Self::default();
         for entry in entries {
-            let bytes = from_hex(&entry.public_key)
-                .with_context(|| format!("peer {}: public_key is not hex", entry.node_id))?;
-            let key = DilithiumPublic::from_bytes(&bytes).map_err(|e| {
-                anyhow::anyhow!("peer {}: invalid public key: {:?}", entry.node_id, e)
-            })?;
-            if store.keys.insert(entry.node_id, key).is_some() {
-                bail!("peers file lists node_id {} more than once", entry.node_id);
+            let id = entry.node_id;
+            if store.keys.contains_key(&id) {
+                bail!("peers file lists node_id {} more than once", id);
             }
+            let hexes: Vec<&String> = entry
+                .public_key
+                .iter()
+                .chain(entry.public_keys.iter())
+                .collect();
+            if hexes.is_empty() {
+                bail!("peer {}: no public_key or public_keys", id);
+            }
+            let mut keys = Vec::new();
+            for hex in hexes {
+                let bytes =
+                    from_hex(hex).with_context(|| format!("peer {}: public key is not hex", id))?;
+                let key = DilithiumPublic::from_bytes(&bytes)
+                    .map_err(|e| anyhow::anyhow!("peer {}: invalid public key: {:?}", id, e))?;
+                keys.push(key);
+            }
+            store.keys.insert(id, keys);
         }
         Ok(store)
     }
 
     pub fn insert(&mut self, node_id: u64, key: DilithiumPublic) {
-        self.keys.insert(node_id, key);
+        self.keys.entry(node_id).or_default().push(key);
     }
 
-    pub fn get(&self, node_id: u64) -> Option<&DilithiumPublic> {
-        self.keys.get(&node_id)
+    pub fn get(&self, node_id: u64) -> Option<&[DilithiumPublic]> {
+        self.keys.get(&node_id).map(Vec::as_slice)
     }
 
+    /// Number of pinned nodes.
     pub fn len(&self) -> usize {
         self.keys.len()
     }
@@ -325,7 +344,7 @@ pub fn open(
     envelope: &SecureEnvelope,
     now: u64,
 ) -> Result<NetworkMessage, EnvelopeError> {
-    let key = trust
+    let keys = trust
         .get(envelope.sender_id)
         .ok_or(EnvelopeError::UnknownSender)?;
 
@@ -337,7 +356,12 @@ pub fn open(
         envelope.nonce,
         &envelope.payload,
     );
-    verify_detached_signature(&signature, &signed, key).map_err(|_| EnvelopeError::BadSignature)?;
+    if !keys
+        .iter()
+        .any(|key| verify_detached_signature(&signature, &signed, key).is_ok())
+    {
+        return Err(EnvelopeError::BadSignature);
+    }
 
     if envelope.timestamp_ms.abs_diff(now) > MAX_CLOCK_SKEW_MS {
         return Err(EnvelopeError::StaleTimestamp);
@@ -364,7 +388,8 @@ pub type PeerMap = Arc<RwLock<HashMap<SocketAddr, (mpsc::Sender<SecureEnvelope>,
 #[derive(Clone)]
 pub struct PeerRegistry {
     peers: PeerMap,
-    trust: Arc<TrustStore>,
+    /// Swapped as a whole by `reload`, so a message is checked against one consistent store.
+    trust: Arc<std::sync::RwLock<Arc<TrustStore>>>,
     replay: Arc<std::sync::Mutex<ReplayGuard>>,
 }
 
@@ -372,7 +397,7 @@ impl PeerRegistry {
     pub fn new(trust: TrustStore) -> Self {
         Self {
             peers: Arc::new(RwLock::new(HashMap::new())),
-            trust: Arc::new(trust),
+            trust: Arc::new(std::sync::RwLock::new(Arc::new(trust))),
             replay: Arc::new(std::sync::Mutex::new(ReplayGuard::default())),
         }
     }
@@ -384,6 +409,18 @@ impl PeerRegistry {
             "[P2P] Registered authenticated peer: {} [Node ID: {}]",
             addr, node_id
         );
+    }
+
+    /// Replaces the trust store. Connections of peers whose key was removed are closed on
+    /// their next envelope, which no longer verifies.
+    pub fn reload(&self, trust: TrustStore) -> usize {
+        let pinned = trust.len();
+        *self.trust.write().unwrap_or_else(|p| p.into_inner()) = Arc::new(trust);
+        pinned
+    }
+
+    pub fn pinned_peers(&self) -> usize {
+        self.trust.read().unwrap_or_else(|p| p.into_inner()).len()
     }
 
     pub async fn peer_count(&self) -> usize {
@@ -402,7 +439,8 @@ impl PeerRegistry {
 
     pub fn open(&self, envelope: &SecureEnvelope) -> Result<NetworkMessage, EnvelopeError> {
         let mut replay = self.replay.lock().unwrap_or_else(|p| p.into_inner());
-        open(&self.trust, &mut replay, envelope, now_ms())
+        let trust = self.trust.read().unwrap_or_else(|p| p.into_inner()).clone();
+        open(&trust, &mut replay, envelope, now_ms())
     }
 
     pub async fn broadcast(
@@ -478,7 +516,7 @@ impl P2PNetwork {
         info!(
             "[P2P] Mesh listener active on {} ({} pinned peers)",
             listener.local_addr()?,
-            self.registry.trust.len()
+            self.registry.pinned_peers()
         );
 
         let semaphore = Arc::new(Semaphore::new(self.max_connections));
@@ -882,7 +920,10 @@ mod tests {
         );
         std::fs::write(&path, &one).unwrap();
         let store = TrustStore::load(&path).unwrap();
-        assert_eq!(store.get(2).unwrap().as_bytes(), peer.public_key.as_bytes());
+        assert_eq!(
+            store.get(2).unwrap()[0].as_bytes(),
+            peer.public_key.as_bytes()
+        );
 
         let dup = format!(
             r#"[{{"node_id": 2, "public_key": "{0}"}}, {{"node_id": 2, "public_key": "{0}"}}]"#,
@@ -890,6 +931,60 @@ mod tests {
         );
         std::fs::write(&path, dup).unwrap();
         assert!(TrustStore::load(&path).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn rotation_accepts_old_and_new_keys_then_revokes_the_old_one() {
+        let old = NodeCrypto::generate();
+        let new = NodeCrypto::generate();
+        let dir = std::env::temp_dir().join(format!("sokol-rotate-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("peers.json");
+
+        std::fs::write(
+            &path,
+            format!(
+                r#"[{{"node_id": 2, "public_keys": ["{}", "{}"]}}]"#,
+                old.public_key_hex(),
+                new.public_key_hex()
+            ),
+        )
+        .unwrap();
+        let registry = PeerRegistry::new(TrustStore::load(&path).unwrap());
+        for signer in [&old, &new] {
+            let env = seal(signer, 2, &block_cmd("10.0.0.2"), &dag())
+                .await
+                .unwrap();
+            assert!(
+                registry.open(&env).is_ok(),
+                "both keys are valid during the rotation"
+            );
+        }
+
+        std::fs::write(
+            &path,
+            format!(
+                r#"[{{"node_id": 2, "public_key": "{}"}}]"#,
+                new.public_key_hex()
+            ),
+        )
+        .unwrap();
+        assert_eq!(registry.reload(TrustStore::load(&path).unwrap()), 1);
+        let env = seal(&old, 2, &block_cmd("10.0.0.2"), &dag()).await.unwrap();
+        assert_eq!(
+            registry.open(&env).unwrap_err(),
+            EnvelopeError::BadSignature,
+            "old key revoked"
+        );
+        let env = seal(&new, 2, &block_cmd("10.0.0.2"), &dag()).await.unwrap();
+        assert!(registry.open(&env).is_ok());
+
+        std::fs::write(&path, r#"[{"node_id": 3}]"#).unwrap();
+        assert!(
+            TrustStore::load(&path).is_err(),
+            "an entry needs at least one key"
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 

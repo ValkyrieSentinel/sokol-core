@@ -89,7 +89,11 @@ ping_fragmented_from() {
     ip netns exec "$NS" ping -c 2 -W 1 -s 3000 -I "$1" "$HOST_IP" >/dev/null 2>&1
 }
 
-start_orchestrator
+PEER_KEY_HEX=$("$BIN" --key-file "$WORK/peer2.key" --print-public-key)
+PEER3_KEY_HEX=$("$BIN" --key-file "$WORK/peer3.key" --print-public-key)
+printf '[{"node_id": 2, "public_key": "%s"}]' "$PEER_KEY_HEX" >"$WORK/peers.json"
+
+start_orchestrator --peers-file "$WORK/peers.json"
 
 orchestrator_up() {
     grep -q "$READY" "$LOG" && kill -0 "$ORCH_PID" 2>/dev/null
@@ -173,6 +177,12 @@ ctl() {
     printf '%s\n' "$1" | nc -U -q1 "$WORK/control.sock"
 }
 check "control socket refuses to ban a protected address" bash -c "ctl() { printf '%s\\n' \"\$1\" | nc -U -q1 '$WORK/control.sock'; }; ctl 'BAN_IP:127.0.0.1' | grep -q '^ERR 127.0.0.1 is protected'"
+check "startup loads the pinned peers file" grep -q "(1 pinned peers)" "$LOG"
+printf '[{"node_id": 2, "public_keys": ["%s", "%s"]}, {"node_id": 3, "public_key": "%s"}]' \
+    "$PEER_KEY_HEX" "$PEER3_KEY_HEX" "$PEER3_KEY_HEX" >"$WORK/peers.json"
+check "RELOAD_PEERS picks up a rotated key and a new peer" bash -c "printf 'RELOAD_PEERS\\n' | nc -U -q1 '$WORK/control.sock' | grep -q '^OK 2 pinned peers'"
+printf 'not json' >"$WORK/peers.json"
+check "RELOAD_PEERS keeps the current trust when the file is broken" bash -c "printf 'RELOAD_PEERS\\n' | nc -U -q1 '$WORK/control.sock' | grep -q 'previous trust store kept'"
 OPERATOR_BIN="$(dirname "$BIN")/sokol-operator"
 OP_TOKEN=smoke-operator-token-0123
 SOKOL_OPERATOR_TOKEN=$OP_TOKEN SOKOL_OPERATOR_BIND=127.0.0.1:3900 "$OPERATOR_BIN" >"$WORK/operator.log" 2>&1 &

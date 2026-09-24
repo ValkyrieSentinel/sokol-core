@@ -297,13 +297,17 @@ fn bind_private_socket(path: &str, gid: Option<u32>) -> anyhow::Result<tokio::ne
     Ok(listener)
 }
 
-async fn execute_control(
-    cmd: control::ControlCommand,
-    blocks: &SharedBlockTable,
-    policy: &BlockPolicy,
-    sntl_db: &SentinelDb,
-) -> String {
+struct ControlCtx {
+    blocks: SharedBlockTable,
+    policy: Arc<BlockPolicy>,
+    sntl_db: Arc<SentinelDb>,
+    registry: PeerRegistry,
+    peers_file: Option<std::path::PathBuf>,
+}
+
+async fn execute_control(cmd: control::ControlCommand, ctx: &ControlCtx) -> String {
     use control::ControlCommand;
+    let (blocks, policy, sntl_db) = (&ctx.blocks, &ctx.policy, &ctx.sntl_db);
     match cmd {
         ControlCommand::Ban(ip) => {
             if let Err(why) = policy.check(ip) {
@@ -346,6 +350,23 @@ async fn execute_control(
             sntl_db.append(format!("OPERATOR_FLUSH|Released:{}", released.len()));
             format!("OK released {} dynamic blocks", released.len())
         }
+        ControlCommand::ReloadPeers => match &ctx.peers_file {
+            None => "ERR no --peers-file configured".to_string(),
+            Some(path) => match TrustStore::load(path) {
+                Ok(trust) => {
+                    let pinned = ctx.registry.reload(trust);
+                    log::warn!(
+                        "[Control] Reloaded {}: {} pinned peers",
+                        path.display(),
+                        pinned
+                    );
+                    sntl_db.append(format!("PEERS_RELOADED|Pinned:{}", pinned));
+                    format!("OK {} pinned peers", pinned)
+                }
+                // A broken file must not wipe the current trust: keep it and report.
+                Err(e) => format!("ERR {:#}; previous trust store kept", e),
+            },
+        },
         ControlCommand::Unsupported(why) => format!("ERR {}", why),
     }
 }
@@ -917,9 +938,13 @@ async fn main() -> Result<(), anyhow::Error> {
     let unix_listener = bind_private_socket(socket_path, ipc_gid)?;
 
     let control_listener = bind_private_socket(&args.control_socket, control_gid)?;
-    let blocks_ctl = blocks.clone();
-    let policy_ctl = block_policy.clone();
-    let db_ctl = sntl_db.clone();
+    let ctl_ctx = Arc::new(ControlCtx {
+        blocks: blocks.clone(),
+        policy: block_policy.clone(),
+        sntl_db: sntl_db.clone(),
+        registry: peer_registry.clone(),
+        peers_file: args.peers_file.clone(),
+    });
     tokio::spawn(async move {
         loop {
             let (stream, _) = match control_listener.accept().await {
@@ -930,7 +955,7 @@ async fn main() -> Result<(), anyhow::Error> {
                     continue;
                 }
             };
-            let (blocks, policy, db) = (blocks_ctl.clone(), policy_ctl.clone(), db_ctl.clone());
+            let ctx = ctl_ctx.clone();
             tokio::spawn(async move {
                 let (read_half, mut write_half) = stream.into_split();
                 let mut reader = BufReader::new(read_half);
@@ -946,7 +971,7 @@ async fn main() -> Result<(), anyhow::Error> {
                         Ok(_) => {}
                     }
                     let reply = match control::parse(&line) {
-                        Ok(cmd) => execute_control(cmd, &blocks, &policy, &db).await,
+                        Ok(cmd) => execute_control(cmd, &ctx).await,
                         Err(e) => format!("ERR {}", e),
                     };
                     if write_half

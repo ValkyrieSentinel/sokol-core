@@ -105,6 +105,17 @@ Collect the keys into a peers file on every node:
 sudo ./target/release/orchestrator -i eth0 --node-id 1 --peers-file /etc/sokol/peers.json --seed-peer 10.0.0.2:8080
 ```
 
+To rotate a node's key without downtime:
+
+1. Generate the new key: `orchestrator --key-file /var/lib/sokol/node.key.new --print-public-key`.
+2. On every peer, list both keys for that node — `{"node_id": 1, "public_keys": ["<old>", "<new>"]}` —
+   and apply it with `printf 'RELOAD_PEERS\n' | nc -U /run/sokol/control.sock`.
+3. Move `node.key.new` over `node.key` and restart that node.
+4. Remove the old key from every peers file and send `RELOAD_PEERS` again. Open connections that
+   still sign with the removed key are closed on their next message.
+
+A peers file that fails to parse is rejected and the previous trust stays in force.
+
 Envelopes are signed over sender, timestamp, nonce and payload; they are rejected outside a
 ±30 s clock window (keep nodes NTP-synced) and accepted at most once. Mesh traffic is
 authenticated but not encrypted.

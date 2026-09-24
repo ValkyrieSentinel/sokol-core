@@ -11,6 +11,8 @@ pub enum ControlCommand {
     Unban(IpAddr),
     /// Releases all dynamic (trap, IPC, mesh) blocks; operator and `--block` bans stay.
     FlushDynamic,
+    /// Re-reads `--peers-file` (key rotation / revocation without a restart).
+    ReloadPeers,
     /// A command the dashboard knows but this node cannot carry out.
     Unsupported(&'static str),
 }
@@ -38,6 +40,7 @@ pub fn parse(line: &str) -> Result<ControlCommand, String> {
         "BAN_IP" => ip(arg).map(ControlCommand::Ban),
         "UNBAN_IP" => ip(arg).map(ControlCommand::Unban),
         "FLUSH_BANS" if arg.is_none() => Ok(ControlCommand::FlushDynamic),
+        "RELOAD_PEERS" if arg.is_none() => Ok(ControlCommand::ReloadPeers),
         "XDP_LOAD" | "XDP_UNLOAD" => Ok(ControlCommand::Unsupported(
             "toggling XDP from the dashboard is not supported; stop or start the service",
         )),
@@ -67,6 +70,7 @@ mod tests {
             Ok(ControlCommand::Ban("203.0.113.5".parse().unwrap()))
         );
         assert_eq!(parse("FLUSH_BANS"), Ok(ControlCommand::FlushDynamic));
+        assert_eq!(parse("RELOAD_PEERS\n"), Ok(ControlCommand::ReloadPeers));
         assert!(matches!(
             parse("XDP_UNLOAD"),
             Ok(ControlCommand::Unsupported(_))
