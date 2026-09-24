@@ -160,6 +160,21 @@ The same address is not re-sent within `--cooldown-secs` (60), signals are cappe
 `--max-signals-per-sec` (50), and noisy rules can be skipped with `--ignore-sid`. The adapter only
 needs to read the EVE log and write to the IPC socket (group `sokol-ipc`).
 
+### CrowdSec
+
+`sokol-crowdsec` is a CrowdSec bouncer: it polls the Local API decision stream and turns `ban`
+decisions on single addresses into signals.
+
+```shell
+cscli bouncers add sokol                         # prints the API key
+SOKOL_CROWDSEC_KEY=<key> sokol-crowdsec --lapi-url http://127.0.0.1:8080 --ipc-socket /run/sokol/sokol.sock
+```
+
+Only local decisions (origins `crowdsec` and `cscli`) are forwarded by default; community lists
+(`CAPI`, `lists`) can hold tens of thousands of addresses and are added with `--origins` only if the
+mesh should carry them. Range decisions are skipped until prefix blocks exist. Decisions deleted in
+CrowdSec end on Sokol's own TTL; lift one early with `UNBAN_IP` on the control socket.
+
 Other detectors can use the same line protocol on the IPC socket:
 `SIGNAL:<source>|<src ip>|<dst ip or ->|<reason>`.
 

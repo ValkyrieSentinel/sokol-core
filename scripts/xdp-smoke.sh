@@ -26,6 +26,9 @@ cleanup() {
     [ -n "$OPERATOR_PID" ] && kill "$OPERATOR_PID" 2>/dev/null || true
     [ -n "${SURICATA_PID:-}" ] && kill "$SURICATA_PID" 2>/dev/null || true
     [ -n "${ADAPTER_PID:-}" ] && kill "$ADAPTER_PID" 2>/dev/null || true
+    [ -n "${CS_ADAPTER_PID:-}" ] && kill "$CS_ADAPTER_PID" 2>/dev/null || true
+    [ -n "${CS_BOUNCER:-}" ] && cscli bouncers delete "$CS_BOUNCER" >/dev/null 2>&1 || true
+    [ -n "${CROWDSEC_PID:-}" ] && kill "$CROWDSEC_PID" 2>/dev/null || true
     pkill -f "gobgpd -f $WORK" 2>/dev/null || true
     [ -n "${NODE2_PID:-}" ] && kill "$NODE2_PID" 2>/dev/null || true
     ip link del sokol-wg0 2>/dev/null || true
@@ -247,6 +250,38 @@ if command -v suricata >/dev/null; then
     ADAPTER_PID=""; SURICATA_PID=""
 else
     echo "SKIP  Suricata checks (suricata not installed)"
+fi
+
+# CrowdSec decision -> sokol-crowdsec -> orchestrator -> XDP.
+if command -v cscli >/dev/null && command -v crowdsec >/dev/null; then
+    if ! cscli lapi status >/dev/null 2>&1; then
+        crowdsec -c /etc/crowdsec/config.yaml >"$WORK/crowdsec.log" 2>&1 </dev/null &
+        CROWDSEC_PID=$!
+        for _ in $(seq 1 60); do cscli lapi status >/dev/null 2>&1 && break; sleep 0.5; done
+    fi
+    CS_BOUNCER="sokol-smoke-$$"
+    CS_KEY=$(cscli bouncers add "$CS_BOUNCER" -o raw)
+    CS_IP=10.231.0.6
+    ip netns exec "$NS" ip addr add "$CS_IP/24" dev "$PEER_IF"
+    check "the CrowdSec test address reaches the node before the decision" \
+        ip netns exec "$NS" ping -c 1 -W 1 -I "$CS_IP" "$HOST_IP"
+    SOKOL_CROWDSEC_KEY="$CS_KEY" "$(dirname "$BIN")/sokol-crowdsec" --poll-secs 1 >"$WORK/crowdsec-adapter.log" 2>&1 </dev/null &
+    CS_ADAPTER_PID=$!
+    cscli decisions add --ip "$CS_IP" --reason "sokol smoke ban" --duration 5m >/dev/null 2>&1
+    for _ in $(seq 1 50); do
+        grep -q "Dynamic block enforced in XDP: $CS_IP" "$LOG" && break
+        sleep 0.2
+    done
+    check "CrowdSec ban decision is forwarded as a signal" grep -q "SIGNAL:crowdsec|$CS_IP|-|sokol smoke ban (origin cscli" "$WORK/crowdsec-adapter.log"
+    check "CrowdSec ban blocks the address in XDP" \
+        bash -c "! ip netns exec $NS ping -c 2 -W 1 -I $CS_IP $HOST_IP >/dev/null 2>&1"
+    check "the block reason names CrowdSec and the scenario" grep -q "Dynamic block enforced in XDP: $CS_IP.*crowdsec: sokol smoke ban" "$LOG"
+    cscli decisions delete --ip "$CS_IP" >/dev/null 2>&1 || true
+    kill "$CS_ADAPTER_PID" 2>/dev/null || true
+    cscli bouncers delete "$CS_BOUNCER" >/dev/null 2>&1 || true
+    CS_ADAPTER_PID=""; CS_BOUNCER=""
+else
+    echo "SKIP  CrowdSec checks (crowdsec not installed)"
 fi
 
 ipc "DROP_IMMEDIATE:$ALLOWED_IP"

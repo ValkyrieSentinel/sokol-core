@@ -25,6 +25,8 @@ serde_json = "1.0"
 chrono = "0.4"
 ipnet = "2.9"
 libc = "0.2"
+# Plain-HTTP client for the local CrowdSec API (sokol-crowdsec); no TLS stack needed on localhost.
+ureq = { version = "2", default-features = false }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
