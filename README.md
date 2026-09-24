@@ -143,7 +143,7 @@ dropping `CAP_PERFMON` does not), `ProtectSystem=strict` and related hardening
 
 `--metrics-bind 127.0.0.1:9469` serves Prometheus metrics at `/metrics`:
 `sokol_xdp_rx_packets_total`, `sokol_xdp_rx_bytes_total`,
-`sokol_xdp_dropped_packets_total{reason=...}`, `sokol_xdp_events_suppressed_total`,
+`sokol_xdp_dropped_packets_total{reason=...}` (e.g. `blocklist`, `invalid_tcp_flags`, `fragment_blocked`), `sokol_xdp_events_suppressed_total`,
 `sokol_blocks_active`, `sokol_p2p_active_peers`, `sokol_audit_queue_overflow_total`.
 
 Kernel drop events reach user space at most 64 times per second per CPU (trap-port events only

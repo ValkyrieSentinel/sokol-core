@@ -433,13 +433,27 @@ fn try_sentinel_vfr_filter(ctx: &XdpContext) -> Result<u32, ()> {
                 unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*tcp_ptr).dst_port)) };
             let port = u16::from_be(dst_port);
 
+            let flags = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*tcp_ptr).flags)) };
+            if common::tcp_flags::is_invalid(flags) {
+                record_drop(packet_len, drop_reason::INVALID_TCP_FLAGS);
+                emit_drop_event_sampled(
+                    ctx,
+                    &src_ip_16,
+                    &dst_ip_16,
+                    packet_len as u32,
+                    drop_reason::INVALID_TCP_FLAGS,
+                    protocol,
+                    ip_version,
+                );
+                return Ok(xdp_action::XDP_DROP);
+            }
+
             if port == 80 || port == 443 || port == ADMIN_SSH_PORT {
                 record_rx(packet_len);
                 return Ok(xdp_action::XDP_PASS);
             }
 
             // Only connection attempts (SYN without ACK) count as trap hits, not every segment.
-            let flags = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*tcp_ptr).flags)) };
             if port == TRAP_PORT && flags & TCP_SYN != 0 && flags & TCP_ACK == 0 {
                 emit_drop_event_sampled(
                     ctx,

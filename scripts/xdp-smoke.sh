@@ -106,6 +106,37 @@ metric() {
 sleep 1.2
 check "metrics: blocklist drops are counted" bash -c "test \"\$(curl -s http://127.0.0.1:9469/metrics | awk '\$1 == \"sokol_xdp_dropped_packets_total{reason=\\\"blocklist\\\"}\" { print \$2 }')\" -ge 2"
 
+# Scanner probes with impossible TCP flag combinations are dropped in XDP.
+send_tcp_flags() {
+    ip netns exec "$NS" python3 - "$ALLOWED_IP" "$HOST_IP" "$@" <<'PY'
+import socket, struct, sys
+src, dst, flag_list = sys.argv[1], sys.argv[2], [int(f, 0) for f in sys.argv[3:]]
+def csum(data):
+    if len(data) % 2:
+        data += b"\0"
+    s = sum(struct.unpack("!%dH" % (len(data) // 2), data))
+    s = (s >> 16) + (s & 0xFFFF)
+    return ~(s + (s >> 16)) & 0xFFFF
+sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_TCP)
+sock.bind((src, 0))
+for i, flags in enumerate(flag_list):
+    hdr = struct.pack("!HHIIBBHHH", 40000 + i, 9, 1, 0, 5 << 4, flags, 1024, 0, 0)
+    pseudo = socket.inet_aton(src) + socket.inet_aton(dst) + struct.pack("!BBH", 0, 6, len(hdr))
+    hdr = hdr[:16] + struct.pack("!H", csum(pseudo + hdr)) + hdr[18:]
+    sock.sendto(hdr, (dst, 0))
+PY
+}
+BEFORE=$(metric 'sokol_xdp_dropped_packets_total{reason="invalid_tcp_flags"}')
+# NULL, XMAS (FIN|PSH|URG), SYN|FIN, FIN alone, SYN|RST — five of each
+send_tcp_flags $(for _ in 1 2 3 4 5; do printf '0x00 0x29 0x03 0x01 0x06 '; done)
+sleep 1.2
+AFTER=$(metric 'sokol_xdp_dropped_packets_total{reason="invalid_tcp_flags"}')
+check "NULL/XMAS/SYN-FIN/FIN/SYN-RST probes are dropped in XDP ($BEFORE -> $AFTER)" test $((AFTER - BEFORE)) -eq 25
+send_tcp_flags 0x02 0x10 0x14
+sleep 1.2
+check "SYN, ACK and RST|ACK segments are not counted as invalid" \
+    test "$(metric 'sokol_xdp_dropped_packets_total{reason="invalid_tcp_flags"}')" -eq "$AFTER"
+
 # SYN flood on the XDP trap port: events must be rate-limited, not one per packet.
 FLOOD_START=$SECONDS
 ip netns exec "$NS" bash -c "for i in \$(seq 1 3000); do (echo > /dev/tcp/$HOST_IP/44333) 2>/dev/null; done; true"

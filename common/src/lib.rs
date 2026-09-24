@@ -84,6 +84,7 @@ pub mod drop_reason {
     pub const SOCK_REDIRECTED: u16 = 7;
     pub const MANUAL_BLOCK: u16 = 8;
     pub const FRAGMENT_BLOCKED: u16 = 9;
+    pub const INVALID_TCP_FLAGS: u16 = 10;
 
     /// Label for metrics; `None` for codes that are never recorded as drops.
     pub const fn name(code: u16) -> Option<&'static str> {
@@ -97,6 +98,7 @@ pub mod drop_reason {
             SOCK_REDIRECTED => Some("sock_redirected"),
             MANUAL_BLOCK => Some("manual_block"),
             FRAGMENT_BLOCKED => Some("fragment_blocked"),
+            INVALID_TCP_FLAGS => Some("invalid_tcp_flags"),
             _ => None,
         }
     }
@@ -106,6 +108,83 @@ pub mod drop_reason {
 pub mod config_flags {
     /// Drop every IPv4 fragment (for hosts whose policy forbids fragmentation).
     pub const DROP_IPV4_FRAGMENTS: u32 = 1 << 0;
+}
+
+pub mod tcp_flags {
+    pub const FIN: u8 = 0x01;
+    pub const SYN: u8 = 0x02;
+    pub const RST: u8 = 0x04;
+    pub const PSH: u8 = 0x08;
+    pub const ACK: u8 = 0x10;
+    pub const URG: u8 = 0x20;
+
+    /// Flag combinations no conforming TCP stack sends; scanners use them to fingerprint hosts
+    /// (NULL, XMAS, FIN and SYN-FIN scans). Every segment after the first carries ACK, so FIN,
+    /// PSH or URG without ACK only appears in probes.
+    #[inline(always)]
+    pub const fn is_invalid(flags: u8) -> bool {
+        let f = flags & (FIN | SYN | RST | PSH | ACK | URG);
+        f == 0
+            || f & (SYN | FIN) == (SYN | FIN)
+            || f & (SYN | RST) == (SYN | RST)
+            || f & (FIN | RST) == (FIN | RST)
+            || (f & ACK == 0 && f & (FIN | PSH | URG) != 0)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn legitimate_segments_pass() {
+            for ok in [
+                SYN,
+                SYN | ACK,
+                ACK,
+                PSH | ACK,
+                FIN | ACK,
+                FIN | PSH | ACK,
+                RST,
+                RST | ACK,
+                URG | ACK | PSH,
+            ] {
+                assert!(!is_invalid(ok), "{:#04x} is legitimate", ok);
+            }
+            // ECE/CWR (ECN) bits do not change validity.
+            assert!(!is_invalid(SYN | 0x40 | 0x80));
+        }
+
+        #[test]
+        fn scan_probes_are_invalid() {
+            for bad in [
+                0,
+                FIN,
+                FIN | PSH | URG,
+                SYN | FIN,
+                SYN | FIN | ACK,
+                SYN | RST,
+                FIN | RST | ACK,
+                PSH,
+                URG,
+            ] {
+                assert!(is_invalid(bad), "{:#04x} is a scan probe", bad);
+            }
+        }
+
+        #[test]
+        fn exhaustive_against_the_rule_table() {
+            for flags in 0u16..=255 {
+                let f = flags as u8 & 0x3F;
+                let has = |b: u8| f & b != 0;
+                let expected = f == 0
+                    || (has(SYN) && has(FIN))
+                    || (has(SYN) && has(RST))
+                    || (has(FIN) && has(RST))
+                    || (!has(ACK) && (has(FIN) || has(PSH) || has(URG)));
+                assert_eq!(is_invalid(flags as u8), expected, "flags {:#04x}", flags);
+            }
+        }
+    }
 }
 
 pub mod atp;
