@@ -286,6 +286,25 @@ instances.
 Kernel drop events reach user space at most 64 times per second per CPU (trap-port events only
 for connection attempts); the rest are counted in `sokol_xdp_events_suppressed_total`.
 
+## Demo
+
+`demo/demo.sh` runs the whole story on one Linux machine: three nodes meshed with pinned keys, an
+attacker, a rogue node, Suricata on node 1 and the operator dashboard on http://127.0.0.1:3000.
+
+```shell
+sudo demo/demo.sh target/release            # pauses before each step
+sudo DEMO_AUTO=1 demo/demo.sh target/release
+```
+
+1. The attacker scans node 1; Suricata alerts and all three nodes drop the attacker (the demo prints
+   the time from scan to block on each node).
+2. A rogue node with its own valid key orders a block; the others reject it.
+3. A flood on node 2 is dropped in XDP and node 1 reports a distributed storm.
+4. A signal against the operator's address is refused by the never-block policy.
+5. The blocks expire on their TTL and every node's audit chain verifies.
+
+Each step checks its outcome, and CI runs the demo on every change.
+
 ## Measurements
 
 `bench/` reproduces the numbers in the project's evaluation (Linux, root; timings come from the

@@ -59,3 +59,6 @@ jobs:
           sudo apt-get install -y -qq netcat-openbsd wireguard-tools suricata crowdsec
           sudo systemctl stop suricata 2>/dev/null || true
           sudo scripts/xdp-smoke.sh target/release/orchestrator
+
+      - name: Demo scenario (3 nodes, attacker, rogue node, Suricata)
+        run: sudo DEMO_AUTO=1 demo/demo.sh target/release
