@@ -47,7 +47,7 @@ cargo +nightly test --release
 sudo scripts/xdp-smoke.sh target/release/orchestrator
 ```
 
-Run (must be run with sudo, as root privileges are required to work with XDP maps and network interfaces):
+Run as root for a quick test (for production use the systemd unit below, which runs unprivileged):
 
 ```shell
 sudo ./target/release/orchestrator
@@ -120,6 +120,16 @@ connects, so run it on a decoy host or only on ports with no real service.
 
 At most 256 trap connections are handled at once; binary floods get a slow 32 B/s drip for up
 to 30 s instead of a burst.
+
+## Running as a service
+
+`deploy/sokol-orchestrator.service` runs the orchestrator as user `sokol` with only
+`CAP_NET_ADMIN`, `CAP_BPF` and `CAP_PERFMON` (the smoke test checks that this set works and that
+dropping `CAP_PERFMON` does not), `ProtectSystem=strict` and related hardening
+(`systemd-analyze security`: 3.7 "OK"). State lives in `/var/lib/sokol`, the control socket in
+`/run/sokol/sokol.sock` for members of `sokol-ipc`; point `trident_trap` at it with
+`SOKOL_IPC_SOCKET=/run/sokol/sokol.sock` (it also needs `CAP_NET_BIND_SERVICE` for ports below
+1024). SIGTERM shuts down gracefully and flushes the audit log.
 
 # Project Structure
 

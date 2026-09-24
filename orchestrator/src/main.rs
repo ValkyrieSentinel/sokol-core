@@ -31,8 +31,13 @@ use crate::p2p::{connect_to_peer, DagTracker, NodeCrypto, P2PNetwork, PeerRegist
 
 /// Audit trail writer. Records are queued (bounded, so a flood cannot exhaust memory) and
 /// written by one thread, fsynced every 100 ms or 64 records: a crash loses at most that window.
+enum AuditMsg {
+    Record(String),
+    Flush(std::sync::mpsc::SyncSender<()>),
+}
+
 pub struct SentinelDb {
-    tx: std::sync::mpsc::SyncSender<String>,
+    tx: std::sync::mpsc::SyncSender<AuditMsg>,
     dropped: Arc<std::sync::atomic::AtomicU64>,
 }
 
@@ -46,7 +51,7 @@ impl SentinelDb {
             .map_err(|e| anyhow::anyhow!("{} ({})", e, path))?;
         log::info!("Audit log {} opened: {} records verified", path, log.len());
 
-        let (tx, rx) = std::sync::mpsc::sync_channel::<String>(Self::QUEUE_CAPACITY);
+        let (tx, rx) = std::sync::mpsc::sync_channel::<AuditMsg>(Self::QUEUE_CAPACITY);
         let dropped = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let dropped_writer = dropped.clone();
 
@@ -55,7 +60,13 @@ impl SentinelDb {
             use std::sync::mpsc::RecvTimeoutError;
             loop {
                 match rx.recv_timeout(Self::SYNC_INTERVAL) {
-                    Ok(payload) => {
+                    Ok(AuditMsg::Flush(ack)) => {
+                        if let Err(e) = log.sync() {
+                            log::error!("[Audit] fsync failed: {}", e);
+                        }
+                        let _ = ack.send(());
+                    }
+                    Ok(AuditMsg::Record(payload)) => {
                         let lost = dropped_writer.swap(0, Ordering::Relaxed);
                         if lost > 0 {
                             let note = format!("AUDIT_QUEUE_OVERFLOW|Dropped:{}", lost);
@@ -87,8 +98,16 @@ impl SentinelDb {
         Ok(Self { tx, dropped })
     }
 
+    /// Waits until everything queued so far is written and fsynced (used on shutdown).
+    pub fn flush(&self, wait: Duration) {
+        let (ack_tx, ack_rx) = std::sync::mpsc::sync_channel(1);
+        if self.tx.send(AuditMsg::Flush(ack_tx)).is_ok() && ack_rx.recv_timeout(wait).is_err() {
+            log::error!("[Audit] Flush did not complete within {:?}", wait);
+        }
+    }
+
     pub fn append(&self, data: String) {
-        match self.tx.try_send(data) {
+        match self.tx.try_send(AuditMsg::Record(data)) {
             Ok(()) => {}
             Err(std::sync::mpsc::TrySendError::Full(_)) => {
                 self.dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -162,9 +181,13 @@ struct Args {
     /// Drop all IPv4 fragments in XDP (default: fragments pass, subject to the blocklist).
     #[arg(long)]
     drop_ipv4_fragments: bool,
+
+    /// Control socket for local tools (trident_trap uses SOKOL_IPC_SOCKET to find it).
+    /// Under systemd use a RuntimeDirectory, e.g. /run/sokol/sokol.sock.
+    #[arg(long, default_value = "/run/sokol.sock")]
+    ipc_socket: String,
 }
 
-const IPC_SOCKET_PATH: &str = "/run/sokol.sock";
 const MAX_IPC_LINE: u64 = 4096;
 
 fn build_block_policy(args: &Args) -> anyhow::Result<BlockPolicy> {
@@ -435,7 +458,7 @@ async fn main() -> Result<(), anyhow::Error> {
     let shutdown_tx_ctrlc = shutdown_tx.clone();
 
     ctrlc::set_handler(move || {
-        log::warn!("SIGINT received. Teardown initiated...");
+        log::warn!("SIGINT/SIGTERM received. Teardown initiated...");
         let _ = shutdown_tx_ctrlc.send(true);
     })?;
 
@@ -657,7 +680,7 @@ async fn main() -> Result<(), anyhow::Error> {
         });
     }
 
-    let socket_path = IPC_SOCKET_PATH;
+    let socket_path = args.ipc_socket.as_str();
     let _ = std::fs::remove_file(socket_path);
 
     let unix_listener = tokio::net::UnixListener::bind(socket_path)
@@ -683,8 +706,9 @@ async fn main() -> Result<(), anyhow::Error> {
     let node_id_unix = args.node_id;
     let policy_unix = block_policy.clone();
 
+    let socket_path_log = socket_path.to_string();
     tokio::spawn(async move {
-        log::info!("[UNIX SOCKET] Listening for trap events on {}", socket_path);
+        log::info!("[UNIX SOCKET] Listening for trap events on {}", socket_path_log);
         loop {
             match unix_listener.accept().await {
                 Ok((stream, _)) => {
@@ -891,6 +915,8 @@ async fn main() -> Result<(), anyhow::Error> {
     }
 
     log::info!("Sokol-Core main loop terminated gracefully. Cleaning up resources...");
+    sntl_db.append("NODE_SHUTDOWN".to_string());
+    sntl_db.flush(Duration::from_secs(2));
     let _ = std::fs::remove_file(socket_path);
 
     Ok(())

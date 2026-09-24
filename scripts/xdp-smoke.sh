@@ -124,6 +124,38 @@ check "audit log from the first run is re-verified on restart" \
 check "strict mode: unfragmented traffic from $ALLOWED_IP passes" ping_from "$ALLOWED_IP"
 check "strict mode: fragmented IPv4 is dropped" bash -c "! ip netns exec $NS ping -c 2 -W 1 -s 3000 -I $ALLOWED_IP $HOST_IP >/dev/null 2>&1"
 
+stop_orchestrator
+check "SIGINT/SIGTERM shutdown is graceful" grep -q "terminated gracefully" "$LOG"
+
+# Unprivileged run: only the capabilities the systemd unit grants.
+NONROOT="$WORK/nonroot"
+mkdir -p "$NONROOT"
+chown nobody "$NONROOT"
+chmod 755 "$WORK"
+run_nonroot() {
+    local caps="$1"
+    : >"$LOG"
+    setpriv --reuid nobody --regid nogroup --clear-groups \
+        --inh-caps "$caps" --ambient-caps "$caps" --bounding-set "$caps" \
+        "$BIN" --interface "$HOST_IF" \
+        --db-path "$NONROOT/events.log" --key-file "$NONROOT/node.key" \
+        --p2p-bind "127.0.0.1:0" --ipc-socket "$NONROOT/sokol.sock" \
+        >"$LOG" 2>&1 &
+    ORCH_PID=$!
+    for _ in $(seq 1 50); do
+        grep -q "$READY" "$LOG" && break
+        kill -0 "$ORCH_PID" 2>/dev/null || break
+        sleep 0.2
+    done
+}
+run_nonroot "-all,+net_admin,+bpf"
+check "non-root without CAP_PERFMON is refused by the kernel" bash -c "! grep -q '$READY' '$LOG'"
+stop_orchestrator
+run_nonroot "-all,+net_admin,+bpf,+perfmon"
+check "non-root with CAP_NET_ADMIN+CAP_BPF+CAP_PERFMON starts" orchestrator_up
+check "non-root: traffic still flows" ping_from "$ALLOWED_IP"
+stop_orchestrator
+
 if [ "$FAILED" -ne 0 ]; then
     echo "--- orchestrator log ---"
     cat "$LOG"

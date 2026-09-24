@@ -7,6 +7,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{sleep, timeout, Duration};
 
+fn ipc_socket_path() -> String {
+    std::env::var("SOKOL_IPC_SOCKET").unwrap_or_else(|_| "/run/sokol.sock".to_string())
+}
+
 /// Ports that decoy services listen on. 8080 is left out: it is the orchestrator's P2P port.
 const DEFAULT_TRAP_PORTS: [u16; 6] = [22, 80, 443, 3306, 6379, 8443];
 /// The XDP program always passes this port as the operator's real SSH (ADMIN_SSH_PORT).
@@ -522,10 +526,10 @@ async fn run_embedded_mock_jail(
 }
 
 async fn send_log_to_orchestrator(log_msg: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let socket_path = "/run/sokol.sock";
+    let socket_path = ipc_socket_path();
     let msg = format!("DB_LOG:{}\n", log_msg);
 
-    match tokio::net::UnixStream::connect(socket_path).await {
+    match tokio::net::UnixStream::connect(&socket_path).await {
         Ok(mut socket) => {
             socket.write_all(msg.as_bytes()).await?;
             socket.flush().await?;
@@ -540,10 +544,10 @@ async fn send_log_to_orchestrator(log_msg: &str) -> Result<(), Box<dyn std::erro
 }
 
 async fn notify_ebpf_kernel_apt(ip: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let socket_path = "/run/sokol.sock";
+    let socket_path = ipc_socket_path();
     let msg = format!("APT_HIGH_PRIORITY:{}\n", ip);
 
-    match tokio::net::UnixStream::connect(socket_path).await {
+    match tokio::net::UnixStream::connect(&socket_path).await {
         Ok(mut socket) => {
             socket.write_all(msg.as_bytes()).await?;
             socket.flush().await?;
@@ -558,13 +562,13 @@ async fn notify_ebpf_kernel_apt(ip: &str) -> Result<(), Box<dyn std::error::Erro
 }
 
 async fn trigger_xdp_drop(ip: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let socket_path = "/run/sokol.sock";
+    let socket_path = ipc_socket_path();
     let msg = format!("DROP_IMMEDIATE:{}\n", ip);
     let max_retries = 3;
     let mut retry_delay = Duration::from_millis(50);
 
     for attempt in 1..=max_retries {
-        match tokio::net::UnixStream::connect(socket_path).await {
+        match tokio::net::UnixStream::connect(&socket_path).await {
             Ok(mut socket) => {
                 if let Err(e) = socket.write_all(msg.as_bytes()).await {
                     eprintln!(
