@@ -1,4 +1,3 @@
-
 pub const MAX_KEYS: usize = 32;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -21,10 +20,14 @@ impl CanonicalError {
     pub const fn as_str(&self) -> &'static str {
         match self {
             Self::EmptyPayload => "Payload is empty",
-            Self::InvalidFraming => "Invalid object framing: must strictly start with '{' and end with '}'",
+            Self::InvalidFraming => {
+                "Invalid object framing: must strictly start with '{' and end with '}'"
+            }
             Self::SyntaxErrorKey => "Syntax error: expected string key in object",
             Self::UnterminatedKey => "Unterminated key string",
-            Self::DuplicateKey => "Consensus fault: duplicate key detected in strict object payload",
+            Self::DuplicateKey => {
+                "Consensus fault: duplicate key detected in strict object payload"
+            }
             Self::KeyCapacityExceeded => "Exceeded maximum key capacity in strict validator buffer",
             Self::ExpectedColon => "Expected ':' separator after key",
             Self::UnexpectedEndValue => "Unexpected end of payload inside value field",
@@ -226,7 +229,8 @@ impl CanonicalParser {
             }
             Ok(i)
         } else {
-            while i < len && inner[i] != b',' && inner[i] != b'}' && !inner[i].is_ascii_whitespace() {
+            while i < len && inner[i] != b',' && inner[i] != b'}' && !inner[i].is_ascii_whitespace()
+            {
                 i += 1;
             }
             Ok(i)

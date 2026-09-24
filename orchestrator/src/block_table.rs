@@ -69,7 +69,10 @@ impl ExpiryTracker {
         entry.strikes = entry.strikes.saturating_add(1);
         entry.last_strike = now;
 
-        if lifetime == Lifetime::Permanent || entry.state == State::Permanent || self.policy.base.is_zero() {
+        if lifetime == Lifetime::Permanent
+            || entry.state == State::Permanent
+            || self.policy.base.is_zero()
+        {
             entry.state = State::Permanent;
             return None;
         }
@@ -85,7 +88,9 @@ impl ExpiryTracker {
     }
 
     pub fn is_permanent(&self, ip: &IpAddr) -> bool {
-        self.entries.get(ip).is_some_and(|e| e.state == State::Permanent)
+        self.entries
+            .get(ip)
+            .is_some_and(|e| e.state == State::Permanent)
     }
 
     /// Forgets a dynamic block and returns true; a permanent block is kept and false returned.
@@ -119,7 +124,10 @@ impl ExpiryTracker {
     }
 
     pub fn active(&self) -> usize {
-        self.entries.values().filter(|e| e.state != State::Expired).count()
+        self.entries
+            .values()
+            .filter(|e| e.state != State::Expired)
+            .count()
     }
 }
 
@@ -143,7 +151,12 @@ impl BlockTable {
     }
 
     /// Adds `ip` (as a /32 or /128) to the kernel blocklist. Returns the lifetime applied.
-    pub fn insert(&mut self, ip: IpAddr, lifetime: Lifetime, now: Instant) -> Result<Option<Duration>, MapError> {
+    pub fn insert(
+        &mut self,
+        ip: IpAddr,
+        lifetime: Lifetime,
+        now: Instant,
+    ) -> Result<Option<Duration>, MapError> {
         match ip.to_canonical() {
             IpAddr::V4(v4) => self.v4.insert(&Key::new(32, v4.octets()), 1u32, 0)?,
             IpAddr::V6(v6) => self.v6.insert(&Key::new(128, v6.octets()), 1u32, 0)?,
@@ -174,7 +187,11 @@ impl BlockTable {
         let expired = self.expiry.take_expired(now);
         for ip in &expired {
             if let Err(e) = self.remove_from_map(*ip) {
-                log::error!("[BlockTable] Failed to remove expired block {}: {:?}", ip, e);
+                log::error!(
+                    "[BlockTable] Failed to remove expired block {}: {:?}",
+                    ip,
+                    e
+                );
             }
         }
         expired
@@ -204,18 +221,44 @@ mod tests {
         let mut tracker = ExpiryTracker::new(POLICY);
         let a = ip("203.0.113.1");
 
-        assert_eq!(tracker.record(a, Lifetime::Dynamic, t0), Some(Duration::from_secs(60)));
-        assert!(tracker.take_expired(t0 + Duration::from_secs(59)).is_empty());
+        assert_eq!(
+            tracker.record(a, Lifetime::Dynamic, t0),
+            Some(Duration::from_secs(60))
+        );
+        assert!(tracker
+            .take_expired(t0 + Duration::from_secs(59))
+            .is_empty());
         assert_eq!(tracker.take_expired(t0 + Duration::from_secs(60)), vec![a]);
-        assert!(tracker.take_expired(t0 + Duration::from_secs(61)).is_empty(), "released once");
+        assert!(
+            tracker
+                .take_expired(t0 + Duration::from_secs(61))
+                .is_empty(),
+            "released once"
+        );
 
         let t1 = t0 + Duration::from_secs(120);
-        assert_eq!(tracker.record(a, Lifetime::Dynamic, t1), Some(Duration::from_secs(120)));
-        assert_eq!(tracker.record(a, Lifetime::Dynamic, t1), Some(Duration::from_secs(240)));
-        assert_eq!(tracker.record(a, Lifetime::Dynamic, t1), Some(Duration::from_secs(480)));
-        assert_eq!(tracker.record(a, Lifetime::Dynamic, t1), Some(Duration::from_secs(600)), "capped");
+        assert_eq!(
+            tracker.record(a, Lifetime::Dynamic, t1),
+            Some(Duration::from_secs(120))
+        );
+        assert_eq!(
+            tracker.record(a, Lifetime::Dynamic, t1),
+            Some(Duration::from_secs(240))
+        );
+        assert_eq!(
+            tracker.record(a, Lifetime::Dynamic, t1),
+            Some(Duration::from_secs(480))
+        );
+        assert_eq!(
+            tracker.record(a, Lifetime::Dynamic, t1),
+            Some(Duration::from_secs(600)),
+            "capped"
+        );
         for _ in 0..40 {
-            assert_eq!(tracker.record(a, Lifetime::Dynamic, t1), Some(Duration::from_secs(600)));
+            assert_eq!(
+                tracker.record(a, Lifetime::Dynamic, t1),
+                Some(Duration::from_secs(600))
+            );
         }
     }
 
@@ -228,17 +271,25 @@ mod tests {
         tracker.record(a, Lifetime::Dynamic, t0);
         let later = t0 + STRIKE_MEMORY + Duration::from_secs(1);
         assert_eq!(tracker.take_expired(later), vec![a]);
-        assert_eq!(tracker.record(a, Lifetime::Dynamic, later), Some(Duration::from_secs(60)));
+        assert_eq!(
+            tracker.record(a, Lifetime::Dynamic, later),
+            Some(Duration::from_secs(60))
+        );
     }
 
     #[test]
     fn a_shorter_new_block_does_not_cut_a_longer_one() {
         let t0 = Instant::now();
-        let mut tracker = ExpiryTracker::new(TtlPolicy { base: Duration::from_secs(60), max: Duration::from_secs(60) });
+        let mut tracker = ExpiryTracker::new(TtlPolicy {
+            base: Duration::from_secs(60),
+            max: Duration::from_secs(60),
+        });
         let a = ip("203.0.113.3");
         tracker.record(a, Lifetime::Dynamic, t0 + Duration::from_secs(30));
         tracker.record(a, Lifetime::Dynamic, t0);
-        assert!(tracker.take_expired(t0 + Duration::from_secs(60)).is_empty());
+        assert!(tracker
+            .take_expired(t0 + Duration::from_secs(60))
+            .is_empty());
         assert_eq!(tracker.take_expired(t0 + Duration::from_secs(90)), vec![a]);
     }
 
@@ -248,8 +299,14 @@ mod tests {
         let mut tracker = ExpiryTracker::new(POLICY);
         let a = ip("203.0.113.4");
         assert_eq!(tracker.record(a, Lifetime::Permanent, t0), None);
-        assert_eq!(tracker.record(a, Lifetime::Dynamic, t0), None, "a trap hit must not shorten a static block");
-        assert!(tracker.take_expired(t0 + Duration::from_secs(10_000_000)).is_empty());
+        assert_eq!(
+            tracker.record(a, Lifetime::Dynamic, t0),
+            None,
+            "a trap hit must not shorten a static block"
+        );
+        assert!(tracker
+            .take_expired(t0 + Duration::from_secs(10_000_000))
+            .is_empty());
         assert_eq!(tracker.active(), 1);
     }
 
@@ -260,7 +317,10 @@ mod tests {
         let (operator, dynamic) = (ip("203.0.113.7"), ip("203.0.113.8"));
         tracker.record(operator, Lifetime::Permanent, t0);
         tracker.record(dynamic, Lifetime::Dynamic, t0);
-        assert!(!tracker.release_dynamic(&operator), "a mesh unblock must not lift an operator block");
+        assert!(
+            !tracker.release_dynamic(&operator),
+            "a mesh unblock must not lift an operator block"
+        );
         assert!(tracker.is_permanent(&operator));
         assert!(tracker.release_dynamic(&dynamic));
         assert_eq!(tracker.active(), 1);
@@ -269,9 +329,17 @@ mod tests {
     #[test]
     fn zero_base_disables_expiry() {
         let t0 = Instant::now();
-        let mut tracker = ExpiryTracker::new(TtlPolicy { base: Duration::ZERO, max: Duration::ZERO });
-        assert_eq!(tracker.record(ip("203.0.113.5"), Lifetime::Dynamic, t0), None);
-        assert!(tracker.take_expired(t0 + Duration::from_secs(10_000_000)).is_empty());
+        let mut tracker = ExpiryTracker::new(TtlPolicy {
+            base: Duration::ZERO,
+            max: Duration::ZERO,
+        });
+        assert_eq!(
+            tracker.record(ip("203.0.113.5"), Lifetime::Dynamic, t0),
+            None
+        );
+        assert!(tracker
+            .take_expired(t0 + Duration::from_secs(10_000_000))
+            .is_empty());
     }
 
     #[test]
@@ -283,6 +351,9 @@ mod tests {
         tracker.record(a, Lifetime::Dynamic, t0);
         tracker.forget(&a);
         assert_eq!(tracker.active(), 0);
-        assert_eq!(tracker.record(a, Lifetime::Dynamic, t0), Some(Duration::from_secs(60)));
+        assert_eq!(
+            tracker.record(a, Lifetime::Dynamic, t0),
+            Some(Duration::from_secs(60))
+        );
     }
 }

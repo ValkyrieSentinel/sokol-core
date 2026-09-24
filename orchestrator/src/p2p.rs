@@ -31,8 +31,8 @@ use pqcrypto_dilithium::dilithium3::{
 };
 use pqcrypto_traits::sign::{DetachedSignature as _, PublicKey as _, SecretKey as _};
 
-use common::canonical::CanonicalParser;
 use crate::MeshCommand;
+use common::canonical::CanonicalParser;
 
 const ENVELOPE_DOMAIN: &[u8] = b"sokol-mesh-envelope-v1\0";
 pub const MAX_CLOCK_SKEW_MS: u64 = 30_000;
@@ -101,14 +101,21 @@ impl NodeCrypto {
                     .create_new(true)
                     .mode(0o600)
                     .open(path)
-                    .with_context(|| format!("failed to create node key file {}", path.display()))?;
+                    .with_context(|| {
+                        format!("failed to create node key file {}", path.display())
+                    })?;
                 file.write_all(crypto.public_key.as_bytes())?;
                 file.write_all(crypto.secret_key.as_bytes())?;
                 file.sync_all()?;
-                info!("[P2P] Generated new node identity key at {}", path.display());
+                info!(
+                    "[P2P] Generated new node identity key at {}",
+                    path.display()
+                );
                 Ok(crypto)
             }
-            Err(e) => Err(e).with_context(|| format!("failed to read node key file {}", path.display())),
+            Err(e) => {
+                Err(e).with_context(|| format!("failed to read node key file {}", path.display()))
+            }
         }
     }
 
@@ -160,8 +167,9 @@ impl TrustStore {
         for entry in entries {
             let bytes = from_hex(&entry.public_key)
                 .with_context(|| format!("peer {}: public_key is not hex", entry.node_id))?;
-            let key = DilithiumPublic::from_bytes(&bytes)
-                .map_err(|e| anyhow::anyhow!("peer {}: invalid public key: {:?}", entry.node_id, e))?;
+            let key = DilithiumPublic::from_bytes(&bytes).map_err(|e| {
+                anyhow::anyhow!("peer {}: invalid public key: {:?}", entry.node_id, e)
+            })?;
             if store.keys.insert(entry.node_id, key).is_some() {
                 bail!("peers file lists node_id {} more than once", entry.node_id);
             }
@@ -189,7 +197,13 @@ pub struct ReplayGuard {
 }
 
 impl ReplayGuard {
-    fn check_and_record(&mut self, sender_id: u64, nonce: u64, timestamp_ms: u64, now: u64) -> bool {
+    fn check_and_record(
+        &mut self,
+        sender_id: u64,
+        nonce: u64,
+        timestamp_ms: u64,
+        now: u64,
+    ) -> bool {
         if self.seen.len() >= MAX_REPLAY_ENTRIES / 2 {
             let horizon = now.saturating_sub(2 * MAX_CLOCK_SKEW_MS);
             self.seen.retain(|_, ts| *ts >= horizon);
@@ -311,10 +325,12 @@ pub fn open(
     envelope: &SecureEnvelope,
     now: u64,
 ) -> Result<NetworkMessage, EnvelopeError> {
-    let key = trust.get(envelope.sender_id).ok_or(EnvelopeError::UnknownSender)?;
+    let key = trust
+        .get(envelope.sender_id)
+        .ok_or(EnvelopeError::UnknownSender)?;
 
-    let signature =
-        DilithiumSignature::from_bytes(&envelope.signature).map_err(|_| EnvelopeError::BadSignature)?;
+    let signature = DilithiumSignature::from_bytes(&envelope.signature)
+        .map_err(|_| EnvelopeError::BadSignature)?;
     let signed = signing_bytes(
         envelope.sender_id,
         envelope.timestamp_ms,
@@ -327,7 +343,12 @@ pub fn open(
         return Err(EnvelopeError::StaleTimestamp);
     }
 
-    if !replay.check_and_record(envelope.sender_id, envelope.nonce, envelope.timestamp_ms, now) {
+    if !replay.check_and_record(
+        envelope.sender_id,
+        envelope.nonce,
+        envelope.timestamp_ms,
+        now,
+    ) {
         return Err(EnvelopeError::Replay);
     }
 
@@ -391,7 +412,13 @@ impl PeerRegistry {
         crypto: &NodeCrypto,
         dag: &Arc<Mutex<DagTracker>>,
     ) -> Result<()> {
-        let envelope = seal(crypto, node_id, &NetworkMessage::Command(command.clone()), dag).await?;
+        let envelope = seal(
+            crypto,
+            node_id,
+            &NetworkMessage::Command(command.clone()),
+            dag,
+        )
+        .await?;
 
         let peers = self.peers.read().await;
         for (addr, (tx, _)) in peers.iter() {
@@ -534,7 +561,13 @@ async fn run_connection(
     let (mut reader, writer) = stream.into_split();
     let (tx, rx) = mpsc::channel::<SecureEnvelope>(100);
 
-    let handshake = seal(&crypto, node_id, &NetworkMessage::Handshake { node_id }, &dag).await?;
+    let handshake = seal(
+        &crypto,
+        node_id,
+        &NetworkMessage::Handshake { node_id },
+        &dag,
+    )
+    .await?;
     tx.send(handshake).await?;
 
     spawn_peer_writer(rx, writer, peer_addr, registry.clone());
@@ -684,14 +717,25 @@ async fn handle_reader_loop(
         match (authenticated_peer, net_msg) {
             (None, NetworkMessage::Handshake { node_id }) => {
                 if node_id != envelope.sender_id {
-                    bail!("handshake node_id {} differs from signer {}", node_id, envelope.sender_id);
+                    bail!(
+                        "handshake node_id {} differs from signer {}",
+                        node_id,
+                        envelope.sender_id
+                    );
                 }
                 if node_id == local_node_id {
                     bail!("peer presented this node's own identity");
                 }
                 authenticated_peer = Some(node_id);
-                registry.add_peer(peer_addr, writer_tx.clone(), node_id).await;
-                spawn_ping_loop(writer_tx.clone(), local_node_id, crypto.clone(), dag.clone());
+                registry
+                    .add_peer(peer_addr, writer_tx.clone(), node_id)
+                    .await;
+                spawn_ping_loop(
+                    writer_tx.clone(),
+                    local_node_id,
+                    crypto.clone(),
+                    dag.clone(),
+                );
             }
             (None, _) => bail!("first message was not a handshake"),
             (Some(_), NetworkMessage::Handshake { .. }) => {
@@ -737,9 +781,14 @@ mod tests {
     async fn pinned_peer_envelope_opens() {
         let peer = NodeCrypto::generate();
         let trust = trust_with(7, &peer);
-        let env = seal(&peer, 7, &block_cmd("10.0.0.9"), &dag()).await.unwrap();
+        let env = seal(&peer, 7, &block_cmd("10.0.0.9"), &dag())
+            .await
+            .unwrap();
         let msg = open(&trust, &mut ReplayGuard::default(), &env, now_ms()).unwrap();
-        assert!(matches!(msg, NetworkMessage::Command(MeshCommand::BlockIp { .. })));
+        assert!(matches!(
+            msg,
+            NetworkMessage::Command(MeshCommand::BlockIp { .. })
+        ));
     }
 
     #[tokio::test]
@@ -747,12 +796,16 @@ mod tests {
         let pinned = NodeCrypto::generate();
         let stranger = NodeCrypto::generate();
         let trust = trust_with(7, &pinned);
-        let env = seal(&stranger, 7, &block_cmd("10.0.0.9"), &dag()).await.unwrap();
+        let env = seal(&stranger, 7, &block_cmd("10.0.0.9"), &dag())
+            .await
+            .unwrap();
         assert_eq!(
             open(&trust, &mut ReplayGuard::default(), &env, now_ms()).unwrap_err(),
             EnvelopeError::BadSignature
         );
-        let env = seal(&stranger, 666, &block_cmd("10.0.0.9"), &dag()).await.unwrap();
+        let env = seal(&stranger, 666, &block_cmd("10.0.0.9"), &dag())
+            .await
+            .unwrap();
         assert_eq!(
             open(&trust, &mut ReplayGuard::default(), &env, now_ms()).unwrap_err(),
             EnvelopeError::UnknownSender
@@ -763,7 +816,9 @@ mod tests {
     async fn header_fields_are_covered_by_the_signature() {
         let peer = NodeCrypto::generate();
         let trust = trust_with(7, &peer);
-        let env = seal(&peer, 7, &block_cmd("10.0.0.9"), &dag()).await.unwrap();
+        let env = seal(&peer, 7, &block_cmd("10.0.0.9"), &dag())
+            .await
+            .unwrap();
 
         let mut new_nonce = env.clone();
         new_nonce.nonce ^= 1;
@@ -784,10 +839,15 @@ mod tests {
     async fn replay_and_stale_envelopes_are_rejected() {
         let peer = NodeCrypto::generate();
         let trust = trust_with(7, &peer);
-        let env = seal(&peer, 7, &block_cmd("10.0.0.9"), &dag()).await.unwrap();
+        let env = seal(&peer, 7, &block_cmd("10.0.0.9"), &dag())
+            .await
+            .unwrap();
         let mut guard = ReplayGuard::default();
         assert!(open(&trust, &mut guard, &env, now_ms()).is_ok());
-        assert_eq!(open(&trust, &mut guard, &env, now_ms()).unwrap_err(), EnvelopeError::Replay);
+        assert_eq!(
+            open(&trust, &mut guard, &env, now_ms()).unwrap_err(),
+            EnvelopeError::Replay
+        );
 
         let later = env.timestamp_ms + MAX_CLOCK_SKEW_MS + 1;
         assert_eq!(
@@ -816,7 +876,10 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("peers.json");
 
-        let one = format!(r#"[{{"node_id": 2, "public_key": "{}"}}]"#, peer.public_key_hex());
+        let one = format!(
+            r#"[{{"node_id": 2, "public_key": "{}"}}]"#,
+            peer.public_key_hex()
+        );
         std::fs::write(&path, &one).unwrap();
         let store = TrustStore::load(&path).unwrap();
         assert_eq!(store.get(2).unwrap().as_bytes(), peer.public_key.as_bytes());
@@ -870,12 +933,18 @@ mod tests {
 
         send_as(&stranger, 666, addr, "10.0.0.66").await;
         send_as(&stranger, 2, addr, "10.0.0.67").await;
-        assert!(cmd_rx.try_recv().is_err(), "stranger's command reached the orchestrator");
+        assert!(
+            cmd_rx.try_recv().is_err(),
+            "stranger's command reached the orchestrator"
+        );
 
         send_as(&friend, 2, addr, "10.0.0.2").await;
         match timeout(Duration::from_secs(2), cmd_rx.recv()).await {
             Ok(Some(MeshCommand::BlockIp { ip, .. })) => assert_eq!(ip, "10.0.0.2"),
-            other => panic!("pinned peer's command was not delivered: {:?}", other.is_ok()),
+            other => panic!(
+                "pinned peer's command was not delivered: {:?}",
+                other.is_ok()
+            ),
         }
     }
 
@@ -897,15 +966,31 @@ mod tests {
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let net = P2PNetwork::new(addr, 1, n1.clone(), dag1.clone(), tx1, 8, shutdown_rx, reg1.clone());
+        let net = P2PNetwork::new(
+            addr,
+            1,
+            n1.clone(),
+            dag1.clone(),
+            tx1,
+            8,
+            shutdown_rx,
+            reg1.clone(),
+        );
         tokio::spawn(async move { net.serve(listener).await });
         let (n2c, dag2c, reg2c) = (n2.clone(), dag2.clone(), reg2.clone());
         tokio::spawn(async move { connect_to_peer(addr, 2, n2c, dag2c, reg2c, tx2).await });
         tokio::time::sleep(Duration::from_millis(500)).await;
 
-        let cmd = |ip: &str| MeshCommand::BlockIp { ip: ip.into(), reason: "test".into() };
-        reg1.broadcast(&cmd("10.0.0.21"), 1, &n1, &dag1).await.unwrap();
-        reg2.broadcast(&cmd("10.0.0.12"), 2, &n2, &dag2).await.unwrap();
+        let cmd = |ip: &str| MeshCommand::BlockIp {
+            ip: ip.into(),
+            reason: "test".into(),
+        };
+        reg1.broadcast(&cmd("10.0.0.21"), 1, &n1, &dag1)
+            .await
+            .unwrap();
+        reg2.broadcast(&cmd("10.0.0.12"), 2, &n2, &dag2)
+            .await
+            .unwrap();
 
         for (rx, want) in [(&mut rx2, "10.0.0.21"), (&mut rx1, "10.0.0.12")] {
             match timeout(Duration::from_secs(2), rx.recv()).await {
@@ -928,13 +1013,24 @@ mod tests {
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let net = P2PNetwork::new(addr, 1, server, Arc::new(dag()), cmd_tx, 8, shutdown_rx, PeerRegistry::new(trust));
+        let net = P2PNetwork::new(
+            addr,
+            1,
+            server,
+            Arc::new(dag()),
+            cmd_tx,
+            8,
+            shutdown_rx,
+            PeerRegistry::new(trust),
+        );
         tokio::spawn(async move { net.serve(listener).await });
 
         let mut stream = TcpStream::connect(addr).await.unwrap();
         let d = dag();
         let frames = [
-            seal(&a, 2, &NetworkMessage::Handshake { node_id: 2 }, &d).await.unwrap(),
+            seal(&a, 2, &NetworkMessage::Handshake { node_id: 2 }, &d)
+                .await
+                .unwrap(),
             seal(&b, 3, &block_cmd("10.0.0.3"), &d).await.unwrap(),
         ];
         for env in frames {
@@ -943,6 +1039,9 @@ mod tests {
             let _ = stream.write_all(&bytes).await;
         }
         tokio::time::sleep(Duration::from_millis(300)).await;
-        assert!(cmd_rx.try_recv().is_err(), "envelope from node 3 accepted on node 2's connection");
+        assert!(
+            cmd_rx.try_recv().is_err(),
+            "envelope from node 3 accepted on node 2's connection"
+        );
     }
 }

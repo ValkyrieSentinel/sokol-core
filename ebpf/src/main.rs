@@ -9,7 +9,10 @@ use aya_ebpf::{
 };
 use core::mem;
 
-use common::{config_flags, drop_reason, DropEvent, PacketStats, DROP_REASON_SLOTS, MAX_EVENTS_PER_CPU_PER_SEC};
+use common::{
+    config_flags, drop_reason, DropEvent, PacketStats, DROP_REASON_SLOTS,
+    MAX_EVENTS_PER_CPU_PER_SEC,
+};
 
 const ETH_P_IP: u16 = 0x0800;
 const ETH_P_IPV6: u16 = 0x86DD;
@@ -191,7 +194,11 @@ pub fn sentinel_vfr_filter(ctx: XdpContext) -> u32 {
 }
 
 #[inline(always)]
-fn parse_v6_next_header(ctx: &XdpContext, initial_offset: usize, initial_next: u8) -> Result<(u8, usize, bool), ()> {
+fn parse_v6_next_header(
+    ctx: &XdpContext,
+    initial_offset: usize,
+    initial_next: u8,
+) -> Result<(u8, usize, bool), ()> {
     let mut curr_next = initial_next;
     let mut curr_offset = initial_offset;
     let mut non_first_fragment = false;
@@ -200,8 +207,12 @@ fn parse_v6_next_header(ctx: &XdpContext, initial_offset: usize, initial_next: u
         match curr_next {
             IPPROTO_HOPOPTS | IPPROTO_ROUTING | IPPROTO_DSTOPTS => {
                 let ext_ptr = ptr_at::<Ip6ExtHdr>(ctx, curr_offset)?;
-                let next = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*ext_ptr).next_header)) };
-                let ext_len = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*ext_ptr).hdr_ext_len)) };
+                let next = unsafe {
+                    core::ptr::read_unaligned(core::ptr::addr_of!((*ext_ptr).next_header))
+                };
+                let ext_len = unsafe {
+                    core::ptr::read_unaligned(core::ptr::addr_of!((*ext_ptr).hdr_ext_len))
+                };
                 let len_bytes = ((ext_len as usize) + 1) * 8;
 
                 curr_next = next;
@@ -209,8 +220,11 @@ fn parse_v6_next_header(ctx: &XdpContext, initial_offset: usize, initial_next: u
             }
             IPPROTO_FRAGMENT => {
                 let ext_ptr = ptr_at::<Ip6FragHdr>(ctx, curr_offset)?;
-                let next = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*ext_ptr).next_header)) };
-                let off_raw = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*ext_ptr).frag_off)) };
+                let next = unsafe {
+                    core::ptr::read_unaligned(core::ptr::addr_of!((*ext_ptr).next_header))
+                };
+                let off_raw =
+                    unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*ext_ptr).frag_off)) };
                 curr_next = next;
                 curr_offset += 8;
                 if u16::from_be(off_raw) & 0xFFF8 != 0 {
@@ -229,7 +243,8 @@ fn parse_v6_next_header(ctx: &XdpContext, initial_offset: usize, initial_next: u
 #[inline(always)]
 fn try_sentinel_vfr_filter(ctx: &XdpContext) -> Result<u32, ()> {
     let eth_ptr = ptr_at::<EthHdr>(ctx, 0)?;
-    let raw_eth_type = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*eth_ptr).ether_type)) };
+    let raw_eth_type =
+        unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*eth_ptr).ether_type)) };
     let mut eth_type = u16::from_be(raw_eth_type);
     let packet_len = (ctx.data_end() as usize - ctx.data() as usize) as u64;
 
@@ -238,7 +253,8 @@ fn try_sentinel_vfr_filter(ctx: &XdpContext) -> Result<u32, ()> {
     for _ in 0..2 {
         if eth_type == ETH_P_8021Q || eth_type == ETH_P_8021AD {
             let vlan_ptr = ptr_at::<VlanHdr>(ctx, ip_offset)?;
-            let raw_next_type = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*vlan_ptr).ether_type)) };
+            let raw_next_type =
+                unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*vlan_ptr).ether_type)) };
             eth_type = u16::from_be(raw_next_type);
             ip_offset += mem::size_of::<VlanHdr>();
         } else {
@@ -262,28 +278,52 @@ fn try_sentinel_vfr_filter(ctx: &XdpContext) -> Result<u32, ()> {
                 Ok(ptr) => ptr,
                 Err(_) => {
                     record_drop(packet_len, drop_reason::MALFORMED_HEADER);
-                    emit_drop_event_sampled(ctx, &[0u8; 16], &[0u8; 16], packet_len as u32, drop_reason::MALFORMED_HEADER, 0, 4);
+                    emit_drop_event_sampled(
+                        ctx,
+                        &[0u8; 16],
+                        &[0u8; 16],
+                        packet_len as u32,
+                        drop_reason::MALFORMED_HEADER,
+                        0,
+                        4,
+                    );
                     return Ok(xdp_action::XDP_DROP);
                 }
             };
 
-            let version_ihl = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*ip_ptr).version_ihl)) };
+            let version_ihl =
+                unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*ip_ptr).version_ihl)) };
             let version = version_ihl >> 4;
             let ihl_bytes = ((version_ihl & 0x0F) * 4) as usize;
 
-            if version != 4 || ihl_bytes < 20 || ihl_bytes > 60 || ctx.data() as usize + ip_offset + ihl_bytes > ctx.data_end() as usize {
+            if version != 4
+                || ihl_bytes < 20
+                || ihl_bytes > 60
+                || ctx.data() as usize + ip_offset + ihl_bytes > ctx.data_end() as usize
+            {
                 record_drop(packet_len, drop_reason::MALFORMED_HEADER);
-                emit_drop_event_sampled(ctx, &[0u8; 16], &[0u8; 16], packet_len as u32, drop_reason::MALFORMED_HEADER, 0, 4);
+                emit_drop_event_sampled(
+                    ctx,
+                    &[0u8; 16],
+                    &[0u8; 16],
+                    packet_len as u32,
+                    drop_reason::MALFORMED_HEADER,
+                    0,
+                    4,
+                );
                 return Ok(xdp_action::XDP_DROP);
             }
 
-            let frag_off_raw = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*ip_ptr).frag_off)) };
+            let frag_off_raw =
+                unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*ip_ptr).frag_off)) };
             let frag_off = u16::from_be(frag_off_raw);
             let is_fragment = (frag_off & (IP_MF | IP_OFFSET_MASK)) != 0;
             non_first_fragment = (frag_off & IP_OFFSET_MASK) != 0;
 
-            let src_u32 = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*ip_ptr).src_addr)) };
-            let dst_u32 = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*ip_ptr).dst_addr)) };
+            let src_u32 =
+                unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*ip_ptr).src_addr)) };
+            let dst_u32 =
+                unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*ip_ptr).dst_addr)) };
 
             let src_bytes = src_u32.to_ne_bytes();
             let dst_bytes = dst_u32.to_ne_bytes();
@@ -291,7 +331,8 @@ fn try_sentinel_vfr_filter(ctx: &XdpContext) -> Result<u32, ()> {
             let key = Key::new(32, src_bytes);
             is_blocked = BLOCKLIST_V4.get(&key).is_some();
 
-            protocol = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*ip_ptr).protocol)) };
+            protocol =
+                unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*ip_ptr).protocol)) };
             l4_offset = ip_offset + ihl_bytes;
             ip_version = 4;
 
@@ -300,7 +341,15 @@ fn try_sentinel_vfr_filter(ctx: &XdpContext) -> Result<u32, ()> {
 
             if is_fragment && !is_blocked && config_enabled(config_flags::DROP_IPV4_FRAGMENTS) {
                 record_drop(packet_len, drop_reason::FRAGMENT_BLOCKED);
-                emit_drop_event_sampled(ctx, &src_ip_16, &dst_ip_16, packet_len as u32, drop_reason::FRAGMENT_BLOCKED, protocol, ip_version);
+                emit_drop_event_sampled(
+                    ctx,
+                    &src_ip_16,
+                    &dst_ip_16,
+                    packet_len as u32,
+                    drop_reason::FRAGMENT_BLOCKED,
+                    protocol,
+                    ip_version,
+                );
                 return Ok(xdp_action::XDP_DROP);
             }
         }
@@ -309,28 +358,49 @@ fn try_sentinel_vfr_filter(ctx: &XdpContext) -> Result<u32, ()> {
                 Ok(ptr) => ptr,
                 Err(_) => {
                     record_drop(packet_len, drop_reason::MALFORMED_HEADER);
-                    emit_drop_event_sampled(ctx, &[0u8; 16], &[0u8; 16], packet_len as u32, drop_reason::MALFORMED_HEADER, 0, 6);
+                    emit_drop_event_sampled(
+                        ctx,
+                        &[0u8; 16],
+                        &[0u8; 16],
+                        packet_len as u32,
+                        drop_reason::MALFORMED_HEADER,
+                        0,
+                        6,
+                    );
                     return Ok(xdp_action::XDP_DROP);
                 }
             };
 
-            let raw_ver = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*ip6_ptr).ver_tc_fl)) };
+            let raw_ver =
+                unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*ip6_ptr).ver_tc_fl)) };
             let version = (u32::from_be(raw_ver) >> 28) as u8;
 
             if version != 6 {
                 record_drop(packet_len, drop_reason::MALFORMED_HEADER);
-                emit_drop_event_sampled(ctx, &[0u8; 16], &[0u8; 16], packet_len as u32, drop_reason::MALFORMED_HEADER, 0, 6);
+                emit_drop_event_sampled(
+                    ctx,
+                    &[0u8; 16],
+                    &[0u8; 16],
+                    packet_len as u32,
+                    drop_reason::MALFORMED_HEADER,
+                    0,
+                    6,
+                );
                 return Ok(xdp_action::XDP_DROP);
             }
 
-            src_ip_16 = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*ip6_ptr).src_addr)) };
-            dst_ip_16 = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*ip6_ptr).dst_addr)) };
+            src_ip_16 =
+                unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*ip6_ptr).src_addr)) };
+            dst_ip_16 =
+                unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*ip6_ptr).dst_addr)) };
 
             let key = Key::new(128, src_ip_16);
             is_blocked = BLOCKLIST_V6.get(&key).is_some();
 
-            let next_hdr = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*ip6_ptr).next_header)) };
-            let (real_proto, real_l4_offset, v6_non_first) = parse_v6_next_header(ctx, ip_offset + mem::size_of::<Ip6Hdr>(), next_hdr)?;
+            let next_hdr =
+                unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*ip6_ptr).next_header)) };
+            let (real_proto, real_l4_offset, v6_non_first) =
+                parse_v6_next_header(ctx, ip_offset + mem::size_of::<Ip6Hdr>(), next_hdr)?;
 
             protocol = real_proto;
             l4_offset = real_l4_offset;
@@ -345,13 +415,22 @@ fn try_sentinel_vfr_filter(ctx: &XdpContext) -> Result<u32, ()> {
 
     if is_blocked {
         record_drop(packet_len, drop_reason::SLOW_PATH_LPM_HIT);
-        emit_drop_event_sampled(ctx, &src_ip_16, &dst_ip_16, packet_len as u32, drop_reason::SLOW_PATH_LPM_HIT, protocol, ip_version);
+        emit_drop_event_sampled(
+            ctx,
+            &src_ip_16,
+            &dst_ip_16,
+            packet_len as u32,
+            drop_reason::SLOW_PATH_LPM_HIT,
+            protocol,
+            ip_version,
+        );
         return Ok(xdp_action::XDP_DROP);
     }
 
     if protocol == IPPROTO_TCP && !non_first_fragment {
         if let Ok(tcp_ptr) = ptr_at::<TcpHdr>(ctx, l4_offset) {
-            let dst_port = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*tcp_ptr).dst_port)) };
+            let dst_port =
+                unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*tcp_ptr).dst_port)) };
             let port = u16::from_be(dst_port);
 
             if port == 80 || port == 443 || port == ADMIN_SSH_PORT {
@@ -362,7 +441,15 @@ fn try_sentinel_vfr_filter(ctx: &XdpContext) -> Result<u32, ()> {
             // Only connection attempts (SYN without ACK) count as trap hits, not every segment.
             let flags = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*tcp_ptr).flags)) };
             if port == TRAP_PORT && flags & TCP_SYN != 0 && flags & TCP_ACK == 0 {
-                emit_drop_event_sampled(ctx, &src_ip_16, &dst_ip_16, packet_len as u32, drop_reason::TRAP_INTERCEPTED, protocol, ip_version);
+                emit_drop_event_sampled(
+                    ctx,
+                    &src_ip_16,
+                    &dst_ip_16,
+                    packet_len as u32,
+                    drop_reason::TRAP_INTERCEPTED,
+                    protocol,
+                    ip_version,
+                );
                 record_rx(packet_len);
                 return Ok(xdp_action::XDP_PASS);
             }

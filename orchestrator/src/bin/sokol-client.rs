@@ -1,8 +1,3 @@
-use aya::{
-    maps::{lpm_trie::Key, LpmTrie, PerCpuArray},
-    programs::{xdp::XdpLinkId, Xdp, XdpFlags},
-    Bpf, Pod,
-};
 use axum::{
     extract::{Json, State},
     response::sse::Event,
@@ -10,15 +5,15 @@ use axum::{
     routing::{get, post},
     Router,
 };
+use aya::{
+    maps::{lpm_trie::Key, LpmTrie, PerCpuArray},
+    programs::{xdp::XdpLinkId, Xdp, XdpFlags},
+    Bpf, Pod,
+};
 use futures_util::stream::{self, Stream};
 use log::info;
 use serde::{Deserialize, Serialize};
-use std::{
-    convert::Infallible,
-    net::Ipv4Addr,
-    sync::Arc,
-    time::Duration,
-};
+use std::{convert::Infallible, net::Ipv4Addr, sync::Arc, time::Duration};
 use tokio::sync::Mutex;
 
 #[repr(transparent)]
@@ -62,7 +57,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let token = match std::env::var("SOKOL_CLIENT_TOKEN") {
         Ok(t) if t.len() >= 16 => t,
         _ => {
-            log::error!("[!] Set SOKOL_CLIENT_TOKEN (at least 16 characters) to start the client cabinet.");
+            log::error!(
+                "[!] Set SOKOL_CLIENT_TOKEN (at least 16 characters) to start the client cabinet."
+            );
             std::process::exit(1);
         }
     };
@@ -79,7 +76,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "/../target/bpfel-unknown-none/release/ebpf-probe"
     )))?;
 
-    let program: &mut Xdp = ebpf.program_mut("sentinel_vfr_filter").unwrap().try_into()?;
+    let program: &mut Xdp = ebpf
+        .program_mut("sentinel_vfr_filter")
+        .unwrap()
+        .try_into()?;
     program.load()?;
     let link_id = program.attach(&iface, XdpFlags::default())?;
 
@@ -112,7 +112,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/client/list/update", post(client_update_list))
         .with_state(state);
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:3001").await.unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:3001")
+        .await
+        .unwrap();
     axum::serve(listener, app).await.unwrap();
 
     Ok(())
@@ -158,27 +160,36 @@ async fn client_toggle_protection(
     let enable = !client.protection_active;
     let link = mgr.xdp_link.take();
 
-    let result: Result<Option<XdpLinkId>, String> = match mgr.ebpf.program_mut("sentinel_vfr_filter") {
-        None => Err("XDP program missing from the loaded object".into()),
-        Some(prog) => match TryInto::<&mut Xdp>::try_into(prog) {
-            Err(e) => Err(e.to_string()),
-            Ok(xdp_prog) if enable => xdp_prog.attach(&iface, XdpFlags::default()).map(Some).map_err(|e| e.to_string()),
-            Ok(xdp_prog) => match link {
-                Some(link_id) => xdp_prog.detach(link_id).map(|_| None).map_err(|e| e.to_string()),
-                None => Ok(None),
+    let result: Result<Option<XdpLinkId>, String> =
+        match mgr.ebpf.program_mut("sentinel_vfr_filter") {
+            None => Err("XDP program missing from the loaded object".into()),
+            Some(prog) => match TryInto::<&mut Xdp>::try_into(prog) {
+                Err(e) => Err(e.to_string()),
+                Ok(xdp_prog) if enable => xdp_prog
+                    .attach(&iface, XdpFlags::default())
+                    .map(Some)
+                    .map_err(|e| e.to_string()),
+                Ok(xdp_prog) => match link {
+                    Some(link_id) => xdp_prog
+                        .detach(link_id)
+                        .map(|_| None)
+                        .map_err(|e| e.to_string()),
+                    None => Ok(None),
+                },
             },
-        },
-    };
+        };
 
     match result {
         Ok(new_link) => {
             mgr.xdp_link = new_link;
             client.protection_active = enable;
-            Json(serde_json::json!({ "success": true, "protection_active": client.protection_active }))
+            Json(
+                serde_json::json!({ "success": true, "protection_active": client.protection_active }),
+            )
         }
-        Err(e) => {
-            Json(serde_json::json!({ "success": false, "error": e, "protection_active": client.protection_active }))
-        }
+        Err(e) => Json(
+            serde_json::json!({ "success": false, "error": e, "protection_active": client.protection_active }),
+        ),
     }
 }
 
@@ -201,10 +212,14 @@ async fn client_update_list(
 
     if req.list_type != "blacklist" {
         // The XDP program has no allow-list map; accepting the request would be a silent no-op.
-        return Json(serde_json::json!({ "success": false, "error": "whitelist is not supported by the XDP program" }));
+        return Json(
+            serde_json::json!({ "success": false, "error": "whitelist is not supported by the XDP program" }),
+        );
     }
     let Ok(addr) = req.ip.trim().parse::<Ipv4Addr>() else {
-        return Json(serde_json::json!({ "success": false, "error": "only IPv4 addresses are supported here" }));
+        return Json(
+            serde_json::json!({ "success": false, "error": "only IPv4 addresses are supported here" }),
+        );
     };
     let adding = match req.action.as_str() {
         "add" => true,
@@ -272,7 +287,10 @@ async fn client_metrics_stream(
 
         let (packets, bytes) = totals.or(last).unwrap_or((0, 0));
         let (pps, mbps) = match last {
-            Some((p0, b0)) => (packets.saturating_sub(p0), bytes.saturating_sub(b0) as f64 * 8.0 / 1e6),
+            Some((p0, b0)) => (
+                packets.saturating_sub(p0),
+                bytes.saturating_sub(b0) as f64 * 8.0 / 1e6,
+            ),
             None => (0, 0.0),
         };
 
@@ -292,7 +310,10 @@ async fn client_metrics_stream(
             chrono::Utc::now().format("%H:%M:%S")
         );
 
-        Some((Ok(Event::default().data(payload)), (state, Some((packets, bytes)))))
+        Some((
+            Ok(Event::default().data(payload)),
+            (state, Some((packets, bytes))),
+        ))
     });
 
     Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::default())

@@ -36,7 +36,10 @@ pub struct Record {
 pub enum AuditError {
     Io(io::Error),
     /// A complete record at `offset` does not continue the chain (or has a bad header).
-    Corrupt { offset: u64, reason: &'static str },
+    Corrupt {
+        offset: u64,
+        reason: &'static str,
+    },
     PayloadTooLarge(usize),
 }
 
@@ -48,7 +51,11 @@ impl std::fmt::Display for AuditError {
                 write!(f, "audit log corrupt at byte {}: {}", offset, reason)
             }
             Self::PayloadTooLarge(n) => {
-                write!(f, "audit record of {} bytes exceeds {} bytes", n, MAX_PAYLOAD)
+                write!(
+                    f,
+                    "audit record of {} bytes exceeds {} bytes",
+                    n, MAX_PAYLOAD
+                )
             }
         }
     }
@@ -346,7 +353,11 @@ mod tests {
         assert_eq!(log.len(), 1);
         log.append(b"after crash").unwrap();
         log.sync().unwrap();
-        let payloads: Vec<Vec<u8>> = read_all(&path).unwrap().into_iter().map(|r| r.payload).collect();
+        let payloads: Vec<Vec<u8>> = read_all(&path)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.payload)
+            .collect();
         assert_eq!(payloads, vec![b"kept".to_vec(), b"after crash".to_vec()]);
     }
 
@@ -366,9 +377,16 @@ mod tests {
 
         assert!(matches!(
             AuditLog::open(&path),
-            Err(AuditError::Corrupt { offset: 0, reason: "hash chain mismatch" })
+            Err(AuditError::Corrupt {
+                offset: 0,
+                reason: "hash chain mismatch"
+            })
         ));
-        assert_eq!(std::fs::read(&path).unwrap(), bytes, "corrupt log must not be modified");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            bytes,
+            "corrupt log must not be modified"
+        );
     }
 
     #[test]
@@ -378,7 +396,10 @@ mod tests {
         let mut old = vec![0u8; 4096];
         old[0..4].copy_from_slice(&0x534E544Cu32.to_le_bytes());
         std::fs::write(&path, &old).unwrap();
-        assert!(matches!(AuditLog::open(&path), Err(AuditError::Corrupt { offset: 0, .. })));
+        assert!(matches!(
+            AuditLog::open(&path),
+            Err(AuditError::Corrupt { offset: 0, .. })
+        ));
     }
 
     #[test]

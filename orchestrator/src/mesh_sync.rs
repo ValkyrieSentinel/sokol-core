@@ -1,12 +1,12 @@
+use log::{error, info, warn};
+use serde::{Deserialize, Serialize};
 use std::net::Ipv6Addr;
 use std::sync::Arc;
-use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, watch};
-use log::{error, info, warn};
 
-use common::NodeTelemetry;
 use crate::cluster_state::BirdEyeView;
 use crate::SentinelDb;
+use common::NodeTelemetry;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum AlertLevel {
@@ -30,17 +30,24 @@ pub struct UpstreamBgpIntegration {
 
 impl UpstreamBgpIntegration {
     pub fn new(upstream_router_addr: std::net::SocketAddr) -> Self {
-        Self { upstream_router_addr }
+        Self {
+            upstream_router_addr,
+        }
     }
 
-    pub async fn dispatch_flowspec_v6(&self, prefix: &str, prefix_len: u8, drop: bool) -> anyhow::Result<()> {
+    pub async fn dispatch_flowspec_v6(
+        &self,
+        prefix: &str,
+        prefix_len: u8,
+        drop: bool,
+    ) -> anyhow::Result<()> {
         let ip_str = prefix.split('/').next().unwrap_or(prefix);
         let ipv6: Ipv6Addr = ip_str.parse()?;
-        
+
         let mut nlri_buf = Vec::new();
         nlri_buf.push(prefix_len);
         let octets = ipv6.octets();
-        
+
         let bytes_needed = (prefix_len as usize).div_ceil(8);
         if bytes_needed > 16 {
             anyhow::bail!("Invalid IPv6 Flowspec prefix length: {}", prefix_len);

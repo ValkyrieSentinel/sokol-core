@@ -53,7 +53,11 @@ impl<T: Default + Clone, const R: usize> Tensor<T, R> {
         let (strides, capacity) = compute_strides_and_capacity(&shape)?;
         let data = vec![T::default(); capacity].into_boxed_slice();
 
-        Ok(Self { data, shape, strides })
+        Ok(Self {
+            data,
+            shape,
+            strides,
+        })
     }
 }
 
@@ -62,7 +66,11 @@ impl<T: Clone, const R: usize> Tensor<T, R> {
         let (strides, capacity) = compute_strides_and_capacity(&shape)?;
         let data = vec![elem; capacity].into_boxed_slice();
 
-        Ok(Self { data, shape, strides })
+        Ok(Self {
+            data,
+            shape,
+            strides,
+        })
     }
 
     pub fn from_vec(shape: [usize; R], data: Vec<T>) -> Result<Self, TensorError> {

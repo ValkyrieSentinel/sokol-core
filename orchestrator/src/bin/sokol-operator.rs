@@ -13,11 +13,7 @@ use chrono::Utc;
 use futures_util::stream::{self, Stream};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashSet,
-    convert::Infallible,
-    path::Path as StdPath,
-    sync::Arc,
-    time::Duration,
+    collections::HashSet, convert::Infallible, path::Path as StdPath, sync::Arc, time::Duration,
 };
 use sysinfo::{Networks, System};
 use tokio::{
@@ -88,8 +84,13 @@ fn operator_token() -> Result<String, String> {
         Ok(token) if token.len() >= 16 => Ok(token),
         Ok(_) => Err("SOKOL_OPERATOR_TOKEN must be at least 16 characters".into()),
         Err(_) => {
-            let token: String = (0..32).map(|_| format!("{:x}", rand::random::<u8>() & 0xF)).collect();
-            log::warn!("[*] SOKOL_OPERATOR_TOKEN not set; generated one-time token: {}", token);
+            let token: String = (0..32)
+                .map(|_| format!("{:x}", rand::random::<u8>() & 0xF))
+                .collect();
+            log::warn!(
+                "[*] SOKOL_OPERATOR_TOKEN not set; generated one-time token: {}",
+                token
+            );
             Ok(token)
         }
     }
@@ -112,13 +113,21 @@ fn presented_token(headers: &HeaderMap) -> Option<String> {
         .iter()
         .filter_map(|v| v.to_str().ok())
         .flat_map(|v| v.split(';'))
-        .find_map(|kv| kv.trim().strip_prefix(&format!("{}=", SESSION_COOKIE)).map(str::to_string))
+        .find_map(|kv| {
+            kv.trim()
+                .strip_prefix(&format!("{}=", SESSION_COOKIE))
+                .map(str::to_string)
+        })
 }
 
 async fn require_token(State(state): State<AppState>, req: Request, next: Next) -> Response {
     match presented_token(req.headers()) {
         Some(t) if constant_time_eq(t.as_bytes(), state.token.as_bytes()) => next.run(req).await,
-        _ => (StatusCode::UNAUTHORIZED, Json(serde_json::json!({ "success": false, "error": "unauthorized" }))).into_response(),
+        _ => (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "success": false, "error": "unauthorized" })),
+        )
+            .into_response(),
     }
 }
 
@@ -129,10 +138,21 @@ struct LoginReq {
 
 async fn api_login(State(state): State<AppState>, Json(req): Json<LoginReq>) -> Response {
     if !constant_time_eq(req.token.as_bytes(), state.token.as_bytes()) {
-        return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({ "success": false }))).into_response();
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "success": false })),
+        )
+            .into_response();
     }
-    let cookie = format!("{}={}; HttpOnly; SameSite=Strict; Path=/", SESSION_COOKIE, state.token);
-    ([(header::SET_COOKIE, cookie)], Json(serde_json::json!({ "success": true }))).into_response()
+    let cookie = format!(
+        "{}={}; HttpOnly; SameSite=Strict; Path=/",
+        SESSION_COOKIE, state.token
+    );
+    (
+        [(header::SET_COOKIE, cookie)],
+        Json(serde_json::json!({ "success": true })),
+    )
+        .into_response()
 }
 
 /// The node control protocol is line-based, so anything but a plain address could smuggle
@@ -191,7 +211,10 @@ async fn main() {
         }
 
         if let Ok(listener) = UnixListener::bind(socket_path) {
-            log::info!("[*] Global Trident Telemetry Unix Socket active on {}", socket_path);
+            log::info!(
+                "[*] Global Trident Telemetry Unix Socket active on {}",
+                socket_path
+            );
             while let Ok((mut stream, _)) = listener.accept().await {
                 let state_inner = state_clone.clone();
                 tokio::spawn(async move {
@@ -205,13 +228,17 @@ async fn main() {
                 });
             }
         } else {
-            log::error!("[!] Не вдалося створити телеметричний сокет: {}", socket_path);
+            log::error!(
+                "[!] Не вдалося створити телеметричний сокет: {}",
+                socket_path
+            );
         }
     });
 
     let app = build_router(state);
 
-    let bind_addr = std::env::var("SOKOL_OPERATOR_BIND").unwrap_or_else(|_| "127.0.0.1:3000".to_string());
+    let bind_addr =
+        std::env::var("SOKOL_OPERATOR_BIND").unwrap_or_else(|_| "127.0.0.1:3000".to_string());
     let listener = TcpListener::bind(&bind_addr).await.unwrap();
     log::info!("[*] Command Center operational at http://{}", bind_addr);
     axum::serve(listener, app).await.unwrap();
@@ -242,7 +269,10 @@ async fn process_trident_telemetry(state: &AppState, raw_msg: &str) {
 
     for line in raw_msg.lines() {
         if let Some(data) = line.strip_prefix("HEARTBEAT:") {
-            let id = extract_value(data, "ID=").unwrap_or("0".into()).parse::<u32>().unwrap_or(0);
+            let id = extract_value(data, "ID=")
+                .unwrap_or("0".into())
+                .parse::<u32>()
+                .unwrap_or(0);
             if !nodes.iter().any(|n| n.id == id) {
                 nodes.push(ClientNode {
                     id,
@@ -261,7 +291,10 @@ async fn process_trident_telemetry(state: &AppState, raw_msg: &str) {
                 node.last_seen = Utc::now().format("%H:%M:%S").to_string();
             }
         } else if let Some(data) = line.strip_prefix("DB_LOG:") {
-            let node_id = extract_value(data, "NODE=").unwrap_or("1".into()).parse::<u32>().unwrap_or(1);
+            let node_id = extract_value(data, "NODE=")
+                .unwrap_or("1".into())
+                .parse::<u32>()
+                .unwrap_or(1);
 
             if data.contains("TIER=Tier1BotTarpit") {
                 metrics.traps.tier1_bot_tarpit += 1;
@@ -281,7 +314,8 @@ async fn process_trident_telemetry(state: &AppState, raw_msg: &str) {
                     timestamp: Utc::now().format("%H:%M:%S").to_string(),
                     node_id,
                     source_ip: extract_value(data, "IP=").unwrap_or_else(|| "Unknown".into()),
-                    attack_vector: extract_value(data, "VEC=").unwrap_or_else(|| "Unknown Anomaly".into()),
+                    attack_vector: extract_value(data, "VEC=")
+                        .unwrap_or_else(|| "Unknown Anomaly".into()),
                     mitigation: "TRIDENT_TRAP_ENGAGED".into(),
                 },
             );
@@ -297,7 +331,9 @@ async fn process_trident_telemetry(state: &AppState, raw_msg: &str) {
 }
 
 fn extract_value(s: &str, key: &str) -> Option<String> {
-    s.split('|').find(|p| p.starts_with(key)).map(|p| p[key.len()..].to_string())
+    s.split('|')
+        .find(|p| p.starts_with(key))
+        .map(|p| p[key.len()..].to_string())
 }
 
 async fn dashboard_handler() -> Html<&'static str> {
@@ -323,7 +359,10 @@ async fn api_update_blacklist(
     Json(req): Json<BlacklistReq>,
 ) -> Json<serde_json::Value> {
     let Some(target) = parse_block_target(&req.ip) else {
-        return result_json(Err(format!("'{}' is not an IP address or CIDR", req.ip.trim())));
+        return result_json(Err(format!(
+            "'{}' is not an IP address or CIDR",
+            req.ip.trim()
+        )));
     };
     let adding = match req.action.as_str() {
         "add" => true,
@@ -334,7 +373,11 @@ async fn api_update_blacklist(
     let Some(node) = nodes.iter_mut().find(|n| n.id == id) else {
         return result_json(Err(format!("unknown node {}", id)));
     };
-    let cmd = if adding { format!("BAN_IP:{}\n", target) } else { format!("UNBAN_IP:{}\n", target) };
+    let cmd = if adding {
+        format!("BAN_IP:{}\n", target)
+    } else {
+        format!("UNBAN_IP:{}\n", target)
+    };
     let res = send_command_to_node(&node.control_socket, &cmd).await;
     if res.is_ok() {
         if adding {
@@ -369,7 +412,11 @@ async fn api_toggle_xdp(
     let Some(node) = nodes.iter_mut().find(|n| n.id == id) else {
         return result_json(Err(format!("unknown node {}", id)));
     };
-    let cmd = if node.xdp_loaded { "XDP_UNLOAD\n" } else { "XDP_LOAD\n" };
+    let cmd = if node.xdp_loaded {
+        "XDP_UNLOAD\n"
+    } else {
+        "XDP_LOAD\n"
+    };
     let res = send_command_to_node(&node.control_socket, cmd).await;
     if res.is_ok() {
         node.xdp_loaded = !node.xdp_loaded;
@@ -385,8 +432,16 @@ async fn api_toggle_shield(
     let Some(node) = nodes.iter_mut().find(|n| n.id == id) else {
         return result_json(Err(format!("unknown node {}", id)));
     };
-    let next_mode = if node.defense_mode == "NORMAL" { "MAX_SHIELD" } else { "NORMAL" };
-    let res = send_command_to_node(&node.control_socket, &format!("SET_DEFENSE:{}\n", next_mode)).await;
+    let next_mode = if node.defense_mode == "NORMAL" {
+        "MAX_SHIELD"
+    } else {
+        "NORMAL"
+    };
+    let res = send_command_to_node(
+        &node.control_socket,
+        &format!("SET_DEFENSE:{}\n", next_mode),
+    )
+    .await;
     if res.is_ok() {
         node.defense_mode = next_mode.into();
     }
@@ -400,8 +455,17 @@ async fn api_broadcast_command(
     if !MESH_COMMANDS.contains(&req.command.as_str()) {
         return result_json(Err(format!("unknown mesh command '{}'", req.command)));
     }
-    log::info!("[P2P MESH] Broadcasting command across active nodes: {}", req.command);
-    result_json(send_command_to_node("/run/sokol_p2p.sock", &format!("BROADCAST:{}\n", req.command)).await)
+    log::info!(
+        "[P2P MESH] Broadcasting command across active nodes: {}",
+        req.command
+    );
+    result_json(
+        send_command_to_node(
+            "/run/sokol_p2p.sock",
+            &format!("BROADCAST:{}\n", req.command),
+        )
+        .await,
+    )
 }
 
 /// Node control sockets are not served by the orchestrator yet; a missing socket is an error,
@@ -409,10 +473,18 @@ async fn api_broadcast_command(
 async fn send_command_to_node(socket_path: &str, cmd: &str) -> Result<(), String> {
     if !StdPath::new(socket_path).exists() {
         log::warn!("[!] Socket missing for command routing: {}", socket_path);
-        return Err(format!("node control socket {} is not available", socket_path));
+        return Err(format!(
+            "node control socket {} is not available",
+            socket_path
+        ));
     }
-    let mut socket = UnixStream::connect(socket_path).await.map_err(|e| e.to_string())?;
-    socket.write_all(cmd.as_bytes()).await.map_err(|e| e.to_string())?;
+    let mut socket = UnixStream::connect(socket_path)
+        .await
+        .map_err(|e| e.to_string())?;
+    socket
+        .write_all(cmd.as_bytes())
+        .await
+        .map_err(|e| e.to_string())?;
     socket.flush().await.map_err(|e| e.to_string())?;
     Ok(())
 }
@@ -787,11 +859,20 @@ mod tests {
         }
     }
 
-    async fn call(app: Router, req: axum::http::Request<Body>) -> (StatusCode, HeaderMap, serde_json::Value) {
+    async fn call(
+        app: Router,
+        req: axum::http::Request<Body>,
+    ) -> (StatusCode, HeaderMap, serde_json::Value) {
         let res = app.oneshot(req).await.unwrap();
         let (status, headers) = (res.status(), res.headers().clone());
-        let bytes = axum::body::to_bytes(res.into_body(), 1 << 20).await.unwrap();
-        (status, headers, serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null))
+        let bytes = axum::body::to_bytes(res.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        (
+            status,
+            headers,
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+        )
     }
 
     fn get(uri: &str) -> axum::http::request::Builder {
@@ -816,21 +897,35 @@ mod tests {
 
         let (status, _, _) = call(
             app.clone(),
-            axum::http::Request::builder().method("POST").uri("/api/nodes/1/flush").body(Body::empty()).unwrap(),
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/api/nodes/1/flush")
+                .body(Body::empty())
+                .unwrap(),
         )
         .await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED, "body-less POST (CSRF shape) must be rejected");
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "body-less POST (CSRF shape) must be rejected"
+        );
 
         let (status, _, _) = call(
             app.clone(),
-            get("/api/data").header(header::AUTHORIZATION, "Bearer wrong-token-000000").body(Body::empty()).unwrap(),
+            get("/api/data")
+                .header(header::AUTHORIZATION, "Bearer wrong-token-000000")
+                .body(Body::empty())
+                .unwrap(),
         )
         .await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
 
         let (status, _, _) = call(
             app.clone(),
-            get("/api/data").header(header::AUTHORIZATION, format!("Bearer {}", TOKEN)).body(Body::empty()).unwrap(),
+            get("/api/data")
+                .header(header::AUTHORIZATION, format!("Bearer {}", TOKEN))
+                .body(Body::empty())
+                .unwrap(),
         )
         .await;
         assert_eq!(status, StatusCode::OK);
@@ -847,7 +942,9 @@ mod tests {
                 .method("POST")
                 .uri("/api/login")
                 .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(serde_json::json!({ "token": token }).to_string()))
+                .body(Body::from(
+                    serde_json::json!({ "token": token }).to_string(),
+                ))
                 .unwrap()
         };
         let (status, _, _) = call(app.clone(), login("nope")).await;
@@ -855,11 +952,23 @@ mod tests {
 
         let (status, headers, _) = call(app.clone(), login(TOKEN)).await;
         assert_eq!(status, StatusCode::OK);
-        let cookie = headers.get(header::SET_COOKIE).unwrap().to_str().unwrap().to_string();
+        let cookie = headers
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
         assert!(cookie.contains("HttpOnly") && cookie.contains("SameSite=Strict"));
 
         let pair = cookie.split(';').next().unwrap().to_string();
-        let (status, _, _) = call(app, get("/api/data").header(header::COOKIE, pair).body(Body::empty()).unwrap()).await;
+        let (status, _, _) = call(
+            app,
+            get("/api/data")
+                .header(header::COOKIE, pair)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
         assert_eq!(status, StatusCode::OK);
     }
 
@@ -871,22 +980,37 @@ mod tests {
 
         let (_, _, body) = call(
             app.clone(),
-            post_json("/api/nodes/7/blacklist", serde_json::json!({ "ip": "1.2.3.4\nXDP_UNLOAD", "action": "add" })),
+            post_json(
+                "/api/nodes/7/blacklist",
+                serde_json::json!({ "ip": "1.2.3.4\nXDP_UNLOAD", "action": "add" }),
+            ),
         )
         .await;
         assert_eq!(body["success"], false, "newline injection must be rejected");
 
         let (_, _, body) = call(
             app.clone(),
-            post_json("/api/nodes/7/blacklist", serde_json::json!({ "ip": "203.0.113.5", "action": "add" })),
+            post_json(
+                "/api/nodes/7/blacklist",
+                serde_json::json!({ "ip": "203.0.113.5", "action": "add" }),
+            ),
         )
         .await;
-        assert_eq!(body["success"], false, "no node control socket exists, so this cannot succeed");
-        assert!(st.nodes.read().await[0].blacklist.is_empty(), "state must not change on failure");
+        assert_eq!(
+            body["success"], false,
+            "no node control socket exists, so this cannot succeed"
+        );
+        assert!(
+            st.nodes.read().await[0].blacklist.is_empty(),
+            "state must not change on failure"
+        );
 
         let (_, _, body) = call(
             app,
-            post_json("/api/mesh/broadcast", serde_json::json!({ "command": "RELOAD_RULES\nXDP_UNLOAD" })),
+            post_json(
+                "/api/mesh/broadcast",
+                serde_json::json!({ "command": "RELOAD_RULES\nXDP_UNLOAD" }),
+            ),
         )
         .await;
         assert_eq!(body["success"], false);
@@ -894,8 +1018,14 @@ mod tests {
 
     #[test]
     fn block_targets_are_addresses_only() {
-        assert_eq!(parse_block_target(" 10.0.0.1 ").as_deref(), Some("10.0.0.1"));
-        assert_eq!(parse_block_target("2001:db8::/32").as_deref(), Some("2001:db8::/32"));
+        assert_eq!(
+            parse_block_target(" 10.0.0.1 ").as_deref(),
+            Some("10.0.0.1")
+        );
+        assert_eq!(
+            parse_block_target("2001:db8::/32").as_deref(),
+            Some("2001:db8::/32")
+        );
         assert_eq!(parse_block_target("10.0.0.1\nFLUSH_BANS"), None);
         assert_eq!(parse_block_target("example.com"), None);
     }

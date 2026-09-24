@@ -60,7 +60,10 @@ impl BlockPolicy {
 /// `::ffff:a.b.c.d` is the same host as `a.b.c.d`.
 fn canonical(ip: IpAddr) -> IpAddr {
     match ip {
-        IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(IpAddr::V6(v6)),
+        IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .map(IpAddr::V4)
+            .unwrap_or(IpAddr::V6(v6)),
         v4 => v4,
     }
 }
@@ -71,7 +74,9 @@ fn local_interface_addresses() -> Vec<IpAddr> {
     // SAFETY: getifaddrs allocates a list that we walk read-only and release with freeifaddrs.
     unsafe {
         if libc::getifaddrs(&mut head) != 0 {
-            log::warn!("[BlockPolicy] getifaddrs failed; this node's own addresses are not protected");
+            log::warn!(
+                "[BlockPolicy] getifaddrs failed; this node's own addresses are not protected"
+            );
             return out;
         }
         let mut cur = head;
@@ -81,7 +86,9 @@ fn local_interface_addresses() -> Vec<IpAddr> {
                 match (*addr).sa_family as i32 {
                     libc::AF_INET => {
                         let sin = &*(addr as *const libc::sockaddr_in);
-                        out.push(IpAddr::V4(Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr))));
+                        out.push(IpAddr::V4(Ipv4Addr::from(u32::from_be(
+                            sin.sin_addr.s_addr,
+                        ))));
                     }
                     libc::AF_INET6 => {
                         let sin6 = &*(addr as *const libc::sockaddr_in6);
@@ -150,8 +157,20 @@ mod tests {
     #[test]
     fn builtin_ranges_are_protected() {
         let policy = BlockPolicy::builtin();
-        for protected in ["127.0.0.1", "::1", "0.0.0.0", "::", "224.0.0.251", "fe80::1", "::ffff:127.0.0.1"] {
-            assert!(policy.check(ip(protected)).is_err(), "{} should be protected", protected);
+        for protected in [
+            "127.0.0.1",
+            "::1",
+            "0.0.0.0",
+            "::",
+            "224.0.0.251",
+            "fe80::1",
+            "::ffff:127.0.0.1",
+        ] {
+            assert!(
+                policy.check(ip(protected)).is_err(),
+                "{} should be protected",
+                protected
+            );
         }
         assert!(policy.check(ip("203.0.113.9")).is_ok());
         assert!(policy.check(ip("2001:db8::9")).is_ok());
@@ -160,9 +179,15 @@ mod tests {
     #[test]
     fn operator_ranges_and_mapped_addresses_are_protected() {
         let mut policy = BlockPolicy::builtin();
-        policy.protect("10.20.0.0/16".parse().unwrap(), "operator never-block range");
+        policy.protect(
+            "10.20.0.0/16".parse().unwrap(),
+            "operator never-block range",
+        );
         policy.protect_ip(ip("198.51.100.7"), "mesh peer");
-        assert_eq!(policy.check(ip("10.20.3.4")), Err("operator never-block range"));
+        assert_eq!(
+            policy.check(ip("10.20.3.4")),
+            Err("operator never-block range")
+        );
         assert_eq!(policy.check(ip("::ffff:198.51.100.7")), Err("mesh peer"));
         assert!(policy.check(ip("10.21.0.1")).is_ok());
     }

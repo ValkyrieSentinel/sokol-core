@@ -23,26 +23,73 @@ fn family(out: &mut String, name: &str, kind: &str, help: &str) {
 pub fn render(s: &Snapshot) -> String {
     let mut out = String::new();
 
-    family(&mut out, "sokol_xdp_rx_packets_total", "counter", "Packets seen by the XDP program.");
+    family(
+        &mut out,
+        "sokol_xdp_rx_packets_total",
+        "counter",
+        "Packets seen by the XDP program.",
+    );
     let _ = writeln!(out, "sokol_xdp_rx_packets_total {}", s.rx_packets);
-    family(&mut out, "sokol_xdp_rx_bytes_total", "counter", "Bytes seen by the XDP program.");
+    family(
+        &mut out,
+        "sokol_xdp_rx_bytes_total",
+        "counter",
+        "Bytes seen by the XDP program.",
+    );
     let _ = writeln!(out, "sokol_xdp_rx_bytes_total {}", s.rx_bytes);
 
-    family(&mut out, "sokol_xdp_dropped_packets_total", "counter", "Packets dropped in XDP, by reason.");
+    family(
+        &mut out,
+        "sokol_xdp_dropped_packets_total",
+        "counter",
+        "Packets dropped in XDP, by reason.",
+    );
     for (code, count) in s.drops_by_reason.iter().enumerate() {
         if let Some(reason) = drop_reason::name(code as u16) {
-            let _ = writeln!(out, "sokol_xdp_dropped_packets_total{{reason=\"{}\"}} {}", reason, count);
+            let _ = writeln!(
+                out,
+                "sokol_xdp_dropped_packets_total{{reason=\"{}\"}} {}",
+                reason, count
+            );
         }
     }
 
-    family(&mut out, "sokol_xdp_events_suppressed_total", "counter", "Kernel events withheld by the per-CPU rate limit.");
-    let _ = writeln!(out, "sokol_xdp_events_suppressed_total {}", s.events_suppressed);
-    family(&mut out, "sokol_blocks_active", "gauge", "Addresses currently blocked (static and dynamic).");
+    family(
+        &mut out,
+        "sokol_xdp_events_suppressed_total",
+        "counter",
+        "Kernel events withheld by the per-CPU rate limit.",
+    );
+    let _ = writeln!(
+        out,
+        "sokol_xdp_events_suppressed_total {}",
+        s.events_suppressed
+    );
+    family(
+        &mut out,
+        "sokol_blocks_active",
+        "gauge",
+        "Addresses currently blocked (static and dynamic).",
+    );
     let _ = writeln!(out, "sokol_blocks_active {}", s.blocks_active);
-    family(&mut out, "sokol_p2p_active_peers", "gauge", "Authenticated mesh peers connected.");
+    family(
+        &mut out,
+        "sokol_p2p_active_peers",
+        "gauge",
+        "Authenticated mesh peers connected.",
+    );
     let _ = writeln!(out, "sokol_p2p_active_peers {}", s.p2p_peers);
-    family(&mut out, "sokol_audit_queue_overflow_total", "counter", "Audit records lost because the write queue was full.");
-    let _ = writeln!(out, "sokol_audit_queue_overflow_total {}", s.audit_queue_overflow);
+    family(
+        &mut out,
+        "sokol_audit_queue_overflow_total",
+        "counter",
+        "Audit records lost because the write queue was full.",
+    );
+    let _ = writeln!(
+        out,
+        "sokol_audit_queue_overflow_total {}",
+        s.audit_queue_overflow
+    );
 
     out
 }
@@ -76,7 +123,11 @@ mod tests {
         // Every sample line belongs to a declared family.
         for line in text.lines().filter(|l| !l.starts_with('#')) {
             let name = line.split(['{', ' ']).next().unwrap();
-            assert!(text.contains(&format!("# TYPE {} ", name)), "{} has no TYPE line", name);
+            assert!(
+                text.contains(&format!("# TYPE {} ", name)),
+                "{} has no TYPE line",
+                name
+            );
         }
     }
 }

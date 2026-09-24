@@ -2,9 +2,9 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::sync::Semaphore;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
 use tokio::time::{sleep, timeout, Duration};
 
 fn ipc_socket_path() -> String {
@@ -37,20 +37,32 @@ impl TrapConfig {
             None => DEFAULT_TRAP_PORTS.to_vec(),
             Some(list) => list
                 .split(',')
-                .map(|p| p.trim().parse::<u16>().map_err(|_| format!("invalid trap port '{}'", p.trim())))
+                .map(|p| {
+                    p.trim()
+                        .parse::<u16>()
+                        .map_err(|_| format!("invalid trap port '{}'", p.trim()))
+                })
                 .collect::<Result<Vec<_>, _>>()?,
         };
         if ports.contains(&ADMIN_SSH_PORT) {
-            return Err(format!("port {} is the operator SSH port and cannot be a trap", ADMIN_SSH_PORT));
+            return Err(format!(
+                "port {} is the operator SSH port and cannot be a trap",
+                ADMIN_SSH_PORT
+            ));
         }
         let jail_addr = match jail {
             None | Some("") => None,
             Some(raw) => {
-                let addr: SocketAddr = raw.parse().map_err(|_| format!("invalid SOKOL_JAIL_ADDR '{}'", raw))?;
+                let addr: SocketAddr = raw
+                    .parse()
+                    .map_err(|_| format!("invalid SOKOL_JAIL_ADDR '{}'", raw))?;
                 // Proxying into the real sshd would hand attackers a login prompt that
                 // appears to come from localhost.
                 if addr.port() == ADMIN_SSH_PORT {
-                    return Err(format!("SOKOL_JAIL_ADDR must not point at the operator SSH port {}", ADMIN_SSH_PORT));
+                    return Err(format!(
+                        "SOKOL_JAIL_ADDR must not point at the operator SSH port {}",
+                        ADMIN_SSH_PORT
+                    ));
                 }
                 Some(addr)
             }
@@ -239,9 +251,9 @@ fn classify_traffic_tier(payload: &[u8], fp: &ConnectionFingerprint) -> TridentT
         return TridentTier::Tier3InteractiveJail;
     }
 
-    let has_shellcode_patterns = payload.windows(4).any(|w| {
-        w == b"\x90\x90\x90\x90" || w == b"\x31\xc0\x50\x68" || w == b"\xeb\xfe\x90\x90"
-    });
+    let has_shellcode_patterns = payload
+        .windows(4)
+        .any(|w| w == b"\x90\x90\x90\x90" || w == b"\x31\xc0\x50\x68" || w == b"\xeb\xfe\x90\x90");
 
     if has_shellcode_patterns || (fp.non_printable_ratio > 0.6 && payload.len() > 128) {
         return TridentTier::Tier2AptSandbox;
@@ -323,7 +335,10 @@ async fn run_tier1_bot_tarpit(
         .await;
 
     for i in 0..120 {
-        let chunk_data = format!("<div>Diagnostic block ID: {} - Synchronizing state...</div>\n", i);
+        let chunk_data = format!(
+            "<div>Diagnostic block ID: {} - Synchronizing state...</div>\n",
+            i
+        );
         let chunk = format!("{:X}\r\n{}\r\n", chunk_data.len(), chunk_data);
         if stream.write_all(chunk.as_bytes()).await.is_err() {
             break;
@@ -490,7 +505,10 @@ async fn run_embedded_mock_jail(
                     .filter(|c| c.is_ascii_graphic() || *c == ' ')
                     .collect::<String>();
 
-                let chunk_log = format!("EMBEDDED_JAIL_INPUT|IP={}|BYTES={}|SNIPPET={}", ip, n, snippet);
+                let chunk_log = format!(
+                    "EMBEDDED_JAIL_INPUT|IP={}|BYTES={}|SNIPPET={}",
+                    ip, n, snippet
+                );
                 let _ = send_log_to_orchestrator(&chunk_log).await;
 
                 if stream
@@ -525,7 +543,9 @@ async fn run_embedded_mock_jail(
     Ok(())
 }
 
-async fn send_log_to_orchestrator(log_msg: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn send_log_to_orchestrator(
+    log_msg: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let socket_path = ipc_socket_path();
     let msg = format!("DB_LOG:{}\n", log_msg);
 
@@ -555,7 +575,10 @@ async fn notify_ebpf_kernel_apt(ip: &str) -> Result<(), Box<dyn std::error::Erro
             Ok(())
         }
         Err(e) => {
-            eprintln!("\x1b[1;31m[CRITICAL]\x1b[0m APT Notification failed for IP {}: {}", ip, e);
+            eprintln!(
+                "\x1b[1;31m[CRITICAL]\x1b[0m APT Notification failed for IP {}: {}",
+                ip, e
+            );
             Err(e.into())
         }
     }
@@ -582,7 +605,10 @@ async fn trigger_xdp_drop(ip: &str) -> Result<(), Box<dyn std::error::Error + Se
                     );
                 } else {
                     let _ = socket.shutdown().await;
-                    println!("[XDP_ACTION] IP {} sent to IPC orchestrator for XDP drop.", ip);
+                    println!(
+                        "[XDP_ACTION] IP {} sent to IPC orchestrator for XDP drop.",
+                        ip
+                    );
                     return Ok(());
                 }
             }
@@ -634,9 +660,15 @@ mod tests {
     #[test]
     fn defaults_avoid_the_p2p_and_admin_ssh_ports() {
         let config = TrapConfig::parse(None, None).unwrap();
-        assert!(!config.ports.contains(&8080), "8080 is the orchestrator P2P port");
+        assert!(
+            !config.ports.contains(&8080),
+            "8080 is the orchestrator P2P port"
+        );
         assert!(!config.ports.contains(&ADMIN_SSH_PORT));
-        assert!(config.jail_addr.is_none(), "no external jail unless configured");
+        assert!(
+            config.jail_addr.is_none(),
+            "no external jail unless configured"
+        );
     }
 
     #[test]

@@ -41,7 +41,7 @@ impl SokolEngine {
         if current.is_nan() || prev.is_nan() || current.is_infinite() || prev.is_infinite() {
             return Err(EngineError::InvalidFloat);
         }
-        
+
         let derivative = (current - prev) / dt;
         Ok(derivative.abs() > self.epsilon)
     }
@@ -56,7 +56,7 @@ impl SokolEngine {
     pub fn compute_shannon_entropy(probabilities: &[f64]) -> EntropyValue {
         let h = probabilities
             .iter()
-            .filter(|&&p| p > 0.0 && !p.is_nan() && !p.is_infinite()) 
+            .filter(|&&p| p > 0.0 && !p.is_nan() && !p.is_infinite())
             .map(|&p| -p * p.log2())
             .sum();
         EntropyValue(h)
@@ -64,7 +64,7 @@ impl SokolEngine {
 
     pub fn compute_relaxation_time(alpha: f64) -> RelaxationSec {
         if alpha <= 0.0 || alpha >= 1.0 || alpha.is_nan() {
-            return RelaxationSec(0.0); 
+            return RelaxationSec(0.0);
         }
         RelaxationSec(-1.0 / alpha.ln())
     }
@@ -80,15 +80,27 @@ mod tests {
 
         let normal_prev = 1000.0;
         let normal_curr = 1200.0;
-        assert_eq!(engine.detect_anomaly(normal_curr, normal_prev, 1.0), Ok(false));
+        assert_eq!(
+            engine.detect_anomaly(normal_curr, normal_prev, 1.0),
+            Ok(false)
+        );
 
         let spike_prev = 1200.0;
         let spike_curr = 2500.0;
         assert_eq!(engine.detect_anomaly(spike_curr, spike_prev, 1.0), Ok(true));
 
-        assert_eq!(engine.detect_anomaly(2500.0, 1200.0, 0.0), Err(EngineError::ZeroDeltaTime));
-        assert_eq!(engine.detect_anomaly(2500.0, 1200.0, f64::INFINITY), Err(EngineError::ZeroDeltaTime));
-        assert_eq!(engine.detect_anomaly(f64::NAN, 1200.0, 1.0), Err(EngineError::InvalidFloat));
+        assert_eq!(
+            engine.detect_anomaly(2500.0, 1200.0, 0.0),
+            Err(EngineError::ZeroDeltaTime)
+        );
+        assert_eq!(
+            engine.detect_anomaly(2500.0, 1200.0, f64::INFINITY),
+            Err(EngineError::ZeroDeltaTime)
+        );
+        assert_eq!(
+            engine.detect_anomaly(f64::NAN, 1200.0, 1.0),
+            Err(EngineError::InvalidFloat)
+        );
     }
 
     #[test]
@@ -96,10 +108,10 @@ mod tests {
         let flow = SokolEngine::compute_flow_rate(10000, 2.0);
         assert_eq!(flow, FlowRate(5000.0));
 
-        let entropy = SokolEngine::compute_shannon_entropy(&[0.5, 0.5, f64::NAN]); 
+        let entropy = SokolEngine::compute_shannon_entropy(&[0.5, 0.5, f64::NAN]);
         assert_eq!(entropy, EntropyValue(1.0));
 
         let tau = SokolEngine::compute_relaxation_time(0.5);
-        assert!(tau.0 > 1.44 && tau.0 < 1.45); 
+        assert!(tau.0 > 1.44 && tau.0 < 1.45);
     }
 }

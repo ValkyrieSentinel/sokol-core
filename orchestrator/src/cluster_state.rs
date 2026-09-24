@@ -1,8 +1,8 @@
+use common::NodeTelemetry;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
-use common::NodeTelemetry;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClusterStatus {
@@ -42,19 +42,24 @@ impl BirdEyeView {
 
     pub async fn ingest(&self, telemetry: NodeTelemetry) {
         let mut state = self.state.write().await;
-        
-        let old_drops = state.nodes
+
+        let old_drops = state
+            .nodes
             .get(&telemetry.node_id)
             .map_or(0, |n| n.telemetry.dropped_packets);
-        
-        state.total_dropped_packets = state.total_dropped_packets
+
+        state.total_dropped_packets = state
+            .total_dropped_packets
             .saturating_sub(old_drops)
             .saturating_add(telemetry.dropped_packets);
 
-        state.nodes.insert(telemetry.node_id, NodeState {
-            telemetry,
-            last_seen: Instant::now(),
-        });
+        state.nodes.insert(
+            telemetry.node_id,
+            NodeState {
+                telemetry,
+                last_seen: Instant::now(),
+            },
+        );
     }
 
     pub async fn global_cluster_health(&self) -> ClusterStatus {
@@ -66,7 +71,8 @@ impl BirdEyeView {
             return ClusterStatus::Unknown;
         }
 
-        let attacked_nodes = state.nodes
+        let attacked_nodes = state
+            .nodes
             .values()
             .filter(|n| n.telemetry.under_attack != 0)
             .count();
@@ -83,7 +89,10 @@ impl BirdEyeView {
     }
 
     pub async fn is_global_storm_detected(&self) -> bool {
-        matches!(self.global_cluster_health().await, ClusterStatus::DistributedStorm)
+        matches!(
+            self.global_cluster_health().await,
+            ClusterStatus::DistributedStorm
+        )
     }
 
     pub async fn total_cluster_drops(&self) -> u64 {
@@ -95,11 +104,12 @@ impl BirdEyeView {
     async fn prune_stale_nodes_locked(&self, state: &mut ClusterState) {
         let now = Instant::now();
         let ttl = self.ttl;
-        
+
         state.nodes.retain(|_, node| {
             let is_alive = now.duration_since(node.last_seen) <= ttl;
             if !is_alive {
-                state.total_dropped_packets = state.total_dropped_packets
+                state.total_dropped_packets = state
+                    .total_dropped_packets
                     .saturating_sub(node.telemetry.dropped_packets);
             }
             is_alive
@@ -127,17 +137,26 @@ mod tests {
     #[tokio::test]
     async fn cluster_status_follows_the_share_of_attacked_nodes() {
         let bird_eye = BirdEyeView::new(0.4, Duration::from_secs(300));
-        assert_eq!(bird_eye.global_cluster_health().await, ClusterStatus::Unknown);
+        assert_eq!(
+            bird_eye.global_cluster_health().await,
+            ClusterStatus::Unknown
+        );
 
         bird_eye.ingest(node(1, 0, false)).await;
         bird_eye.ingest(node(2, 0, false)).await;
         bird_eye.ingest(node(3, 20_000, true)).await;
-        assert_eq!(bird_eye.global_cluster_health().await, ClusterStatus::LocalIncident);
+        assert_eq!(
+            bird_eye.global_cluster_health().await,
+            ClusterStatus::LocalIncident
+        );
         assert_eq!(bird_eye.total_cluster_drops().await, 20_000);
 
         bird_eye.ingest(node(4, 15_000, true)).await;
         bird_eye.ingest(node(5, 30_000, true)).await;
-        assert_eq!(bird_eye.global_cluster_health().await, ClusterStatus::DistributedStorm);
+        assert_eq!(
+            bird_eye.global_cluster_health().await,
+            ClusterStatus::DistributedStorm
+        );
         assert_eq!(bird_eye.total_cluster_drops().await, 65_000);
 
         bird_eye.ingest(node(5, 10_000, true)).await;

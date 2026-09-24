@@ -17,7 +17,7 @@ jobs:
 
       - name: Install Rust nightly
         run: |
-          rustup toolchain install nightly --profile minimal --component rust-src,clippy
+          rustup toolchain install nightly --profile minimal --component rust-src,clippy,rustfmt
           rustup default nightly
 
       - name: Install bpf-linker
@@ -30,6 +30,11 @@ jobs:
         with:
           workspaces: |
             . -> target
+
+      - name: Format
+        run: |
+          cargo fmt --all --check
+          (cd ebpf && cargo fmt --check)
 
       - name: Build eBPF program
         working-directory: ebpf

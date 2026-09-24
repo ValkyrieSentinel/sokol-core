@@ -85,7 +85,14 @@ fn read_new_events(reader: &mut Option<Reader>, events: &mut Vec<AuditEvent>) ->
 
             if ip == "Unknown" {
                 if let Some(found_ip) = log_str
-                    .split(|c: char| c.is_whitespace() || c == '|' || c == '=' || c == ',' || c == '"' || c == '\'')
+                    .split(|c: char| {
+                        c.is_whitespace()
+                            || c == '|'
+                            || c == '='
+                            || c == ','
+                            || c == '"'
+                            || c == '\''
+                    })
                     .map(|token| token.trim_matches(|c: char| !c.is_ascii_digit() && c != '.'))
                     .find_map(|candidate| candidate.parse::<Ipv4Addr>().ok())
                 {
@@ -115,7 +122,11 @@ fn get_ebpf_active_blocks() -> Vec<String> {
     let output = Command::new("bpftool")
         .args(["map", "dump", "name", "BLOCKLIST_V4"])
         .output()
-        .or_else(|_| Command::new("sudo").args(["bpftool", "map", "dump", "name", "BLOCKLIST_V4"]).output());
+        .or_else(|_| {
+            Command::new("sudo")
+                .args(["bpftool", "map", "dump", "name", "BLOCKLIST_V4"])
+                .output()
+        });
 
     let mut banned_ips = Vec::new();
     if let Ok(out) = output {
@@ -130,7 +141,10 @@ fn get_ebpf_active_blocks() -> Vec<String> {
                         .collect();
 
                     if hex_bytes.len() >= 8 {
-                        let ip = format!("{}.{}.{}.{}", hex_bytes[4], hex_bytes[5], hex_bytes[6], hex_bytes[7]);
+                        let ip = format!(
+                            "{}.{}.{}.{}",
+                            hex_bytes[4], hex_bytes[5], hex_bytes[6], hex_bytes[7]
+                        );
                         banned_ips.push(ip);
                     }
                 }
@@ -146,7 +160,10 @@ fn main() -> io::Result<()> {
     let mut read_error: Option<String> = None;
 
     loop {
-        read_error = read_new_events(&mut reader, &mut events).err().map(|e| e.to_string()).or(read_error);
+        read_error = read_new_events(&mut reader, &mut events)
+            .err()
+            .map(|e| e.to_string())
+            .or(read_error);
 
         let total_attacks = events.len();
         let mut unique_ips = HashMap::new();
@@ -170,8 +187,14 @@ fn main() -> io::Result<()> {
             println!("[!] AUDIT LOG VERIFICATION FAILED: {}", err);
         }
         println!("[*] Total Intercepted Attacks (audit) : {}", total_attacks);
-        println!("[*] Unique Attacker IPs Logged         : {}", unique_ips.len());
-        println!("[*] Active eBPF XDP Kernel Drops (IPs) : {}", ebpf_blocks.len());
+        println!(
+            "[*] Unique Attacker IPs Logged         : {}",
+            unique_ips.len()
+        );
+        println!(
+            "[*] Active eBPF XDP Kernel Drops (IPs) : {}",
+            ebpf_blocks.len()
+        );
 
         println!("\n--- Active eBPF Kernel Blocklist (BLOCKLIST_V4) ---");
         if ebpf_blocks.is_empty() {
@@ -188,19 +211,18 @@ fn main() -> io::Result<()> {
         }
 
         println!("\n--- Live Captured Attack Payloads (audit log) ---");
-        println!("{:<6} | {:<15} | {:<18} | {:<6} | {:<20}", "SEQ", "IP ADDRESS", "TIER", "LEN", "PAYLOAD SNIPPET");
+        println!(
+            "{:<6} | {:<15} | {:<18} | {:<6} | {:<20}",
+            "SEQ", "IP ADDRESS", "TIER", "LEN", "PAYLOAD SNIPPET"
+        );
         println!("{}", "-".repeat(78));
 
         let start = events.len().saturating_sub(8);
 
         for ev in &events[start..] {
             println!(
-                "{:<6} | {:<15} | {:<18.18} | {:<6} | {:<20.20}", 
-                ev.seq,
-                ev.ip, 
-                ev.tier, 
-                ev.payload_len,
-                ev.payload_snippet
+                "{:<6} | {:<15} | {:<18.18} | {:<6} | {:<20.20}",
+                ev.seq, ev.ip, ev.tier, ev.payload_len, ev.payload_snippet
             );
         }
 
