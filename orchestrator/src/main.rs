@@ -805,14 +805,7 @@ async fn enforce_block_local(
             );
             push_telemetry(&telemetry_msg).await;
 
-            let broadcast_cmd = MeshCommand::BlockIp {
-                ip: shown.clone(),
-                reason: reason.to_string(),
-            };
-            let _ = registry
-                .broadcast(&broadcast_cmd, node_id, node_crypto, dag_tracker)
-                .await;
-            Enforcement::Enforced
+      Enforcement::Enforced
         }
         Err(e) => {
             log::error!(
