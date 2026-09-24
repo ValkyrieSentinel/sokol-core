@@ -24,7 +24,7 @@ use common::canonical::CanonicalParser;
 use common::{DropEvent, NodeTelemetry};
 
 use crate::cluster_state::BirdEyeView;
-use crate::p2p::{connect_to_peer, DagTracker, NodeCrypto, P2PNetwork, PeerRegistry};
+use crate::p2p::{connect_to_peer, DagTracker, NodeCrypto, P2PNetwork, PeerRegistry, TrustStore};
 
 #[link(name = "sntl_db", kind = "static")]
 extern "C" {
@@ -105,6 +105,19 @@ struct Args {
 
     #[arg(long, default_value = "2001:db8:1000::/64")]
     ipv6_prefix: String,
+
+    /// Node identity key (ML-DSA/Dilithium3). Created with mode 0600 on first start.
+    #[arg(long, default_value = "/var/lib/sokol/node.key")]
+    key_file: std::path::PathBuf,
+
+    /// JSON list of pinned mesh peers: [{"node_id": 2, "public_key": "<hex>"}].
+    /// Without it the mesh accepts no peers.
+    #[arg(long)]
+    peers_file: Option<std::path::PathBuf>,
+
+    /// Print this node's public key (hex) for other nodes' peers files, then exit.
+    #[arg(long)]
+    print_public_key: bool,
 }
 
 async fn push_telemetry(msg: &str) {
@@ -187,6 +200,20 @@ async fn enforce_block_local(
 async fn main() -> Result<(), anyhow::Error> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let args = Args::parse();
+
+    let node_crypto = Arc::new(NodeCrypto::load_or_create(&args.key_file)?);
+    if args.print_public_key {
+        println!("{}", node_crypto.public_key_hex());
+        return Ok(());
+    }
+
+    let trust_store = match &args.peers_file {
+        Some(path) => TrustStore::load(path)?,
+        None => {
+            log::warn!("[P2P] No --peers-file given: mesh messages from all peers will be rejected.");
+            TrustStore::default()
+        }
+    };
 
     log::info!("Initializing Sokol-Core Production Daemon on interface: {} [Node ID: {}]", args.interface, args.node_id);
 
@@ -316,10 +343,9 @@ async fn main() -> Result<(), anyhow::Error> {
         let _ = shutdown_tx_ctrlc.send(true);
     })?;
 
-    let peer_registry = PeerRegistry::new();
+    let peer_registry = PeerRegistry::new(trust_store);
     let (mesh_cmd_tx, mut mesh_cmd_rx) = mpsc::channel::<MeshCommand>(1000);
 
-    let node_crypto = Arc::new(NodeCrypto::new());
     let dag_tracker = Arc::new(tokio::sync::Mutex::new(DagTracker::new()));
 
     let p2p_bind_addr: std::net::SocketAddr = args.p2p_bind.parse().expect("Invalid P2P bind address");

@@ -54,6 +54,7 @@ RUST_LOG=info "$BIN" \
     --interface "$HOST_IF" \
     --block "$BLOCKED_IP" \
     --db-path "$WORK/events.sntl" \
+    --key-file "$WORK/node.key" \
     --p2p-bind "127.0.0.1:0" \
     >"$LOG" 2>&1 &
 ORCH_PID=$!

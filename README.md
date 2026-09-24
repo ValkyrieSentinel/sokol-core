@@ -54,6 +54,35 @@ Run (must be run with sudo, as root privileges are required to work with XDP map
 sudo ./target/release/orchestrator
 ```
 
+## Mesh peers
+
+Nodes accept mesh commands (e.g. `BlockIp`) only from peers whose public key is pinned in a
+peers file. Without `--peers-file` the mesh rejects every peer.
+
+Each node keeps its identity key in `--key-file` (default `/var/lib/sokol/node.key`, created
+with mode `0600` on first start). Print a node's public key:
+
+```shell
+sudo ./target/release/orchestrator --print-public-key
+```
+
+Collect the keys into a peers file on every node:
+
+```json
+[
+  { "node_id": 2, "public_key": "<hex from node 2>" },
+  { "node_id": 3, "public_key": "<hex from node 3>" }
+]
+```
+
+```shell
+sudo ./target/release/orchestrator -i eth0 --node-id 1 --peers-file /etc/sokol/peers.json --seed-peer 10.0.0.2:8080
+```
+
+Envelopes are signed over sender, timestamp, nonce and payload; they are rejected outside a
+±30 s clock window (keep nodes NTP-synced) and accepted at most once. Mesh traffic is
+authenticated but not encrypted.
+
 # Project Structure
 
 `ebpf/` — kernel space code (Rust XDP program).
