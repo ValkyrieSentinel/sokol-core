@@ -32,7 +32,9 @@ use common::{DropEvent, NodeTelemetry};
 use crate::block_policy::BlockPolicy;
 use crate::block_table::{BlockTable, Lifetime, TtlPolicy, Watermark};
 use crate::cluster_state::BirdEyeView;
-use crate::p2p::{connect_to_peer, DagTracker, NodeCrypto, P2PNetwork, PeerRegistry, TrustStore};
+use crate::p2p::{
+    maintain_peer_connection, DagTracker, NodeCrypto, P2PNetwork, PeerRegistry, TrustStore,
+};
 
 /// Audit trail writer. Records are queued (bounded, so a flood cannot exhaust memory) and
 /// written by one thread, fsynced every 100 ms or 64 records: a crash loses at most that window.
@@ -744,25 +746,15 @@ async fn main() -> Result<(), anyhow::Error> {
             let dag_clone = dag_tracker.clone();
             let node_id = args.node_id;
 
-            tokio::spawn(async move {
-                log::info!("[P2P] Connecting to seed peer: {}", seed_addr);
-                if let Err(e) = connect_to_peer(
-                    seed_addr,
-                    node_id,
-                    crypto_clone,
-                    dag_clone,
-                    reg_clone,
-                    tx_clone,
-                )
-                .await
-                {
-                    log::warn!(
-                        "[P2P] Failed to connect to seed peer {}: {:?}",
-                        seed_addr,
-                        e
-                    );
-                }
-            });
+            log::info!("[P2P] Maintaining connection to seed peer: {}", seed_addr);
+            tokio::spawn(maintain_peer_connection(
+                seed_addr,
+                node_id,
+                crypto_clone,
+                dag_clone,
+                reg_clone,
+                tx_clone,
+            ));
         }
     }
 
@@ -773,6 +765,46 @@ async fn main() -> Result<(), anyhow::Error> {
     let cluster_summary = Arc::new(std::sync::RwLock::new(mesh_sync::ClusterSummary::default()));
 
     let blocks_mesh = blocks.clone();
+
+    // Catch-up for peers that (re)connect: send them our running dynamic blocks.
+    let (peer_up_tx, mut peer_up_rx) = mpsc::unbounded_channel::<std::net::SocketAddr>();
+    peer_registry.on_peer_up(peer_up_tx);
+    {
+        let (blocks, registry, crypto, dag) = (
+            blocks.clone(),
+            peer_registry.clone(),
+            node_crypto.clone(),
+            dag_tracker.clone(),
+        );
+        let node_id = args.node_id;
+        tokio::spawn(async move {
+            while let Some(addr) = peer_up_rx.recv().await {
+                let snapshot = blocks
+                    .lock()
+                    .await
+                    .dynamic_snapshot(std::time::Instant::now());
+                if snapshot.is_empty() {
+                    continue;
+                }
+                for chunk in snapshot.chunks(mesh_sync::SYNC_CHUNK) {
+                    let cmd = MeshCommand::BlockSync {
+                        blocks: chunk
+                            .iter()
+                            .map(|(ip, left)| mesh_sync::SyncedBlock {
+                                ip: ip.to_string(),
+                                remaining_secs: left.as_secs().max(1),
+                            })
+                            .collect(),
+                    };
+                    if let Err(e) = registry.send_to(addr, &cmd, node_id, &crypto, &dag).await {
+                        log::warn!("[Mesh] Block sync to {} failed: {:#}", addr, e);
+                        break;
+                    }
+                }
+                log::info!("[Mesh] Sent {} running blocks to {}", snapshot.len(), addr);
+            }
+        });
+    }
     let sntl_db_mesh = sntl_db.clone();
     let node_id_mesh = args.node_id;
     let policy_mesh = block_policy.clone();
@@ -834,6 +866,47 @@ async fn main() -> Result<(), anyhow::Error> {
                         log::error!(
                             "[Mesh] Received unparseable IP in BlockIp command: '{}'",
                             ip
+                        );
+                    }
+                }
+                MeshCommand::BlockSync { blocks } => {
+                    let now = std::time::Instant::now();
+                    let mut adopted = 0;
+                    for entry in blocks {
+                        let Ok(ip_addr) = entry.ip.trim().parse::<IpAddr>() else {
+                            continue;
+                        };
+                        let ip_addr = ip_addr.to_canonical();
+                        if policy_mesh.check(ip_addr).is_err() {
+                            continue;
+                        }
+                        let remaining = Duration::from_secs(entry.remaining_secs);
+                        let result = blocks_mesh
+                            .lock()
+                            .await
+                            .insert_until(ip_addr, remaining, now);
+                        match result {
+                            Ok(true) => {
+                                adopted += 1;
+                                sntl_db_mesh.append(format!(
+                                    "MESH_BLOCK_{}|IP:{}|TTL:{}s|Reason:sync from peer",
+                                    ip_tag(ip_addr),
+                                    ip_addr,
+                                    entry.remaining_secs
+                                ));
+                            }
+                            Ok(false) => {}
+                            Err(e) => log::error!(
+                                "[Mesh] Failed to adopt synced block {}: {:?}",
+                                ip_addr,
+                                e
+                            ),
+                        }
+                    }
+                    if adopted > 0 {
+                        log::warn!(
+                            "[Mesh] Adopted {} blocks missed while disconnected",
+                            adopted
                         );
                     }
                 }

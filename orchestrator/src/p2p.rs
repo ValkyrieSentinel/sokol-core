@@ -318,7 +318,7 @@ pub async fn seal(
 ) -> Result<SecureEnvelope> {
     let payload = serde_json::to_vec(message)?;
     let payload_str = std::str::from_utf8(&payload).context("Payload is not valid UTF-8")?;
-    CanonicalParser::validate_strict_json_object(payload_str)
+    check_canonical(payload_str)
         .map_err(|e| anyhow::anyhow!("Canonical validation failed: {:?}", e))?;
 
     let dag_parents = dag.lock().await.get_parents_and_register(&payload).0;
@@ -378,16 +378,33 @@ pub fn open(
 
     let payload_str =
         std::str::from_utf8(&envelope.payload).map_err(|_| EnvelopeError::MalformedPayload)?;
-    CanonicalParser::validate_strict_json_object(payload_str)
-        .map_err(|_| EnvelopeError::MalformedPayload)?;
+    check_canonical(payload_str).map_err(|_| EnvelopeError::MalformedPayload)?;
     serde_json::from_slice(&envelope.payload).map_err(|_| EnvelopeError::MalformedPayload)
 }
 
-pub type PeerMap = Arc<RwLock<HashMap<SocketAddr, (mpsc::Sender<SecureEnvelope>, u64)>>>;
+/// Objects must pass the strict duplicate-key check. Unit variants (Ping, Pong, Ack) serialize
+/// as a bare JSON string, which has no keys to duplicate; requiring an object here rejected
+/// every heartbeat, so idle connections were torn down by the 30 s read timeout.
+fn check_canonical(payload: &str) -> Result<(), common::canonical::CanonicalError> {
+    let trimmed = payload.trim();
+    if trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() >= 2 {
+        return Ok(());
+    }
+    CanonicalParser::validate_strict_json_object(payload)
+}
+
+/// addr -> (writer, node id, connection id). The connection id lets a connection that ends
+/// remove only its own entry: a stale connection timing out after the peer already reconnected
+/// from the same address must not unregister the new one.
+pub type PeerMap = Arc<RwLock<HashMap<SocketAddr, (mpsc::Sender<SecureEnvelope>, u64, u64)>>>;
+
+static NEXT_CONNECTION_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 #[derive(Clone)]
 pub struct PeerRegistry {
     peers: PeerMap,
+    /// Told the address of every peer that completes its handshake.
+    peer_up: Arc<std::sync::Mutex<Option<mpsc::UnboundedSender<SocketAddr>>>>,
     /// Swapped as a whole by `reload`, so a message is checked against one consistent store.
     trust: Arc<std::sync::RwLock<Arc<TrustStore>>>,
     replay: Arc<std::sync::Mutex<ReplayGuard>>,
@@ -397,18 +414,67 @@ impl PeerRegistry {
     pub fn new(trust: TrustStore) -> Self {
         Self {
             peers: Arc::new(RwLock::new(HashMap::new())),
+            peer_up: Arc::new(std::sync::Mutex::new(None)),
             trust: Arc::new(std::sync::RwLock::new(Arc::new(trust))),
             replay: Arc::new(std::sync::Mutex::new(ReplayGuard::default())),
         }
     }
 
-    pub async fn add_peer(&self, addr: SocketAddr, tx: mpsc::Sender<SecureEnvelope>, node_id: u64) {
+    pub async fn add_peer(
+        &self,
+        addr: SocketAddr,
+        tx: mpsc::Sender<SecureEnvelope>,
+        node_id: u64,
+        conn_id: u64,
+    ) {
         let mut peers = self.peers.write().await;
-        peers.insert(addr, (tx, node_id));
+        peers.insert(addr, (tx, node_id, conn_id));
         info!(
             "[P2P] Registered authenticated peer: {} [Node ID: {}]",
             addr, node_id
         );
+        if let Some(tx) = self
+            .peer_up
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+        {
+            let _ = tx.send(addr);
+        }
+    }
+
+    pub fn on_peer_up(&self, tx: mpsc::UnboundedSender<SocketAddr>) {
+        *self.peer_up.lock().unwrap_or_else(|p| p.into_inner()) = Some(tx);
+    }
+
+    /// Sends one command to one connected peer.
+    pub async fn send_to(
+        &self,
+        addr: SocketAddr,
+        command: &MeshCommand,
+        node_id: u64,
+        crypto: &NodeCrypto,
+        dag: &Arc<Mutex<DagTracker>>,
+    ) -> Result<()> {
+        let envelope = seal(
+            crypto,
+            node_id,
+            &NetworkMessage::Command(command.clone()),
+            dag,
+        )
+        .await?;
+        let tx = self
+            .peers
+            .read()
+            .await
+            .get(&addr)
+            .map(|(tx, _, _)| tx.clone())
+            .ok_or_else(|| anyhow::anyhow!("peer {} is not connected", addr))?;
+        match timeout(Duration::from_secs(2), tx.send(envelope)).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) => Err(anyhow::anyhow!("peer {} writer closed", addr)),
+            Err(_) => Err(anyhow::anyhow!("peer {} queue stayed full for 2 s", addr)),
+        }
     }
 
     /// Replaces the trust store. Connections of peers whose key was removed are closed on
@@ -427,9 +493,12 @@ impl PeerRegistry {
         self.peers.read().await.len()
     }
 
-    pub async fn remove_peer(&self, addr: &SocketAddr) {
+    pub async fn remove_peer(&self, addr: &SocketAddr, conn_id: u64) {
         let mut peers = self.peers.write().await;
-        if let Some((_, node_id)) = peers.remove(addr) {
+        if peers.get(addr).is_some_and(|(_, _, id)| *id != conn_id) {
+            return;
+        }
+        if let Some((_, node_id, _)) = peers.remove(addr) {
             info!(
                 "[P2P] Unregistered peer from registry: {} [Node ID: {}]",
                 addr, node_id
@@ -458,13 +527,13 @@ impl PeerRegistry {
         )
         .await?;
 
+        // Never wait for a slow or dead peer: a full queue would stall the caller (the main
+        // tick, IPC handling) behind one bad link. A peer that misses a block catches up through
+        // BlockSync when it reconnects.
         let peers = self.peers.read().await;
-        for (addr, (tx, _)) in peers.iter() {
-            if let Err(e) = tx.send(envelope.clone()).await {
-                warn!(
-                    "[P2P] Failed to queue secure broadcast message for peer {}: {}",
-                    addr, e
-                );
+        for (addr, (tx, _, _)) in peers.iter() {
+            if let Err(e) = tx.try_send(envelope.clone()) {
+                warn!("[P2P] Dropping broadcast for peer {}: {}", addr, e);
             }
         }
         Ok(())
@@ -585,6 +654,50 @@ pub async fn connect_to_peer(
     run_connection(stream, peer_addr, node_id, crypto, dag, cmd_tx, registry).await
 }
 
+/// Delay before the next dial: doubles from 1 s up to 30 s, and starts over after a connection
+/// that stayed up for at least 30 s.
+pub fn next_backoff(previous: Duration, connection_lived: Duration) -> Duration {
+    const MIN: Duration = Duration::from_secs(1);
+    const MAX: Duration = Duration::from_secs(30);
+    if connection_lived >= MAX {
+        MIN
+    } else {
+        (previous * 2).clamp(MIN, MAX)
+    }
+}
+
+/// Keeps a connection to a seed peer for the life of the process: dials, and after a failed
+/// dial or a dropped connection dials again with back-off. Without this a peer that was not up
+/// yet at start, or a link that failed once, stayed disconnected for good.
+pub async fn maintain_peer_connection(
+    peer_addr: SocketAddr,
+    node_id: u64,
+    crypto: Arc<NodeCrypto>,
+    dag: Arc<Mutex<DagTracker>>,
+    registry: PeerRegistry,
+    cmd_tx: mpsc::Sender<MeshCommand>,
+) {
+    let mut backoff = Duration::ZERO;
+    loop {
+        let started = std::time::Instant::now();
+        match connect_to_peer(
+            peer_addr,
+            node_id,
+            crypto.clone(),
+            dag.clone(),
+            registry.clone(),
+            cmd_tx.clone(),
+        )
+        .await
+        {
+            Ok(()) => info!("[P2P] Connection to seed peer {} closed", peer_addr),
+            Err(e) => debug!("[P2P] Seed peer {} unreachable: {:#}", peer_addr, e),
+        }
+        backoff = next_backoff(backoff, started.elapsed());
+        tokio::time::sleep(backoff).await;
+    }
+}
+
 /// Both sides announce themselves with a signed handshake. The peer is registered for
 /// broadcasts only once its own handshake authenticated against the trust store.
 async fn run_connection(
@@ -596,6 +709,8 @@ async fn run_connection(
     cmd_tx: mpsc::Sender<MeshCommand>,
     registry: PeerRegistry,
 ) -> Result<()> {
+    // Mesh messages are small and latency-sensitive.
+    let _ = stream.set_nodelay(true);
     let (mut reader, writer) = stream.into_split();
     let (tx, rx) = mpsc::channel::<SecureEnvelope>(100);
 
@@ -608,7 +723,8 @@ async fn run_connection(
     .await?;
     tx.send(handshake).await?;
 
-    spawn_peer_writer(rx, writer, peer_addr, registry.clone());
+    let conn_id = NEXT_CONNECTION_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    spawn_peer_writer(rx, writer, peer_addr, registry.clone(), conn_id);
 
     let result = handle_reader_loop(
         &mut reader,
@@ -619,9 +735,10 @@ async fn run_connection(
         cmd_tx,
         registry.clone(),
         tx,
+        conn_id,
     )
     .await;
-    registry.remove_peer(&peer_addr).await;
+    registry.remove_peer(&peer_addr, conn_id).await;
     result
 }
 
@@ -630,6 +747,7 @@ fn spawn_peer_writer(
     mut writer: tokio::net::tcp::OwnedWriteHalf,
     peer_addr: SocketAddr,
     registry: PeerRegistry,
+    conn_id: u64,
 ) {
     tokio::spawn(async move {
         while let Some(envelope) = rx.recv().await {
@@ -641,19 +759,20 @@ fn spawn_peer_writer(
                 }
             };
 
-            let len_buf = (payload.len() as u32).to_be_bytes();
-            if timeout(Duration::from_secs(5), writer.write_all(&len_buf))
-                .await
-                .is_err()
-                || timeout(Duration::from_secs(5), writer.write_all(&payload))
-                    .await
-                    .is_err()
-            {
+            // One write per frame: a separate write of the 4-byte length made the payload wait
+            // for the peer's (delayed) ACK under Nagle, adding a round trip to every message.
+            let mut frame = Vec::with_capacity(4 + payload.len());
+            frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+            frame.extend_from_slice(&payload);
+            if !matches!(
+                timeout(Duration::from_secs(5), writer.write_all(&frame)).await,
+                Ok(Ok(()))
+            ) {
                 warn!("[P2P] Write failed to peer {}", peer_addr);
                 break;
             }
         }
-        registry.remove_peer(&peer_addr).await;
+        registry.remove_peer(&peer_addr, conn_id).await;
     });
 }
 
@@ -691,6 +810,7 @@ async fn handle_reader_loop(
     cmd_tx: mpsc::Sender<MeshCommand>,
     registry: PeerRegistry,
     writer_tx: mpsc::Sender<SecureEnvelope>,
+    conn_id: u64,
 ) -> Result<()> {
     let mut len_buf = [0u8; 4];
     let mut authenticated_peer: Option<u64> = None;
@@ -766,7 +886,7 @@ async fn handle_reader_loop(
                 }
                 authenticated_peer = Some(node_id);
                 registry
-                    .add_peer(peer_addr, writer_tx.clone(), node_id)
+                    .add_peer(peer_addr, writer_tx.clone(), node_id, conn_id)
                     .await;
                 spawn_ping_loop(
                     writer_tx.clone(),
@@ -1100,6 +1220,199 @@ mod tests {
                 _ => panic!("broadcast for {} was not delivered", want),
             }
         }
+    }
+
+    #[tokio::test]
+    async fn a_stale_connection_cannot_unregister_its_replacement() {
+        let registry = PeerRegistry::new(TrustStore::default());
+        let addr: SocketAddr = "127.0.0.1:7946".parse().unwrap();
+        let (old_tx, _old_rx) = mpsc::channel(1);
+        let (new_tx, _new_rx) = mpsc::channel(1);
+        registry.add_peer(addr, old_tx, 2, 1).await;
+        registry.add_peer(addr, new_tx, 2, 2).await;
+        registry.remove_peer(&addr, 1).await;
+        assert_eq!(
+            registry.peer_count().await,
+            1,
+            "old connection 1 must not remove connection 2"
+        );
+        registry.remove_peer(&addr, 2).await;
+        assert_eq!(registry.peer_count().await, 0);
+    }
+
+    /// A peer whose queue is full must not block a broadcast to everyone else.
+    #[tokio::test]
+    async fn broadcast_does_not_wait_for_a_stuck_peer() {
+        let registry = PeerRegistry::new(TrustStore::default());
+        let crypto = NodeCrypto::generate();
+        let d = Arc::new(dag());
+        let (stuck_tx, _stuck_rx) = mpsc::channel(1);
+        let (ok_tx, mut ok_rx) = mpsc::channel(8);
+        registry
+            .add_peer("127.0.0.1:1".parse().unwrap(), stuck_tx, 2, 1)
+            .await;
+        registry
+            .add_peer("127.0.0.1:2".parse().unwrap(), ok_tx, 3, 2)
+            .await;
+        let cmd = MeshCommand::BlockIp {
+            ip: "203.0.113.1".into(),
+            reason: "t".into(),
+        };
+        for _ in 0..3 {
+            timeout(
+                Duration::from_millis(500),
+                registry.broadcast(&cmd, 1, &crypto, &d),
+            )
+            .await
+            .expect("broadcast blocked on a stuck peer")
+            .unwrap();
+        }
+        let mut delivered = 0;
+        while ok_rx.try_recv().is_ok() {
+            delivered += 1;
+        }
+        assert_eq!(delivered, 3, "the healthy peer still gets every message");
+    }
+
+    #[tokio::test]
+    async fn heartbeat_messages_seal_and_open() {
+        let peer = NodeCrypto::generate();
+        let trust = trust_with(7, &peer);
+        let mut guard = ReplayGuard::default();
+        for msg in [
+            NetworkMessage::Ping,
+            NetworkMessage::Pong,
+            NetworkMessage::Ack,
+        ] {
+            let env = seal(&peer, 7, &msg, &dag())
+                .await
+                .expect("heartbeats must be sealable");
+            assert!(open(&trust, &mut guard, &env, now_ms()).is_ok());
+        }
+    }
+
+    /// A pinned peer that pings gets a pong back over the same connection.
+    #[tokio::test]
+    async fn ping_is_answered_with_pong() {
+        let server = Arc::new(NodeCrypto::generate());
+        let peer = NodeCrypto::generate();
+        let mut trust = TrustStore::default();
+        trust.insert(2, peer.public_key);
+        let (cmd_tx, _cmd_rx) = mpsc::channel(8);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let net = P2PNetwork::new(
+            addr,
+            1,
+            server.clone(),
+            Arc::new(dag()),
+            cmd_tx,
+            8,
+            shutdown_rx,
+            PeerRegistry::new(trust),
+        );
+        tokio::spawn(async move { net.serve(listener).await });
+
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let d = dag();
+        for msg in [
+            NetworkMessage::Handshake { node_id: 2 },
+            NetworkMessage::Ping,
+        ] {
+            let bytes = bincode::serialize(&seal(&peer, 2, &msg, &d).await.unwrap()).unwrap();
+            stream
+                .write_all(&(bytes.len() as u32).to_be_bytes())
+                .await
+                .unwrap();
+            stream.write_all(&bytes).await.unwrap();
+        }
+        let mut server_trust = TrustStore::default();
+        server_trust.insert(1, server.public_key);
+        let mut guard = ReplayGuard::default();
+        for _ in 0..3 {
+            let mut len = [0u8; 4];
+            timeout(Duration::from_secs(2), stream.read_exact(&mut len))
+                .await
+                .unwrap()
+                .unwrap();
+            let mut buf = vec![0u8; u32::from_be_bytes(len) as usize];
+            stream.read_exact(&mut buf).await.unwrap();
+            let env: SecureEnvelope = bincode::deserialize(&buf).unwrap();
+            if let Ok(NetworkMessage::Pong) = open(&server_trust, &mut guard, &env, now_ms()) {
+                return;
+            }
+        }
+        panic!("no pong after the ping");
+    }
+
+    #[test]
+    fn backoff_grows_to_a_cap_and_resets_after_a_stable_connection() {
+        let s = Duration::from_secs;
+        let mut b = Duration::ZERO;
+        let mut seen = Vec::new();
+        for _ in 0..7 {
+            b = next_backoff(b, s(0));
+            seen.push(b.as_secs());
+        }
+        assert_eq!(seen, vec![1, 2, 4, 8, 16, 30, 30]);
+        assert_eq!(
+            next_backoff(s(30), s(45)),
+            s(1),
+            "a connection that lived resets the delay"
+        );
+    }
+
+    /// A dialer started before its peer keeps trying and connects once the peer is up.
+    #[tokio::test]
+    async fn seed_connection_is_retried_until_the_peer_comes_up() {
+        let a = Arc::new(NodeCrypto::generate());
+        let b = Arc::new(NodeCrypto::generate());
+        let mut trust_a = TrustStore::default();
+        trust_a.insert(2, b.public_key);
+        let mut trust_b = TrustStore::default();
+        trust_b.insert(1, a.public_key);
+        let reg_a = PeerRegistry::new(trust_a);
+
+        // Reserve a port, then free it: the peer is "not up yet".
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = probe.local_addr().unwrap();
+        drop(probe);
+
+        let (tx_a, _rx_a) = mpsc::channel(8);
+        tokio::spawn(maintain_peer_connection(
+            addr,
+            1,
+            a.clone(),
+            Arc::new(dag()),
+            reg_a.clone(),
+            tx_a,
+        ));
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert_eq!(reg_a.peer_count().await, 0);
+
+        let listener = TcpListener::bind(addr).await.unwrap();
+        let (tx_b, _rx_b) = mpsc::channel(8);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let net = P2PNetwork::new(
+            addr,
+            2,
+            b,
+            Arc::new(dag()),
+            tx_b,
+            8,
+            shutdown_rx,
+            PeerRegistry::new(trust_b),
+        );
+        tokio::spawn(async move { net.serve(listener).await });
+
+        for _ in 0..60 {
+            if reg_a.peer_count().await == 1 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("the dialer never reconnected after the peer came up");
     }
 
     /// A peer may report only its own telemetry.
