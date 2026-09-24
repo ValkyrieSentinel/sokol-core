@@ -363,8 +363,20 @@ sleep 0.5
 check "root IPC DROP_IMMEDIATE blocks $ALLOWED_IP" bash -c "! ip netns exec $NS ping -c 2 -W 1 -I $ALLOWED_IP $HOST_IP >/dev/null 2>&1"
 
 stop_orchestrator
-start_orchestrator --drop-ipv4-fragments
+TRAP_PROTECTED=10.231.0.8; TRAP_OPEN=10.231.0.10
+ip netns exec "$NS" ip addr add "$TRAP_PROTECTED/24" dev "$PEER_IF"
+ip netns exec "$NS" ip addr add "$TRAP_OPEN/24" dev "$PEER_IF"
+start_orchestrator --drop-ipv4-fragments --trap-port 2324 --never-block "$TRAP_PROTECTED"
 check "orchestrator restarts on the same interface" orchestrator_up
+# The built-in decoy trap audits what actually happened to its block, not a fixed EnforcedDrop.
+for src in "$TRAP_PROTECTED" "$TRAP_OPEN"; do
+    ip netns exec "$NS" nc -z -w 1 -s "$src" "$HOST_IP" 2324 >/dev/null 2>&1 || true
+done
+sleep 1
+check "a trap hit from a protected address is audited as refused, not enforced" bash -c \
+    "grep -aq 'TRAP_HIT|Port:2324|IP:$TRAP_PROTECTED|Action:Refused' '$WORK/events.sntl' && ! grep -aq 'TRAP_HIT|Port:2324|IP:$TRAP_PROTECTED|Action:EnforcedDrop' '$WORK/events.sntl'"
+check "a trap hit from an unprotected address is audited as enforced" \
+    grep -aq "TRAP_HIT|Port:2324|IP:$TRAP_OPEN|Action:EnforcedDrop" "$WORK/events.sntl"
 MONITOR_BIN="$(dirname "$BIN")/monitor"
 check "monitor --verify accepts the audit chain" bash -c "'$MONITOR_BIN' --verify '$WORK/events.sntl' | grep -q '^OK'"
 check "audit log from the first run is re-verified on restart" \
