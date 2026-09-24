@@ -450,6 +450,25 @@ fn ttl_label(ttl: Option<Duration>) -> String {
     }
 }
 
+/// What became of a local block request; each outcome has its own audit record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Enforcement {
+    Enforced,
+    Refused,
+    Failed,
+}
+
+impl Enforcement {
+    /// The `Action:` a trap hit records.
+    fn trap_action(self) -> &'static str {
+        match self {
+            Enforcement::Enforced => "EnforcedDrop",
+            Enforcement::Refused => "Refused",
+            Enforcement::Failed => "Failed",
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn enforce_block_local(
     target: IpNet,
@@ -461,7 +480,7 @@ async fn enforce_block_local(
     node_crypto: &Arc<NodeCrypto>,
     dag_tracker: &Arc<tokio::sync::Mutex<DagTracker>>,
     policy: &BlockPolicy,
-) {
+) -> Enforcement {
     let ip = block_table::canonical(target);
     let shown = show(&ip);
     if let Err(why) = policy.check_net(ip) {
@@ -475,7 +494,7 @@ async fn enforce_block_local(
             "BLOCK_REFUSED|IP:{}|Protected:{}|Reason:{}",
             shown, why, reason
         ));
-        return;
+        return Enforcement::Refused;
     }
     let result = blocks
         .lock()
@@ -510,6 +529,7 @@ async fn enforce_block_local(
             let _ = registry
                 .broadcast(&broadcast_cmd, node_id, node_crypto, dag_tracker)
                 .await;
+            Enforcement::Enforced
         }
         Err(e) => {
             log::error!(
@@ -517,6 +537,11 @@ async fn enforce_block_local(
                 shown,
                 e
             );
+            sntl_db.append(format!(
+                "BLOCK_FAILED|IP:{}|Error:{:?}|Reason:{}",
+                shown, e, reason
+            ));
+            Enforcement::Failed
         }
     }
 }
@@ -1019,7 +1044,7 @@ async fn main() -> Result<(), anyhow::Error> {
                                 );
 
                                 let reason = format!("Decoy TCP trap hit on port {}", port);
-                                enforce_block_local(
+                                let outcome = enforce_block_local(
                                     host(ip),
                                     &reason,
                                     &blocks_trap,
@@ -1032,8 +1057,10 @@ async fn main() -> Result<(), anyhow::Error> {
                                 )
                                 .await;
                                 db_trap.append(format!(
-                                    "TRAP_HIT|Port:{}|IP:{}|Action:EnforcedDrop",
-                                    port, ip
+                                    "TRAP_HIT|Port:{}|IP:{}|Action:{}",
+                                    port,
+                                    ip,
+                                    outcome.trap_action()
                                 ));
 
                                 let telemetry_msg = format!(
@@ -1190,7 +1217,7 @@ async fn main() -> Result<(), anyhow::Error> {
                                                     "[XDP_ACTION] Trap triggered ban for IP: {}",
                                                     show(&ip)
                                                 );
-                                                enforce_block_local(
+                                                let _ = enforce_block_local(
                                                     ip,
                                                     "Unix IPC DROP_IMMEDIATE trigger",
                                                     &blocks_stream,
@@ -1259,7 +1286,7 @@ async fn main() -> Result<(), anyhow::Error> {
                                                     ));
                                                     let reason =
                                                         format!("{}: {}", sig.source, sig.reason);
-                                                    enforce_block_local(
+                                                    let _ = enforce_block_local(
                                                         ip,
                                                         &reason,
                                                         &blocks_stream,
