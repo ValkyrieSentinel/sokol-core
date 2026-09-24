@@ -24,6 +24,11 @@ READY="Sokol-Core running with SokolEngine"
 cleanup() {
     [ -n "$ORCH_PID" ] && kill "$ORCH_PID" 2>/dev/null && wait "$ORCH_PID" 2>/dev/null || true
     [ -n "$OPERATOR_PID" ] && kill "$OPERATOR_PID" 2>/dev/null || true
+    [ -n "${SURICATA_PID:-}" ] && kill "$SURICATA_PID" 2>/dev/null || true
+    [ -n "${ADAPTER_PID:-}" ] && kill "$ADAPTER_PID" 2>/dev/null || true
+    [ -n "${CS_ADAPTER_PID:-}" ] && kill "$CS_ADAPTER_PID" 2>/dev/null || true
+    [ -n "${CS_BOUNCER:-}" ] && cscli bouncers delete "$CS_BOUNCER" >/dev/null 2>&1 || true
+    [ -n "${CROWDSEC_PID:-}" ] && kill "$CROWDSEC_PID" 2>/dev/null || true
     pkill -f "gobgpd -f $WORK" 2>/dev/null || true
     [ -n "${NODE2_PID:-}" ] && kill "$NODE2_PID" 2>/dev/null || true
     ip link del sokol-wg0 2>/dev/null || true
@@ -206,6 +211,78 @@ sleep 0.3
 check "operator unban lifts the block" ping_from "$ALLOWED_IP"
 kill "$OPERATOR_PID" 2>/dev/null || true
 OPERATOR_PID=""
+
+# Suricata -> sokol-suricata -> orchestrator -> XDP, with the time from probe to block.
+if command -v suricata >/dev/null; then
+    PROBE_IP=10.231.0.5
+    ip netns exec "$NS" ip addr add "$PROBE_IP/24" dev "$PEER_IF"
+    printf 'alert tcp any any -> any 23 (msg:"SOKOL TEST telnet probe"; flags:S; classtype:attempted-recon; sid:1000001; rev:1;)\n' >"$WORK/sokol.rules"
+    mkdir -p "$WORK/suricata"
+    suricata -c /etc/suricata/suricata.yaml -S "$WORK/sokol.rules" -i "$HOST_IF" -l "$WORK/suricata" -k none \
+        --set outputs.1.eve-log.enabled=yes >"$WORK/suricata.out" 2>&1 &
+    SURICATA_PID=$!
+    for _ in $(seq 1 120); do
+        grep -qi "engine started" "$WORK/suricata/suricata.log" "$WORK/suricata.out" 2>/dev/null && break
+        sleep 0.5
+    done
+    touch "$WORK/suricata/eve.json"
+    "$(dirname "$BIN")/sokol-suricata" --eve "$WORK/suricata/eve.json" >"$WORK/adapter.log" 2>&1 &
+    ADAPTER_PID=$!
+    sleep 1
+    check "the probe address reaches the node before the alert" \
+        ip netns exec "$NS" ping -c 1 -W 1 -I "$PROBE_IP" "$HOST_IP"
+    ip netns exec "$NS" ping -D -i 0.01 -W 1 -I "$PROBE_IP" "$HOST_IP" >"$WORK/probe-ping.log" 2>&1 &
+    PING_PID=$!
+    sleep 0.3
+    T_PROBE=$(date +%s.%N)
+    ip netns exec "$NS" nc -z -w 1 -s "$PROBE_IP" "$HOST_IP" 23 2>/dev/null || true
+    sleep 3
+    kill "$PING_PID" 2>/dev/null || true
+    LAST_REPLY=$(grep -o '^\[[0-9.]*\]' "$WORK/probe-ping.log" | tail -1 | tr -d '[]')
+    check "Suricata alert is forwarded as a signal" grep -q "SIGNAL:suricata|$PROBE_IP|$HOST_IP|sid:1000001" "$WORK/adapter.log"
+    check "Suricata alert blocks the probing address in XDP" \
+        bash -c "! ip netns exec $NS ping -c 2 -W 1 -I $PROBE_IP $HOST_IP >/dev/null 2>&1"
+    check "the block reason names Suricata and the rule" grep -q "Dynamic block enforced in XDP: $PROBE_IP.*suricata: sid:1000001 SOKOL TEST telnet probe" "$LOG"
+    if [ -n "$LAST_REPLY" ]; then
+        echo "      probe -> last reply before block: $(awk -v a="$T_PROBE" -v b="$LAST_REPLY" 'BEGIN { printf "%.0f ms", (b - a) * 1000 }')"
+    fi
+    kill "$ADAPTER_PID" "$SURICATA_PID" 2>/dev/null || true
+    ADAPTER_PID=""; SURICATA_PID=""
+else
+    echo "SKIP  Suricata checks (suricata not installed)"
+fi
+
+# CrowdSec decision -> sokol-crowdsec -> orchestrator -> XDP.
+if command -v cscli >/dev/null && command -v crowdsec >/dev/null; then
+    if ! cscli lapi status >/dev/null 2>&1; then
+        crowdsec -c /etc/crowdsec/config.yaml >"$WORK/crowdsec.log" 2>&1 </dev/null &
+        CROWDSEC_PID=$!
+        for _ in $(seq 1 60); do cscli lapi status >/dev/null 2>&1 && break; sleep 0.5; done
+    fi
+    CS_BOUNCER="sokol-smoke-$$"
+    CS_KEY=$(cscli bouncers add "$CS_BOUNCER" -o raw)
+    CS_IP=10.231.0.6
+    ip netns exec "$NS" ip addr add "$CS_IP/24" dev "$PEER_IF"
+    check "the CrowdSec test address reaches the node before the decision" \
+        ip netns exec "$NS" ping -c 1 -W 1 -I "$CS_IP" "$HOST_IP"
+    SOKOL_CROWDSEC_KEY="$CS_KEY" "$(dirname "$BIN")/sokol-crowdsec" --poll-secs 1 >"$WORK/crowdsec-adapter.log" 2>&1 </dev/null &
+    CS_ADAPTER_PID=$!
+    cscli decisions add --ip "$CS_IP" --reason "sokol smoke ban" --duration 5m >/dev/null 2>&1
+    for _ in $(seq 1 50); do
+        grep -q "Dynamic block enforced in XDP: $CS_IP" "$LOG" && break
+        sleep 0.2
+    done
+    check "CrowdSec ban decision is forwarded as a signal" grep -q "SIGNAL:crowdsec|$CS_IP|-|sokol smoke ban (origin cscli" "$WORK/crowdsec-adapter.log"
+    check "CrowdSec ban blocks the address in XDP" \
+        bash -c "! ip netns exec $NS ping -c 2 -W 1 -I $CS_IP $HOST_IP >/dev/null 2>&1"
+    check "the block reason names CrowdSec and the scenario" grep -q "Dynamic block enforced in XDP: $CS_IP.*crowdsec: sokol smoke ban" "$LOG"
+    cscli decisions delete --ip "$CS_IP" >/dev/null 2>&1 || true
+    kill "$CS_ADAPTER_PID" 2>/dev/null || true
+    cscli bouncers delete "$CS_BOUNCER" >/dev/null 2>&1 || true
+    CS_ADAPTER_PID=""; CS_BOUNCER=""
+else
+    echo "SKIP  CrowdSec checks (crowdsec not installed)"
+fi
 
 ipc "DROP_IMMEDIATE:$ALLOWED_IP"
 sleep 0.5

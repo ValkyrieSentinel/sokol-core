@@ -102,7 +102,7 @@ Collect the keys into a peers file on every node:
 ```
 
 ```shell
-sudo ./target/release/orchestrator -i eth0 --node-id 1 --peers-file /etc/sokol/peers.json --seed-peer 10.0.0.2:8080
+sudo ./target/release/orchestrator -i eth0 --node-id 1 --peers-file /etc/sokol/peers.json --seed-peer 10.0.0.2:7946
 ```
 
 To rotate a node's key without downtime:
@@ -144,6 +144,40 @@ Envelopes are signed over sender, timestamp, nonce and payload; they are rejecte
 ±30 s clock window (keep nodes NTP-synced) and accepted at most once. Mesh traffic is
 authenticated but not encrypted.
 
+## Signals from detectors (Suricata)
+
+Sokol enforces decisions made by detectors you already run. `sokol-suricata` follows Suricata's
+EVE log and sends each alert at or above `--max-severity` (default 2) to the node as a signal:
+
+```shell
+sokol-suricata --eve /var/log/suricata/eve.json --ipc-socket /run/sokol/sokol.sock
+```
+
+The node blocks the offending address in XDP, shares the block with its mesh peers and records the
+rule in the audit log (`suricata: sid:<id> <signature>`). If the alert fired on this node's own
+outbound traffic, the remote destination is blocked instead; the never-block policy still applies.
+The same address is not re-sent within `--cooldown-secs` (60), signals are capped at
+`--max-signals-per-sec` (50), and noisy rules can be skipped with `--ignore-sid`. The adapter only
+needs to read the EVE log and write to the IPC socket (group `sokol-ipc`).
+
+### CrowdSec
+
+`sokol-crowdsec` is a CrowdSec bouncer: it polls the Local API decision stream and turns `ban`
+decisions on single addresses into signals.
+
+```shell
+cscli bouncers add sokol                         # prints the API key
+SOKOL_CROWDSEC_KEY=<key> sokol-crowdsec --lapi-url http://127.0.0.1:8080 --ipc-socket /run/sokol/sokol.sock
+```
+
+Only local decisions (origins `crowdsec` and `cscli`) are forwarded by default; community lists
+(`CAPI`, `lists`) can hold tens of thousands of addresses and are added with `--origins` only if the
+mesh should carry them. Range decisions are skipped until prefix blocks exist. Decisions deleted in
+CrowdSec end on Sokol's own TTL; lift one early with `UNBAN_IP` on the control socket.
+
+Other detectors can use the same line protocol on the IPC socket:
+`SIGNAL:<source>|<src ip>|<dst ip or ->|<reason>`.
+
 ## Local control socket and protected addresses
 
 `/run/sokol.sock` accepts `DROP_IMMEDIATE:<ip>` from local tools such as `trident_trap`.
@@ -183,8 +217,8 @@ on an interface the orchestrator already uses. It refuses to start without `SOKO
 `trident_trap` listens on decoy ports and asks the orchestrator to block every source that
 connects, so run it on a decoy host or only on ports with no real service.
 
-- `SOKOL_TRAP_PORTS` — comma-separated ports (default `22,80,443,3306,6379,8443`; `8080` is the
-  orchestrator's P2P port and `2222` the operator SSH port, which is refused)
+- `SOKOL_TRAP_PORTS` — comma-separated ports (default `22,80,443,3306,6379,8443`; `2222`, the
+  operator SSH port, is refused)
 - `SOKOL_JAIL_ADDR` — optional external interactive jail for SSH attackers; without it an
   embedded mock jail answers. It must not be the operator SSH port.
 
@@ -251,6 +285,41 @@ instances.
 
 Kernel drop events reach user space at most 64 times per second per CPU (trap-port events only
 for connection attempts); the rest are counted in `sokol_xdp_events_suppressed_total`.
+
+## Demo
+
+`demo/demo.sh` runs the whole story on one Linux machine: three nodes meshed with pinned keys, an
+attacker, a rogue node, Suricata on node 1 and the operator dashboard on http://127.0.0.1:3000.
+
+```shell
+sudo demo/demo.sh target/release            # pauses before each step
+sudo DEMO_AUTO=1 demo/demo.sh target/release
+```
+
+1. The attacker scans node 1; Suricata alerts and all three nodes drop the attacker (the demo prints
+   the time from scan to block on each node).
+2. A rogue node with its own valid key orders a block; the others reject it.
+3. A flood on node 2 is dropped in XDP and node 1 reports a distributed storm.
+4. A signal against the operator's address is refused by the never-block policy.
+5. The blocks expire on their TTL and every node's audit chain verifies.
+
+Each step checks its outcome, and CI runs the demo on every change.
+
+## Measurements
+
+`bench/` reproduces the numbers in the project's evaluation (Linux, root; timings come from the
+nodes' own audit logs, read with `monitor --dump`):
+
+```shell
+sudo bench/local.sh latency target/release/orchestrator 20      # signal -> first dropped packet
+sudo bench/local.sh fill    target/release/orchestrator 65536   # map capacity, rate, memory, expiry
+sudo bench/mesh.sh propagation target/release/orchestrator target/release/monitor 10 20
+sudo bench/mesh.sh propagation target/release/orchestrator target/release/monitor 5 20 delay 100ms 20ms loss 5%
+sudo bench/mesh.sh partition   target/release/orchestrator target/release/monitor 4 45
+```
+
+These run on virtual interfaces in one kernel (generic XDP). They measure the control path and
+the mesh, not line-rate packet processing on a physical NIC.
 
 # Project Structure
 

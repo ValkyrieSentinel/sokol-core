@@ -4,6 +4,9 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use ipnet::IpNet;
 
+/// Reason given for this host's own interface addresses.
+pub const LOCAL_ADDRESS: &str = "address of this node";
+
 pub struct BlockPolicy {
     protected: Vec<(IpNet, &'static str)>,
 }
@@ -49,7 +52,7 @@ impl BlockPolicy {
     /// Adds every address configured on this host's interfaces and its default gateways.
     pub fn protect_host_addresses(&mut self) {
         for ip in local_interface_addresses() {
-            self.protect_ip(ip, "address of this node");
+            self.protect_ip(ip, LOCAL_ADDRESS);
         }
         for ip in default_gateways() {
             self.protect_ip(ip, "default gateway");

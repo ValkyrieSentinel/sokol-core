@@ -30,6 +30,11 @@ pub enum MeshCommand {
         level: AlertLevel,
         message: String,
     },
+    /// The sender's running dynamic blocks, sent to a peer when it (re)connects so a node that
+    /// was cut off catches up on blocks it missed.
+    BlockSync {
+        blocks: Vec<SyncedBlock>,
+    },
     /// Periodic load report of `node_id` (must be the authenticated sender).
     Telemetry {
         node_id: u64,
@@ -39,6 +44,15 @@ pub enum MeshCommand {
         blocks_active: u64,
     },
 }
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct SyncedBlock {
+    pub ip: String,
+    pub remaining_secs: u64,
+}
+
+/// Entries per BlockSync message (keeps each envelope well under the 128 KiB frame limit).
+pub const SYNC_CHUNK: usize = 1000;
 
 impl MeshCommand {
     pub fn telemetry_record(&self) -> Option<NodeTelemetry> {

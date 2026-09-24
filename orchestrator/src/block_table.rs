@@ -87,6 +87,45 @@ impl ExpiryTracker {
         Some(ttl)
     }
 
+    /// Adopts a block learned from a peer's snapshot until `now + remaining` (capped at the local
+    /// maximum, so a peer cannot impose an endless block). Does not count as a strike. Returns
+    /// true if the address was not blocked before.
+    pub fn record_until(&mut self, ip: IpAddr, remaining: Duration, now: Instant) -> bool {
+        let until = now + remaining.min(self.policy.max);
+        let entry = self.entries.entry(ip).or_insert(Entry {
+            state: State::Expired,
+            strikes: 0,
+            last_strike: now,
+        });
+        match entry.state {
+            State::Permanent => false,
+            State::Until(existing) => {
+                if until > existing {
+                    entry.state = State::Until(until);
+                }
+                false
+            }
+            State::Expired => {
+                entry.state = State::Until(until);
+                true
+            }
+        }
+    }
+
+    /// Running dynamic blocks and their remaining time, for a peer that just (re)connected.
+    pub fn dynamic_snapshot(&self, now: Instant) -> Vec<(IpAddr, Duration)> {
+        let mut out: Vec<(IpAddr, Duration)> = self
+            .entries
+            .iter()
+            .filter_map(|(ip, e)| match e.state {
+                State::Until(until) if until > now => Some((*ip, until - now)),
+                _ => None,
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
     pub fn is_permanent(&self, ip: &IpAddr) -> bool {
         self.entries
             .get(ip)
@@ -296,6 +335,28 @@ impl BlockTable {
         self.expiry.active_by_family()
     }
 
+    /// Installs a block from a peer's snapshot; see [`ExpiryTracker::record_until`].
+    pub fn insert_until(
+        &mut self,
+        ip: IpAddr,
+        remaining: Duration,
+        now: Instant,
+    ) -> Result<bool, MapError> {
+        let ip = ip.to_canonical();
+        let new = self.expiry.record_until(ip, remaining, now);
+        if new {
+            match ip {
+                IpAddr::V4(v4) => self.v4.insert(&Key::new(32, v4.octets()), 1u32, 0)?,
+                IpAddr::V6(v6) => self.v6.insert(&Key::new(128, v6.octets()), 1u32, 0)?,
+            }
+        }
+        Ok(new)
+    }
+
+    pub fn dynamic_snapshot(&self, now: Instant) -> Vec<(IpAddr, Duration)> {
+        self.expiry.dynamic_snapshot(now)
+    }
+
     pub fn active_ips(&self) -> std::collections::HashSet<IpAddr> {
         self.expiry.active_ips()
     }
@@ -464,6 +525,40 @@ mod tests {
             2,
             "v4 back below, v6 crossing up"
         );
+    }
+
+    #[test]
+    fn snapshot_and_adoption_of_peer_blocks() {
+        let t0 = Instant::now();
+        let s = Duration::from_secs;
+        let mut a = ExpiryTracker::new(POLICY);
+        a.record(ip("203.0.113.20"), Lifetime::Dynamic, t0);
+        a.record(ip("203.0.113.21"), Lifetime::Permanent, t0);
+        let snap = a.dynamic_snapshot(t0 + s(10));
+        assert_eq!(
+            snap,
+            vec![(ip("203.0.113.20"), s(50))],
+            "only running dynamic blocks, with time left"
+        );
+
+        let mut b = ExpiryTracker::new(POLICY);
+        assert!(b.record_until(ip("203.0.113.20"), s(50), t0));
+        assert!(
+            !b.record_until(ip("203.0.113.20"), s(50), t0),
+            "second sync is not new"
+        );
+        assert_eq!(b.take_expired(t0 + s(50)), vec![ip("203.0.113.20")]);
+
+        // A peer cannot impose a block longer than the local maximum.
+        assert!(b.record_until(ip("203.0.113.22"), s(1_000_000), t0));
+        assert!(b
+            .take_expired(t0 + POLICY.max)
+            .contains(&ip("203.0.113.22")));
+
+        // Nor shorten or override a local permanent block.
+        b.record(ip("203.0.113.23"), Lifetime::Permanent, t0);
+        assert!(!b.record_until(ip("203.0.113.23"), s(1), t0));
+        assert!(b.is_permanent(&ip("203.0.113.23")));
     }
 
     #[test]
