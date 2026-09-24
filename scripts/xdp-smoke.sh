@@ -16,12 +16,14 @@ BLOCKED_IP=10.231.0.3
 WORK="$(mktemp -d)"
 LOG="$WORK/orchestrator.log"
 ORCH_PID=""
+OPERATOR_PID=""
 FAILED=0
 # Logged after XDP/TC attach, IPC socket and P2P setup all succeeded.
 READY="Sokol-Core running with SokolEngine"
 
 cleanup() {
     [ -n "$ORCH_PID" ] && kill "$ORCH_PID" 2>/dev/null && wait "$ORCH_PID" 2>/dev/null || true
+    [ -n "$OPERATOR_PID" ] && kill "$OPERATOR_PID" 2>/dev/null || true
     ip link del "$HOST_IF" 2>/dev/null || true
     ip netns del "$NS" 2>/dev/null || true
     rm -rf "$WORK"
@@ -61,6 +63,7 @@ start_orchestrator() {
         --key-file "$WORK/node.key" \
         --p2p-bind "127.0.0.1:0" \
         --metrics-bind "127.0.0.1:9469" \
+        --control-socket "$WORK/control.sock" \
         "$@" \
         >"$LOG" 2>&1 &
     ORCH_PID=$!
@@ -132,6 +135,32 @@ sleep 0.5
 check "loopback is never blocked" grep -q "Refusing to block 127.0.0.1 (loopback)" "$LOG"
 check "the node's own address is never blocked" grep -q "Refusing to block $HOST_IP (address of this node)" "$LOG"
 
+# Operator dashboard -> node control socket -> XDP, end to end.
+ctl() {
+    printf '%s\n' "$1" | nc -U -q1 "$WORK/control.sock"
+}
+check "control socket refuses to ban a protected address" bash -c "ctl() { printf '%s\\n' \"\$1\" | nc -U -q1 '$WORK/control.sock'; }; ctl 'BAN_IP:127.0.0.1' | grep -q '^ERR 127.0.0.1 is protected'"
+OPERATOR_BIN="$(dirname "$BIN")/sokol-operator"
+OP_TOKEN=smoke-operator-token-0123
+SOKOL_OPERATOR_TOKEN=$OP_TOKEN SOKOL_OPERATOR_BIND=127.0.0.1:3900 "$OPERATOR_BIN" >"$WORK/operator.log" 2>&1 &
+OPERATOR_PID=$!
+op() {
+    curl -s -X POST -H "Authorization: Bearer $OP_TOKEN" -H 'Content-Type: application/json' -d "$2" "http://127.0.0.1:3900$1"
+}
+for _ in $(seq 1 30); do
+    curl -s -H "Authorization: Bearer $OP_TOKEN" http://127.0.0.1:3900/api/data | grep -q '"id":1' && break
+    sleep 0.3
+done
+check "operator sees the node via its heartbeat" bash -c "curl -s -H 'Authorization: Bearer $OP_TOKEN' http://127.0.0.1:3900/api/data | grep -q '\"id\":1'"
+check "operator ban via dashboard API succeeds" bash -c "curl -s -X POST -H 'Authorization: Bearer $OP_TOKEN' -H 'Content-Type: application/json' -d '{\"ip\":\"$ALLOWED_IP\",\"action\":\"add\"}' http://127.0.0.1:3900/api/nodes/1/blacklist | grep -q '\"success\":true'"
+sleep 0.3
+check "operator ban is enforced in XDP" bash -c "! ip netns exec $NS ping -c 1 -W 1 -I $ALLOWED_IP $HOST_IP >/dev/null 2>&1"
+op /api/nodes/1/blacklist "{\"ip\":\"$ALLOWED_IP\",\"action\":\"remove\"}" >/dev/null
+sleep 0.3
+check "operator unban lifts the block" ping_from "$ALLOWED_IP"
+kill "$OPERATOR_PID" 2>/dev/null || true
+OPERATOR_PID=""
+
 ipc "DROP_IMMEDIATE:$ALLOWED_IP"
 sleep 0.5
 check "root IPC DROP_IMMEDIATE blocks $ALLOWED_IP" bash -c "! ip netns exec $NS ping -c 2 -W 1 -I $ALLOWED_IP $HOST_IP >/dev/null 2>&1"
@@ -169,6 +198,7 @@ run_nonroot() {
         "$BIN" --interface "$HOST_IF" \
         --db-path "$NONROOT/events.log" --key-file "$NONROOT/node.key" \
         --p2p-bind "127.0.0.1:0" --ipc-socket "$NONROOT/sokol.sock" \
+        --control-socket "$NONROOT/control.sock" \
         >"$LOG" 2>&1 &
     ORCH_PID=$!
     for _ in $(seq 1 50); do

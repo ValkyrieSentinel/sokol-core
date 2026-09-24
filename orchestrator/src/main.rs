@@ -3,6 +3,7 @@ pub use mesh_sync::{AlertLevel, MeshCommand, MeshOrchestrator};
 mod block_policy;
 mod block_table;
 pub mod cluster_state;
+mod control;
 mod mesh_sync;
 mod metrics;
 mod p2p;
@@ -217,6 +218,15 @@ struct Args {
     /// Serve Prometheus metrics at http://<addr>/metrics (e.g. 127.0.0.1:9469). Off by default.
     #[arg(long, value_name = "ADDR")]
     metrics_bind: Option<std::net::SocketAddr>,
+
+    /// Operator control socket (BAN_IP, UNBAN_IP, FLUSH_BANS) used by sokol-operator.
+    /// Kept apart from --ipc-socket so traps cannot lift bans.
+    #[arg(long, default_value = "/run/sokol-control.sock")]
+    control_socket: String,
+
+    /// Group allowed to use the control socket (0660); without it root-only (0600).
+    #[arg(long)]
+    control_group: Option<String>,
 }
 
 const MAX_IPC_LINE: u64 = 4096;
@@ -240,6 +250,74 @@ fn build_block_policy(args: &Args) -> anyhow::Result<BlockPolicy> {
         policy.protect(net, "operator never-block range");
     }
     Ok(policy)
+}
+
+/// Binds a Unix socket that only root, or members of `gid`, can connect to.
+fn bind_private_socket(path: &str, gid: Option<u32>) -> anyhow::Result<tokio::net::UnixListener> {
+    let _ = std::fs::remove_file(path);
+    let listener = tokio::net::UnixListener::bind(path)
+        .map_err(|e| anyhow::anyhow!("Failed to bind Unix socket at {}: {}", path, e))?;
+    match gid {
+        Some(gid) => {
+            std::os::unix::fs::chown(path, None, Some(gid))?;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o660))?;
+        }
+        None => std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?,
+    }
+    Ok(listener)
+}
+
+async fn execute_control(
+    cmd: control::ControlCommand,
+    blocks: &SharedBlockTable,
+    policy: &BlockPolicy,
+    sntl_db: &SentinelDb,
+) -> String {
+    use control::ControlCommand;
+    match cmd {
+        ControlCommand::Ban(ip) => {
+            if let Err(why) = policy.check(ip) {
+                return format!("ERR {} is protected ({})", ip, why);
+            }
+            let result =
+                blocks
+                    .lock()
+                    .await
+                    .insert(ip, Lifetime::Permanent, std::time::Instant::now());
+            match result {
+                Ok(_) => {
+                    log::warn!("[Control] Operator ban for {}", ip);
+                    sntl_db.append(format!("OPERATOR_BAN_{}|IP:{}", ip_tag(ip), ip));
+                    format!("OK banned {}", ip)
+                }
+                Err(e) => format!("ERR kernel map update failed: {:?}", e),
+            }
+        }
+        ControlCommand::Unban(ip) => {
+            let result = blocks.lock().await.remove(ip);
+            match result {
+                Ok(()) => {
+                    log::warn!("[Control] Operator unban for {}", ip);
+                    sntl_db.append(format!("OPERATOR_UNBAN_{}|IP:{}", ip_tag(ip), ip));
+                    format!("OK unbanned {}", ip)
+                }
+                Err(e) => format!(
+                    "ERR {} was not blocked or could not be removed: {:?}",
+                    ip, e
+                ),
+            }
+        }
+        ControlCommand::FlushDynamic => {
+            let released = blocks.lock().await.flush_dynamic();
+            log::warn!(
+                "[Control] Operator flushed {} dynamic blocks",
+                released.len()
+            );
+            sntl_db.append(format!("OPERATOR_FLUSH|Released:{}", released.len()));
+            format!("OK released {} dynamic blocks", released.len())
+        }
+        ControlCommand::Unsupported(why) => format!("ERR {}", why),
+    }
 }
 
 fn resolve_group(name: &str) -> anyhow::Result<u32> {
@@ -371,6 +449,11 @@ async fn main() -> Result<(), anyhow::Error> {
 
     let block_policy = Arc::new(build_block_policy(&args)?);
     let ipc_gid = args.ipc_group.as_deref().map(resolve_group).transpose()?;
+    let control_gid = args
+        .control_group
+        .as_deref()
+        .map(resolve_group)
+        .transpose()?;
 
     log::info!(
         "Initializing Sokol-Core Production Daemon on interface: {} [Node ID: {}]",
@@ -784,21 +867,55 @@ async fn main() -> Result<(), anyhow::Error> {
         });
     }
 
-    let socket_path = args.ipc_socket.as_str();
-    let _ = std::fs::remove_file(socket_path);
-
-    let unix_listener = tokio::net::UnixListener::bind(socket_path)
-        .map_err(|e| anyhow::anyhow!("Failed to bind Unix socket at {}: {}", socket_path, e))?;
-
     // Anyone who can write to this socket can make the node drop arbitrary sources and push
     // the block to the whole mesh, so it is root-only unless an operator group is named.
-    match ipc_gid {
-        Some(gid) => {
-            std::os::unix::fs::chown(socket_path, None, Some(gid))?;
-            std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o660))?;
+    let socket_path = args.ipc_socket.as_str();
+    let unix_listener = bind_private_socket(socket_path, ipc_gid)?;
+
+    let control_listener = bind_private_socket(&args.control_socket, control_gid)?;
+    let blocks_ctl = blocks.clone();
+    let policy_ctl = block_policy.clone();
+    let db_ctl = sntl_db.clone();
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = match control_listener.accept().await {
+                Ok(conn) => conn,
+                Err(e) => {
+                    log::error!("[Control] Accept error: {}", e);
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+            };
+            let (blocks, policy, db) = (blocks_ctl.clone(), policy_ctl.clone(), db_ctl.clone());
+            tokio::spawn(async move {
+                let (read_half, mut write_half) = stream.into_split();
+                let mut reader = BufReader::new(read_half);
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    match (&mut reader)
+                        .take(control::MAX_LINE)
+                        .read_line(&mut line)
+                        .await
+                    {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {}
+                    }
+                    let reply = match control::parse(&line) {
+                        Ok(cmd) => execute_control(cmd, &blocks, &policy, &db).await,
+                        Err(e) => format!("ERR {}", e),
+                    };
+                    if write_half
+                        .write_all(format!("{}\n", reply).as_bytes())
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            });
         }
-        None => std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600))?,
-    }
+    });
 
     let blocks_unix = blocks.clone();
     let db_unix = sntl_db.clone();
@@ -1003,6 +1120,7 @@ async fn main() -> Result<(), anyhow::Error> {
     let mut shutdown_rx_loop = shutdown_rx.clone();
     let node_id_hb = args.node_id;
     let p2p_bind_hb = args.p2p_bind.clone();
+    let control_socket_hb = args.control_socket.clone();
 
     loop {
         tokio::select! {
@@ -1022,7 +1140,7 @@ async fn main() -> Result<(), anyhow::Error> {
                     sntl_db.append(format!("BLOCK_EXPIRED_{}|IP:{}", ip_tag(ip), ip));
                 }
 
-                let hb_msg = format!("HEARTBEAT:ID={}|NAME=Sokol-Node-{}|EP={}|MODE=NORMAL\n", node_id_hb, node_id_hb, p2p_bind_hb);
+                let hb_msg = format!("HEARTBEAT:ID={}|NAME=Sokol-Node-{}|EP={}|MODE=NORMAL|CTL={}\n", node_id_hb, node_id_hb, p2p_bind_hb, control_socket_hb);
                 push_telemetry(&hb_msg).await;
 
                 if !atp_controller.try_consume(250) {
@@ -1099,6 +1217,7 @@ async fn main() -> Result<(), anyhow::Error> {
     sntl_db.append("NODE_SHUTDOWN".to_string());
     sntl_db.flush(Duration::from_secs(2));
     let _ = std::fs::remove_file(socket_path);
+    let _ = std::fs::remove_file(&args.control_socket);
 
     Ok(())
 }

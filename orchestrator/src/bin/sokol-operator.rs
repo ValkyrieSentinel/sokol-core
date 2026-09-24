@@ -278,7 +278,8 @@ async fn process_trident_telemetry(state: &AppState, raw_msg: &str) {
                     id,
                     name: extract_value(data, "NAME=").unwrap_or(format!("Node-{}", id)),
                     endpoint: extract_value(data, "EP=").unwrap_or("Unknown".into()),
-                    control_socket: format!("/run/sokol_node_{}.sock", id),
+                    control_socket: extract_value(data, "CTL=")
+                        .unwrap_or_else(|| format!("/run/sokol_node_{}.sock", id)),
                     health_status: "HEALTHY".into(),
                     last_seen: Utc::now().format("%H:%M:%S").to_string(),
                     xdp_loaded: true,
@@ -289,6 +290,9 @@ async fn process_trident_telemetry(state: &AppState, raw_msg: &str) {
                 metrics.p2p_active_peers = nodes.len() as u32;
             } else if let Some(node) = nodes.iter_mut().find(|n| n.id == id) {
                 node.last_seen = Utc::now().format("%H:%M:%S").to_string();
+                if let Some(ctl) = extract_value(data, "CTL=") {
+                    node.control_socket = ctl;
+                }
             }
         } else if let Some(data) = line.strip_prefix("DB_LOG:") {
             let node_id = extract_value(data, "NODE=")
@@ -397,11 +401,17 @@ async fn api_flush_blacklist(
     let Some(node) = nodes.iter_mut().find(|n| n.id == id) else {
         return result_json(Err(format!("unknown node {}", id)));
     };
-    let res = send_command_to_node(&node.control_socket, "FLUSH_BANS\n").await;
-    if res.is_ok() {
-        node.blacklist.clear();
+    // Operator bans are permanent on the node; lift each one, then the dynamic blocks.
+    let banned: Vec<String> = node.blacklist.iter().cloned().collect();
+    for ip in banned {
+        if let Err(e) =
+            send_command_to_node(&node.control_socket, &format!("UNBAN_IP:{}\n", ip)).await
+        {
+            return result_json(Err(format!("unban {} failed: {}", ip, e)));
+        }
+        node.blacklist.remove(&ip);
     }
-    result_json(res)
+    result_json(send_command_to_node(&node.control_socket, "FLUSH_BANS\n").await)
 }
 
 async fn api_toggle_xdp(
@@ -468,9 +478,10 @@ async fn api_broadcast_command(
     )
 }
 
-/// Node control sockets are not served by the orchestrator yet; a missing socket is an error,
-/// not a silent success.
+/// Sends one command to the node's control socket (announced as CTL= in its heartbeat) and
+/// returns its reply. The node answers "OK ..." or "ERR ..."; anything else is a failure.
 async fn send_command_to_node(socket_path: &str, cmd: &str) -> Result<(), String> {
+    use tokio::io::AsyncBufReadExt;
     if !StdPath::new(socket_path).exists() {
         log::warn!("[!] Socket missing for command routing: {}", socket_path);
         return Err(format!(
@@ -478,15 +489,28 @@ async fn send_command_to_node(socket_path: &str, cmd: &str) -> Result<(), String
             socket_path
         ));
     }
-    let mut socket = UnixStream::connect(socket_path)
+    let exchange = async {
+        let mut socket = UnixStream::connect(socket_path)
+            .await
+            .map_err(|e| e.to_string())?;
+        socket
+            .write_all(cmd.as_bytes())
+            .await
+            .map_err(|e| e.to_string())?;
+        let mut reply = String::new();
+        tokio::io::BufReader::new(&mut socket)
+            .read_line(&mut reply)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok::<String, String>(reply.trim().to_string())
+    };
+    let reply = tokio::time::timeout(Duration::from_secs(3), exchange)
         .await
-        .map_err(|e| e.to_string())?;
-    socket
-        .write_all(cmd.as_bytes())
-        .await
-        .map_err(|e| e.to_string())?;
-    socket.flush().await.map_err(|e| e.to_string())?;
-    Ok(())
+        .map_err(|_| "node did not answer within 3 s".to_string())??;
+    match reply.strip_prefix("OK") {
+        Some(_) => Ok(()),
+        None => Err(reply.strip_prefix("ERR ").unwrap_or(&reply).to_string()),
+    }
 }
 
 async fn metrics_stream(
@@ -1014,6 +1038,86 @@ mod tests {
         )
         .await;
         assert_eq!(body["success"], false);
+    }
+
+    /// A fake node that answers like the orchestrator's control socket.
+    async fn fake_node(path: std::path::PathBuf, log: Arc<RwLock<Vec<String>>>) {
+        use tokio::io::AsyncBufReadExt;
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let log = log.clone();
+                tokio::spawn(async move {
+                    let (r, mut w) = stream.into_split();
+                    let mut lines = tokio::io::BufReader::new(r).lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        log.write().await.push(line.clone());
+                        let reply = if line.starts_with("BAN_IP:10.") {
+                            "ERR 10.0.0.1 is protected (loopback)\n"
+                        } else {
+                            "OK done\n"
+                        };
+                        let _ = w.write_all(reply.as_bytes()).await;
+                    }
+                });
+            }
+        });
+    }
+
+    #[tokio::test]
+    async fn commands_reach_the_node_socket_and_its_reply_decides_the_outcome() {
+        let dir = std::env::temp_dir().join(format!("sokol-op-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("ctl.sock");
+        let seen = Arc::new(RwLock::new(Vec::new()));
+        fake_node(sock.clone(), seen.clone()).await;
+
+        let st = state();
+        process_trident_telemetry(
+            &st,
+            &format!(
+                "HEARTBEAT:ID=3|NAME=n3|EP=x|MODE=NORMAL|CTL={}\n",
+                sock.display()
+            ),
+        )
+        .await;
+        let app = build_router(st.clone());
+        let ban = |ip: &str| {
+            post_json(
+                "/api/nodes/3/blacklist",
+                serde_json::json!({ "ip": ip, "action": "add" }),
+            )
+        };
+
+        let (_, _, body) = call(app.clone(), ban("203.0.113.7")).await;
+        assert_eq!(body["success"], true, "{}", body);
+        assert!(st.nodes.read().await[0].blacklist.contains("203.0.113.7"));
+
+        let (_, _, body) = call(app.clone(), ban("10.0.0.1")).await;
+        assert_eq!(body["success"], false);
+        assert_eq!(body["error"], "10.0.0.1 is protected (loopback)");
+        assert!(!st.nodes.read().await[0].blacklist.contains("10.0.0.1"));
+
+        let flush = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/nodes/3/flush")
+            .header(header::AUTHORIZATION, format!("Bearer {}", TOKEN))
+            .body(Body::empty())
+            .unwrap();
+        let (_, _, body) = call(app, flush).await;
+        assert_eq!(body["success"], true);
+        assert!(st.nodes.read().await[0].blacklist.is_empty());
+        assert_eq!(
+            *seen.read().await,
+            vec![
+                "BAN_IP:203.0.113.7",
+                "BAN_IP:10.0.0.1",
+                "UNBAN_IP:203.0.113.7",
+                "FLUSH_BANS"
+            ]
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

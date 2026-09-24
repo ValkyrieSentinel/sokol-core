@@ -106,8 +106,11 @@ sudo ./target/release/orchestrator -i eth0 --never-block 203.0.113.0/24 --never-
 `sokol-operator` (default `127.0.0.1:3000`, override with `SOKOL_OPERATOR_BIND`) requires a
 token on every API call. Set `SOKOL_OPERATOR_TOKEN` (16+ characters), or read the one-time
 token it prints at startup; the dashboard asks for it and keeps it in an `HttpOnly`,
-`SameSite=Strict` cookie. Node control actions report failure until the orchestrator serves
-per-node control sockets.
+`SameSite=Strict` cookie. Ban/unban/flush buttons go to the node's control socket
+(`--control-socket`, announced in its heartbeat): operator bans are permanent until lifted,
+"Flush" lifts the operator's bans and all dynamic blocks, `--block` addresses stay, and protected
+addresses are refused. The operator needs access to that socket (`--control-group`, e.g.
+`sokol-ops`). XDP toggle and shield mode are reported as unsupported.
 
 `sokol-client` (`127.0.0.1:3001`) attaches its own XDP program to `SOKOL_IFACE`, so do not run it
 on an interface the orchestrator already uses. It refuses to start without `SOKOL_CLIENT_TOKEN`

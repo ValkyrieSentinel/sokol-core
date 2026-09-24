@@ -2,6 +2,7 @@
 #
 #   useradd --system --no-create-home --shell /usr/sbin/nologin sokol
 #   groupadd --system sokol-ipc            # members may send DROP_IMMEDIATE (e.g. trident_trap)
+#   groupadd --system sokol-ops            # members may ban/unban via the control socket (sokol-operator)
 #   install -m 0755 target/release/orchestrator /usr/local/bin/sokol-orchestrator
 #   install -m 0644 deploy/sokol-orchestrator.service /etc/systemd/system/
 #   edit /etc/default/sokol (see SOKOL_ARGS below), then: systemctl enable --now sokol-orchestrator
@@ -14,7 +15,7 @@ Wants=network-online.target
 Type=simple
 User=sokol
 Group=sokol
-SupplementaryGroups=sokol-ipc
+SupplementaryGroups=sokol-ipc sokol-ops
 EnvironmentFile=-/etc/default/sokol
 # Example /etc/default/sokol:
 #   SOKOL_ARGS=--interface eth0 --node-id 1 --peers-file /etc/sokol/peers.json --never-block 203.0.113.0/24
@@ -23,6 +24,8 @@ ExecStart=/usr/local/bin/sokol-orchestrator \
     --key-file /var/lib/sokol/node.key \
     --ipc-socket /run/sokol/sokol.sock \
     --ipc-group sokol-ipc \
+    --control-socket /run/sokol/control.sock \
+    --control-group sokol-ops \
     $SOKOL_ARGS
 Restart=on-failure
 RestartSec=2s

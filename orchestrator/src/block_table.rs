@@ -106,6 +106,18 @@ impl ExpiryTracker {
         self.entries.remove(ip);
     }
 
+    /// Ends every running dynamic block now (keeping strike history); returns their addresses.
+    pub fn take_all_dynamic(&mut self) -> Vec<IpAddr> {
+        let mut released = Vec::new();
+        for (ip, entry) in self.entries.iter_mut() {
+            if let State::Until(_) = entry.state {
+                entry.state = State::Expired;
+                released.push(*ip);
+            }
+        }
+        released
+    }
+
     /// Addresses whose block ran out at `now`. Their strike history is kept for escalation.
     pub fn take_expired(&mut self, now: Instant) -> Vec<IpAddr> {
         let mut expired = Vec::new();
@@ -173,6 +185,28 @@ impl BlockTable {
         }
         self.remove_from_map(ip)?;
         Ok(true)
+    }
+
+    /// Lifts any block of `ip`, permanent ones included (operator authority).
+    pub fn remove(&mut self, ip: IpAddr) -> Result<(), MapError> {
+        let ip = ip.to_canonical();
+        self.expiry.forget(&ip);
+        self.remove_from_map(ip)
+    }
+
+    /// Lifts all dynamic blocks; operator and `--block` bans stay.
+    pub fn flush_dynamic(&mut self) -> Vec<IpAddr> {
+        let released = self.expiry.take_all_dynamic();
+        for ip in &released {
+            if let Err(e) = self.remove_from_map(*ip) {
+                log::error!(
+                    "[BlockTable] Failed to remove flushed block {}: {:?}",
+                    ip,
+                    e
+                );
+            }
+        }
+        released
     }
 
     fn remove_from_map(&mut self, ip: IpAddr) -> Result<(), MapError> {
@@ -324,6 +358,24 @@ mod tests {
         assert!(tracker.is_permanent(&operator));
         assert!(tracker.release_dynamic(&dynamic));
         assert_eq!(tracker.active(), 1);
+    }
+
+    #[test]
+    fn flush_releases_only_dynamic_blocks() {
+        let t0 = Instant::now();
+        let mut tracker = ExpiryTracker::new(POLICY);
+        let (operator, dynamic) = (ip("203.0.113.9"), ip("203.0.113.10"));
+        tracker.record(operator, Lifetime::Permanent, t0);
+        tracker.record(dynamic, Lifetime::Dynamic, t0);
+        assert_eq!(tracker.take_all_dynamic(), vec![dynamic]);
+        assert!(tracker.take_all_dynamic().is_empty());
+        assert_eq!(tracker.active(), 1);
+        assert!(tracker.is_permanent(&operator));
+        // Strike history survives a flush: the next block escalates.
+        assert_eq!(
+            tracker.record(dynamic, Lifetime::Dynamic, t0),
+            Some(Duration::from_secs(120))
+        );
     }
 
     #[test]
