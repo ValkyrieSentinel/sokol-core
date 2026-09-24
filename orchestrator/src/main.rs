@@ -305,7 +305,12 @@ async fn main() -> Result<(), anyhow::Error> {
         .program_mut("sentinel_vfr_tc")
         .ok_or_else(|| anyhow::anyhow!("Critical: Program sentinel_vfr_tc not found in ELF"))?;
     let tc_program: &mut SchedClassifier = tc_prog_mut.try_into()?;
-    tc::qdisc_add_clsact(&args.interface)?;
+    // The clsact qdisc outlives the process; on restart it already exists, which is fine.
+    if let Err(e) = tc::qdisc_add_clsact(&args.interface) {
+        if e.kind() != std::io::ErrorKind::AlreadyExists {
+            return Err(e.into());
+        }
+    }
     tc_program.load()?;
     let _tc_link = tc_program.attach(&args.interface, TcAttachType::Ingress)?;
     log::info!("TC stateful VFR program successfully locked and attached to ingress of {}", args.interface);
