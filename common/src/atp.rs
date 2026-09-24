@@ -12,9 +12,14 @@ pub enum AtpError {
 impl fmt::Display for AtpError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            AtpError::DissonanceExhausted => write!(f, "DISSONANCE: ATP execution budget exhausted"),
+            AtpError::DissonanceExhausted => {
+                write!(f, "DISSONANCE: ATP execution budget exhausted")
+            }
             AtpError::ResourceFault => {
-                write!(f, "Resource Fault: Local memory ceiling or stack depth breached")
+                write!(
+                    f,
+                    "Resource Fault: Local memory ceiling or stack depth breached"
+                )
             }
         }
     }

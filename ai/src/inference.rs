@@ -1,6 +1,6 @@
+use crate::tensor::{Tensor, TensorError};
 use std::error::Error;
 use std::fmt;
-use crate::tensor::{Tensor, TensorError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InferenceError {
@@ -200,7 +200,7 @@ pub fn softmax<const N: usize>(
     let out_d = output.data_mut();
 
     let max_val = in_d.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-    
+
     let sum: f32 = in_d
         .iter()
         .zip(out_d.iter_mut())

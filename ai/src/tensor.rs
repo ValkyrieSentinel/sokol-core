@@ -53,7 +53,11 @@ impl<T: Default + Clone, const R: usize> Tensor<T, R> {
         let (strides, capacity) = compute_strides_and_capacity(&shape)?;
         let data = vec![T::default(); capacity].into_boxed_slice();
 
-        Ok(Self { data, shape, strides })
+        Ok(Self {
+            data,
+            shape,
+            strides,
+        })
     }
 }
 
@@ -62,7 +66,11 @@ impl<T: Clone, const R: usize> Tensor<T, R> {
         let (strides, capacity) = compute_strides_and_capacity(&shape)?;
         let data = vec![elem; capacity].into_boxed_slice();
 
-        Ok(Self { data, shape, strides })
+        Ok(Self {
+            data,
+            shape,
+            strides,
+        })
     }
 
     pub fn from_vec(shape: [usize; R], data: Vec<T>) -> Result<Self, TensorError> {
@@ -176,15 +184,20 @@ impl<T, const R: usize> Tensor<T, R> {
             Err(_) => None,
         }
     }
-    
-    
+
+    /// # Safety
+    ///
+    /// Every index must be below the corresponding dimension of `shape()`; otherwise the
+    /// computed offset is out of bounds and the behaviour is undefined.
     #[inline(always)]
     pub unsafe fn get_unchecked(&self, indices: [usize; R]) -> &T {
         let idx = self.offset_unchecked(indices);
         self.data.get_unchecked(idx)
     }
-    
-    
+
+    /// # Safety
+    ///
+    /// Same contract as [`get_unchecked`](Self::get_unchecked).
     #[inline(always)]
     pub unsafe fn get_unchecked_mut(&mut self, indices: [usize; R]) -> &mut T {
         let idx = self.offset_unchecked(indices);

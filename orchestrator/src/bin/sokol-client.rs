@@ -1,8 +1,3 @@
-use aya::{
-    maps::{lpm_trie::Key, Array, LpmTrie},
-    programs::{xdp::XdpLinkId, Xdp, XdpFlags},
-    Bpf, Pod,
-};
 use axum::{
     extract::{Json, State},
     response::sse::Event,
@@ -10,15 +5,15 @@ use axum::{
     routing::{get, post},
     Router,
 };
+use aya::{
+    maps::{lpm_trie::Key, LpmTrie, PerCpuArray},
+    programs::{xdp::XdpLinkId, Xdp, XdpFlags},
+    Bpf, Pod,
+};
 use futures_util::stream::{self, Stream};
 use log::info;
 use serde::{Deserialize, Serialize};
-use std::{
-    convert::Infallible,
-    net::Ipv4Addr,
-    sync::Arc,
-    time::Duration,
-};
+use std::{convert::Infallible, net::Ipv4Addr, sync::Arc, time::Duration};
 use tokio::sync::Mutex;
 
 #[repr(transparent)]
@@ -30,6 +25,7 @@ unsafe impl Pod for BpfPacketStats {}
 #[derive(Clone, Serialize, Deserialize)]
 struct ClientData {
     name: String,
+    #[serde(skip_serializing)]
     token: String,
     protection_active: bool,
     packets_inspected: u64,
@@ -58,6 +54,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("[*] Запуск SOKOL-CLIENT Kernel Cabinet на http://127.0.0.1:3001");
 
     let iface = std::env::var("SOKOL_IFACE").unwrap_or_else(|_| "eth0".into());
+    let token = match std::env::var("SOKOL_CLIENT_TOKEN") {
+        Ok(t) if t.len() >= 16 => t,
+        _ => {
+            log::error!(
+                "[!] Set SOKOL_CLIENT_TOKEN (at least 16 characters) to start the client cabinet."
+            );
+            std::process::exit(1);
+        }
+    };
 
     #[cfg(debug_assertions)]
     let mut ebpf = Bpf::load(aya::include_bytes_aligned!(concat!(
@@ -71,17 +76,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "/../target/bpfel-unknown-none/release/ebpf-probe"
     )))?;
 
-    let program: &mut Xdp = ebpf.program_mut("sentinel_vfr_filter").unwrap().try_into()?;
+    let program: &mut Xdp = ebpf
+        .program_mut("sentinel_vfr_filter")
+        .unwrap()
+        .try_into()?;
     program.load()?;
     let link_id = program.attach(&iface, XdpFlags::default())?;
 
     let client_data = ClientData {
         name: format!("Client Node [{}]", iface),
-        token: "sokol-secure-token-01".to_string(),
+        token,
         protection_active: true,
         packets_inspected: 0,
         attacks_blocked: 0,
-        bandwidth_mbps: 128.4,
+        bandwidth_mbps: 0.0,
         threat_level: "LOW".to_string(),
         whitelist: vec![],
         blacklist: vec![],
@@ -104,7 +112,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/client/list/update", post(client_update_list))
         .with_state(state);
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:3001").await.unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:3001")
+        .await
+        .unwrap();
     axum::serve(listener, app).await.unwrap();
 
     Ok(())
@@ -119,12 +129,17 @@ struct ClientAuthReq {
     token: String,
 }
 
+fn token_matches(expected: &str, presented: &str) -> bool {
+    let (a, b) = (expected.as_bytes(), presented.as_bytes());
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
 async fn client_get_data(
     State(state): State<AppState>,
     Json(req): Json<ClientAuthReq>,
 ) -> Json<serde_json::Value> {
     let client = state.client.lock().await;
-    if client.token == req.token {
+    if token_matches(&client.token, &req.token) {
         Json(serde_json::json!({ "success": true, "client": *client, "logs": [] }))
     } else {
         Json(serde_json::json!({ "success": false, "error": "Unauthorized" }))
@@ -136,32 +151,46 @@ async fn client_toggle_protection(
     Json(req): Json<ClientAuthReq>,
 ) -> Json<serde_json::Value> {
     let mut client = state.client.lock().await;
-    if client.token != req.token {
+    if !token_matches(&client.token, &req.token) {
         return Json(serde_json::json!({ "success": false, "error": "Unauthorized" }));
     }
 
     let mut mgr = state.ebpf_mgr.lock().await;
-    client.protection_active = !client.protection_active;
-
     let iface = mgr.iface.clone();
+    let enable = !client.protection_active;
+    let link = mgr.xdp_link.take();
 
-    if client.protection_active {
-        if let Some(prog) = mgr.ebpf.program_mut("sentinel_vfr_filter") {
-            if let Ok(xdp_prog) = TryInto::<&mut Xdp>::try_into(prog) {
-                if let Ok(id) = xdp_prog.attach(&iface, XdpFlags::default()) {
-                    mgr.xdp_link = Some(id);
-                }
-            }
+    let result: Result<Option<XdpLinkId>, String> =
+        match mgr.ebpf.program_mut("sentinel_vfr_filter") {
+            None => Err("XDP program missing from the loaded object".into()),
+            Some(prog) => match TryInto::<&mut Xdp>::try_into(prog) {
+                Err(e) => Err(e.to_string()),
+                Ok(xdp_prog) if enable => xdp_prog
+                    .attach(&iface, XdpFlags::default())
+                    .map(Some)
+                    .map_err(|e| e.to_string()),
+                Ok(xdp_prog) => match link {
+                    Some(link_id) => xdp_prog
+                        .detach(link_id)
+                        .map(|_| None)
+                        .map_err(|e| e.to_string()),
+                    None => Ok(None),
+                },
+            },
+        };
+
+    match result {
+        Ok(new_link) => {
+            mgr.xdp_link = new_link;
+            client.protection_active = enable;
+            Json(
+                serde_json::json!({ "success": true, "protection_active": client.protection_active }),
+            )
         }
-    } else if let Some(link_id) = mgr.xdp_link.take() {
-        if let Some(prog) = mgr.ebpf.program_mut("sentinel_vfr_filter") {
-            if let Ok(xdp_prog) = TryInto::<&mut Xdp>::try_into(prog) {
-                let _ = xdp_prog.detach(link_id);
-            }
-        }
+        Err(e) => Json(
+            serde_json::json!({ "success": false, "error": e, "protection_active": client.protection_active }),
+        ),
     }
-
-    Json(serde_json::json!({ "success": true, "protection_active": client.protection_active }))
 }
 
 #[derive(Deserialize)]
@@ -177,39 +206,48 @@ async fn client_update_list(
     Json(req): Json<ListUpdateReq>,
 ) -> Json<serde_json::Value> {
     let mut client = state.client.lock().await;
-    if client.token != req.token {
+    if !token_matches(&client.token, &req.token) {
         return Json(serde_json::json!({ "success": false, "error": "Unauthorized" }));
     }
 
+    if req.list_type != "blacklist" {
+        // The XDP program has no allow-list map; accepting the request would be a silent no-op.
+        return Json(
+            serde_json::json!({ "success": false, "error": "whitelist is not supported by the XDP program" }),
+        );
+    }
+    let Ok(addr) = req.ip.trim().parse::<Ipv4Addr>() else {
+        return Json(
+            serde_json::json!({ "success": false, "error": "only IPv4 addresses are supported here" }),
+        );
+    };
+    let adding = match req.action.as_str() {
+        "add" => true,
+        "remove" => false,
+        _ => return Json(serde_json::json!({ "success": false, "error": "unknown action" })),
+    };
+
     let mut mgr = state.ebpf_mgr.lock().await;
-    let map_name = if req.list_type == "whitelist" { "WHITELIST_V4" } else { "BLOCKLIST_V4" };
+    let key = Key::new(32, addr.octets());
+    let map_result = match mgr.ebpf.map_mut("BLOCKLIST_V4") {
+        None => Err("BLOCKLIST_V4 map missing".to_string()),
+        Some(map_data) => match LpmTrie::<_, [u8; 4], u32>::try_from(map_data) {
+            Err(e) => Err(e.to_string()),
+            Ok(mut trie) if adding => trie.insert(&key, 1, 0).map_err(|e| e.to_string()),
+            Ok(mut trie) => trie.remove(&key).map_err(|e| e.to_string()),
+        },
+    };
+    if let Err(e) = map_result {
+        return Json(serde_json::json!({ "success": false, "error": e }));
+    }
 
-    if let Ok(addr) = req.ip.parse::<Ipv4Addr>() {
-        let key = Key::new(32, addr.octets());
-
-        if let Some(map_data) = mgr.ebpf.map_mut(map_name) {
-            if let Ok(mut trie) = LpmTrie::<_, [u8; 4], u32>::try_from(map_data) {
-                if req.action == "add" {
-                    let _ = trie.insert(&key, 1, 0);
-                } else {
-                    let _ = trie.remove(&key);
-                }
-            }
+    let ip = addr.to_string();
+    if adding {
+        if !client.blacklist.contains(&ip) {
+            client.blacklist.push(ip);
         }
-
-        if req.action == "add" {
-            if req.list_type == "whitelist" {
-                if !client.whitelist.contains(&req.ip) {
-                    client.whitelist.push(req.ip.clone());
-                }
-            } else if !client.blacklist.contains(&req.ip) {
-                client.blacklist.push(req.ip.clone());
-            }
-        } else if req.list_type == "whitelist" {
-            client.whitelist.retain(|x| x != &req.ip);
-        } else {
-            client.blacklist.retain(|x| x != &req.ip);
-        }
+    } else {
+        client.blacklist.retain(|x| x != &ip);
     }
 
     Json(serde_json::json!({
@@ -222,43 +260,60 @@ async fn client_update_list(
 async fn client_metrics_stream(
     State(state): State<AppState>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    let initial_state = (state, 0u64);
+    let initial_state = (state, None::<(u64, u64)>);
 
-    let stream = stream::unfold(initial_state, |(state, last_total)| async move {
+    let stream = stream::unfold(initial_state, |(state, last)| async move {
         tokio::time::sleep(Duration::from_millis(1000)).await;
 
-        let mut total_pps = 0;
-        let mut current_total = last_total;
+        // STATS is a per-CPU array: the totals are the sum over CPUs.
+        let mut totals = None;
         let mut total_dropped = 0;
-
         {
             let mut mgr = state.ebpf_mgr.lock().await;
             if let Some(map_data) = mgr.ebpf.map_mut("STATS") {
-                if let Ok(stats_map) = Array::<_, BpfPacketStats>::try_from(map_data) {
-                    if let Ok(stats) = stats_map.get(&0u32, 0) {
-                        current_total = stats.0.rx_packets;
-                        total_pps = current_total.saturating_sub(last_total);
-                        total_dropped = stats.0.dropped_packets;
+                if let Ok(stats_map) = PerCpuArray::<_, BpfPacketStats>::try_from(map_data) {
+                    if let Ok(per_cpu) = stats_map.get(&0u32, 0) {
+                        let (mut packets, mut bytes) = (0u64, 0u64);
+                        for cpu in per_cpu.iter() {
+                            packets += cpu.0.rx_packets;
+                            bytes += cpu.0.rx_bytes;
+                            total_dropped += cpu.0.dropped_packets;
+                        }
+                        totals = Some((packets, bytes));
                     }
                 }
             }
         }
 
+        let (packets, bytes) = totals.or(last).unwrap_or((0, 0));
+        let (pps, mbps) = match last {
+            Some((p0, b0)) => (
+                packets.saturating_sub(p0),
+                bytes.saturating_sub(b0) as f64 * 8.0 / 1e6,
+            ),
+            None => (0, 0.0),
+        };
+
         {
             let mut client = state.client.lock().await;
-            client.packets_inspected = current_total;
+            client.packets_inspected = packets;
             client.attacks_blocked = total_dropped;
+            client.bandwidth_mbps = mbps;
         }
 
         let payload = format!(
-            r#"{{"packets_per_sec": {}, "packets_inspected": {}, "attacks_blocked": {}, "time": "{}"}}"#,
-            total_pps,
-            current_total,
+            r#"{{"packets_per_sec": {}, "packets_inspected": {}, "attacks_blocked": {}, "bandwidth_mbps": {:.2}, "time": "{}"}}"#,
+            pps,
+            packets,
             total_dropped,
+            mbps,
             chrono::Utc::now().format("%H:%M:%S")
         );
 
-        Some((Ok(Event::default().data(payload)), (state, current_total)))
+        Some((
+            Ok(Event::default().data(payload)),
+            (state, Some((packets, bytes))),
+        ))
     });
 
     Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::default())
@@ -275,8 +330,8 @@ const CLIENT_HTML: &str = r###"
 <body class="bg-zinc-950 text-zinc-100 font-mono antialiased min-h-screen p-6 flex flex-col items-center">
     <div id="client-login" class="w-full max-w-md bg-zinc-900 border border-zinc-800 rounded-xl p-8 text-center shadow-2xl mt-20">
         <h2 class="text-lg font-bold text-cyan-400 mb-1">ЯДРО КАБІНЕТУ КЛІЄНТА</h2>
-        <p class="text-xs text-zinc-500 mb-6">Введіть токен доступу (за замовчуванням: sokol-secure-token-01)</p>
-        <input type="text" id="client-token-input" class="w-full bg-zinc-950 border border-zinc-700 rounded p-2 text-sm text-zinc-300 mb-4 text-center focus:border-cyan-500 outline-none" value="sokol-secure-token-01">
+        <p class="text-xs text-zinc-500 mb-6">Введіть токен доступу (SOKOL_CLIENT_TOKEN)</p>
+        <input type="password" id="client-token-input" class="w-full bg-zinc-950 border border-zinc-700 rounded p-2 text-sm text-zinc-300 mb-4 text-center focus:border-cyan-500 outline-none" value="">
         <button onclick="clientLogin()" class="w-full bg-cyan-600/20 border border-cyan-500/50 text-cyan-400 font-bold py-2 rounded text-sm hover:bg-cyan-600/30 transition">ПІДКЛЮЧИТИСЬ ДО XDP</button>
     </div>
 
@@ -304,7 +359,7 @@ const CLIENT_HTML: &str = r###"
             </div>
             <div class="bg-zinc-900 border border-zinc-800 p-4 rounded-xl">
                 <div class="text-xs text-zinc-500 mb-1">Швидкість (Mbps)</div>
-                <div id="m-bandwidth" class="text-lg font-bold text-cyan-400">128.4</div>
+                <div id="m-bandwidth" class="text-lg font-bold text-cyan-400">0</div>
             </div>
             <div class="bg-zinc-900 border border-zinc-800 p-4 rounded-xl">
                 <div class="text-xs text-zinc-500 mb-1">Статус ядра</div>
@@ -356,7 +411,8 @@ const CLIENT_HTML: &str = r###"
         async function toggleProtection() {
             const res = await fetch('/api/client/toggle', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({token: currentToken}) });
             const data = await res.json();
-            if(data.success) {
+            if(!data.success) { alert('Помилка: ' + (data.error || 'невідома')); return; }
+            {
                 const btn = document.getElementById('prot-btn');
                 if(data.protection_active) {
                     btn.className = "text-xs px-3 py-1.5 rounded border transition bg-emerald-950/40 text-emerald-400 border-emerald-800";
@@ -379,6 +435,9 @@ const CLIENT_HTML: &str = r###"
                 if(data.attacks_blocked !== undefined) {
                     document.getElementById('m-attacks').innerText = data.attacks_blocked.toLocaleString();
                 }
+                if(data.bandwidth_mbps !== undefined) {
+                    document.getElementById('m-bandwidth').innerText = data.bandwidth_mbps.toFixed(2);
+                }
             }
         }
 
@@ -396,13 +455,22 @@ const CLIENT_HTML: &str = r###"
             if (data.success) {
                 if(!ipVal) document.getElementById(inputId).value = '';
                 renderLists({ whitelist: data.whitelist, blacklist: data.blacklist });
-            }
+            } else { alert('Помилка: ' + (data.error || 'невідома')); }
         }
 
+        function esc(v) {
+            return String(v).replace(/[&<>"'`]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;','`':'&#96;'}[c]));
+        }
+
+        document.addEventListener('click', e => {
+            const btn = e.target.closest('button.list-remove');
+            if (btn) updateList(btn.dataset.list, 'remove', btn.dataset.ip);
+        });
+
         function renderLists(client) {
-            document.getElementById('whitelist-items').innerHTML = client.whitelist.length ? client.whitelist.map(ip => `<li class="flex justify-between items-center bg-zinc-950 p-2 rounded border border-zinc-800"><span>${ip}</span><button onclick="updateList('whitelist', 'remove', '${ip}')" class="text-red-400 hover:text-red-300 text-[10px] bg-red-950/40 border border-red-900/50 px-2 py-0.5 rounded">[видалити]</button></li>`).join('') : '<li class="text-zinc-600 text-xs italic">Список порожній</li>';
+            document.getElementById('whitelist-items').innerHTML = client.whitelist.length ? client.whitelist.map(ip => `<li class="flex justify-between items-center bg-zinc-950 p-2 rounded border border-zinc-800"><span>${esc(ip)}</span><button data-list="whitelist" data-ip="${esc(ip)}" class="list-remove text-red-400 hover:text-red-300 text-[10px] bg-red-950/40 border border-red-900/50 px-2 py-0.5 rounded">[видалити]</button></li>`).join('') : '<li class="text-zinc-600 text-xs italic">Список порожній</li>';
             
-            document.getElementById('blacklist-items').innerHTML = client.blacklist.length ? client.blacklist.map(ip => `<li class="flex justify-between items-center bg-zinc-950 p-2 rounded border border-zinc-800"><span>${ip}</span><button onclick="updateList('blacklist', 'remove', '${ip}')" class="text-red-400 hover:text-red-300 text-[10px] bg-red-950/40 border border-red-900/50 px-2 py-0.5 rounded">[видалити]</button></li>`).join('') : '<li class="text-zinc-600 text-xs italic">Список порожній</li>';
+            document.getElementById('blacklist-items').innerHTML = client.blacklist.length ? client.blacklist.map(ip => `<li class="flex justify-between items-center bg-zinc-950 p-2 rounded border border-zinc-800"><span>${esc(ip)}</span><button data-list="blacklist" data-ip="${esc(ip)}" class="list-remove text-red-400 hover:text-red-300 text-[10px] bg-red-950/40 border border-red-900/50 px-2 py-0.5 rounded">[видалити]</button></li>`).join('') : '<li class="text-zinc-600 text-xs italic">Список порожній</li>';
         }
 
         function logoutClient() {

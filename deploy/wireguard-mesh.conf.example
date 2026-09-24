@@ -1,0 +1,19 @@
+# /etc/wireguard/sokol0.conf on node 1 (10.99.0.1). One [Peer] per other mesh node.
+# Generate keys: wg genkey | tee privatekey | wg pubkey > publickey
+# Start: systemctl enable --now wg-quick@sokol0
+#
+# The mesh's own ML-DSA/Dilithium signatures authenticate every command; WireGuard adds the
+# confidentiality the mesh protocol does not have. Bind the orchestrator's P2P listener to the
+# tunnel address only (--p2p-bind 10.99.0.1:7946) so mesh traffic never leaves the tunnel.
+
+[Interface]
+Address = 10.99.0.1/24
+ListenPort = 51820
+PrivateKey = <node 1 private key>
+
+[Peer]
+# node 2
+PublicKey = <node 2 public key>
+AllowedIPs = 10.99.0.2/32
+Endpoint = 198.51.100.2:51820
+PersistentKeepalive = 25

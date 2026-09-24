@@ -1,20 +1,18 @@
 use std::collections::HashMap;
-use std::fs::File;
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, Write};
 use std::net::Ipv4Addr;
 use std::path::Path;
 use std::process::Command;
 use std::thread;
 use std::time::Duration;
 
-const DB_FILE: &str = "/var/lib/sokol/sntl_events.sntl";
-const MAGIC: u32 = 0x534E544C;
-const PAGE_SIZE: usize = 4096;
-const HEADER_SIZE: usize = 64;
+use common::audit_log::{verify_chain, AuditReader};
+
+const DB_FILE: &str = "/var/lib/sokol/audit.log";
 
 #[derive(Debug, Clone)]
 struct AuditEvent {
-    page_id: u64,
+    seq: u64,
     ip: String,
     tier: String,
     payload_len: String,
@@ -23,61 +21,40 @@ struct AuditEvent {
     raw: String,
 }
 
-fn read_new_events(
-    file: &mut Option<File>,
-    current_pos: &mut u64,
-    events: &mut Vec<AuditEvent>,
-) -> io::Result<()> {
+type Reader = AuditReader<io::BufReader<std::fs::File>>;
+
+fn read_new_events(reader: &mut Option<Reader>, events: &mut Vec<AuditEvent>) -> io::Result<()> {
     let path = Path::new(DB_FILE);
     if !path.exists() {
-        *current_pos = 0;
+        *reader = None;
         events.clear();
-        *file = None;
         return Ok(());
     }
 
-    if file.is_none() {
-        *file = Some(File::open(path)?);
-    }
-
-    let f = file.as_mut().unwrap();
-    let metadata = f.metadata()?;
-    let file_size = metadata.len();
-
-    if file_size < *current_pos {
-        *current_pos = 0;
-        events.clear();
-    }
-
-    if *current_pos >= file_size {
-        return Ok(());
-    }
-
-    f.seek(SeekFrom::Start(*current_pos))?;
-    let mut buffer = [0u8; PAGE_SIZE];
-
-    while *current_pos + (PAGE_SIZE as u64) <= file_size {
-        let n = f.read(&mut buffer)?;
-        if n < PAGE_SIZE {
-            break;
+    // A file smaller than what we already verified was replaced: start over.
+    if let Some(r) = reader.as_ref() {
+        if std::fs::metadata(path)?.len() < r.offset() {
+            *reader = None;
+            events.clear();
         }
+    }
+    if reader.is_none() {
+        *reader = Some(AuditReader::open(path)?);
+    }
+    let r = reader.as_mut().unwrap();
 
-        *current_pos += PAGE_SIZE as u64;
-
-        let magic = u32::from_le_bytes(buffer[0..4].try_into().unwrap_or([0; 4]));
-        if magic != MAGIC {
-            continue;
-        }
-
-        let page_id = u64::from_le_bytes(buffer[16..24].try_into().unwrap_or([0; 8]));
-        let data_len = u32::from_le_bytes(buffer[40..44].try_into().unwrap_or([0; 4]));
-
-        let payload_end = HEADER_SIZE + data_len as usize;
-        if payload_end <= PAGE_SIZE {
-            let payload_bytes = &buffer[HEADER_SIZE..payload_end];
-
-            let log_str = String::from_utf8_lossy(payload_bytes)
-                .replace('\0', "")
+    loop {
+        let record = match r.next_record() {
+            Ok(Some(record)) => record,
+            Ok(None) => break,
+            Err(e) => return Err(io::Error::other(e.to_string())),
+        };
+        let data_len = record.payload.len();
+        {
+            let log_str = String::from_utf8_lossy(&record.payload)
+                .chars()
+                .filter(|c| !c.is_control())
+                .collect::<String>()
                 .trim()
                 .to_string();
 
@@ -108,7 +85,14 @@ fn read_new_events(
 
             if ip == "Unknown" {
                 if let Some(found_ip) = log_str
-                    .split(|c: char| c.is_whitespace() || c == '|' || c == '=' || c == ',' || c == '"' || c == '\'')
+                    .split(|c: char| {
+                        c.is_whitespace()
+                            || c == '|'
+                            || c == '='
+                            || c == ','
+                            || c == '"'
+                            || c == '\''
+                    })
                     .map(|token| token.trim_matches(|c: char| !c.is_ascii_digit() && c != '.'))
                     .find_map(|candidate| candidate.parse::<Ipv4Addr>().ok())
                 {
@@ -121,7 +105,7 @@ fn read_new_events(
             }
 
             events.push(AuditEvent {
-                page_id,
+                seq: record.seq,
                 ip,
                 tier,
                 payload_len,
@@ -138,7 +122,11 @@ fn get_ebpf_active_blocks() -> Vec<String> {
     let output = Command::new("bpftool")
         .args(["map", "dump", "name", "BLOCKLIST_V4"])
         .output()
-        .or_else(|_| Command::new("sudo").args(["bpftool", "map", "dump", "name", "BLOCKLIST_V4"]).output());
+        .or_else(|_| {
+            Command::new("sudo")
+                .args(["bpftool", "map", "dump", "name", "BLOCKLIST_V4"])
+                .output()
+        });
 
     let mut banned_ips = Vec::new();
     if let Ok(out) = output {
@@ -153,7 +141,10 @@ fn get_ebpf_active_blocks() -> Vec<String> {
                         .collect();
 
                     if hex_bytes.len() >= 8 {
-                        let ip = format!("{}.{}.{}.{}", hex_bytes[4], hex_bytes[5], hex_bytes[6], hex_bytes[7]);
+                        let ip = format!(
+                            "{}.{}.{}.{}",
+                            hex_bytes[4], hex_bytes[5], hex_bytes[6], hex_bytes[7]
+                        );
                         banned_ips.push(ip);
                     }
                 }
@@ -163,13 +154,48 @@ fn get_ebpf_active_blocks() -> Vec<String> {
     banned_ips
 }
 
+fn to_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+/// `monitor --verify [path]`: checks every retained segment and the active log as one chain.
+/// Exit code 0 = intact, 1 = broken. Record the printed head somewhere the node cannot write
+/// to make later rewrites of the whole chain detectable.
+fn verify(path: &str) -> ! {
+    match verify_chain(Path::new(path)) {
+        Ok(s) => {
+            println!(
+                "OK {}: {} file(s), records {}..{}, head {}",
+                path,
+                s.segments,
+                s.first_seq,
+                s.next_seq,
+                to_hex(&s.head)
+            );
+            std::process::exit(0);
+        }
+        Err(e) => {
+            println!("BROKEN {}: {}", path, e);
+            std::process::exit(1);
+        }
+    }
+}
+
 fn main() -> io::Result<()> {
-    let mut db_file: Option<File> = None;
-    let mut db_pos: u64 = 0;
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("--verify") {
+        verify(args.get(2).map(String::as_str).unwrap_or(DB_FILE));
+    }
+
+    let mut reader: Option<Reader> = None;
     let mut events: Vec<AuditEvent> = Vec::new();
+    let mut read_error: Option<String> = None;
 
     loop {
-        let _ = read_new_events(&mut db_file, &mut db_pos, &mut events);
+        read_error = read_new_events(&mut reader, &mut events)
+            .err()
+            .map(|e| e.to_string())
+            .or(read_error);
 
         let total_attacks = events.len();
         let mut unique_ips = HashMap::new();
@@ -189,9 +215,18 @@ fn main() -> io::Result<()> {
         println!("       SOKOL-CORE: RUST NATIVE SECURITY & EBPF TELEMETRY         ");
         println!("==================================================================");
 
-        println!("[*] Total Intercepted Attacks (sntl_db) : {}", total_attacks);
-        println!("[*] Unique Attacker IPs Logged         : {}", unique_ips.len());
-        println!("[*] Active eBPF XDP Kernel Drops (IPs) : {}", ebpf_blocks.len());
+        if let Some(err) = &read_error {
+            println!("[!] AUDIT LOG VERIFICATION FAILED: {}", err);
+        }
+        println!("[*] Total Intercepted Attacks (audit) : {}", total_attacks);
+        println!(
+            "[*] Unique Attacker IPs Logged         : {}",
+            unique_ips.len()
+        );
+        println!(
+            "[*] Active eBPF XDP Kernel Drops (IPs) : {}",
+            ebpf_blocks.len()
+        );
 
         println!("\n--- Active eBPF Kernel Blocklist (BLOCKLIST_V4) ---");
         if ebpf_blocks.is_empty() {
@@ -207,20 +242,19 @@ fn main() -> io::Result<()> {
             println!("    {:<25} : {}", tier, count);
         }
 
-        println!("\n--- Live Captured Attack Payloads (sntl_db) ---");
-        println!("{:<6} | {:<15} | {:<18} | {:<6} | {:<20}", "PAGE", "IP ADDRESS", "TIER", "LEN", "PAYLOAD SNIPPET");
+        println!("\n--- Live Captured Attack Payloads (audit log) ---");
+        println!(
+            "{:<6} | {:<15} | {:<18} | {:<6} | {:<20}",
+            "SEQ", "IP ADDRESS", "TIER", "LEN", "PAYLOAD SNIPPET"
+        );
         println!("{}", "-".repeat(78));
 
         let start = events.len().saturating_sub(8);
 
         for ev in &events[start..] {
             println!(
-                "{:<6} | {:<15} | {:<18.18} | {:<6} | {:<20.20}", 
-                ev.page_id, 
-                ev.ip, 
-                ev.tier, 
-                ev.payload_len,
-                ev.payload_snippet
+                "{:<6} | {:<15} | {:<18.18} | {:<6} | {:<20.20}",
+                ev.seq, ev.ip, ev.tier, ev.payload_len, ev.payload_snippet
             );
         }
 

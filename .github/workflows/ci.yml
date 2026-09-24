@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  BPF_LINKER_VERSION: v0.11.1
+
+jobs:
+  build-test-smoke:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust nightly
+        run: |
+          rustup toolchain install nightly --profile minimal --component rust-src,clippy,rustfmt
+          rustup default nightly
+
+      - name: Install bpf-linker
+        run: |
+          curl -sSfL "https://github.com/aya-rs/bpf-linker/releases/download/${BPF_LINKER_VERSION}/bpf-linker-x86_64-unknown-linux-musl.tar.zst" \
+            | tar --zstd -x -C /usr/local/bin
+          bpf-linker --version
+
+      - name: Install GoBGP (BGP Flowspec smoke checks)
+        run: |
+          curl -sSfL "https://github.com/osrg/gobgp/releases/download/v4.9.0/gobgp_4.9.0_linux_amd64.tar.gz" \
+            | sudo tar -xz -C /usr/local/bin gobgp gobgpd
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+
+      - name: Format
+        run: |
+          cargo fmt --all --check
+          (cd ebpf && cargo fmt --check)
+
+      - name: Build eBPF program
+        working-directory: ebpf
+        run: cargo build --release --locked
+
+      - name: Build workspace
+        run: cargo build --release --locked
+
+      - name: Test
+        run: cargo test --release
+
+      - name: Clippy
+        run: cargo clippy --release --all-targets -- -D warnings
+
+      - name: XDP smoke test (veth + netns)
+        run: |
+          sudo apt-get install -y -qq netcat-openbsd wireguard-tools
+          sudo scripts/xdp-smoke.sh target/release/orchestrator

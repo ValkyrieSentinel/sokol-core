@@ -1,0 +1,64 @@
+# Sokol-Core orchestrator as an unprivileged service.
+#
+#   useradd --system --no-create-home --shell /usr/sbin/nologin sokol
+#   groupadd --system sokol-ipc            # members may send DROP_IMMEDIATE (e.g. trident_trap)
+#   groupadd --system sokol-ops            # members may ban/unban via the control socket (sokol-operator)
+#   install -m 0755 target/release/orchestrator /usr/local/bin/sokol-orchestrator
+#   install -m 0644 deploy/sokol-orchestrator.service /etc/systemd/system/
+#   edit /etc/default/sokol (see SOKOL_ARGS below), then: systemctl enable --now sokol-orchestrator
+[Unit]
+Description=Sokol-Core XDP orchestrator
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=sokol
+Group=sokol
+SupplementaryGroups=sokol-ipc sokol-ops
+EnvironmentFile=-/etc/default/sokol
+# Example /etc/default/sokol:
+#   SOKOL_ARGS=--interface eth0 --node-id 1 --peers-file /etc/sokol/peers.json --never-block 203.0.113.0/24
+ExecStart=/usr/local/bin/sokol-orchestrator \
+    --db-path /var/lib/sokol/audit.log \
+    --key-file /var/lib/sokol/node.key \
+    --ipc-socket /run/sokol/sokol.sock \
+    --ipc-group sokol-ipc \
+    --control-socket /run/sokol/control.sock \
+    --control-group sokol-ops \
+    $SOKOL_ARGS
+Restart=on-failure
+RestartSec=2s
+
+# Exactly what XDP attach, map creation/updates and the verifier need (verified in
+# scripts/xdp-smoke.sh: without CAP_PERFMON the load is refused).
+AmbientCapabilities=CAP_NET_ADMIN CAP_BPF CAP_PERFMON
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_BPF CAP_PERFMON
+NoNewPrivileges=yes
+# BPF maps are charged to locked memory on kernels before 5.11.
+LimitMEMLOCK=infinity
+
+StateDirectory=sokol
+StateDirectoryMode=0700
+RuntimeDirectory=sokol
+RuntimeDirectoryMode=0755
+
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+
+[Install]
+WantedBy=multi-user.target
