@@ -201,10 +201,37 @@ Other detectors can use the same line protocol on the IPC socket:
 It is root-only (`0600`) unless `--ipc-group <group>` is given, in which case members of that
 group may write to it (`0660`).
 
-Blocks from traps, the control socket and the mesh expire: the first lasts `--block-ttl`
-seconds (default 900), each repeat within 24 hours doubles it up to `--block-ttl-max` (default
-86400). `--block-ttl 0` makes them permanent. `--block` addresses are always permanent, and a mesh
-`UnblockIp` cannot lift them.
+### Block decisions and who may take them back
+
+Every block is a *claim*: one immutable decision with its issuer (node), kind, target, times and
+reason; its identity is the hash of its bytes. An address is dropped while at least one claim on
+it stands.
+
+| Kind | Made by | Expires | Lifted by | Shared over the mesh |
+|---|---|---|---|---|
+| static | `--block` | never | the configuration only (`UNBAN_IP` refuses) | no |
+| operator | `BAN_IP` on the control socket | never | `UNBAN_IP` / dashboard | no |
+| detector | traps, IPC, `SIGNAL`, adapters, the mesh | yes | its issuer, or the local operator | yes |
+
+A detector claim made here lasts `--block-ttl` seconds (default 900), each repeat within 24 hours
+doubles it up to `--block-ttl-max` (default 86400); `--block-ttl 0` makes them permanent. A peer's
+claim keeps its own expiry but is enforced here for at most `--block-ttl-max`.
+
+- Only the node that issued a claim can retract it over the mesh; a peer cannot lift another
+  node's block, including this node's own detections.
+- `UNBAN_IP` and `FLUSH_BANS` lift the *claims* standing at that moment, by id, on this node. A
+  peer's copy of a lifted claim never reinstates it, however long it lives or however often the
+  mesh reconnects; a new detection is a new claim and blocks again. Lifting this node's own
+  detections also retracts them mesh-wide; other nodes' claims are lifted here only.
+- This node's own claims and lifts are kept in `--state-file` (default `<db-path>.blocks.json`) and
+  restored on start, re-checked against the never-block policy. Peers' claims come back through
+  the mesh.
+- The kernel map follows the claims. A map write or delete that fails (e.g. the map is full) stays
+  pending, is retried every second and is shown as `sokol_blocks_pending`; `sokol_blocks_active`
+  counts only entries the kernel holds.
+- Nodes exchange a digest of their shared claims every 15 s; a node whose digest differs sends its
+  state, so a node that missed messages (a partition, a full send queue) converges without waiting
+  for a reconnect. All nodes of a mesh must run this protocol version.
 
 Blocks can be single addresses or CIDR prefixes (`--block 198.51.100.0/24`, `BAN_IP:198.51.100.0/24`
 on the control socket, `SIGNAL:<source>|<prefix>|-|<reason>`, CrowdSec range decisions, mesh and

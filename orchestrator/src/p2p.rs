@@ -448,6 +448,16 @@ impl PeerRegistry {
     }
 
     /// Sends one command to one connected peer.
+    /// Address of the live connection authenticated as `node_id`, if any.
+    pub async fn addr_of(&self, node_id: u64) -> Option<SocketAddr> {
+        self.peers
+            .read()
+            .await
+            .iter()
+            .find(|(_, (_, id, _))| *id == node_id)
+            .map(|(addr, _)| *addr)
+    }
+
     pub async fn send_to(
         &self,
         addr: SocketAddr,
@@ -900,12 +910,16 @@ async fn handle_reader_loop(
                 debug!("[P2P] Ignoring repeated handshake from {}", peer_addr);
             }
             (Some(peer_id), NetworkMessage::Command(command)) => {
-                // A peer reports only its own load; otherwise it could fake other nodes and
-                // tip the cluster into (or out of) a storm.
-                if let MeshCommand::Telemetry { node_id, .. } = &command {
-                    if *node_id != peer_id {
-                        bail!("node {} sent telemetry claiming node {}", peer_id, node_id);
+                // A peer speaks only for itself: its own load (else it could fake other nodes
+                // and tip the cluster into or out of a storm), its own block decisions and its
+                // own retractions (ADR-1: nobody takes back another node's decision).
+                if let Some(claimed) = command.claimed_sender() {
+                    if claimed != peer_id {
+                        bail!("node {} sent a command claiming node {}", peer_id, claimed);
                     }
+                }
+                if let MeshCommand::LocalDetection { .. } = &command {
+                    bail!("node {} sent a local-only command", peer_id);
                 }
                 if let Err(e) = cmd_tx.send(command).await {
                     bail!("local orchestrator channel closed: {}", e);
@@ -925,11 +939,16 @@ async fn handle_reader_loop(
 mod tests {
     use super::*;
 
+    /// A command that names no sender, for transport tests.
+    fn alert(text: &str) -> MeshCommand {
+        MeshCommand::Alert {
+            level: crate::mesh_sync::AlertLevel::Info,
+            message: text.to_string(),
+        }
+    }
+
     fn block_cmd(ip: &str) -> NetworkMessage {
-        NetworkMessage::Command(MeshCommand::BlockIp {
-            ip: ip.to_string(),
-            reason: "test".to_string(),
-        })
+        NetworkMessage::Command(alert(ip))
     }
 
     fn dag() -> Mutex<DagTracker> {
@@ -952,8 +971,63 @@ mod tests {
         let msg = open(&trust, &mut ReplayGuard::default(), &env, now_ms()).unwrap();
         assert!(matches!(
             msg,
-            NetworkMessage::Command(MeshCommand::BlockIp { .. })
+            NetworkMessage::Command(MeshCommand::Alert { .. })
         ));
+    }
+
+    /// ADR-1 at the transport: a pinned peer may send its own block decisions, not another
+    /// node's; a claim naming someone else closes the connection before it reaches the node.
+    #[tokio::test]
+    async fn a_peer_cannot_send_claims_in_another_nodes_name() {
+        use crate::block_table::{Claim, ClaimKind};
+        let server = Arc::new(NodeCrypto::generate());
+        let friend = Arc::new(NodeCrypto::generate());
+        let mut trust = TrustStore::default();
+        trust.insert(2, friend.public_key);
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(8);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let net = P2PNetwork::new(
+            addr,
+            1,
+            server,
+            Arc::new(dag()),
+            cmd_tx,
+            8,
+            shutdown_rx,
+            PeerRegistry::new(trust),
+        );
+        tokio::spawn(async move { net.serve(listener).await });
+
+        let claim = |issuer: u64| {
+            NetworkMessage::Command(MeshCommand::Claim {
+                claim: Claim {
+                    issuer,
+                    kind: ClaimKind::Detector,
+                    target: "203.0.113.9".into(),
+                    issued_ms: 1,
+                    expires_ms: Some(2),
+                    reason: "t".into(),
+                },
+            })
+        };
+        for (issuer, delivered) in [(3, false), (2, true)] {
+            let mut stream = TcpStream::connect(addr).await.unwrap();
+            let d = dag();
+            for msg in [NetworkMessage::Handshake { node_id: 2 }, claim(issuer)] {
+                let env = seal(&friend, 2, &msg, &d).await.unwrap();
+                let bytes = bincode::serialize(&env).unwrap();
+                let _ = stream.write_all(&(bytes.len() as u32).to_be_bytes()).await;
+                let _ = stream.write_all(&bytes).await;
+            }
+            let got = timeout(Duration::from_millis(500), cmd_rx.recv()).await;
+            match (got, delivered) {
+                (Ok(Some(MeshCommand::Claim { claim })), true) => assert_eq!(claim.issuer, 2),
+                (Err(_), false) => {}
+                (other, _) => panic!("issuer {}: unexpected {:?}", issuer, other.is_ok()),
+            }
+        }
     }
 
     #[tokio::test]
@@ -1162,7 +1236,7 @@ mod tests {
 
         send_as(&friend, 2, addr, "10.0.0.2").await;
         match timeout(Duration::from_secs(2), cmd_rx.recv()).await {
-            Ok(Some(MeshCommand::BlockIp { ip, .. })) => assert_eq!(ip, "10.0.0.2"),
+            Ok(Some(MeshCommand::Alert { message, .. })) => assert_eq!(message, "10.0.0.2"),
             other => panic!(
                 "pinned peer's command was not delivered: {:?}",
                 other.is_ok()
@@ -1203,10 +1277,7 @@ mod tests {
         tokio::spawn(async move { connect_to_peer(addr, 2, n2c, dag2c, reg2c, tx2).await });
         tokio::time::sleep(Duration::from_millis(500)).await;
 
-        let cmd = |ip: &str| MeshCommand::BlockIp {
-            ip: ip.into(),
-            reason: "test".into(),
-        };
+        let cmd = alert;
         reg1.broadcast(&cmd("10.0.0.21"), 1, &n1, &dag1)
             .await
             .unwrap();
@@ -1216,7 +1287,7 @@ mod tests {
 
         for (rx, want) in [(&mut rx2, "10.0.0.21"), (&mut rx1, "10.0.0.12")] {
             match timeout(Duration::from_secs(2), rx.recv()).await {
-                Ok(Some(MeshCommand::BlockIp { ip, .. })) => assert_eq!(ip, want),
+                Ok(Some(MeshCommand::Alert { message, .. })) => assert_eq!(message, want),
                 _ => panic!("broadcast for {} was not delivered", want),
             }
         }
@@ -1254,10 +1325,7 @@ mod tests {
         registry
             .add_peer("127.0.0.1:2".parse().unwrap(), ok_tx, 3, 2)
             .await;
-        let cmd = MeshCommand::BlockIp {
-            ip: "203.0.113.1".into(),
-            reason: "t".into(),
-        };
+        let cmd = alert("203.0.113.1");
         for _ in 0..3 {
             timeout(
                 Duration::from_millis(500),

@@ -13,6 +13,7 @@ pub struct Snapshot {
     pub blocks_active_v4: usize,
     pub blocks_active_v6: usize,
     pub blocks_capacity: usize,
+    pub blocks_pending: usize,
     pub p2p_peers: usize,
     pub audit_queue_overflow: u64,
     pub audit_healthy: bool,
@@ -100,6 +101,13 @@ pub fn render(s: &Snapshot) -> String {
         "Entries each blocklist map can hold.",
     );
     let _ = writeln!(out, "sokol_blocks_capacity {}", s.blocks_capacity);
+    family(
+        &mut out,
+        "sokol_blocks_pending",
+        "gauge",
+        "Targets whose kernel entry does not match the block decisions yet (retried every second).",
+    );
+    let _ = writeln!(out, "sokol_blocks_pending {}", s.blocks_pending);
     family(
         &mut out,
         "sokol_p2p_active_peers",
