@@ -8,15 +8,21 @@
 //! the remote party. Normally that is the source. When the source is this node itself (the
 //! alert fired on our own outbound traffic, e.g. a beacon to a malicious host), the destination
 //! is blocked instead. Every other protection of the block policy still applies.
+//!
+//! The source may also be a CIDR prefix (e.g. a CrowdSec range decision); a prefix is blocked
+//! as given, never swapped for the destination.
 use std::net::IpAddr;
 
+use ipnet::IpNet;
+
 use crate::block_policy::{BlockPolicy, LOCAL_ADDRESS};
+use crate::block_table::{host, parse_target};
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct Signal {
     pub source: String,
-    pub src: IpAddr,
-    pub dst: Option<IpAddr>,
+    pub src: IpNet,
+    pub dst: Option<IpNet>,
     pub reason: String,
 }
 
@@ -34,17 +40,15 @@ pub fn parse(payload: &str) -> Result<Signal, String> {
     {
         return Err(format!("invalid signal source '{}'", source));
     }
-    let src = src
-        .parse::<IpAddr>()
-        .map_err(|_| format!("invalid source address '{}'", src))?
-        .to_canonical();
+    let src =
+        parse_target(src).ok_or_else(|| format!("invalid source address or prefix '{}'", src))?;
     let dst = match dst {
         "-" | "" => None,
-        raw => Some(
-            raw.parse::<IpAddr>()
-                .map_err(|_| format!("invalid destination address '{}'", raw))?
-                .to_canonical(),
-        ),
+        raw => {
+            Some(host(raw.parse::<IpAddr>().map_err(|_| {
+                format!("invalid destination address '{}'", raw)
+            })?))
+        }
     };
     // The reason ends up in logs, the audit trail and the dashboard: keep it printable and short.
     let reason: String = reason
@@ -61,15 +65,21 @@ pub fn parse(payload: &str) -> Result<Signal, String> {
 }
 
 /// Picks the address to block, or explains why none may be.
-pub fn target(signal: &Signal, policy: &BlockPolicy) -> Result<IpAddr, String> {
-    match policy.check(signal.src) {
+pub fn target(signal: &Signal, policy: &BlockPolicy) -> Result<IpNet, String> {
+    if signal.src.prefix_len() != signal.src.max_prefix_len() {
+        return policy
+            .check_net(signal.src)
+            .map(|()| signal.src)
+            .map_err(|why| format!("prefix {} is refused ({})", signal.src, why));
+    }
+    match policy.check(signal.src.addr()) {
         Ok(()) => Ok(signal.src),
         Err(LOCAL_ADDRESS) => {
             let dst = signal
                 .dst
                 .ok_or("source is this node and no destination was given")?;
             policy
-                .check(dst)
+                .check(dst.addr())
                 .map(|()| dst)
                 .map_err(|why| format!("destination {} is protected ({})", dst, why))
         }
@@ -81,14 +91,14 @@ pub fn target(signal: &Signal, policy: &BlockPolicy) -> Result<IpAddr, String> {
 mod tests {
     use super::*;
 
-    fn ip(s: &str) -> IpAddr {
-        s.parse().unwrap()
+    fn ip(s: &str) -> IpNet {
+        parse_target(s).unwrap()
     }
 
     fn policy() -> BlockPolicy {
         let mut p = BlockPolicy::builtin();
-        p.protect_ip(ip("10.0.0.1"), LOCAL_ADDRESS);
-        p.protect_ip(ip("10.0.0.254"), "default gateway");
+        p.protect_ip("10.0.0.1".parse().unwrap(), LOCAL_ADDRESS);
+        p.protect_ip("10.0.0.254".parse().unwrap(), "default gateway");
         p
     }
 
@@ -120,7 +130,8 @@ mod tests {
             "sur icata|203.0.113.5|-|x",
             "suricata|not-an-ip|-|x",
             "suricata|203.0.113.5|nope|x",
-            "suricata|10.0.0.0/8|-|x",
+            "suricata|10.0.0.0/33|-|x",
+            "suricata|203.0.113.5|198.51.100.0/24|x",
         ] {
             assert!(parse(bad).is_err(), "{:?} should be rejected", bad);
         }
@@ -135,6 +146,20 @@ mod tests {
         // Alert on our own outbound traffic: the remote is the destination.
         let outbound = parse("suricata|10.0.0.1|198.51.100.9|beacon").unwrap();
         assert_eq!(target(&outbound, &p), Ok(ip("198.51.100.9")));
+    }
+
+    #[test]
+    fn prefixes_are_blocked_as_given_under_the_prefix_rules() {
+        let p = policy();
+        let range = parse("crowdsec|198.51.100.0/24|-|range decision").unwrap();
+        assert_eq!(target(&range, &p), Ok(ip("198.51.100.0/24")));
+        let covers_node = parse("crowdsec|10.0.0.0/24|198.51.100.9|x").unwrap();
+        assert!(
+            target(&covers_node, &p).unwrap_err().contains("refused"),
+            "never flipped to the destination"
+        );
+        let too_wide = parse("crowdsec|198.0.0.0/8|-|x").unwrap();
+        assert!(target(&too_wide, &p).is_err());
     }
 
     #[test]

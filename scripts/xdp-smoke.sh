@@ -27,6 +27,7 @@ cleanup() {
     [ -n "${SURICATA_PID:-}" ] && kill "$SURICATA_PID" 2>/dev/null || true
     [ -n "${ADAPTER_PID:-}" ] && kill "$ADAPTER_PID" 2>/dev/null || true
     [ -n "${CS_ADAPTER_PID:-}" ] && kill "$CS_ADAPTER_PID" 2>/dev/null || true
+    [ -n "${TRAP_PID:-}" ] && kill "$TRAP_PID" 2>/dev/null || true
     [ -n "${CS_BOUNCER:-}" ] && cscli bouncers delete "$CS_BOUNCER" >/dev/null 2>&1 || true
     [ -n "${CROWDSEC_PID:-}" ] && kill "$CROWDSEC_PID" 2>/dev/null || true
     pkill -f "gobgpd -f $WORK" 2>/dev/null || true
@@ -180,6 +181,35 @@ sleep 0.5
 check "loopback is never blocked" grep -q "Refusing to block 127.0.0.1 (loopback)" "$LOG"
 check "the node's own address is never blocked" grep -q "Refusing to block $HOST_IP (address of this node)" "$LOG"
 
+# FastNetMon hook: an attack report marks the node under attack without blocking the victim.
+FNM="$(dirname "$BIN")/sokol-fastnetmon-notify"
+wait_metric() {   # wait_metric <name> <value>: up to 8 s for the next metrics refresh
+    for _ in $(seq 1 40); do [ "$(metric "$1")" = "$2" ] && return 0; sleep 0.2; done
+    return 1
+}
+echo "attack details from fastnetmon" | "$FNM" "$HOST_IP" incoming 35000 ban 2>/dev/null
+check "FastNetMon ban report is active on the node" wait_metric sokol_external_attacks_active 1
+check "the report marks this node under attack in the cluster view" wait_metric sokol_cluster_nodes_under_attack 1
+check "the reported victim (this node) is not blocked" ping_from "$ALLOWED_IP"
+"$FNM" "$HOST_IP" incoming 0 unban </dev/null 2>/dev/null
+check "FastNetMon unban clears the report" wait_metric sokol_external_attacks_active 0
+
+# CIDR blocks through the control socket, under the prefix rules.
+CIDR_IP=10.231.0.130
+ip netns exec "$NS" ip addr add "$CIDR_IP/24" dev "$PEER_IF"
+check "an address in 10.231.0.128/26 reaches the node before the prefix block" \
+    ip netns exec "$NS" ping -c 1 -W 1 -I "$CIDR_IP" "$HOST_IP"
+check "control socket bans a /26 prefix" bash -c "printf 'BAN_IP:10.231.0.128/26\\n' | nc -U -q1 '$WORK/control.sock' | grep -q '^OK banned 10.231.0.128/26'"
+check "an address inside the banned prefix is dropped in XDP" \
+    bash -c "! ip netns exec $NS ping -c 2 -W 1 -I $CIDR_IP $HOST_IP >/dev/null 2>&1"
+check "an address outside the prefix still passes" ping_from "$ALLOWED_IP"
+check "a prefix covering this node is refused" bash -c "printf 'BAN_IP:10.231.0.0/24\\n' | nc -U -q1 '$WORK/control.sock' | grep -q '^ERR 10.231.0.0/24 is protected (address of this node)'"
+check "a prefix wider than /16 is refused" bash -c "printf 'BAN_IP:198.0.0.0/8\\n' | nc -U -q1 '$WORK/control.sock' | grep -q 'wider than'"
+printf 'UNBAN_IP:10.231.0.128/26\n' | nc -U -q1 "$WORK/control.sock" >/dev/null
+sleep 0.3
+check "lifting the prefix lets its addresses through again" \
+    ip netns exec "$NS" ping -c 1 -W 1 -I "$CIDR_IP" "$HOST_IP"
+
 # Operator dashboard -> node control socket -> XDP, end to end.
 ctl() {
     printf '%s\n' "$1" | nc -U -q1 "$WORK/control.sock"
@@ -283,6 +313,20 @@ if command -v cscli >/dev/null && command -v crowdsec >/dev/null; then
 else
     echo "SKIP  CrowdSec checks (crowdsec not installed)"
 fi
+
+# Decoy trap: a connection that sends nothing is blocked after 5 s, with the trap's reason.
+TRAP_IP=10.231.0.7
+ip netns exec "$NS" ip addr add "$TRAP_IP/24" dev "$PEER_IF"
+SOKOL_TRAP_PORTS=2323 "$(dirname "$BIN")/trident_trap" >"$WORK/trap.log" 2>&1 </dev/null &
+TRAP_PID=$!
+sleep 1
+ip netns exec "$NS" nc -w 7 -s "$TRAP_IP" "$HOST_IP" 2323 </dev/null >/dev/null 2>&1 || true
+sleep 1
+check "trident trap blocks a silent connection in XDP" \
+    bash -c "! ip netns exec $NS ping -c 2 -W 1 -I $TRAP_IP $HOST_IP >/dev/null 2>&1"
+check "the trap's block carries its reason" \
+    grep -q "Dynamic block enforced in XDP: $TRAP_IP.*trident: trap port 2323: connected without sending data" "$LOG"
+kill "$TRAP_PID" 2>/dev/null || true; TRAP_PID=""
 
 ipc "DROP_IMMEDIATE:$ALLOWED_IP"
 sleep 0.5

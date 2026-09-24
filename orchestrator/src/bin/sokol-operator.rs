@@ -49,10 +49,10 @@ struct SecurityAlert {
 #[derive(Clone, Serialize, Deserialize, Default)]
 struct TrapMetrics {
     tier1_bot_tarpit: u64,
-    tier1_5_revenge: u64,
-    tier2_apt_sandbox: u64,
+    tier1_5_slow_drip: u64,
+    tier2_payload_capture: u64,
     tier3_interactive_jail: u64,
-    total_bytes_vacuumed: u64,
+    total_bytes_captured: u64,
     active_banned_ips: usize,
     total_dropped: u64,
 }
@@ -302,10 +302,10 @@ async fn process_trident_telemetry(state: &AppState, raw_msg: &str) {
 
             if data.contains("TIER=Tier1BotTarpit") {
                 metrics.traps.tier1_bot_tarpit += 1;
-            } else if data.contains("TIER=Tier1_5Revenge") {
-                metrics.traps.tier1_5_revenge += 1;
-            } else if data.contains("TIER=Tier2AptSandbox") {
-                metrics.traps.tier2_apt_sandbox += 1;
+            } else if data.contains("TIER=Tier1_5SlowDrip") {
+                metrics.traps.tier1_5_slow_drip += 1;
+            } else if data.contains("TIER=Tier2PayloadCapture") {
+                metrics.traps.tier2_payload_capture += 1;
             } else if data.contains("TIER=Tier3InteractiveJail") {
                 metrics.traps.tier3_interactive_jail += 1;
             }
@@ -603,7 +603,7 @@ const HTML_DASHBOARD: &str = r###"
             <div class="bg-zinc-900 border border-zinc-800 p-4 rounded-xl flex items-center justify-between">
                 <div>
                     <h1 class="font-bold text-amber-500">SOKOL-CORE</h1>
-                    <p class="text-[10px] text-zinc-500">Trident Engine v2.5</p>
+                    <p class="text-[10px] text-zinc-500">XDP enforcement + trust mesh</p>
                 </div>
                 <div class="text-right">
                     <div class="text-[10px]">SYS CPU</div>
@@ -619,17 +619,17 @@ const HTML_DASHBOARD: &str = r###"
             </div>
             <div class="bg-zinc-900 border border-zinc-800 p-4 rounded-xl flex items-center justify-between">
                 <div>
-                    <div class="text-[10px] text-zinc-500">TRAP TIER-1.5 (REVENGE)</div>
+                    <div class="text-[10px] text-zinc-500">TRAP TIER-1.5 (SLOW DRIP)</div>
                     <div id="trap-t15" class="text-xl font-bold text-amber-400">0</div>
                 </div>
                 <div class="text-right text-[10px] text-zinc-500">Floods</div>
             </div>
             <div class="bg-zinc-900 border border-zinc-800 p-4 rounded-xl flex items-center justify-between">
                 <div>
-                    <div class="text-[10px] text-zinc-500">TRAP TIER-2 (APT SANDBOX)</div>
+                    <div class="text-[10px] text-zinc-500">TRAP TIER-2 (PAYLOAD CAPTURE)</div>
                     <div id="trap-t2" class="text-xl font-bold text-purple-400">0</div>
                 </div>
-                <div class="text-right text-[10px] text-zinc-500">Stagers</div>
+                <div class="text-right text-[10px] text-zinc-500">Shellcode-like</div>
             </div>
             <div class="bg-zinc-900 border border-zinc-800 p-4 rounded-xl flex items-center justify-between">
                 <div>
@@ -754,8 +754,8 @@ const HTML_DASHBOARD: &str = r###"
                 document.getElementById('m-dblat').innerText = data.metrics.db_latency_ms.toFixed(1) + ' ms';
                 
                 document.getElementById('trap-t1').innerText = data.metrics.traps.tier1_bot_tarpit;
-                document.getElementById('trap-t15').innerText = data.metrics.traps.tier1_5_revenge;
-                document.getElementById('trap-t2').innerText = data.metrics.traps.tier2_apt_sandbox;
+                document.getElementById('trap-t15').innerText = data.metrics.traps.tier1_5_slow_drip;
+                document.getElementById('trap-t2').innerText = data.metrics.traps.tier2_payload_capture;
                 document.getElementById('trap-t3').innerText = data.metrics.traps.tier3_interactive_jail;
                 document.getElementById('trap-banned').innerText = data.metrics.traps.active_banned_ips;
 

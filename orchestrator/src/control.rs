@@ -1,14 +1,16 @@
 //! Operator control socket (`--control-socket`): one command per line, one reply line each
 //! (`OK ...` or `ERR ...`). It is separate from the IPC socket that traps write to, because a
 //! trap parses attacker traffic and must not be able to lift bans.
-use std::net::IpAddr;
+use ipnet::IpNet;
+
+use crate::block_table::parse_target;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum ControlCommand {
-    /// Operator ban: permanent until the operator lifts it.
-    Ban(IpAddr),
-    /// Lifts any block of this address, including operator and `--block` ones.
-    Unban(IpAddr),
+    /// Operator ban (address or prefix): permanent until the operator lifts it.
+    Ban(IpNet),
+    /// Lifts any block of this address or prefix, including operator and `--block` ones.
+    Unban(IpNet),
     /// Releases all dynamic (trap, IPC, mesh) blocks; operator and `--block` bans stay.
     FlushDynamic,
     /// Re-reads `--peers-file` (key rotation / revocation without a restart).
@@ -25,16 +27,9 @@ pub fn parse(line: &str) -> Result<ControlCommand, String> {
         Some((v, a)) => (v, Some(a.trim())),
         None => (line, None),
     };
-    let ip = |arg: Option<&str>| -> Result<IpAddr, String> {
+    let ip = |arg: Option<&str>| -> Result<IpNet, String> {
         let raw = arg.ok_or_else(|| format!("{} needs an address", verb))?;
-        raw.parse::<IpAddr>()
-            .map(|ip| ip.to_canonical())
-            .map_err(|_| {
-                format!(
-                    "'{}' is not an IP address (prefixes are not supported yet)",
-                    raw
-                )
-            })
+        parse_target(raw).ok_or_else(|| format!("'{}' is not an IP address or CIDR prefix", raw))
     };
     match verb {
         "BAN_IP" => ip(arg).map(ControlCommand::Ban),
@@ -59,17 +54,23 @@ mod tests {
     fn parses_the_dashboard_commands() {
         assert_eq!(
             parse("BAN_IP:203.0.113.5\n"),
-            Ok(ControlCommand::Ban("203.0.113.5".parse().unwrap()))
+            Ok(ControlCommand::Ban(parse_target("203.0.113.5").unwrap()))
         );
         assert_eq!(
             parse("UNBAN_IP: 2001:db8::1"),
-            Ok(ControlCommand::Unban("2001:db8::1".parse().unwrap()))
+            Ok(ControlCommand::Unban(parse_target("2001:db8::1").unwrap()))
         );
         assert_eq!(
             parse("BAN_IP:::ffff:203.0.113.5"),
-            Ok(ControlCommand::Ban("203.0.113.5".parse().unwrap()))
+            Ok(ControlCommand::Ban(parse_target("203.0.113.5").unwrap()))
         );
         assert_eq!(parse("FLUSH_BANS"), Ok(ControlCommand::FlushDynamic));
+        assert_eq!(
+            parse("BAN_IP:198.51.100.7/24"),
+            Ok(ControlCommand::Ban(
+                parse_target("198.51.100.0/24").unwrap()
+            ))
+        );
         assert_eq!(parse("RELOAD_PEERS\n"), Ok(ControlCommand::ReloadPeers));
         assert!(matches!(
             parse("XDP_UNLOAD"),
@@ -86,7 +87,7 @@ mod tests {
         for bad in [
             "",
             "BAN_IP",
-            "BAN_IP:10.0.0.0/8",
+            "BAN_IP:10.0.0.0/33",
             "BAN_IP:example.com",
             "DROP_IMMEDIATE:1.2.3.4",
             "FLUSH_BANS:all",

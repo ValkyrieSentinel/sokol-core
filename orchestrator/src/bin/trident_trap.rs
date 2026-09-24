@@ -79,9 +79,21 @@ pub struct UltimateTridentOrchestrator {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum TridentTier {
     Tier1BotTarpit,
-    Tier1_5Revenge,
-    Tier2AptSandbox,
+    Tier1_5SlowDrip,
+    Tier2PayloadCapture,
     Tier3InteractiveJail,
+}
+
+impl TridentTier {
+    /// Plain description used as the block reason in the node's audit log.
+    pub fn describe(self) -> &'static str {
+        match self {
+            TridentTier::Tier1BotTarpit => "scanner held in an HTTP tarpit",
+            TridentTier::Tier1_5SlowDrip => "binary flood held with a slow drip",
+            TridentTier::Tier2PayloadCapture => "shellcode-like payload captured",
+            TridentTier::Tier3InteractiveJail => "SSH session held in the decoy",
+        }
+    }
 }
 
 pub struct ConnectionFingerprint {
@@ -183,7 +195,8 @@ async fn handle_trident_connection(
     let n = match read_result {
         Ok(Ok(n)) if n > 0 => n,
         _ => {
-            let _ = trigger_xdp_drop(&ip).await;
+            let reason = format!("trap port {}: connected without sending data", port);
+            let _ = trigger_xdp_drop(&ip, &reason).await;
             let _ = stream.shutdown().await;
             return Ok(());
         }
@@ -213,23 +226,21 @@ async fn handle_trident_connection(
                 "[TIER-1] Bot/Scanner detected from IP: {} on port {} | Hash: {:016X}",
                 ip, port, fingerprint.fingerprint_hash
             );
-            run_tier1_bot_tarpit(stream, &ip).await?;
+            run_tier1_bot_tarpit(stream).await?;
         }
-        TridentTier::Tier1_5Revenge => {
+        TridentTier::Tier1_5SlowDrip => {
             println!(
-                "[TIER-1.5 REVENGE] Binary garbage flood from IP: {} on port {} | Counter-strike active!",
+                "[TIER-1.5 SLOW DRIP] Binary flood from IP: {} on port {} | holding the connection with a slow drip",
                 ip, port
             );
-            run_counter_strike_revenge(stream, &ip, fingerprint.fingerprint_hash).await?;
+            run_slow_drip_tarpit(stream, fingerprint.fingerprint_hash).await?;
         }
-        TridentTier::Tier2AptSandbox => {
+        TridentTier::Tier2PayloadCapture => {
             println!(
-                "[TIER-2 APT ALERT] High-value target / Stager detected from IP: {} on port {}! Vacuuming payload...",
+                "[TIER-2 CAPTURE] Shellcode-like payload from IP: {} on port {} | capturing it for analysis",
                 ip, port
             );
-
-            let _ = notify_ebpf_kernel_apt(&ip).await;
-            run_tier2_apt_sandbox(stream, payload, &ip).await?;
+            run_tier2_payload_capture(stream, payload, &ip).await?;
         }
         TridentTier::Tier3InteractiveJail => {
             println!(
@@ -239,6 +250,9 @@ async fn handle_trident_connection(
             run_tier3_interactive_jail(stream, payload, &ip, config.jail_addr).await?;
         }
     }
+
+    let reason = format!("trap port {}: {}", port, tier.describe());
+    let _ = trigger_xdp_drop(&ip, &reason).await;
 
     Ok(())
 }
@@ -257,11 +271,11 @@ fn classify_traffic_tier(payload: &[u8], fp: &ConnectionFingerprint) -> TridentT
         .any(|w| w == b"\x90\x90\x90\x90" || w == b"\x31\xc0\x50\x68" || w == b"\xeb\xfe\x90\x90");
 
     if has_shellcode_patterns || (fp.non_printable_ratio > 0.6 && payload.len() > 128) {
-        return TridentTier::Tier2AptSandbox;
+        return TridentTier::Tier2PayloadCapture;
     }
 
     if fp.non_printable_ratio > 0.4 && payload.len() > 16 {
-        return TridentTier::Tier1_5Revenge;
+        return TridentTier::Tier1_5SlowDrip;
     }
 
     TridentTier::Tier1BotTarpit
@@ -322,10 +336,7 @@ fn calculate_shannon_entropy(data: &[u8]) -> f64 {
     entropy
 }
 
-async fn run_tier1_bot_tarpit(
-    mut stream: TcpStream,
-    ip: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_tier1_bot_tarpit(mut stream: TcpStream) -> Result<(), Box<dyn std::error::Error>> {
     let _ = stream
         .write_all(
             b"HTTP/1.1 200 OK\r\n\
@@ -348,7 +359,6 @@ async fn run_tier1_bot_tarpit(
         sleep(Duration::from_millis(150)).await;
     }
     let _ = stream.write_all(b"0\r\n\r\n").await;
-    let _ = trigger_xdp_drop(ip).await;
     let _ = stream.shutdown().await;
     Ok(())
 }
@@ -356,9 +366,8 @@ async fn run_tier1_bot_tarpit(
 /// Binary floods get a slow drip of noise: the connection is held for up to 30 s at 32 bytes
 /// per second. Answering with a burst (formerly 1 MiB per connection) spent this host's own
 /// uplink on the attacker.
-async fn run_counter_strike_revenge(
+async fn run_slow_drip_tarpit(
     mut stream: TcpStream,
-    ip: &str,
     seed_hash: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut seed: u64 = seed_hash ^ 0xDEADBEEFCAFEBABE;
@@ -378,17 +387,17 @@ async fn run_counter_strike_revenge(
         sleep(Duration::from_millis(500)).await;
     }
 
-    let _ = trigger_xdp_drop(ip).await;
     let _ = stream.shutdown().await;
     Ok(())
 }
 
-async fn run_tier2_apt_sandbox(
+/// Keeps reading what the sender uploads (up to 2 MiB) so the payload can be analysed later.
+async fn run_tier2_payload_capture(
     mut stream: TcpStream,
     initial_payload: &[u8],
     ip: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut stager_storage = initial_payload.to_vec();
+    let mut captured = initial_payload.to_vec();
     let mut buf = vec![0u8; 4096];
 
     loop {
@@ -397,12 +406,12 @@ async fn run_tier2_apt_sandbox(
         match read_res {
             Ok(Ok(0)) | Err(_) => break,
             Ok(Ok(n)) => {
-                stager_storage.extend_from_slice(&buf[..n]);
+                captured.extend_from_slice(&buf[..n]);
 
-                let chunk_log = format!("STAGER_CHUNK|IP={}|BYTES={}", ip, n);
+                let chunk_log = format!("CAPTURE_CHUNK|IP={}|BYTES={}", ip, n);
                 let _ = send_log_to_orchestrator(&chunk_log).await;
 
-                if stager_storage.len() > 2 * 1024 * 1024 {
+                if captured.len() > 2 * 1024 * 1024 {
                     break;
                 }
             }
@@ -411,8 +420,8 @@ async fn run_tier2_apt_sandbox(
     }
 
     println!(
-        "[TIER-2] Successfully vacuumed {} bytes of stager payload from APT operator {}.",
-        stager_storage.len(),
+        "[TIER-2 CAPTURE] Captured {} bytes from {}.",
+        captured.len(),
         ip
     );
 
@@ -421,7 +430,6 @@ async fn run_tier2_apt_sandbox(
         .await;
     let _ = stream.flush().await;
 
-    let _ = trigger_xdp_drop(ip).await;
     let _ = stream.shutdown().await;
     Ok(())
 }
@@ -467,7 +475,6 @@ async fn run_tier3_interactive_jail(
         }
     };
 
-    let _ = trigger_xdp_drop(ip).await;
     let _ = attacker_stream.shutdown().await;
     Ok(())
 }
@@ -536,7 +543,7 @@ async fn run_embedded_mock_jail(
     );
     let _ = send_log_to_orchestrator(&final_log).await;
     println!(
-        "[TIER-3 EMBEDDED TRAP] Vacuumed {} bytes of interactive input from {}.",
+        "[TIER-3 EMBEDDED TRAP] Recorded {} bytes of interactive input from {}.",
         captured_data.len(),
         ip
     );
@@ -564,30 +571,13 @@ async fn send_log_to_orchestrator(
     }
 }
 
-async fn notify_ebpf_kernel_apt(ip: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+/// Asks the node to block `ip`, with the trap's reason recorded in its audit log.
+async fn trigger_xdp_drop(
+    ip: &str,
+    reason: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let socket_path = ipc_socket_path();
-    let msg = format!("APT_HIGH_PRIORITY:{}\n", ip);
-
-    match tokio::net::UnixStream::connect(&socket_path).await {
-        Ok(mut socket) => {
-            socket.write_all(msg.as_bytes()).await?;
-            socket.flush().await?;
-            let _ = socket.shutdown().await;
-            Ok(())
-        }
-        Err(e) => {
-            eprintln!(
-                "\x1b[1;31m[CRITICAL]\x1b[0m APT Notification failed for IP {}: {}",
-                ip, e
-            );
-            Err(e.into())
-        }
-    }
-}
-
-async fn trigger_xdp_drop(ip: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let socket_path = ipc_socket_path();
-    let msg = format!("DROP_IMMEDIATE:{}\n", ip);
+    let msg = format!("SIGNAL:trident|{}|-|{}\n", ip, reason);
     let max_retries = 3;
     let mut retry_delay = Duration::from_millis(50);
 
@@ -628,7 +618,7 @@ async fn trigger_xdp_drop(ip: &str) -> Result<(), Box<dyn std::error::Error + Se
     }
 
     let err_msg = format!(
-        "CRITICAL IPC FAILURE: Failed to deliver DROP_IMMEDIATE for IP {} after {} attempts. Is sokol daemon running?",
+        "CRITICAL IPC FAILURE: Failed to deliver the block signal for IP {} after {} attempts. Is the sokol daemon running?",
         ip, max_retries
     );
     eprintln!("\x1b[1;31m[CRITICAL]\x1b[0m {}", err_msg);
@@ -639,7 +629,7 @@ async fn trigger_xdp_drop(ip: &str) -> Result<(), Box<dyn std::error::Error + Se
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("======================================================");
-    println!("    SOKOL-CORE: MULTI-PORT ULTIMATE TRIDENT ENGINE    ");
+    println!("        SOKOL-CORE: MULTI-PORT DECOY TRAP (trident)    ");
     println!("======================================================");
 
     let config = match TrapConfig::from_env() {

@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 pub use mesh_sync::{AlertLevel, MeshCommand, MeshOrchestrator};
+mod attack_reports;
 mod block_policy;
 mod block_table;
 pub mod cluster_state;
@@ -30,11 +31,14 @@ use common::canonical::CanonicalParser;
 use common::{DropEvent, NodeTelemetry};
 
 use crate::block_policy::BlockPolicy;
-use crate::block_table::{BlockTable, Lifetime, TtlPolicy, Watermark};
+use crate::block_table::{
+    family_tag, host, parse_target, show, BlockTable, Lifetime, TtlPolicy, Watermark,
+};
 use crate::cluster_state::BirdEyeView;
 use crate::p2p::{
     maintain_peer_connection, DagTracker, NodeCrypto, P2PNetwork, PeerRegistry, TrustStore,
 };
+use ipnet::IpNet;
 
 /// Audit trail writer. Records are queued (bounded, so a flood cannot exhaust memory) and
 /// written by one thread, fsynced every 100 ms or 64 records: a crash loses at most that window.
@@ -261,6 +265,19 @@ struct Args {
     #[arg(long, default_value = "1000")]
     attack_drops_per_sec: u64,
 
+    /// How long an attack report (ATTACK:, e.g. from FastNetMon) keeps this node "under attack"
+    /// if the detector never clears it.
+    #[arg(long, default_value = "600")]
+    attack_report_ttl_secs: u64,
+
+    /// Shortest IPv4 prefix a block may have (wider ones are refused).
+    #[arg(long, default_value = "16")]
+    min_block_prefix_v4: u8,
+
+    /// Shortest IPv6 prefix a block may have.
+    #[arg(long, default_value = "48")]
+    min_block_prefix_v6: u8,
+
     /// Share of live nodes under attack above which the cluster is in a distributed storm.
     #[arg(long, default_value = "0.5")]
     storm_threshold: f64,
@@ -290,6 +307,7 @@ const MAX_IPC_LINE: u64 = 4096;
 
 fn build_block_policy(args: &Args) -> anyhow::Result<BlockPolicy> {
     let mut policy = BlockPolicy::builtin();
+    policy.set_min_prefix(args.min_block_prefix_v4, args.min_block_prefix_v6);
     policy.protect_host_addresses();
     for seed in &args.seed_peer {
         if let Ok(addr) = seed.trim().parse::<std::net::SocketAddr>() {
@@ -337,8 +355,9 @@ async fn execute_control(cmd: control::ControlCommand, ctx: &ControlCtx) -> Stri
     let (blocks, policy, sntl_db) = (&ctx.blocks, &ctx.policy, &ctx.sntl_db);
     match cmd {
         ControlCommand::Ban(ip) => {
-            if let Err(why) = policy.check(ip) {
-                return format!("ERR {} is protected ({})", ip, why);
+            let shown = show(&ip);
+            if let Err(why) = policy.check_net(ip) {
+                return format!("ERR {} is protected ({})", shown, why);
             }
             let result =
                 blocks
@@ -347,24 +366,25 @@ async fn execute_control(cmd: control::ControlCommand, ctx: &ControlCtx) -> Stri
                     .insert(ip, Lifetime::Permanent, std::time::Instant::now());
             match result {
                 Ok(_) => {
-                    log::warn!("[Control] Operator ban for {}", ip);
-                    sntl_db.append(format!("OPERATOR_BAN_{}|IP:{}", ip_tag(ip), ip));
-                    format!("OK banned {}", ip)
+                    log::warn!("[Control] Operator ban for {}", shown);
+                    sntl_db.append(format!("OPERATOR_BAN_{}|IP:{}", ip_tag(ip), shown));
+                    format!("OK banned {}", shown)
                 }
                 Err(e) => format!("ERR kernel map update failed: {:?}", e),
             }
         }
         ControlCommand::Unban(ip) => {
+            let shown = show(&ip);
             let result = blocks.lock().await.remove(ip);
             match result {
                 Ok(()) => {
-                    log::warn!("[Control] Operator unban for {}", ip);
-                    sntl_db.append(format!("OPERATOR_UNBAN_{}|IP:{}", ip_tag(ip), ip));
-                    format!("OK unbanned {}", ip)
+                    log::warn!("[Control] Operator unban for {}", shown);
+                    sntl_db.append(format!("OPERATOR_UNBAN_{}|IP:{}", ip_tag(ip), shown));
+                    format!("OK unbanned {}", shown)
                 }
                 Err(e) => format!(
                     "ERR {} was not blocked or could not be removed: {:?}",
-                    ip, e
+                    shown, e
                 ),
             }
         }
@@ -419,12 +439,8 @@ async fn push_telemetry(msg: &str) {
 
 type SharedBlockTable = Arc<tokio::sync::Mutex<BlockTable>>;
 
-fn ip_tag(ip: IpAddr) -> &'static str {
-    if ip.is_ipv4() {
-        "V4"
-    } else {
-        "V6"
-    }
+fn ip_tag(net: IpNet) -> &'static str {
+    family_tag(&net)
 }
 
 fn ttl_label(ttl: Option<Duration>) -> String {
@@ -436,7 +452,7 @@ fn ttl_label(ttl: Option<Duration>) -> String {
 
 #[allow(clippy::too_many_arguments)]
 async fn enforce_block_local(
-    ip: IpAddr,
+    target: IpNet,
     reason: &str,
     blocks: &SharedBlockTable,
     sntl_db: &Arc<SentinelDb>,
@@ -446,17 +462,18 @@ async fn enforce_block_local(
     dag_tracker: &Arc<tokio::sync::Mutex<DagTracker>>,
     policy: &BlockPolicy,
 ) {
-    let ip = ip.to_canonical();
-    if let Err(why) = policy.check(ip) {
+    let ip = block_table::canonical(target);
+    let shown = show(&ip);
+    if let Err(why) = policy.check_net(ip) {
         log::error!(
             "[Local Security] Refusing to block {} ({}) | Requested for: {}",
-            ip,
+            shown,
             why,
             reason
         );
         sntl_db.append(format!(
             "BLOCK_REFUSED|IP:{}|Protected:{}|Reason:{}",
-            ip, why, reason
+            shown, why, reason
         ));
         return;
     }
@@ -468,26 +485,26 @@ async fn enforce_block_local(
         Ok(ttl) => {
             log::warn!(
                 "[Local Security] Dynamic block enforced in XDP: {} for {} | Reason: {}",
-                ip,
+                shown,
                 ttl_label(ttl),
                 reason
             );
             sntl_db.append(format!(
                 "DYNAMIC_BLOCK_{}|IP:{}|TTL:{}|Reason:{}|Enforced",
                 ip_tag(ip),
-                ip,
+                shown,
                 ttl_label(ttl),
                 reason
             ));
 
             let telemetry_msg = format!(
                 "DROP_IMMEDIATE:{}\nDB_LOG:NODE={}|TIER=Tier1BotTarpit|IP={}|VEC={}\n",
-                ip, node_id, ip, reason
+                shown, node_id, shown, reason
             );
             push_telemetry(&telemetry_msg).await;
 
             let broadcast_cmd = MeshCommand::BlockIp {
-                ip: ip.to_string(),
+                ip: shown.clone(),
                 reason: reason.to_string(),
             };
             let _ = registry
@@ -497,7 +514,7 @@ async fn enforce_block_local(
         Err(e) => {
             log::error!(
                 "[Local Security] Failed to insert {} into eBPF: {:?}",
-                ip,
+                shown,
                 e
             );
         }
@@ -526,6 +543,9 @@ async fn main() -> Result<(), anyhow::Error> {
     };
 
     let block_policy = Arc::new(build_block_policy(&args)?);
+    let attack_reports = Arc::new(std::sync::Mutex::new(attack_reports::AttackReports::new(
+        Duration::from_secs(args.attack_report_ttl_secs),
+    )));
     let ipc_gid = args.ipc_group.as_deref().map(resolve_group).transpose()?;
     let control_gid = args
         .control_group
@@ -684,10 +704,9 @@ async fn main() -> Result<(), anyhow::Error> {
 
     for ip_str in &args.block {
         let clean_str = ip_str.trim();
-        if let Ok(ip) = clean_str.parse::<IpAddr>() {
-            let ip = ip.to_canonical();
-            if let Err(why) = block_policy.check(ip) {
-                anyhow::bail!("--block {} refused: address is protected ({})", ip, why);
+        if let Some(ip) = parse_target(clean_str) {
+            if let Err(why) = block_policy.check_net(ip) {
+                anyhow::bail!("--block {} refused ({})", show(&ip), why);
             }
             blocks
                 .lock()
@@ -696,9 +715,12 @@ async fn main() -> Result<(), anyhow::Error> {
             sntl_db.append(format!(
                 "STATIC_BLOCK_{}|IP:{}|Action:XDP_DROP",
                 ip_tag(ip),
-                ip
+                show(&ip)
             ));
-            log::info!("[STATIC BLOCK] Enforced permanent block for CLI IP: {}", ip);
+            log::info!(
+                "[STATIC BLOCK] Enforced permanent block for CLI IP: {}",
+                show(&ip)
+            );
         } else {
             log::error!(
                 "[STATIC BLOCK] Invalid CLI --block IP argument: '{}'",
@@ -793,7 +815,7 @@ async fn main() -> Result<(), anyhow::Error> {
                         blocks: chunk
                             .iter()
                             .map(|(ip, left)| mesh_sync::SyncedBlock {
-                                ip: ip.to_string(),
+                                ip: show(ip),
                                 remaining_secs: left.as_secs().max(1),
                             })
                             .collect(),
@@ -816,18 +838,18 @@ async fn main() -> Result<(), anyhow::Error> {
             match cmd {
                 MeshCommand::BlockIp { ip, reason } => {
                     let clean_ip = ip.trim();
-                    if let Ok(ip_addr) = clean_ip.parse::<IpAddr>() {
-                        let ip_addr = ip_addr.to_canonical();
-                        if let Err(why) = policy_mesh.check(ip_addr) {
+                    if let Some(ip_addr) = parse_target(clean_ip) {
+                        let shown = show(&ip_addr);
+                        if let Err(why) = policy_mesh.check_net(ip_addr) {
                             log::error!(
                                 "[Mesh] Refusing mesh BlockIp for protected {} ({}): {}",
-                                ip_addr,
+                                shown,
                                 why,
                                 reason
                             );
                             sntl_db_mesh.append(format!(
                                 "MESH_BLOCK_REFUSED|IP:{}|Protected:{}|Reason:{}",
-                                ip_addr, why, reason
+                                shown, why, reason
                             ));
                             continue;
                         }
@@ -837,29 +859,27 @@ async fn main() -> Result<(), anyhow::Error> {
                             std::time::Instant::now(),
                         );
                         match result {
-                            Err(e) => log::error!(
-                                "[Mesh] Failed to insert {} into eBPF: {:?}",
-                                ip_addr,
-                                e
-                            ),
+                            Err(e) => {
+                                log::error!("[Mesh] Failed to insert {} into eBPF: {:?}", shown, e)
+                            }
                             Ok(ttl) => {
                                 log::warn!(
                                     "[Mesh] Synchronized block for {} ({}) across mesh: {}",
-                                    ip_addr,
+                                    shown,
                                     ttl_label(ttl),
                                     reason
                                 );
                                 sntl_db_mesh.append(format!(
                                     "MESH_BLOCK_{}|IP:{}|TTL:{}|Reason:{}",
                                     ip_tag(ip_addr),
-                                    ip_addr,
+                                    shown,
                                     ttl_label(ttl),
                                     reason
                                 ));
 
                                 let telemetry_msg = format!(
-                                    "DB_LOG:NODE={}|TIER=Tier1_5Revenge|IP={}|VEC={}\n",
-                                    node_id_mesh, ip_addr, reason
+                                    "DB_LOG:NODE={}|TIER=MeshBlock|IP={}|VEC={}\n",
+                                    node_id_mesh, shown, reason
                                 );
                                 push_telemetry(&telemetry_msg).await;
                             }
@@ -875,11 +895,10 @@ async fn main() -> Result<(), anyhow::Error> {
                     let now = std::time::Instant::now();
                     let mut adopted = 0;
                     for entry in blocks {
-                        let Ok(ip_addr) = entry.ip.trim().parse::<IpAddr>() else {
+                        let Some(ip_addr) = parse_target(&entry.ip) else {
                             continue;
                         };
-                        let ip_addr = ip_addr.to_canonical();
-                        if policy_mesh.check(ip_addr).is_err() {
+                        if policy_mesh.check_net(ip_addr).is_err() {
                             continue;
                         }
                         let remaining = Duration::from_secs(entry.remaining_secs);
@@ -893,14 +912,14 @@ async fn main() -> Result<(), anyhow::Error> {
                                 sntl_db_mesh.append(format!(
                                     "MESH_BLOCK_{}|IP:{}|TTL:{}s|Reason:sync from peer",
                                     ip_tag(ip_addr),
-                                    ip_addr,
+                                    show(&ip_addr),
                                     entry.remaining_secs
                                 ));
                             }
                             Ok(false) => {}
                             Err(e) => log::error!(
                                 "[Mesh] Failed to adopt synced block {}: {:?}",
-                                ip_addr,
+                                show(&ip_addr),
                                 e
                             ),
                         }
@@ -914,8 +933,9 @@ async fn main() -> Result<(), anyhow::Error> {
                 }
                 MeshCommand::UnblockIp { ip } => {
                     let clean_ip = ip.trim();
-                    if let Ok(ip_addr) = clean_ip.parse::<IpAddr>() {
+                    if let Some(ip_addr) = parse_target(clean_ip) {
                         let result = blocks_mesh.lock().await.remove_dynamic(ip_addr);
+                        let ip_addr = show(&ip_addr);
                         match result {
                             Ok(true) => {
                                 log::info!("[Mesh] Unblocked {} per mesh command", ip_addr);
@@ -1000,7 +1020,7 @@ async fn main() -> Result<(), anyhow::Error> {
 
                                 let reason = format!("Decoy TCP trap hit on port {}", port);
                                 enforce_block_local(
-                                    ip,
+                                    host(ip),
                                     &reason,
                                     &blocks_trap,
                                     &db_trap,
@@ -1102,6 +1122,7 @@ async fn main() -> Result<(), anyhow::Error> {
     let dag_unix = dag_tracker.clone();
     let node_id_unix = args.node_id;
     let policy_unix = block_policy.clone();
+    let reports_unix = attack_reports.clone();
 
     let socket_path_log = socket_path.to_string();
     tokio::spawn(async move {
@@ -1119,6 +1140,7 @@ async fn main() -> Result<(), anyhow::Error> {
                     let crypto_stream = crypto_unix.clone();
                     let dag_stream = dag_unix.clone();
                     let policy_stream = policy_unix.clone();
+                    let reports_stream = reports_unix.clone();
                     let peer_uid = stream.peer_cred().map(|c| c.uid()).ok();
 
                     tokio::spawn(async move {
@@ -1160,11 +1182,13 @@ async fn main() -> Result<(), anyhow::Error> {
                                         content.strip_prefix("DROP_IMMEDIATE:")
                                     {
                                         let clean_ip_str = raw_ip_str.trim();
-                                        match clean_ip_str.parse::<IpAddr>() {
+                                        match parse_target(clean_ip_str)
+                                            .ok_or("not an IP address or CIDR prefix")
+                                        {
                                             Ok(ip) => {
                                                 log::warn!(
                                                     "[XDP_ACTION] Trap triggered ban for IP: {}",
-                                                    ip
+                                                    show(&ip)
                                                 );
                                                 enforce_block_local(
                                                     ip,
@@ -1187,44 +1211,39 @@ async fn main() -> Result<(), anyhow::Error> {
                                                 );
                                             }
                                         }
-                                    } else if let Some(raw_ip_str) =
-                                        content.strip_prefix("APT_HIGH_PRIORITY:")
-                                    {
-                                        let clean_ip_str = raw_ip_str.trim();
-                                        match clean_ip_str.parse::<IpAddr>() {
-                                            Ok(ip) => {
+                                    } else if let Some(payload) = content.strip_prefix("ATTACK:") {
+                                        match attack_reports::parse(payload) {
+                                            Ok(report) => {
+                                                reports_stream
+                                                    .lock()
+                                                    .unwrap_or_else(|p| p.into_inner())
+                                                    .apply(&report, std::time::Instant::now());
+                                                let (tag, verb) = if report.active {
+                                                    ("ATTACK_REPORTED", "under attack")
+                                                } else {
+                                                    ("ATTACK_CLEARED", "attack cleared")
+                                                };
                                                 log::warn!(
-                                                    "[APT_ALERT] High-priority stager from IP: {}",
-                                                    ip
+                                                    "[Attack] {} reports {} {} ({} pps, {})",
+                                                    report.source,
+                                                    report.victim,
+                                                    verb,
+                                                    report.pps,
+                                                    report.direction
                                                 );
                                                 db.append(format!(
-                                                    "APT_HIGH_PRIORITY|IP:{}|Enforced",
-                                                    ip
+                                                    "{}|Source:{}|Victim:{}|Direction:{}|PPS:{}",
+                                                    tag,
+                                                    report.source,
+                                                    report.victim,
+                                                    report.direction,
+                                                    report.pps
                                                 ));
-
-                                                let telemetry_msg = format!("DB_LOG:NODE={}|TIER=Tier2AptSandbox|IP={}|VEC=APT High-Priority Stager\n", node_id_unix, ip);
-                                                push_telemetry(&telemetry_msg).await;
-
-                                                enforce_block_local(
-                                                    ip,
-                                                    "Unix IPC APT_HIGH_PRIORITY stager",
-                                                    &blocks_stream,
-                                                    &db,
-                                                    &registry,
-                                                    node_id_unix,
-                                                    &crypto_stream,
-                                                    &dag_stream,
-                                                    &policy_stream,
-                                                )
-                                                .await;
                                             }
-                                            Err(e) => {
-                                                log::error!(
-                                                    "[UNIX IPC FAULT] Failed to parse IP from 'APT_HIGH_PRIORITY:{}': {}",
-                                                    raw_ip_str,
-                                                    e
-                                                );
-                                            }
+                                            Err(e) => log::error!(
+                                                "[UNIX IPC FAULT] Bad ATTACK line: {}",
+                                                e
+                                            ),
                                         }
                                     } else if let Some(payload) = content.strip_prefix("SIGNAL:") {
                                         match signal::parse(payload) {
@@ -1233,9 +1252,9 @@ async fn main() -> Result<(), anyhow::Error> {
                                                     db.append(format!(
                                                         "SIGNAL|Source:{}|Src:{}|Dst:{}|Target:{}|Reason:{}",
                                                         sig.source,
-                                                        sig.src,
-                                                        sig.dst.map(|d| d.to_string()).unwrap_or_else(|| "-".into()),
-                                                        ip,
+                                                        show(&sig.src),
+                                                        sig.dst.map(|d| show(&d)).unwrap_or_else(|| "-".into()),
+                                                        show(&ip),
                                                         sig.reason
                                                     ));
                                                     let reason =
@@ -1261,7 +1280,9 @@ async fn main() -> Result<(), anyhow::Error> {
                                                     );
                                                     db.append(format!(
                                                         "SIGNAL_REFUSED|Source:{}|Src:{}|Why:{}",
-                                                        sig.source, sig.src, why
+                                                        sig.source,
+                                                        show(&sig.src),
+                                                        why
                                                     ));
                                                 }
                                             },
@@ -1366,8 +1387,8 @@ async fn main() -> Result<(), anyhow::Error> {
 
                 let released = blocks.lock().await.expire(std::time::Instant::now());
                 for ip in released {
-                    log::info!("[BlockTable] Block for {} expired; traffic allowed again", ip);
-                    sntl_db.append(format!("BLOCK_EXPIRED_{}|IP:{}", ip_tag(ip), ip));
+                    log::info!("[BlockTable] Block for {} expired; traffic allowed again", show(&ip));
+                    sntl_db.append(format!("BLOCK_EXPIRED_{}|IP:{}", ip_tag(ip), show(&ip)));
                 }
 
                 let hb_msg = format!("HEARTBEAT:ID={}|NAME=Sokol-Node-{}|EP={}|MODE=NORMAL|CTL={}\n", node_id_hb, node_id_hb, p2p_bind_hb, control_socket_hb);
@@ -1408,6 +1429,10 @@ async fn main() -> Result<(), anyhow::Error> {
                 snapshot.p2p_peers = peer_registry.peer_count().await;
                 snapshot.audit_queue_overflow = sntl_db.overflow_total();
 
+                let reported_attacks = attack_reports
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .active(std::time::Instant::now());
                 if telemetry_window_start.elapsed() >= TELEMETRY_INTERVAL {
                     let secs = telemetry_window_start.elapsed().as_secs_f64().max(1.0);
                     let rx_pps = (total_rx_packets.saturating_sub(window_rx) as f64 / secs) as u64;
@@ -1416,7 +1441,7 @@ async fn main() -> Result<(), anyhow::Error> {
                         node_id: node_id_hb,
                         rx_pps,
                         drops_per_sec,
-                        under_attack: drops_per_sec >= args.attack_drops_per_sec,
+                        under_attack: drops_per_sec >= args.attack_drops_per_sec || reported_attacks > 0,
                         blocks_active: (v4_active + v6_active) as u64,
                     };
                     if let Some(record) = report.telemetry_record() {
@@ -1429,6 +1454,7 @@ async fn main() -> Result<(), anyhow::Error> {
                     window_rx = total_rx_packets;
                     window_dropped = total_dropped;
                 }
+                snapshot.external_attacks = reported_attacks;
                 let cluster = *cluster_summary.read().unwrap_or_else(|p| p.into_inner());
                 snapshot.cluster_status = cluster.status_code;
                 snapshot.cluster_nodes = cluster.nodes;
@@ -1442,12 +1468,12 @@ async fn main() -> Result<(), anyhow::Error> {
                         match cli.apply(is_announce, ip).await {
                             Ok(()) => {
                                 let verb = if is_announce { "announced" } else { "withdrew" };
-                                log::info!("[Flowspec] {} discard rule for {}", verb, ip);
-                                sntl_db.append(format!("FLOWSPEC_{}|IP:{}", if is_announce { "ANNOUNCE" } else { "WITHDRAW" }, ip));
+                                log::info!("[Flowspec] {} discard rule for {}", verb, show(&ip));
+                                sntl_db.append(format!("FLOWSPEC_{}|IP:{}", if is_announce { "ANNOUNCE" } else { "WITHDRAW" }, show(&ip)));
                                 if is_announce { flowspec_state.announced(ip) } else { flowspec_state.withdrawn(ip) }
                             }
                             Err(e) => {
-                                log::error!("[Flowspec] gobgp failed for {}: {}; retrying next tick", ip, e);
+                                log::error!("[Flowspec] gobgp failed for {}: {}; retrying next tick", show(&ip), e);
                                 break;
                             }
                         }
@@ -1482,7 +1508,7 @@ async fn main() -> Result<(), anyhow::Error> {
                     );
 
                     let anomaly_telemetry = format!(
-                        "DB_LOG:NODE={}|TIER=Tier3AiAnomaly|IP=0.0.0.0|VEC=Anomaly detected, flow rate {:.2}\n",
+                        "DB_LOG:NODE={}|TIER=Tier3RateAnomaly|IP=0.0.0.0|VEC=Anomaly detected, flow rate {:.2}\n",
                         node_id_hb, flow_rate.0
                     );
                     push_telemetry(&anomaly_telemetry).await;

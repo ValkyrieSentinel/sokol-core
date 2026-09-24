@@ -172,8 +172,22 @@ SOKOL_CROWDSEC_KEY=<key> sokol-crowdsec --lapi-url http://127.0.0.1:8080 --ipc-s
 
 Only local decisions (origins `crowdsec` and `cscli`) are forwarded by default; community lists
 (`CAPI`, `lists`) can hold tens of thousands of addresses and are added with `--origins` only if the
-mesh should carry them. Range decisions are skipped until prefix blocks exist. Decisions deleted in
+mesh should carry them. Range decisions are forwarded as prefixes. Decisions deleted in
 CrowdSec end on Sokol's own TTL; lift one early with `UNBAN_IP` on the control socket.
+
+### FastNetMon
+
+FastNetMon reports the *victim* of a volumetric attack (an address inside the protected network),
+and flood sources are usually spoofed, so a report does not block anything. Instead
+`sokol-fastnetmon-notify`, set as FastNetMon's notify script, marks the node under attack in its
+mesh telemetry until FastNetMon sends `unban` (or `--attack-report-ttl-secs`, default 600, passes).
+That feeds the cluster status and the distributed-storm latch; `sokol_external_attacks_active`
+shows active reports.
+
+```shell
+# /etc/fastnetmon.conf
+notify_script_path = /usr/local/bin/sokol-fastnetmon-notify   # SOKOL_IPC_SOCKET selects the node socket
+```
 
 Other detectors can use the same line protocol on the IPC socket:
 `SIGNAL:<source>|<src ip>|<dst ip or ->|<reason>`.
@@ -188,6 +202,12 @@ Blocks from traps, the control socket and the mesh expire: the first lasts `--bl
 seconds (default 900), each repeat within 24 hours doubles it up to `--block-ttl-max` (default
 86400). `--block-ttl 0` makes them permanent. `--block` addresses are always permanent, and a mesh
 `UnblockIp` cannot lift them.
+
+Blocks can be single addresses or CIDR prefixes (`--block 198.51.100.0/24`, `BAN_IP:198.51.100.0/24`
+on the control socket, `SIGNAL:<source>|<prefix>|-|<reason>`, CrowdSec range decisions, mesh and
+Flowspec). A prefix is refused if it is wider than `--min-block-prefix-v4` (default 16) or
+`--min-block-prefix-v6` (default 48), or if it contains or lies inside any protected address or range
+below — a detector mistake must not cut the node off.
 
 Some addresses are never blocked, whether the request comes from `--block`, the control
 socket, a trap or the mesh: loopback, multicast, IPv6 link-local, every address of this node,
