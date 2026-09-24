@@ -152,6 +152,36 @@ sleep 1.2
 check "SYN, ACK and RST|ACK segments are not counted as invalid" \
     test "$(metric 'sokol_xdp_dropped_packets_total{reason="invalid_tcp_flags"}')" -eq "$AFTER"
 
+# A blocked IPv6 source is dropped even when its extension headers do not parse: a truncated
+# Hop-by-Hop header used to end the program with XDP_PASS before the blocklist hit was acted on.
+BLOCKED_V6=2001:db8:bad::66
+printf 'BAN_IP:%s\n' "$BLOCKED_V6" | nc -U -q1 "$WORK/control.sock" >/dev/null
+send_v6() {   # send_v6 <next header> <count>: bare IPv6 headers from the blocked source
+    ip netns exec "$NS" python3 - "$PEER_IF" "$BLOCKED_V6" "$1" "$2" <<'PY'
+import socket, struct, sys
+ifname, src, nh, count = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
+s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW)
+s.bind((ifname, 0))
+eth = b"\xff" * 6 + s.getsockname()[4][:6] + struct.pack("!H", 0x86DD)
+# payload length 0, hop limit 64; with next header 0 (Hop-by-Hop) the extension header is missing
+ip6 = struct.pack("!IHBB", 6 << 28, 0, nh, 64) + socket.inet_pton(socket.AF_INET6, src) \
+    + socket.inet_pton(socket.AF_INET6, "2001:db8::1")
+for _ in range(count):
+    s.send(eth + ip6)
+PY
+}
+BEFORE=$(metric 'sokol_xdp_dropped_packets_total{reason="blocklist"}')
+send_v6 59 10   # 59 = no next header: parses cleanly
+sleep 1.2
+MID=$(metric 'sokol_xdp_dropped_packets_total{reason="blocklist"}')
+check "blocked IPv6 source is dropped ($BEFORE -> $MID)" test $((MID - BEFORE)) -eq 10
+send_v6 0 10
+sleep 1.2
+AFTER=$(metric 'sokol_xdp_dropped_packets_total{reason="blocklist"}')
+check "blocked IPv6 source with a truncated extension header is dropped ($MID -> $AFTER)" \
+    test $((AFTER - MID)) -eq 10
+printf 'UNBAN_IP:%s\n' "$BLOCKED_V6" | nc -U -q1 "$WORK/control.sock" >/dev/null
+
 # SYN flood on the XDP trap port: events must be rate-limited, not one per packet.
 FLOOD_START=$SECONDS
 ip netns exec "$NS" bash -c "for i in \$(seq 1 3000); do (echo > /dev/tcp/$HOST_IP/44333) 2>/dev/null; done; true"

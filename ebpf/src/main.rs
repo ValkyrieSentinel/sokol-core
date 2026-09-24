@@ -401,8 +401,14 @@ fn try_sentinel_vfr_filter(ctx: &XdpContext) -> Result<u32, ()> {
 
             let next_hdr =
                 unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*ip6_ptr).next_header)) };
+            // A blocklist hit wins over a parse error: a truncated extension header must not
+            // turn a blocked source into XDP_PASS. The L4 fields are unused on the drop path.
             let (real_proto, real_l4_offset, v6_non_first) =
-                parse_v6_next_header(ctx, ip_offset + mem::size_of::<Ip6Hdr>(), next_hdr)?;
+                match parse_v6_next_header(ctx, ip_offset + mem::size_of::<Ip6Hdr>(), next_hdr) {
+                    Ok(parsed) => parsed,
+                    Err(()) if is_blocked => (0, 0, false),
+                    Err(()) => return Err(()),
+                };
 
             protocol = real_proto;
             l4_offset = real_l4_offset;
