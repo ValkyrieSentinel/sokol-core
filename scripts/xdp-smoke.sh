@@ -181,6 +181,19 @@ sleep 0.5
 check "loopback is never blocked" grep -q "Refusing to block 127.0.0.1 (loopback)" "$LOG"
 check "the node's own address is never blocked" grep -q "Refusing to block $HOST_IP (address of this node)" "$LOG"
 
+# FastNetMon hook: an attack report marks the node under attack without blocking the victim.
+FNM="$(dirname "$BIN")/sokol-fastnetmon-notify"
+wait_metric() {   # wait_metric <name> <value>: up to 8 s for the next metrics refresh
+    for _ in $(seq 1 40); do [ "$(metric "$1")" = "$2" ] && return 0; sleep 0.2; done
+    return 1
+}
+echo "attack details from fastnetmon" | "$FNM" "$HOST_IP" incoming 35000 ban 2>/dev/null
+check "FastNetMon ban report is active on the node" wait_metric sokol_external_attacks_active 1
+check "the report marks this node under attack in the cluster view" wait_metric sokol_cluster_nodes_under_attack 1
+check "the reported victim (this node) is not blocked" ping_from "$ALLOWED_IP"
+"$FNM" "$HOST_IP" incoming 0 unban </dev/null 2>/dev/null
+check "FastNetMon unban clears the report" wait_metric sokol_external_attacks_active 0
+
 # CIDR blocks through the control socket, under the prefix rules.
 CIDR_IP=10.231.0.130
 ip netns exec "$NS" ip addr add "$CIDR_IP/24" dev "$PEER_IF"

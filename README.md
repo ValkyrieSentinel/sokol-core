@@ -175,6 +175,20 @@ Only local decisions (origins `crowdsec` and `cscli`) are forwarded by default; 
 mesh should carry them. Range decisions are forwarded as prefixes. Decisions deleted in
 CrowdSec end on Sokol's own TTL; lift one early with `UNBAN_IP` on the control socket.
 
+### FastNetMon
+
+FastNetMon reports the *victim* of a volumetric attack (an address inside the protected network),
+and flood sources are usually spoofed, so a report does not block anything. Instead
+`sokol-fastnetmon-notify`, set as FastNetMon's notify script, marks the node under attack in its
+mesh telemetry until FastNetMon sends `unban` (or `--attack-report-ttl-secs`, default 600, passes).
+That feeds the cluster status and the distributed-storm latch; `sokol_external_attacks_active`
+shows active reports.
+
+```shell
+# /etc/fastnetmon.conf
+notify_script_path = /usr/local/bin/sokol-fastnetmon-notify   # SOKOL_IPC_SOCKET selects the node socket
+```
+
 Other detectors can use the same line protocol on the IPC socket:
 `SIGNAL:<source>|<src ip>|<dst ip or ->|<reason>`.
 

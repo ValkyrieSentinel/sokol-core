@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 pub use mesh_sync::{AlertLevel, MeshCommand, MeshOrchestrator};
+mod attack_reports;
 mod block_policy;
 mod block_table;
 pub mod cluster_state;
@@ -263,6 +264,11 @@ struct Args {
     /// Drops per second at which this node reports itself under attack to the mesh.
     #[arg(long, default_value = "1000")]
     attack_drops_per_sec: u64,
+
+    /// How long an attack report (ATTACK:, e.g. from FastNetMon) keeps this node "under attack"
+    /// if the detector never clears it.
+    #[arg(long, default_value = "600")]
+    attack_report_ttl_secs: u64,
 
     /// Shortest IPv4 prefix a block may have (wider ones are refused).
     #[arg(long, default_value = "16")]
@@ -537,6 +543,9 @@ async fn main() -> Result<(), anyhow::Error> {
     };
 
     let block_policy = Arc::new(build_block_policy(&args)?);
+    let attack_reports = Arc::new(std::sync::Mutex::new(attack_reports::AttackReports::new(
+        Duration::from_secs(args.attack_report_ttl_secs),
+    )));
     let ipc_gid = args.ipc_group.as_deref().map(resolve_group).transpose()?;
     let control_gid = args
         .control_group
@@ -1113,6 +1122,7 @@ async fn main() -> Result<(), anyhow::Error> {
     let dag_unix = dag_tracker.clone();
     let node_id_unix = args.node_id;
     let policy_unix = block_policy.clone();
+    let reports_unix = attack_reports.clone();
 
     let socket_path_log = socket_path.to_string();
     tokio::spawn(async move {
@@ -1130,6 +1140,7 @@ async fn main() -> Result<(), anyhow::Error> {
                     let crypto_stream = crypto_unix.clone();
                     let dag_stream = dag_unix.clone();
                     let policy_stream = policy_unix.clone();
+                    let reports_stream = reports_unix.clone();
                     let peer_uid = stream.peer_cred().map(|c| c.uid()).ok();
 
                     tokio::spawn(async move {
@@ -1199,6 +1210,40 @@ async fn main() -> Result<(), anyhow::Error> {
                                                     e
                                                 );
                                             }
+                                        }
+                                    } else if let Some(payload) = content.strip_prefix("ATTACK:") {
+                                        match attack_reports::parse(payload) {
+                                            Ok(report) => {
+                                                reports_stream
+                                                    .lock()
+                                                    .unwrap_or_else(|p| p.into_inner())
+                                                    .apply(&report, std::time::Instant::now());
+                                                let (tag, verb) = if report.active {
+                                                    ("ATTACK_REPORTED", "under attack")
+                                                } else {
+                                                    ("ATTACK_CLEARED", "attack cleared")
+                                                };
+                                                log::warn!(
+                                                    "[Attack] {} reports {} {} ({} pps, {})",
+                                                    report.source,
+                                                    report.victim,
+                                                    verb,
+                                                    report.pps,
+                                                    report.direction
+                                                );
+                                                db.append(format!(
+                                                    "{}|Source:{}|Victim:{}|Direction:{}|PPS:{}",
+                                                    tag,
+                                                    report.source,
+                                                    report.victim,
+                                                    report.direction,
+                                                    report.pps
+                                                ));
+                                            }
+                                            Err(e) => log::error!(
+                                                "[UNIX IPC FAULT] Bad ATTACK line: {}",
+                                                e
+                                            ),
                                         }
                                     } else if let Some(payload) = content.strip_prefix("SIGNAL:") {
                                         match signal::parse(payload) {
@@ -1384,6 +1429,10 @@ async fn main() -> Result<(), anyhow::Error> {
                 snapshot.p2p_peers = peer_registry.peer_count().await;
                 snapshot.audit_queue_overflow = sntl_db.overflow_total();
 
+                let reported_attacks = attack_reports
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .active(std::time::Instant::now());
                 if telemetry_window_start.elapsed() >= TELEMETRY_INTERVAL {
                     let secs = telemetry_window_start.elapsed().as_secs_f64().max(1.0);
                     let rx_pps = (total_rx_packets.saturating_sub(window_rx) as f64 / secs) as u64;
@@ -1392,7 +1441,7 @@ async fn main() -> Result<(), anyhow::Error> {
                         node_id: node_id_hb,
                         rx_pps,
                         drops_per_sec,
-                        under_attack: drops_per_sec >= args.attack_drops_per_sec,
+                        under_attack: drops_per_sec >= args.attack_drops_per_sec || reported_attacks > 0,
                         blocks_active: (v4_active + v6_active) as u64,
                     };
                     if let Some(record) = report.telemetry_record() {
@@ -1405,6 +1454,7 @@ async fn main() -> Result<(), anyhow::Error> {
                     window_rx = total_rx_packets;
                     window_dropped = total_dropped;
                 }
+                snapshot.external_attacks = reported_attacks;
                 let cluster = *cluster_summary.read().unwrap_or_else(|p| p.into_inner());
                 snapshot.cluster_status = cluster.status_code;
                 snapshot.cluster_nodes = cluster.nodes;

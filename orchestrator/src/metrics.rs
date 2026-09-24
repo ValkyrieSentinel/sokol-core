@@ -16,6 +16,7 @@ pub struct Snapshot {
     pub p2p_peers: usize,
     pub audit_queue_overflow: u64,
     pub flowspec_announced: usize,
+    pub external_attacks: usize,
     pub cluster_status: u8,
     pub cluster_nodes: usize,
     pub cluster_attacked: usize,
@@ -121,6 +122,13 @@ pub fn render(s: &Snapshot) -> String {
         "Blocks announced upstream as BGP Flowspec discard rules.",
     );
     let _ = writeln!(out, "sokol_flowspec_announced {}", s.flowspec_announced);
+    family(
+        &mut out,
+        "sokol_external_attacks_active",
+        "gauge",
+        "Attack reports from flow detectors (FastNetMon) currently in force for this node.",
+    );
+    let _ = writeln!(out, "sokol_external_attacks_active {}", s.external_attacks);
     family(
         &mut out,
         "sokol_cluster_status",
