@@ -858,7 +858,7 @@ async fn main() -> Result<(), anyhow::Error> {
                                 ));
 
                                 let telemetry_msg = format!(
-                                    "DB_LOG:NODE={}|TIER=Tier1_5Revenge|IP={}|VEC={}\n",
+                                    "DB_LOG:NODE={}|TIER=MeshBlock|IP={}|VEC={}\n",
                                     node_id_mesh, ip_addr, reason
                                 );
                                 push_telemetry(&telemetry_msg).await;
@@ -1187,45 +1187,6 @@ async fn main() -> Result<(), anyhow::Error> {
                                                 );
                                             }
                                         }
-                                    } else if let Some(raw_ip_str) =
-                                        content.strip_prefix("APT_HIGH_PRIORITY:")
-                                    {
-                                        let clean_ip_str = raw_ip_str.trim();
-                                        match clean_ip_str.parse::<IpAddr>() {
-                                            Ok(ip) => {
-                                                log::warn!(
-                                                    "[APT_ALERT] High-priority stager from IP: {}",
-                                                    ip
-                                                );
-                                                db.append(format!(
-                                                    "APT_HIGH_PRIORITY|IP:{}|Enforced",
-                                                    ip
-                                                ));
-
-                                                let telemetry_msg = format!("DB_LOG:NODE={}|TIER=Tier2AptSandbox|IP={}|VEC=APT High-Priority Stager\n", node_id_unix, ip);
-                                                push_telemetry(&telemetry_msg).await;
-
-                                                enforce_block_local(
-                                                    ip,
-                                                    "Unix IPC APT_HIGH_PRIORITY stager",
-                                                    &blocks_stream,
-                                                    &db,
-                                                    &registry,
-                                                    node_id_unix,
-                                                    &crypto_stream,
-                                                    &dag_stream,
-                                                    &policy_stream,
-                                                )
-                                                .await;
-                                            }
-                                            Err(e) => {
-                                                log::error!(
-                                                    "[UNIX IPC FAULT] Failed to parse IP from 'APT_HIGH_PRIORITY:{}': {}",
-                                                    raw_ip_str,
-                                                    e
-                                                );
-                                            }
-                                        }
                                     } else if let Some(payload) = content.strip_prefix("SIGNAL:") {
                                         match signal::parse(payload) {
                                             Ok(sig) => match signal::target(&sig, &policy_stream) {
@@ -1482,7 +1443,7 @@ async fn main() -> Result<(), anyhow::Error> {
                     );
 
                     let anomaly_telemetry = format!(
-                        "DB_LOG:NODE={}|TIER=Tier3AiAnomaly|IP=0.0.0.0|VEC=Anomaly detected, flow rate {:.2}\n",
+                        "DB_LOG:NODE={}|TIER=Tier3RateAnomaly|IP=0.0.0.0|VEC=Anomaly detected, flow rate {:.2}\n",
                         node_id_hb, flow_rate.0
                     );
                     push_telemetry(&anomaly_telemetry).await;

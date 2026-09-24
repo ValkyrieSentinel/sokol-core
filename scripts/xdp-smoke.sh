@@ -27,6 +27,7 @@ cleanup() {
     [ -n "${SURICATA_PID:-}" ] && kill "$SURICATA_PID" 2>/dev/null || true
     [ -n "${ADAPTER_PID:-}" ] && kill "$ADAPTER_PID" 2>/dev/null || true
     [ -n "${CS_ADAPTER_PID:-}" ] && kill "$CS_ADAPTER_PID" 2>/dev/null || true
+    [ -n "${TRAP_PID:-}" ] && kill "$TRAP_PID" 2>/dev/null || true
     [ -n "${CS_BOUNCER:-}" ] && cscli bouncers delete "$CS_BOUNCER" >/dev/null 2>&1 || true
     [ -n "${CROWDSEC_PID:-}" ] && kill "$CROWDSEC_PID" 2>/dev/null || true
     pkill -f "gobgpd -f $WORK" 2>/dev/null || true
@@ -283,6 +284,20 @@ if command -v cscli >/dev/null && command -v crowdsec >/dev/null; then
 else
     echo "SKIP  CrowdSec checks (crowdsec not installed)"
 fi
+
+# Decoy trap: a connection that sends nothing is blocked after 5 s, with the trap's reason.
+TRAP_IP=10.231.0.7
+ip netns exec "$NS" ip addr add "$TRAP_IP/24" dev "$PEER_IF"
+SOKOL_TRAP_PORTS=2323 "$(dirname "$BIN")/trident_trap" >"$WORK/trap.log" 2>&1 </dev/null &
+TRAP_PID=$!
+sleep 1
+ip netns exec "$NS" nc -w 7 -s "$TRAP_IP" "$HOST_IP" 2323 </dev/null >/dev/null 2>&1 || true
+sleep 1
+check "trident trap blocks a silent connection in XDP" \
+    bash -c "! ip netns exec $NS ping -c 2 -W 1 -I $TRAP_IP $HOST_IP >/dev/null 2>&1"
+check "the trap's block carries its reason" \
+    grep -q "Dynamic block enforced in XDP: $TRAP_IP.*trident: trap port 2323: connected without sending data" "$LOG"
+kill "$TRAP_PID" 2>/dev/null || true; TRAP_PID=""
 
 ipc "DROP_IMMEDIATE:$ALLOWED_IP"
 sleep 0.5
