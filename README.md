@@ -275,6 +275,17 @@ A missing, reordered or edited segment makes it print `BROKEN` and exit 1. Someo
 access could rebuild the whole chain; to detect that, record the printed head somewhere the node
 cannot write (another host, a ticket, a timestamping service).
 
+Records are fsynced at most 100 ms after the last successful sync (or every 64 records), however
+steady the stream of events. One writer per log: a second process opening the same `--db-path`
+is refused (`<db-path>.lock`).
+
+If the log cannot be written (disk full, I/O error), **enforcement continues**: blocking never
+waits for the audit. The node reports itself degraded instead: `sokol_audit_healthy 0`,
+`MODE=DEGRADED` in its heartbeat to the dashboard, `sokol_audit_write_errors_total`,
+`sokol_audit_lost_total` and `sokol_audit_last_sync_age_seconds`. It keeps reopening the log (which
+drops a torn record) and, once it can write again, records how many records were lost
+(`AUDIT_LOST|Records:<n>`), so the gap is visible in the chain itself.
+
 ## BGP Flowspec (upstream drops)
 
 With `--flowspec-gobgp /usr/local/bin/gobgp` every active block is announced as an RFC 8955

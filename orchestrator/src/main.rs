@@ -36,21 +36,150 @@ use crate::block_table::{
 };
 use crate::cluster_state::BirdEyeView;
 use crate::p2p::{
-    maintain_peer_connection, DagTracker, NodeCrypto, P2PNetwork, PeerRegistry, TrustStore,
+    maintain_peer_connection, now_ms, DagTracker, NodeCrypto, P2PNetwork, PeerRegistry, TrustStore,
 };
 use ipnet::IpNet;
 
 /// Audit trail writer. Records are queued (bounded, so a flood cannot exhaust memory) and
-/// written by one thread, fsynced every 100 ms or 64 records: a crash loses at most that window.
+/// written by one thread. A record is fsynced at most `SYNC_INTERVAL` after the last successful
+/// sync (or after `SYNC_BATCH` records), whatever the pace of events.
+///
+/// ADR-5: enforcement never waits for the audit. When the log cannot be written the node keeps
+/// blocking, counts what it could not record, reports itself DEGRADED (metrics, heartbeat) and
+/// reopens the log, which drops a torn tail, until it can write again.
 enum AuditMsg {
     Record(String),
-    Flush(std::sync::mpsc::SyncSender<()>),
+    /// Acked with whether everything queued before it is written and fsynced.
+    Flush(std::sync::mpsc::SyncSender<bool>),
+}
+
+/// What the audit writer last managed; read by metrics and the heartbeat.
+#[derive(Default)]
+pub struct AuditHealth {
+    write_errors: std::sync::atomic::AtomicU64,
+    sync_errors: std::sync::atomic::AtomicU64,
+    /// Records that could not be written (log unavailable), besides queue overflow.
+    lost: std::sync::atomic::AtomicU64,
+    last_sync_ok_ms: std::sync::atomic::AtomicU64,
+    failing: std::sync::atomic::AtomicBool,
+}
+
+/// A point-in-time view of [`AuditHealth`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AuditStatus {
+    pub healthy: bool,
+    pub write_errors: u64,
+    pub sync_errors: u64,
+    pub lost: u64,
+    pub last_sync_age_ms: u64,
 }
 
 pub struct SentinelDb {
     tx: std::sync::mpsc::SyncSender<AuditMsg>,
     dropped: Arc<std::sync::atomic::AtomicU64>,
     overflow_total: std::sync::atomic::AtomicU64,
+    health: Arc<AuditHealth>,
+}
+
+struct AuditWriter {
+    log: Option<AuditLog>,
+    path: std::path::PathBuf,
+    rotation: Option<Rotation>,
+    health: Arc<AuditHealth>,
+    last_sync: std::time::Instant,
+    /// Records lost since the log was last writable; noted in the log once it is again.
+    lost_pending: u64,
+}
+
+impl AuditWriter {
+    fn fail(&self, what: &str, e: &dyn std::fmt::Display) {
+        use std::sync::atomic::Ordering;
+        if !self.health.failing.swap(true, Ordering::Relaxed) {
+            log::error!(
+                "[Audit] {} failed: {}; node is DEGRADED until the log recovers",
+                what,
+                e
+            );
+        }
+    }
+
+    /// Reopens the log after a failure (dropping the old handle first releases its lock).
+    fn ensure_open(&mut self) -> bool {
+        if self.log.is_some() {
+            return true;
+        }
+        match AuditLog::open_with(&self.path, self.rotation) {
+            Ok(log) => {
+                self.log = Some(log);
+                if self.lost_pending > 0 {
+                    let note = format!("AUDIT_LOST|Records:{}", self.lost_pending);
+                    if self.write(note).is_ok() {
+                        self.lost_pending = 0;
+                    }
+                }
+                self.log.is_some()
+            }
+            Err(e) => {
+                self.fail("reopen", &e);
+                false
+            }
+        }
+    }
+
+    fn write(&mut self, payload: String) -> Result<(), ()> {
+        use std::sync::atomic::Ordering;
+        let Some(log) = self.log.as_mut() else {
+            return Err(());
+        };
+        match log.append(payload.as_bytes()) {
+            Ok(_) => Ok(()),
+            Err(common::audit_log::AuditError::PayloadTooLarge(n)) => {
+                log::error!("[Audit] Record of {} bytes dropped: too large", n);
+                Ok(())
+            }
+            Err(e) => {
+                self.health.write_errors.fetch_add(1, Ordering::Relaxed);
+                self.fail("write", &e);
+                self.log = None;
+                Err(())
+            }
+        }
+    }
+
+    fn record(&mut self, payload: String) {
+        use std::sync::atomic::Ordering;
+        if !self.ensure_open() || self.write(payload).is_err() {
+            self.lost_pending += 1;
+            self.health.lost.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn sync(&mut self) -> bool {
+        use std::sync::atomic::Ordering;
+        self.last_sync = std::time::Instant::now();
+        if !self.ensure_open() {
+            return false;
+        }
+        let result = self.log.as_mut().map(|l| l.sync());
+        match result {
+            Some(Ok(())) => {
+                self.health
+                    .last_sync_ok_ms
+                    .store(now_ms(), Ordering::Relaxed);
+                if self.lost_pending == 0 && self.health.failing.swap(false, Ordering::Relaxed) {
+                    log::warn!("[Audit] Log writable again; node no longer DEGRADED");
+                }
+                true
+            }
+            Some(Err(e)) => {
+                self.health.sync_errors.fetch_add(1, Ordering::Relaxed);
+                self.fail("fsync", &e);
+                self.log = None;
+                false
+            }
+            None => false,
+        }
+    }
 }
 
 impl SentinelDb {
@@ -59,51 +188,56 @@ impl SentinelDb {
     const SYNC_BATCH: usize = 64;
 
     pub fn init(path: &str, rotation: Option<Rotation>) -> anyhow::Result<Self> {
-        let mut log = AuditLog::open_with(std::path::Path::new(path), rotation)
+        let log = AuditLog::open_with(std::path::Path::new(path), rotation)
             .map_err(|e| anyhow::anyhow!("{} ({})", e, path))?;
         log::info!("Audit log {} opened: {} records verified", path, log.len());
 
         let (tx, rx) = std::sync::mpsc::sync_channel::<AuditMsg>(Self::QUEUE_CAPACITY);
         let dropped = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let dropped_writer = dropped.clone();
+        let health = Arc::new(AuditHealth::default());
+        health
+            .last_sync_ok_ms
+            .store(now_ms(), std::sync::atomic::Ordering::Relaxed);
+        let mut writer = AuditWriter {
+            log: Some(log),
+            path: std::path::PathBuf::from(path),
+            rotation,
+            health: health.clone(),
+            last_sync: std::time::Instant::now(),
+            lost_pending: 0,
+        };
 
         std::thread::spawn(move || {
             use std::sync::atomic::Ordering;
             use std::sync::mpsc::RecvTimeoutError;
             loop {
-                match rx.recv_timeout(Self::SYNC_INTERVAL) {
+                let wait = Self::SYNC_INTERVAL.saturating_sub(writer.last_sync.elapsed());
+                match rx.recv_timeout(wait) {
                     Ok(AuditMsg::Flush(ack)) => {
-                        if let Err(e) = log.sync() {
-                            log::error!("[Audit] fsync failed: {}", e);
-                        }
-                        let _ = ack.send(());
+                        let ok = writer.sync();
+                        let _ = ack.send(ok);
                     }
                     Ok(AuditMsg::Record(payload)) => {
                         let lost = dropped_writer.swap(0, Ordering::Relaxed);
                         if lost > 0 {
-                            let note = format!("AUDIT_QUEUE_OVERFLOW|Dropped:{}", lost);
-                            if let Err(e) = log.append(note.as_bytes()) {
-                                log::error!("[Audit] Failed to record queue overflow: {}", e);
-                            }
+                            writer.record(format!("AUDIT_QUEUE_OVERFLOW|Dropped:{}", lost));
                         }
-                        if let Err(e) = log.append(payload.as_bytes()) {
-                            log::error!("[Audit] Failed to append record: {}", e);
-                        }
-                        if log.unsynced() >= Self::SYNC_BATCH {
-                            if let Err(e) = log.sync() {
-                                log::error!("[Audit] fsync failed: {}", e);
-                            }
+                        writer.record(payload);
+                        let unsynced = writer.log.as_ref().map_or(0, |l| l.unsynced());
+                        if unsynced >= Self::SYNC_BATCH
+                            || writer.last_sync.elapsed() >= Self::SYNC_INTERVAL
+                        {
+                            writer.sync();
                         }
                     }
                     Err(RecvTimeoutError::Timeout) => {
-                        if let Err(e) = log.sync() {
-                            log::error!("[Audit] fsync failed: {}", e);
-                        }
+                        writer.sync();
                     }
                     Err(RecvTimeoutError::Disconnected) => break,
                 }
             }
-            let _ = log.sync();
+            writer.sync();
             log::info!("SentinelDb persistence thread terminated.");
         });
 
@@ -111,6 +245,7 @@ impl SentinelDb {
             tx,
             dropped,
             overflow_total: std::sync::atomic::AtomicU64::new(0),
+            health,
         })
     }
 
@@ -119,11 +254,49 @@ impl SentinelDb {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Waits until everything queued so far is written and fsynced (used on shutdown).
-    pub fn flush(&self, wait: Duration) {
+    pub fn status(&self) -> AuditStatus {
+        use std::sync::atomic::Ordering;
+        let h = &self.health;
+        AuditStatus {
+            healthy: !h.failing.load(Ordering::Relaxed),
+            write_errors: h.write_errors.load(Ordering::Relaxed),
+            sync_errors: h.sync_errors.load(Ordering::Relaxed),
+            lost: h.lost.load(Ordering::Relaxed),
+            last_sync_age_ms: now_ms().saturating_sub(h.last_sync_ok_ms.load(Ordering::Relaxed)),
+        }
+    }
+
+    /// Waits up to `wait` in total until everything queued so far is written and fsynced (used
+    /// on shutdown). Returns whether that was confirmed.
+    pub fn flush(&self, wait: Duration) -> bool {
+        let deadline = std::time::Instant::now() + wait;
         let (ack_tx, ack_rx) = std::sync::mpsc::sync_channel(1);
-        if self.tx.send(AuditMsg::Flush(ack_tx)).is_ok() && ack_rx.recv_timeout(wait).is_err() {
-            log::error!("[Audit] Flush did not complete within {:?}", wait);
+        let mut msg = AuditMsg::Flush(ack_tx);
+        loop {
+            match self.tx.try_send(msg) {
+                Ok(()) => break,
+                Err(std::sync::mpsc::TrySendError::Full(back)) => {
+                    if std::time::Instant::now() >= deadline {
+                        log::error!("[Audit] Flush could not be queued within {:?}", wait);
+                        return false;
+                    }
+                    msg = back;
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => return false,
+            }
+        }
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        match ack_rx.recv_timeout(left) {
+            Ok(true) => true,
+            Ok(false) => {
+                log::error!("[Audit] Flush failed: the log could not be written or synced");
+                false
+            }
+            Err(_) => {
+                log::error!("[Audit] Flush did not complete within {:?}", wait);
+                false
+            }
         }
     }
 
@@ -1418,7 +1591,8 @@ async fn main() -> Result<(), anyhow::Error> {
                     sntl_db.append(format!("BLOCK_EXPIRED_{}|IP:{}", ip_tag(ip), show(&ip)));
                 }
 
-                let hb_msg = format!("HEARTBEAT:ID={}|NAME=Sokol-Node-{}|EP={}|MODE=NORMAL|CTL={}\n", node_id_hb, node_id_hb, p2p_bind_hb, control_socket_hb);
+                let mode = if sntl_db.status().healthy { "NORMAL" } else { "DEGRADED" };
+                let hb_msg = format!("HEARTBEAT:ID={}|NAME=Sokol-Node-{}|EP={}|MODE={}|CTL={}\n", node_id_hb, node_id_hb, p2p_bind_hb, mode, control_socket_hb);
                 push_telemetry(&hb_msg).await;
 
                 if !atp_controller.try_consume(250) {
@@ -1455,6 +1629,11 @@ async fn main() -> Result<(), anyhow::Error> {
                 }
                 snapshot.p2p_peers = peer_registry.peer_count().await;
                 snapshot.audit_queue_overflow = sntl_db.overflow_total();
+                let audit = sntl_db.status();
+                snapshot.audit_healthy = audit.healthy;
+                snapshot.audit_write_errors = audit.write_errors + audit.sync_errors;
+                snapshot.audit_lost = audit.lost;
+                snapshot.audit_sync_age_ms = audit.last_sync_age_ms;
 
                 let reported_attacks = attack_reports
                     .lock()
@@ -1568,9 +1747,52 @@ async fn main() -> Result<(), anyhow::Error> {
         }
     }
     sntl_db.append("NODE_SHUTDOWN".to_string());
-    sntl_db.flush(Duration::from_secs(2));
+    if !sntl_db.flush(Duration::from_secs(2)) {
+        log::error!("[Audit] Shutdown without a confirmed final fsync");
+    }
     let _ = std::fs::remove_file(socket_path);
     let _ = std::fs::remove_file(&args.control_socket);
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_log(name: &str) -> String {
+        let dir = std::env::temp_dir().join(format!("sokol-db-{}-{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir.join("audit.log").to_string_lossy().into_owned()
+    }
+
+    /// F07: with an event every 30 ms the old writer's 100 ms receive timeout never fired and
+    /// nothing was fsynced until 64 records had piled up (about 2 s here).
+    #[test]
+    fn a_steady_stream_is_fsynced_within_the_interval() {
+        let db = SentinelDb::init(&temp_log("steady"), None).unwrap();
+        for i in 0..20 {
+            db.append(format!("EVENT|{}", i));
+            std::thread::sleep(Duration::from_millis(30));
+        }
+        let status = db.status();
+        assert!(status.healthy);
+        assert!(
+            status.last_sync_age_ms < 250,
+            "last fsync {} ms ago under a 30 ms event stream",
+            status.last_sync_age_ms
+        );
+        assert!(db.flush(Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn a_second_node_cannot_open_the_same_audit_log() {
+        let path = temp_log("twice");
+        let _first = SentinelDb::init(&path, None).unwrap();
+        let second = SentinelDb::init(&path, None);
+        assert!(
+            second.is_err(),
+            "two writers would interleave sequence numbers"
+        );
+    }
 }
