@@ -96,6 +96,18 @@ its default gateways and its `--seed-peer`s. Add operator and bastion networks e
 sudo ./target/release/orchestrator -i eth0 --never-block 203.0.113.0/24 --never-block 2001:db8:ad::/48
 ```
 
+## Web dashboards
+
+`sokol-operator` (default `127.0.0.1:3000`, override with `SOKOL_OPERATOR_BIND`) requires a
+token on every API call. Set `SOKOL_OPERATOR_TOKEN` (16+ characters), or read the one-time
+token it prints at startup; the dashboard asks for it and keeps it in an `HttpOnly`,
+`SameSite=Strict` cookie. Node control actions report failure until the orchestrator serves
+per-node control sockets.
+
+`sokol-client` (`127.0.0.1:3001`) attaches its own XDP program to `SOKOL_IFACE`, so do not run it
+on an interface the orchestrator already uses. It refuses to start without `SOKOL_CLIENT_TOKEN`
+(16+ characters). Only the IPv4 blacklist is backed by an eBPF map.
+
 # Project Structure
 
 `ebpf/` — kernel space code (Rust XDP program).
