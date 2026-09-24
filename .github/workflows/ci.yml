@@ -38,10 +38,10 @@ jobs:
 
       - name: Build eBPF program
         working-directory: ebpf
-        run: cargo build --release
+        run: cargo build --release --locked
 
       - name: Build workspace
-        run: cargo build --release
+        run: cargo build --release --locked
 
       - name: Test
         run: cargo test --release
