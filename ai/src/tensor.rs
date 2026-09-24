@@ -131,13 +131,9 @@ impl<T, const R: usize> Tensor<T, R> {
         &mut self.data
     }
 
-    pub fn into_vec(self) -> Vec<T> {
-        self.data.into_vec()
-    }
-
-    #[inline]
-    pub fn offset_checked(&self, indices: [usize; R]) -> Result<usize, TensorError> {
+    pub fn offset_checked(&self, indices: &[usize; R]) -> Result<usize, TensorError> {
         let mut offset = 0usize;
+        #[allow(clippy::needless_range_loop)]
         for i in 0..R {
             if indices[i] >= self.shape[i] {
                 return Err(TensorError::IndexOutOfBounds);
@@ -151,56 +147,17 @@ impl<T, const R: usize> Tensor<T, R> {
         Ok(offset)
     }
 
-    #[inline(always)]
-    pub fn offset_unchecked(&self, indices: [usize; R]) -> usize {
-        let mut offset = 0usize;
-        for i in 0..R {
-            offset += indices[i] * self.strides[i];
-        }
-        offset
-    }
-
-    pub fn swap_axes(&mut self, axis1: usize, axis2: usize) -> Result<(), TensorError> {
-        if axis1 >= R || axis2 >= R {
-            return Err(TensorError::IndexOutOfBounds);
-        }
-        self.shape.swap(axis1, axis2);
-        self.strides.swap(axis1, axis2);
-        Ok(())
-    }
-
-    #[inline]
-    pub fn get(&self, indices: [usize; R]) -> Option<&T> {
-        match self.offset_checked(indices) {
-            Ok(offset) => Some(&self.data[offset]),
-            Err(_) => None,
-        }
-    }
-
-    #[inline]
-    pub fn get_mut(&mut self, indices: [usize; R]) -> Option<&mut T> {
-        match self.offset_checked(indices) {
-            Ok(offset) => Some(&mut self.data[offset]),
-            Err(_) => None,
-        }
-    }
-
     /// # Safety
     ///
-    /// Every index must be below the corresponding dimension of `shape()`; otherwise the
-    /// computed offset is out of bounds and the behaviour is undefined.
-    #[inline(always)]
-    pub unsafe fn get_unchecked(&self, indices: [usize; R]) -> &T {
-        let idx = self.offset_unchecked(indices);
+    /// Caller must ensure that `idx < self.len()`.
+    pub unsafe fn get_unchecked(&self, idx: usize) -> &T {
         self.data.get_unchecked(idx)
     }
 
     /// # Safety
     ///
-    /// Same contract as [`get_unchecked`](Self::get_unchecked).
-    #[inline(always)]
-    pub unsafe fn get_unchecked_mut(&mut self, indices: [usize; R]) -> &mut T {
-        let idx = self.offset_unchecked(indices);
+    /// Caller must ensure that `idx < self.len()`.
+    pub unsafe fn get_unchecked_mut(&mut self, idx: usize) -> &mut T {
         self.data.get_unchecked_mut(idx)
     }
 }
@@ -210,9 +167,12 @@ impl<T, const R: usize> Index<[usize; R]> for Tensor<T, R> {
 
     #[inline(always)]
     fn index(&self, indices: [usize; R]) -> &Self::Output {
-        match self.offset_checked(indices) {
+        match self.offset_checked(&indices) {
             Ok(offset) => &self.data[offset],
-            Err(err) => panic!("Tensor index out of bounds: {:?}, error: {}", indices, err),
+            Err(err) => panic!(
+                "Tensor index out of bounds: {:?}, error: {:?}",
+                indices, err
+            ),
         }
     }
 }
@@ -220,9 +180,12 @@ impl<T, const R: usize> Index<[usize; R]> for Tensor<T, R> {
 impl<T, const R: usize> IndexMut<[usize; R]> for Tensor<T, R> {
     #[inline(always)]
     fn index_mut(&mut self, indices: [usize; R]) -> &mut Self::Output {
-        match self.offset_checked(indices) {
+        match self.offset_checked(&indices) {
             Ok(offset) => &mut self.data[offset],
-            Err(err) => panic!("Tensor index out of bounds: {:?}, error: {}", indices, err),
+            Err(err) => panic!(
+                "Tensor index out of bounds: {:?}, error: {:?}",
+                indices, err
+            ),
         }
     }
 }

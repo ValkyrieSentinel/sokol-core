@@ -1729,14 +1729,14 @@ async fn main() -> Result<(), anyhow::Error> {
     let p2p_bind_hb = args.p2p_bind.clone();
     let control_socket_hb = args.control_socket.clone();
     let mut watermark = Watermark::default();
-    let (registry_tick, crypto_tick, dag_tick) = (
+    let (_registry_tick, _crypto_tick, _dag_tick) = (
         peer_registry.clone(),
         node_crypto.clone(),
         dag_tracker.clone(),
     );
-    let node_id_tick = args.node_id;
-    let mut last_digest = std::time::Instant::now();
-    let mut state_error = false;
+    let _node_id_tick = args.node_id;
+    let _last_digest = std::time::Instant::now();
+    let _state_error = false;
     let mut telemetry_window_start = std::time::Instant::now();
     let mut window_rx = 0u64;
     let mut window_dropped = 0u64;
