@@ -12,12 +12,7 @@ test = false
 aya-ebpf = "0.1.1"
 common = { path = "../common", default-features = false }
 
-[unstable]
-build-std = ["core", "alloc"]
-
-[build]
-target = "bpfel-unknown-none"
-
+# Target and build-std live in .cargo/config.toml (cargo ignores them here).
 
 [profile.dev]
 opt-level = 3

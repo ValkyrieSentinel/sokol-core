@@ -1,4 +1,3 @@
-use core::fmt;
 
 pub const MAX_KEYS: usize = 32;
 

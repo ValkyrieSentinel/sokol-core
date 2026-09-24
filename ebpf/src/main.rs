@@ -3,9 +3,9 @@
 
 use aya_ebpf::{
     bindings::{xdp_action, BPF_F_NO_PREALLOC},
-    macros::{classifier, map, xdp},
+    macros::{map, xdp},
     maps::{lpm_trie::Key, Array, LpmTrie, PerCpuArray, RingBuf},
-    programs::{TcContext, XdpContext},
+    programs::XdpContext,
 };
 use core::mem;
 
@@ -361,20 +361,6 @@ fn try_sentinel_vfr_filter(ctx: &XdpContext) -> Result<u32, ()> {
 
     record_rx(packet_len);
     Ok(xdp_action::XDP_PASS)
-}
-
-#[classifier]
-pub fn sentinel_vfr_tc(ctx: TcContext) -> i32 {
-    match try_sentinel_vfr_tc(&ctx) {
-        Ok(ret) => ret,
-        Err(_) => 0,
-    }
-}
-
-#[inline(always)]
-fn try_sentinel_vfr_tc(_ctx: &TcContext) -> Result<i32, ()> {
-    const TC_ACT_OK: i32 = 0;
-    Ok(TC_ACT_OK)
 }
 
 #[inline(always)]

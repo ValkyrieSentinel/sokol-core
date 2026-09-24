@@ -8,7 +8,7 @@ mod sokol;
 
 use aya::maps::lpm_trie::Key;
 use aya::maps::{Array, LpmTrie, MapData, PerCpuArray, RingBuf};
-use aya::programs::{tc, SchedClassifier, TcAttachType, Xdp};
+use aya::programs::Xdp;
 use aya::{include_bytes_aligned, Bpf, Pod};
 use clap::Parser;
 use sokol::SokolEngine;
@@ -346,22 +346,6 @@ async fn main() -> Result<(), anyhow::Error> {
     let _link = program.attach(&args.interface, Default::default())?;
     log::info!("XDP program successfully locked and attached to interface: {}", args.interface);
 
-    let tc_prog_mut = bpf
-        .program_mut("sentinel_vfr_tc")
-        .ok_or_else(|| anyhow::anyhow!("Critical: Program sentinel_vfr_tc not found in ELF"))?;
-    let tc_program: &mut SchedClassifier = tc_prog_mut.try_into()?;
-    // The clsact qdisc outlives the process; on restart it already exists, which is fine.
-    if let Err(e) = tc::qdisc_add_clsact(&args.interface) {
-        if e.kind() != std::io::ErrorKind::AlreadyExists {
-            return Err(e.into());
-        }
-    }
-    tc_program.load()?;
-    let _tc_link = tc_program.attach(&args.interface, TcAttachType::Ingress)?;
-    log::info!("TC stateful VFR program successfully locked and attached to ingress of {}", args.interface);
-
-    std::fs::create_dir_all("/sys/fs/bpf/sokol").ok();
-
     let blocklist_v4_data = bpf.take_map("BLOCKLIST_V4").ok_or_else(|| anyhow::anyhow!("BLOCKLIST_V4 missing"))?;
     let blocklist_v4_trie = LpmTrie::<MapData, [u8; 4], u32>::try_from(blocklist_v4_data)?;
     let blocklist_v4_map = Arc::new(tokio::sync::Mutex::new(blocklist_v4_trie));
@@ -588,7 +572,7 @@ async fn main() -> Result<(), anyhow::Error> {
                     }
                 }
                 MeshCommand::EngageDefense => {
-                    log::warn!("[CRITICAL] Global mesh defense mode engaged on node & upstream BGP Flowspec active!");
+                    log::warn!("[CRITICAL] Global mesh defense mode engaged (no enforcement is attached to this mode yet).");
                 }
                 MeshCommand::DisengageDefense => {
                     log::info!("[CRITICAL] Global mesh defense mode disengaged.");
@@ -822,6 +806,9 @@ async fn main() -> Result<(), anyhow::Error> {
     let sokol_engine = SokolEngine::new(500.0);
     let mut prev_packets = 0;
     let mut prev_bytes = 0;
+    let mut prev_dropped = 0;
+    // Counters are cumulative; the first tick only establishes the baseline.
+    let mut have_baseline = false;
 
     log::info!("Sokol-Core running with SokolEngine anomaly detection & sovereign mesh verification loops.");
 
@@ -864,6 +851,7 @@ async fn main() -> Result<(), anyhow::Error> {
 
                 let delta_packets = total_rx_packets.saturating_sub(prev_packets);
                 let delta_bytes = total_rx_bytes.saturating_sub(prev_bytes);
+                let delta_dropped = total_dropped.saturating_sub(prev_dropped);
 
                 let dt = 1.0;
                 let is_anomaly = sokol_engine.detect_anomaly(
@@ -876,11 +864,14 @@ async fn main() -> Result<(), anyhow::Error> {
 
                 prev_packets = total_rx_packets;
                 prev_bytes = total_rx_bytes;
+                prev_dropped = total_dropped;
+                let first_tick = !have_baseline;
+                have_baseline = true;
 
-                if is_anomaly || total_dropped > 0 {
+                if !first_tick && (is_anomaly || delta_dropped > 0) {
                     log::warn!(
-                        "[SOKOL ANOMALY DETECTED] Flow Rate: {:.2} pkts/s | Pkts/s: {} | Bytes/s: {} | Drops: {}",
-                        flow_rate.0, delta_packets, delta_bytes, total_dropped
+                        "[SOKOL ANOMALY DETECTED] Flow Rate: {:.2} pkts/s | Pkts/s: {} | Bytes/s: {} | Drops/s: {} | Drops total: {}",
+                        flow_rate.0, delta_packets, delta_bytes, delta_dropped, total_dropped
                     );
                     
                     let anomaly_telemetry = format!(

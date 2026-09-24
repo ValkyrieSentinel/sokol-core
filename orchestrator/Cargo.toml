@@ -5,7 +5,6 @@ edition = "2021"
 
 [dependencies]
 aya = { version = "0.12", features = ["default", "tokio"] }
-aya-log = "0.2"
 common = { path = "../common", features = ["std"] }
 tokio = { version = "1.0", features = ["full"] }
 clap = { version = "4.0", features = ["derive"] }
@@ -13,7 +12,6 @@ log = "0.4"
 env_logger = "0.10"
 ctrlc = "3.2"
 anyhow = "1.0"
-sokol_ai = { path = "../ai" }
 rand = "0.8"
 serde = { version = "1.0", features = ["derive"] }
 bincode = "1.3"

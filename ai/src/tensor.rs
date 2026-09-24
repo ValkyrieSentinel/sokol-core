@@ -176,15 +176,20 @@ impl<T, const R: usize> Tensor<T, R> {
             Err(_) => None,
         }
     }
-    
-    
+
+    /// # Safety
+    ///
+    /// Every index must be below the corresponding dimension of `shape()`; otherwise the
+    /// computed offset is out of bounds and the behaviour is undefined.
     #[inline(always)]
     pub unsafe fn get_unchecked(&self, indices: [usize; R]) -> &T {
         let idx = self.offset_unchecked(indices);
         self.data.get_unchecked(idx)
     }
-    
-    
+
+    /// # Safety
+    ///
+    /// Same contract as [`get_unchecked`](Self::get_unchecked).
     #[inline(always)]
     pub unsafe fn get_unchecked_mut(&mut self, indices: [usize; R]) -> &mut T {
         let idx = self.offset_unchecked(indices);

@@ -2,7 +2,7 @@ use std::net::Ipv6Addr;
 use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, watch};
-use log::{info, warn, error};
+use log::{error, info, warn};
 
 use common::NodeTelemetry;
 use crate::cluster_state::BirdEyeView;
@@ -47,17 +47,12 @@ impl UpstreamBgpIntegration {
         }
         nlri_buf.extend_from_slice(&octets[..bytes_needed]);
 
-        if drop {
-            warn!(
-                "[BGP Flowspec] EXECUTING UPSTREAM DROP: IPv6 {}/{} pushed to upstream router {} (RFC 8955)",
-                ipv6, prefix_len, self.upstream_router_addr
-            );
-        } else {
-            info!(
-                "[BGP Flowspec] Removing/Relaxing upstream rule for IPv6 {}/{} on router {}",
-                ipv6, prefix_len, self.upstream_router_addr
-            );
-        }
+        // No BGP session exists yet: the NLRI is built but nothing is sent to the router.
+        warn!(
+            "[BGP Flowspec] NOT IMPLEMENTED: would {} upstream rule for IPv6 {}/{} on router {} (RFC 8955); nothing was sent",
+            if drop { "announce drop" } else { "withdraw" },
+            ipv6, prefix_len, self.upstream_router_addr
+        );
 
         Ok(())
     }
@@ -95,7 +90,7 @@ impl MeshOrchestrator {
     }
 
     pub async fn run_telemetry_processor(&mut self) -> anyhow::Result<()> {
-        info!("[MeshOrchestrator] Production telemetry processor with IPv6 BGP Flowspec mitigation started.");
+        info!("[MeshOrchestrator] Telemetry processor started (BGP Flowspec dispatch is not implemented; storms are only logged).");
 
         let mut storm_active = false;
         let mut shutdown_rx = self.shutdown_rx.clone();

@@ -42,7 +42,7 @@ jobs:
         run: cargo test --release
 
       - name: Clippy
-        run: cargo clippy --release --all-targets
+        run: cargo clippy --release --all-targets -- -D warnings
 
       - name: XDP smoke test (veth + netns)
         run: |

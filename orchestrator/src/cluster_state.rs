@@ -106,3 +106,41 @@ impl BirdEyeView {
         });
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn node(node_id: u64, dropped_packets: u64, under_attack: bool) -> NodeTelemetry {
+        NodeTelemetry {
+            node_id,
+            rx_packets: 0,
+            dropped_packets,
+            anomaly_score: 0.0,
+            under_attack: under_attack as u8,
+            has_attacker_ip: 0,
+            attacker_ip: [0; 16],
+            _pad: [0; 6],
+        }
+    }
+
+    #[tokio::test]
+    async fn cluster_status_follows_the_share_of_attacked_nodes() {
+        let bird_eye = BirdEyeView::new(0.4, Duration::from_secs(300));
+        assert_eq!(bird_eye.global_cluster_health().await, ClusterStatus::Unknown);
+
+        bird_eye.ingest(node(1, 0, false)).await;
+        bird_eye.ingest(node(2, 0, false)).await;
+        bird_eye.ingest(node(3, 20_000, true)).await;
+        assert_eq!(bird_eye.global_cluster_health().await, ClusterStatus::LocalIncident);
+        assert_eq!(bird_eye.total_cluster_drops().await, 20_000);
+
+        bird_eye.ingest(node(4, 15_000, true)).await;
+        bird_eye.ingest(node(5, 30_000, true)).await;
+        assert_eq!(bird_eye.global_cluster_health().await, ClusterStatus::DistributedStorm);
+        assert_eq!(bird_eye.total_cluster_drops().await, 65_000);
+
+        bird_eye.ingest(node(5, 10_000, true)).await;
+        assert_eq!(bird_eye.total_cluster_drops().await, 45_000);
+    }
+}
