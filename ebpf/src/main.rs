@@ -9,7 +9,7 @@ use aya_ebpf::{
 };
 use core::mem;
 
-use common::{config_flags, drop_reason, DropEvent, PacketStats};
+use common::{config_flags, drop_reason, DropEvent, PacketStats, DROP_REASON_SLOTS, MAX_EVENTS_PER_CPU_PER_SEC};
 
 const ETH_P_IP: u16 = 0x0800;
 const ETH_P_IPV6: u16 = 0x86DD;
@@ -26,6 +26,8 @@ const IP_MF: u16 = 0x2000;
 const IP_OFFSET_MASK: u16 = 0x1FFF;
 
 const TRAP_PORT: u16 = 44333;
+const TCP_SYN: u8 = 0x02;
+const TCP_ACK: u8 = 0x10;
 const ADMIN_SSH_PORT: u16 = 2222;
 
 #[repr(C, packed)]
@@ -141,21 +143,27 @@ fn emit_drop_event_sampled(
     protocol: u8,
     ip_version: u8,
 ) {
-    let mut should_emit = reason == drop_reason::TRAP_INTERCEPTED;
+    let Some(stats_ptr) = STATS.get_ptr_mut(0) else {
+        return;
+    };
+    let stats = unsafe { &mut *stats_ptr };
 
-    if !should_emit {
-        if let Some(stats_ptr) = STATS.get_ptr_mut(0) {
-            unsafe {
-                if ((*stats_ptr).dropped_packets & 0xFF) == 0 {
-                    should_emit = true;
-                }
-            }
-        }
-    }
-
-    if !should_emit {
+    // Trap hits are always interesting; other drops are sampled 1 in 256.
+    if reason != drop_reason::TRAP_INTERCEPTED && (stats.dropped_packets & 0xFF) != 0 {
         return;
     }
+
+    // Per-CPU budget, so a flood cannot turn into a flood of events (and audit writes).
+    let now = unsafe { aya_ebpf::helpers::bpf_ktime_get_ns() };
+    if now.wrapping_sub(stats.event_window_start_ns) >= 1_000_000_000 {
+        stats.event_window_start_ns = now;
+        stats.events_in_window = 0;
+    }
+    if stats.events_in_window >= MAX_EVENTS_PER_CPU_PER_SEC {
+        stats.events_suppressed += 1;
+        return;
+    }
+    stats.events_in_window += 1;
 
     if let Some(mut entry) = EVENTS.reserve::<DropEvent>(0) {
         let entry_ptr = entry.as_mut_ptr();
@@ -351,7 +359,9 @@ fn try_sentinel_vfr_filter(ctx: &XdpContext) -> Result<u32, ()> {
                 return Ok(xdp_action::XDP_PASS);
             }
 
-            if port == TRAP_PORT {
+            // Only connection attempts (SYN without ACK) count as trap hits, not every segment.
+            let flags = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*tcp_ptr).flags)) };
+            if port == TRAP_PORT && flags & TCP_SYN != 0 && flags & TCP_ACK == 0 {
                 emit_drop_event_sampled(ctx, &src_ip_16, &dst_ip_16, packet_len as u32, drop_reason::TRAP_INTERCEPTED, protocol, ip_version);
                 record_rx(packet_len);
                 return Ok(xdp_action::XDP_PASS);
@@ -388,6 +398,7 @@ fn record_drop(packet_len: u64, reason: u16) {
             (*stats_ptr).rx_packets += 1;
             (*stats_ptr).rx_bytes += packet_len;
             (*stats_ptr).dropped_packets += 1;
+            (*stats_ptr).drops_by_reason[(reason as usize) & (DROP_REASON_SLOTS - 1)] += 1;
             if reason == drop_reason::SLOW_PATH_LPM_HIT || reason == drop_reason::STATIC_BLOCK {
                 (*stats_ptr).slow_path_hits += 1;
             }

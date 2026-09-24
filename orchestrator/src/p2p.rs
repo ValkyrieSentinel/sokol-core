@@ -365,6 +365,10 @@ impl PeerRegistry {
         );
     }
 
+    pub async fn peer_count(&self) -> usize {
+        self.peers.read().await.len()
+    }
+
     pub async fn remove_peer(&self, addr: &SocketAddr) {
         let mut peers = self.peers.write().await;
         if let Some((_, node_id)) = peers.remove(addr) {

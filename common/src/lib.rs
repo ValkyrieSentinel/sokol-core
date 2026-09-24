@@ -18,7 +18,18 @@ pub struct PacketStats {
     pub fast_path_hits: u64,
     pub slow_path_hits: u64,
     pub redirected_packets: u64,
+    /// Drops per `drop_reason` code (index = code, masked to `DROP_REASON_SLOTS`).
+    pub drops_by_reason: [u64; DROP_REASON_SLOTS],
+    /// Ring-buffer events withheld by the per-CPU rate limit.
+    pub events_suppressed: u64,
+    /// Rate-limit window state (per CPU; not a counter).
+    pub event_window_start_ns: u64,
+    pub events_in_window: u64,
 }
+
+pub const DROP_REASON_SLOTS: usize = 16;
+/// Ring-buffer events allowed per CPU per second; the rest are only counted.
+pub const MAX_EVENTS_PER_CPU_PER_SEC: u64 = 64;
 
 impl PacketStats {
     pub const ZERO: Self = Self {
@@ -29,6 +40,10 @@ impl PacketStats {
         fast_path_hits: 0,
         slow_path_hits: 0,
         redirected_packets: 0,
+        drops_by_reason: [0; DROP_REASON_SLOTS],
+        events_suppressed: 0,
+        event_window_start_ns: 0,
+        events_in_window: 0,
     };
 }
 
@@ -69,6 +84,22 @@ pub mod drop_reason {
     pub const SOCK_REDIRECTED: u16 = 7;
     pub const MANUAL_BLOCK: u16 = 8;
     pub const FRAGMENT_BLOCKED: u16 = 9;
+
+    /// Label for metrics; `None` for codes that are never recorded as drops.
+    pub const fn name(code: u16) -> Option<&'static str> {
+        match code {
+            STATIC_BLOCK => Some("static_block"),
+            FAST_PATH_HIT => Some("fast_path_hit"),
+            SLOW_PATH_LPM_HIT => Some("blocklist"),
+            VFR_ANOMALY => Some("vfr_anomaly"),
+            MALFORMED_HEADER => Some("malformed_header"),
+            TRAP_INTERCEPTED => Some("trap_intercepted"),
+            SOCK_REDIRECTED => Some("sock_redirected"),
+            MANUAL_BLOCK => Some("manual_block"),
+            FRAGMENT_BLOCKED => Some("fragment_blocked"),
+            _ => None,
+        }
+    }
 }
 
 /// Bits of the eBPF `CONFIG` map (index 0).

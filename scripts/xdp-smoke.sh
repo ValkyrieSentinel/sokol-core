@@ -60,6 +60,7 @@ start_orchestrator() {
         --db-path "$WORK/events.sntl" \
         --key-file "$WORK/node.key" \
         --p2p-bind "127.0.0.1:0" \
+        --metrics-bind "127.0.0.1:9469" \
         "$@" \
         >"$LOG" 2>&1 &
     ORCH_PID=$!
@@ -95,6 +96,25 @@ check "orchestrator starts on $HOST_IF" orchestrator_up
 check "fragmented IPv4 from $ALLOWED_IP passes (issue #5)" ping_fragmented_from "$ALLOWED_IP"
 check "traffic from $ALLOWED_IP passes" ping_from "$ALLOWED_IP"
 check "traffic from blocked $BLOCKED_IP is dropped" bash -c "! ip netns exec $NS ping -c 2 -W 1 -I $BLOCKED_IP $HOST_IP >/dev/null 2>&1"
+
+metric() {
+    curl -s http://127.0.0.1:9469/metrics | awk -v m="$1" '$1 == m { print $2 }'
+}
+sleep 1.2
+check "metrics: blocklist drops are counted" bash -c "test \"\$(curl -s http://127.0.0.1:9469/metrics | awk '\$1 == \"sokol_xdp_dropped_packets_total{reason=\\\"blocklist\\\"}\" { print \$2 }')\" -ge 2"
+
+# SYN flood on the XDP trap port: events must be rate-limited, not one per packet.
+FLOOD_START=$SECONDS
+ip netns exec "$NS" bash -c "for i in \$(seq 1 3000); do (echo > /dev/tcp/$HOST_IP/44333) 2>/dev/null; done; true"
+FLOOD_SECONDS=$((SECONDS - FLOOD_START + 1))
+sleep 1.5
+TRAP_EVENTS=$( (grep -a -o "KERNEL_DROP_NOTIFY|Reason:6|" "$WORK/events.sntl" || true) | wc -l)
+CPUS=$(nproc)
+echo "      trap events recorded: $TRAP_EVENTS for 3000 SYNs; suppressed: $(metric sokol_xdp_events_suppressed_total); cpus: $CPUS"
+check "trap SYN flood: excess events are suppressed" test "$(metric sokol_xdp_events_suppressed_total)" -gt 0
+# 64 events per CPU per started second of flood (+1 window for the boundary).
+check "trap SYN flood: recorded events stay within the per-CPU budget" \
+    test "$TRAP_EVENTS" -le $((64 * CPUS * (FLOOD_SECONDS + 1)))
 
 ipc() {
     printf '%s\n' "$1" | nc -U -q1 /run/sokol.sock

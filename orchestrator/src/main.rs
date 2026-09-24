@@ -4,6 +4,7 @@ pub mod cluster_state;
 mod block_policy;
 mod block_table;
 mod mesh_sync;
+mod metrics;
 mod p2p;
 mod sokol;
 
@@ -40,6 +41,7 @@ enum AuditMsg {
 pub struct SentinelDb {
     tx: std::sync::mpsc::SyncSender<AuditMsg>,
     dropped: Arc<std::sync::atomic::AtomicU64>,
+    overflow_total: std::sync::atomic::AtomicU64,
 }
 
 impl SentinelDb {
@@ -96,7 +98,15 @@ impl SentinelDb {
             log::info!("SentinelDb persistence thread terminated.");
         });
 
-        Ok(Self { tx, dropped })
+        Ok(Self {
+            tx,
+            dropped,
+            overflow_total: std::sync::atomic::AtomicU64::new(0),
+        })
+    }
+
+    pub fn overflow_total(&self) -> u64 {
+        self.overflow_total.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Waits until everything queued so far is written and fsynced (used on shutdown).
@@ -112,6 +122,7 @@ impl SentinelDb {
             Ok(()) => {}
             Err(std::sync::mpsc::TrySendError::Full(_)) => {
                 self.dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.overflow_total.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
                 log::error!("Audit writer thread is gone; record lost");
@@ -195,6 +206,10 @@ struct Args {
 
     #[arg(long, default_value = "86400")]
     block_ttl_max: u64,
+
+    /// Serve Prometheus metrics at http://<addr>/metrics (e.g. 127.0.0.1:9469). Off by default.
+    #[arg(long, value_name = "ADDR")]
+    metrics_bind: Option<std::net::SocketAddr>,
 }
 
 const MAX_IPC_LINE: u64 = 4096;
@@ -777,6 +792,30 @@ async fn main() -> Result<(), anyhow::Error> {
     // Counters are cumulative; the first tick only establishes the baseline.
     let mut have_baseline = false;
 
+    let metrics_snapshot = Arc::new(std::sync::RwLock::new(metrics::Snapshot::default()));
+    if let Some(addr) = args.metrics_bind {
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to bind metrics endpoint {}: {}", addr, e))?;
+        let snapshot = metrics_snapshot.clone();
+        let app = axum::Router::new().route(
+            "/metrics",
+            axum::routing::get(move || {
+                let snapshot = snapshot.clone();
+                async move {
+                    let body = metrics::render(&snapshot.read().unwrap_or_else(|p| p.into_inner()));
+                    ([(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4")], body)
+                }
+            }),
+        );
+        log::info!("[Metrics] Prometheus endpoint on http://{}/metrics", addr);
+        tokio::spawn(async move {
+            if let Err(e) = axum::serve(listener, app).await {
+                log::error!("[Metrics] server stopped: {}", e);
+            }
+        });
+    }
+
     log::info!("Sokol-Core running with SokolEngine anomaly detection & sovereign mesh verification loops.");
 
     let mut ticker = tokio::time::interval(Duration::from_secs(1));
@@ -813,14 +852,26 @@ async fn main() -> Result<(), anyhow::Error> {
                 let mut total_rx_packets = 0u64;
                 let mut total_rx_bytes = 0u64;
                 let mut total_dropped = 0u64;
+                let mut snapshot = metrics::Snapshot::default();
 
                 if let Ok(per_cpu_stats) = stats_map.get(&0u32, 0) {
                     for cpu_stat in per_cpu_stats.iter() {
                         total_rx_packets += cpu_stat.0.rx_packets;
                         total_rx_bytes += cpu_stat.0.rx_bytes;
                         total_dropped += cpu_stat.0.dropped_packets;
+                        snapshot.events_suppressed += cpu_stat.0.events_suppressed;
+                        for (sum, n) in snapshot.drops_by_reason.iter_mut().zip(cpu_stat.0.drops_by_reason) {
+                            *sum += n;
+                        }
                     }
                 }
+                snapshot.rx_packets = total_rx_packets;
+                snapshot.rx_bytes = total_rx_bytes;
+                snapshot.dropped_packets = total_dropped;
+                snapshot.blocks_active = blocks.lock().await.active();
+                snapshot.p2p_peers = peer_registry.peer_count().await;
+                snapshot.audit_queue_overflow = sntl_db.overflow_total();
+                *metrics_snapshot.write().unwrap_or_else(|p| p.into_inner()) = snapshot;
 
                 let delta_packets = total_rx_packets.saturating_sub(prev_packets);
                 let delta_bytes = total_rx_bytes.saturating_sub(prev_bytes);
