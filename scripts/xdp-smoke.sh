@@ -24,6 +24,8 @@ READY="Sokol-Core running with SokolEngine"
 cleanup() {
     [ -n "$ORCH_PID" ] && kill "$ORCH_PID" 2>/dev/null && wait "$ORCH_PID" 2>/dev/null || true
     [ -n "$OPERATOR_PID" ] && kill "$OPERATOR_PID" 2>/dev/null || true
+    [ -n "${SURICATA_PID:-}" ] && kill "$SURICATA_PID" 2>/dev/null || true
+    [ -n "${ADAPTER_PID:-}" ] && kill "$ADAPTER_PID" 2>/dev/null || true
     pkill -f "gobgpd -f $WORK" 2>/dev/null || true
     [ -n "${NODE2_PID:-}" ] && kill "$NODE2_PID" 2>/dev/null || true
     ip link del sokol-wg0 2>/dev/null || true
@@ -206,6 +208,46 @@ sleep 0.3
 check "operator unban lifts the block" ping_from "$ALLOWED_IP"
 kill "$OPERATOR_PID" 2>/dev/null || true
 OPERATOR_PID=""
+
+# Suricata -> sokol-suricata -> orchestrator -> XDP, with the time from probe to block.
+if command -v suricata >/dev/null; then
+    PROBE_IP=10.231.0.5
+    ip netns exec "$NS" ip addr add "$PROBE_IP/24" dev "$PEER_IF"
+    printf 'alert tcp any any -> any 23 (msg:"SOKOL TEST telnet probe"; flags:S; classtype:attempted-recon; sid:1000001; rev:1;)\n' >"$WORK/sokol.rules"
+    mkdir -p "$WORK/suricata"
+    suricata -c /etc/suricata/suricata.yaml -S "$WORK/sokol.rules" -i "$HOST_IF" -l "$WORK/suricata" -k none \
+        --set outputs.1.eve-log.enabled=yes >"$WORK/suricata.out" 2>&1 &
+    SURICATA_PID=$!
+    for _ in $(seq 1 120); do
+        grep -qi "engine started" "$WORK/suricata/suricata.log" "$WORK/suricata.out" 2>/dev/null && break
+        sleep 0.5
+    done
+    touch "$WORK/suricata/eve.json"
+    "$(dirname "$BIN")/sokol-suricata" --eve "$WORK/suricata/eve.json" >"$WORK/adapter.log" 2>&1 &
+    ADAPTER_PID=$!
+    sleep 1
+    check "the probe address reaches the node before the alert" \
+        ip netns exec "$NS" ping -c 1 -W 1 -I "$PROBE_IP" "$HOST_IP"
+    ip netns exec "$NS" ping -D -i 0.01 -W 1 -I "$PROBE_IP" "$HOST_IP" >"$WORK/probe-ping.log" 2>&1 &
+    PING_PID=$!
+    sleep 0.3
+    T_PROBE=$(date +%s.%N)
+    ip netns exec "$NS" nc -z -w 1 -s "$PROBE_IP" "$HOST_IP" 23 2>/dev/null || true
+    sleep 3
+    kill "$PING_PID" 2>/dev/null || true
+    LAST_REPLY=$(grep -o '^\[[0-9.]*\]' "$WORK/probe-ping.log" | tail -1 | tr -d '[]')
+    check "Suricata alert is forwarded as a signal" grep -q "SIGNAL:suricata|$PROBE_IP|$HOST_IP|sid:1000001" "$WORK/adapter.log"
+    check "Suricata alert blocks the probing address in XDP" \
+        bash -c "! ip netns exec $NS ping -c 2 -W 1 -I $PROBE_IP $HOST_IP >/dev/null 2>&1"
+    check "the block reason names Suricata and the rule" grep -q "Dynamic block enforced in XDP: $PROBE_IP.*suricata: sid:1000001 SOKOL TEST telnet probe" "$LOG"
+    if [ -n "$LAST_REPLY" ]; then
+        echo "      probe -> last reply before block: $(awk -v a="$T_PROBE" -v b="$LAST_REPLY" 'BEGIN { printf "%.0f ms", (b - a) * 1000 }')"
+    fi
+    kill "$ADAPTER_PID" "$SURICATA_PID" 2>/dev/null || true
+    ADAPTER_PID=""; SURICATA_PID=""
+else
+    echo "SKIP  Suricata checks (suricata not installed)"
+fi
 
 ipc "DROP_IMMEDIATE:$ALLOWED_IP"
 sleep 0.5

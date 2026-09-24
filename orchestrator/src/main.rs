@@ -8,6 +8,7 @@ mod flowspec;
 mod mesh_sync;
 mod metrics;
 mod p2p;
+mod signal;
 mod sokol;
 
 use aya::maps::{Array, LpmTrie, MapData, PerCpuArray, RingBuf};
@@ -1149,6 +1150,50 @@ async fn main() -> Result<(), anyhow::Error> {
                                                     e
                                                 );
                                             }
+                                        }
+                                    } else if let Some(payload) = content.strip_prefix("SIGNAL:") {
+                                        match signal::parse(payload) {
+                                            Ok(sig) => match signal::target(&sig, &policy_stream) {
+                                                Ok(ip) => {
+                                                    db.append(format!(
+                                                        "SIGNAL|Source:{}|Src:{}|Dst:{}|Target:{}|Reason:{}",
+                                                        sig.source,
+                                                        sig.src,
+                                                        sig.dst.map(|d| d.to_string()).unwrap_or_else(|| "-".into()),
+                                                        ip,
+                                                        sig.reason
+                                                    ));
+                                                    let reason =
+                                                        format!("{}: {}", sig.source, sig.reason);
+                                                    enforce_block_local(
+                                                        ip,
+                                                        &reason,
+                                                        &blocks_stream,
+                                                        &db,
+                                                        &registry,
+                                                        node_id_unix,
+                                                        &crypto_stream,
+                                                        &dag_stream,
+                                                        &policy_stream,
+                                                    )
+                                                    .await;
+                                                }
+                                                Err(why) => {
+                                                    log::warn!(
+                                                        "[Signal] {} signal not enforced: {}",
+                                                        sig.source,
+                                                        why
+                                                    );
+                                                    db.append(format!(
+                                                        "SIGNAL_REFUSED|Source:{}|Src:{}|Why:{}",
+                                                        sig.source, sig.src, why
+                                                    ));
+                                                }
+                                            },
+                                            Err(e) => log::error!(
+                                                "[UNIX IPC FAULT] Bad SIGNAL line: {}",
+                                                e
+                                            ),
                                         }
                                     } else if let Some(log_content) =
                                         content.strip_prefix("DB_LOG:")

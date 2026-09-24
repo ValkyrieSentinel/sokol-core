@@ -144,6 +144,25 @@ Envelopes are signed over sender, timestamp, nonce and payload; they are rejecte
 ±30 s clock window (keep nodes NTP-synced) and accepted at most once. Mesh traffic is
 authenticated but not encrypted.
 
+## Signals from detectors (Suricata)
+
+Sokol enforces decisions made by detectors you already run. `sokol-suricata` follows Suricata's
+EVE log and sends each alert at or above `--max-severity` (default 2) to the node as a signal:
+
+```shell
+sokol-suricata --eve /var/log/suricata/eve.json --ipc-socket /run/sokol/sokol.sock
+```
+
+The node blocks the offending address in XDP, shares the block with its mesh peers and records the
+rule in the audit log (`suricata: sid:<id> <signature>`). If the alert fired on this node's own
+outbound traffic, the remote destination is blocked instead; the never-block policy still applies.
+The same address is not re-sent within `--cooldown-secs` (60), signals are capped at
+`--max-signals-per-sec` (50), and noisy rules can be skipped with `--ignore-sid`. The adapter only
+needs to read the EVE log and write to the IPC socket (group `sokol-ipc`).
+
+Other detectors can use the same line protocol on the IPC socket:
+`SIGNAL:<source>|<src ip>|<dst ip or ->|<reason>`.
+
 ## Local control socket and protected addresses
 
 `/run/sokol.sock` accepts `DROP_IMMEDIATE:<ip>` from local tools such as `trident_trap`.
