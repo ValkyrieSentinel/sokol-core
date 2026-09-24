@@ -805,7 +805,7 @@ async fn enforce_block_local(
             );
             push_telemetry(&telemetry_msg).await;
 
-      Enforcement::Enforced
+            Enforcement::Enforced
         }
         Err(e) => {
             log::error!(
