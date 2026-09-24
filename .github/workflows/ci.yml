@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  ZIG_VERSION: 0.14.1
+  BPF_LINKER_VERSION: v0.11.1
+
+jobs:
+  build-test-smoke:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust nightly
+        run: |
+          rustup toolchain install nightly --profile minimal --component rust-src,clippy
+          rustup default nightly
+
+      - name: Install bpf-linker
+        run: |
+          curl -sSfL "https://github.com/aya-rs/bpf-linker/releases/download/${BPF_LINKER_VERSION}/bpf-linker-x86_64-unknown-linux-musl.tar.zst" \
+            | tar --zstd -x -C /usr/local/bin
+          bpf-linker --version
+
+      - name: Install Zig
+        run: |
+          curl -sSfL "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" | tar -xJ -C /opt
+          echo "/opt/zig-x86_64-linux-${ZIG_VERSION}" >> "$GITHUB_PATH"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+
+      - name: Build eBPF program
+        working-directory: ebpf
+        run: cargo build --release
+
+      - name: Build workspace
+        run: cargo build --release
+
+      - name: Test
+        run: cargo test --release
+
+      - name: Clippy
+        run: cargo clippy --release --all-targets
+
+      - name: XDP smoke test (veth + netns)
+        run: sudo scripts/xdp-smoke.sh target/release/orchestrator

@@ -1,5 +1,9 @@
 [build]
 target = "bpfel-unknown-none"
+# The orchestrator embeds the object from <repo>/target/bpfel-unknown-none/<profile>/ebpf-probe
+# (see include_bytes_aligned! in orchestrator/src/main.rs). ebpf is excluded from the
+# workspace, so without this it would land in ebpf/target and the orchestrator build fails.
+target-dir = "../target"
 
 [unstable]
 build-std = ["core", "alloc"]
