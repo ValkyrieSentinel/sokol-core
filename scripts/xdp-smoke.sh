@@ -63,9 +63,13 @@ ip netns exec "$NS" ip addr add "$BLOCKED_IP/24" dev "$PEER_IF"
 ip netns exec "$NS" ip link set "$PEER_IF" up
 ip netns exec "$NS" ip link set lo up
 
-start_orchestrator() {
+STARTS=0
+start_orchestrator() {   # a fresh state file per start unless STATE_FILE is set
     : >"$LOG"
+    STARTS=$((STARTS + 1))
+    LAST_STATE=${STATE_FILE:-$WORK/state.$STARTS.json}
     RUST_LOG=info "$BIN" \
+        --state-file "$LAST_STATE" \
         --interface "$HOST_IF" \
         --block "$BLOCKED_IP" \
         --db-path "$WORK/events.sntl" \
@@ -332,6 +336,18 @@ ipc "DROP_IMMEDIATE:$ALLOWED_IP"
 sleep 0.5
 check "root IPC DROP_IMMEDIATE blocks $ALLOWED_IP" bash -c "! ip netns exec $NS ping -c 2 -W 1 -I $ALLOWED_IP $HOST_IP >/dev/null 2>&1"
 
+# ADR-4: an operator ban survives a restart; --block is lifted only by the configuration.
+PERSIST_IP=10.231.0.11
+ip netns exec "$NS" ip addr add "$PERSIST_IP/24" dev "$PEER_IF"
+printf 'BAN_IP:%s\n' "$PERSIST_IP" | nc -U -q1 "$WORK/control.sock" >/dev/null
+check "operator cannot lift a --block address" bash -c \
+    "printf 'UNBAN_IP:$BLOCKED_IP\\n' | nc -U -q1 '$WORK/control.sock' | grep -q 'blocked by --block'"
+stop_orchestrator
+STATE_FILE=$LAST_STATE start_orchestrator
+check "an operator ban survives a restart" \
+    bash -c "! ip netns exec $NS ping -c 2 -W 1 -I $PERSIST_IP $HOST_IP >/dev/null 2>&1"
+check "the restart reports restored blocks" grep -q "Restored .* of this node's blocks" "$LOG"
+printf 'UNBAN_IP:%s\n' "$PERSIST_IP" | nc -U -q1 "$WORK/control.sock" >/dev/null
 stop_orchestrator
 start_orchestrator --drop-ipv4-fragments
 check "orchestrator restarts on the same interface" orchestrator_up
