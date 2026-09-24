@@ -11,6 +11,12 @@
 //! crash) is truncated away; a complete record whose chain does not match is reported as
 //! corruption and the log is not opened, so evidence is never silently discarded.
 //!
+//! Rotation (optional): when the active file reaches `max_bytes` it is renamed to
+//! `<path>.<first seq, 20 digits>` and a new file starts with a segment header
+//! (`"SALS" | start_seq u64 | previous chain [32]`), so the chain continues across files and
+//! [`verify_chain`] can detect a missing, reordered or edited segment. Only the newest `keep`
+//! rotated segments are kept.
+//!
 //! The chain detects accidental corruption and edits that do not rewrite every later record.
 //! Someone with write access can recompute the whole chain; to make that detectable, export
 //! `head()` somewhere they cannot write.
@@ -23,6 +29,8 @@ pub const MAGIC: [u8; 4] = *b"SAL2";
 pub const HEADER_LEN: usize = 4 + 4 + 8 + 8;
 pub const CHAIN_LEN: usize = 32;
 pub const MAX_PAYLOAD: usize = 64 * 1024;
+pub const SEGMENT_MAGIC: [u8; 4] = *b"SALS";
+pub const SEGMENT_HEADER_LEN: usize = 4 + 8 + CHAIN_LEN;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Record {
@@ -100,6 +108,8 @@ pub struct AuditReader<R> {
     offset: u64,
     next_seq: u64,
     chain: [u8; CHAIN_LEN],
+    /// `(start_seq, previous chain)` from the segment header, if the file has one.
+    segment_start: Option<(u64, [u8; CHAIN_LEN])>,
 }
 
 impl AuditReader<BufReader<File>> {
@@ -115,7 +125,36 @@ impl<R: Read + Seek> AuditReader<R> {
             offset: 0,
             next_seq: 0,
             chain: [0u8; CHAIN_LEN],
+            segment_start: None,
         }
+    }
+
+    pub fn segment_start(&self) -> Option<(u64, [u8; CHAIN_LEN])> {
+        self.segment_start
+    }
+
+    /// Consumes the segment header at the start of a rotated-in file. `Ok(false)` if the
+    /// file is too short to tell yet.
+    fn read_segment_header(&mut self) -> Result<bool, AuditError> {
+        self.inner.seek(SeekFrom::Start(0))?;
+        let mut magic = [0u8; 4];
+        if !read_full(&mut self.inner, &mut magic)? {
+            return Ok(false);
+        }
+        if magic != SEGMENT_MAGIC {
+            return Ok(true);
+        }
+        let mut rest = [0u8; SEGMENT_HEADER_LEN - 4];
+        if !read_full(&mut self.inner, &mut rest)? {
+            return Ok(false);
+        }
+        let start = u64::from_le_bytes(rest[0..8].try_into().unwrap());
+        let prev: [u8; CHAIN_LEN] = rest[8..].try_into().unwrap();
+        self.segment_start = Some((start, prev));
+        self.next_seq = start;
+        self.chain = prev;
+        self.offset = SEGMENT_HEADER_LEN as u64;
+        Ok(true)
     }
 
     /// Byte offset just past the last verified record.
@@ -133,6 +172,9 @@ impl<R: Read + Seek> AuditReader<R> {
 
     /// Returns the next verified record, `Ok(None)` if the data ends (possibly mid-record).
     pub fn next_record(&mut self) -> Result<Option<Record>, AuditError> {
+        if self.offset == 0 && !self.read_segment_header()? {
+            return Ok(None);
+        }
         self.inner.seek(SeekFrom::Start(self.offset))?;
 
         let mut header = [0u8; HEADER_LEN];
@@ -193,17 +235,78 @@ fn read_full<R: Read>(r: &mut R, buf: &mut [u8]) -> io::Result<bool> {
     Ok(true)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Rotation {
+    pub max_bytes: u64,
+    /// Rotated segments to keep; older ones are deleted.
+    pub keep: usize,
+}
+
 pub struct AuditLog {
     file: File,
     path: PathBuf,
     next_seq: u64,
     chain: [u8; CHAIN_LEN],
     unsynced: usize,
+    rotation: Option<Rotation>,
+    size: u64,
+    segment_start_seq: u64,
+}
+
+fn rotated_path(path: &Path, start_seq: u64) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(format!(".{:020}", start_seq));
+    PathBuf::from(name)
+}
+
+/// Rotated segments of `path`, oldest first.
+pub fn rotated_segments(path: &Path) -> io::Result<Vec<(u64, PathBuf)>> {
+    let dir = match path.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d.to_path_buf(),
+        _ => PathBuf::from("."),
+    };
+    let base = match path.file_name() {
+        Some(b) => format!("{}.", b.to_string_lossy()),
+        None => return Ok(Vec::new()),
+    };
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(&dir)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        if let Some(suffix) = name.strip_prefix(&base) {
+            if suffix.len() == 20 && suffix.bytes().all(|b| b.is_ascii_digit()) {
+                out.push((suffix.parse().unwrap(), entry.path()));
+            }
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+fn segment_header(start_seq: u64, prev: &[u8; CHAIN_LEN]) -> [u8; SEGMENT_HEADER_LEN] {
+    let mut h = [0u8; SEGMENT_HEADER_LEN];
+    h[0..4].copy_from_slice(&SEGMENT_MAGIC);
+    h[4..12].copy_from_slice(&start_seq.to_le_bytes());
+    h[12..].copy_from_slice(prev);
+    h
+}
+
+fn sync_dir(path: &Path) {
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        if let Ok(d) = File::open(dir) {
+            let _ = d.sync_all();
+        }
+    }
 }
 
 impl AuditLog {
     /// Opens or creates the log, verifying every existing record.
     pub fn open(path: &Path) -> Result<Self, AuditError> {
+        Self::open_with(path, None)
+    }
+
+    /// Like [`open`](Self::open), rotating the active file at `rotation.max_bytes`.
+    pub fn open_with(path: &Path, rotation: Option<Rotation>) -> Result<Self, AuditError> {
         if let Some(dir) = path.parent() {
             if !dir.as_os_str().is_empty() {
                 std::fs::create_dir_all(dir)?;
@@ -225,13 +328,58 @@ impl AuditLog {
             file.sync_all()?;
         }
 
-        Ok(Self {
+        let mut log = Self {
             file,
             path: path.to_path_buf(),
             next_seq: reader.next_seq(),
             chain: reader.head(),
             unsynced: 0,
-        })
+            rotation,
+            size: valid_len,
+            segment_start_seq: reader.segment_start().map(|(s, _)| s).unwrap_or(0),
+        };
+
+        // A crash between renaming the old segment and writing the new header leaves an empty
+        // active file next to rotated segments: continue the chain from the newest one.
+        if valid_len == 0 {
+            if let Some((_, last)) = rotated_segments(path)?.pop() {
+                let mut prev = AuditReader::open(&last)?;
+                while prev.next_record()?.is_some() {}
+                log.start_segment(prev.next_seq(), prev.head())?;
+            }
+        }
+        Ok(log)
+    }
+
+    fn start_segment(&mut self, start_seq: u64, prev: [u8; CHAIN_LEN]) -> Result<(), AuditError> {
+        self.file.write_all(&segment_header(start_seq, &prev))?;
+        self.file.sync_all()?;
+        self.next_seq = start_seq;
+        self.chain = prev;
+        self.size = SEGMENT_HEADER_LEN as u64;
+        self.segment_start_seq = start_seq;
+        Ok(())
+    }
+
+    fn rotate(&mut self, keep: usize) -> Result<(), AuditError> {
+        self.sync()?;
+        let rotated = rotated_path(&self.path, self.segment_start_seq);
+        std::fs::rename(&self.path, &rotated)?;
+        self.file = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .create_new(true)
+            .open(&self.path)?;
+        let (seq, chain) = (self.next_seq, self.chain);
+        self.start_segment(seq, chain)?;
+        sync_dir(&self.path);
+
+        let segments = rotated_segments(&self.path)?;
+        let excess = segments.len().saturating_sub(keep);
+        for (_, old) in segments.into_iter().take(excess) {
+            std::fs::remove_file(old)?;
+        }
+        Ok(())
     }
 
     pub fn path(&self) -> &Path {
@@ -256,6 +404,12 @@ impl AuditLog {
         if payload.len() > MAX_PAYLOAD {
             return Err(AuditError::PayloadTooLarge(payload.len()));
         }
+        if let Some(rot) = self.rotation {
+            let has_records = self.next_seq > self.segment_start_seq;
+            if rot.max_bytes > 0 && self.size >= rot.max_bytes && has_records {
+                self.rotate(rot.keep)?;
+            }
+        }
         let seq = self.next_seq;
         let header = encode_header(payload.len() as u32, seq, now_ms());
         let chain = next_chain(&self.chain, &header, payload);
@@ -266,6 +420,7 @@ impl AuditLog {
         record.extend_from_slice(&chain);
         self.file.write_all(&record)?;
 
+        self.size += record.len() as u64;
         self.next_seq += 1;
         self.chain = chain;
         self.unsynced += 1;
@@ -283,6 +438,64 @@ impl AuditLog {
         }
         Ok(())
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct ChainSummary {
+    pub segments: usize,
+    /// Sequence number of the oldest record still on disk (older segments may be pruned).
+    pub first_seq: u64,
+    pub next_seq: u64,
+    pub head: [u8; CHAIN_LEN],
+}
+
+/// Verifies every retained segment and the active file as one chain.
+pub fn verify_chain(path: &Path) -> Result<ChainSummary, String> {
+    let mut files: Vec<PathBuf> = rotated_segments(path)
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .map(|(_, p)| p)
+        .collect();
+    let rotated = files.len();
+    files.push(path.to_path_buf());
+
+    let mut expected: Option<(u64, [u8; CHAIN_LEN])> = None;
+    let mut first_seq = None;
+    for (i, file) in files.iter().enumerate() {
+        let name = file.display();
+        let mut reader = AuditReader::open(file).map_err(|e| format!("{}: {}", name, e))?;
+        while reader
+            .next_record()
+            .map_err(|e| format!("{}: {}", name, e))?
+            .is_some()
+        {}
+        let start = reader.segment_start().unwrap_or((0, [0u8; CHAIN_LEN]));
+        if let Some(exp) = expected {
+            if start != exp {
+                return Err(format!(
+                    "{}: does not continue the previous segment (starts at seq {}, expected {}); a segment is missing, reordered or edited",
+                    name, start.0, exp.0
+                ));
+            }
+        }
+        let len = std::fs::metadata(file).map_err(|e| e.to_string())?.len();
+        if i < rotated && len != reader.offset() {
+            return Err(format!(
+                "{}: rotated segment has {} trailing bytes",
+                name,
+                len - reader.offset()
+            ));
+        }
+        first_seq.get_or_insert(start.0);
+        expected = Some((reader.next_seq(), reader.head()));
+    }
+    let (next_seq, head) = expected.unwrap_or((0, [0u8; CHAIN_LEN]));
+    Ok(ChainSummary {
+        segments: files.len(),
+        first_seq: first_seq.unwrap_or(0),
+        next_seq,
+        head,
+    })
 }
 
 #[cfg(test)]
@@ -411,6 +624,98 @@ mod tests {
             Err(AuditError::PayloadTooLarge(_))
         ));
         assert!(log.is_empty());
+    }
+
+    const SMALL: Rotation = Rotation {
+        max_bytes: 200,
+        keep: 3,
+    };
+
+    #[test]
+    fn rotation_keeps_one_chain_across_segments() {
+        let path = temp_path("rotate");
+        let mut log = AuditLog::open_with(&path, Some(SMALL)).unwrap();
+        for i in 0..20 {
+            log.append(format!("record {:02} with some padding", i).as_bytes())
+                .unwrap();
+        }
+        log.sync().unwrap();
+        let segs = rotated_segments(&path).unwrap();
+        assert_eq!(segs.len(), 3, "only `keep` rotated segments remain");
+
+        let summary = verify_chain(&path).unwrap();
+        assert_eq!(summary.next_seq, 20);
+        assert_eq!(summary.head, log.head());
+        assert_eq!(summary.segments, 4);
+        assert!(summary.first_seq > 0, "oldest segments were pruned");
+
+        // Reopening continues the same chain and numbering.
+        drop(log);
+        let mut log = AuditLog::open_with(&path, Some(SMALL)).unwrap();
+        assert_eq!(log.append(b"after reopen").unwrap(), 20);
+        log.sync().unwrap();
+        assert_eq!(verify_chain(&path).unwrap().next_seq, 21);
+    }
+
+    #[test]
+    fn verify_detects_missing_or_edited_segments() {
+        let path = temp_path("rotate-tamper");
+        let mut log = AuditLog::open_with(
+            &path,
+            Some(Rotation {
+                max_bytes: 200,
+                keep: 10,
+            }),
+        )
+        .unwrap();
+        for i in 0..20 {
+            log.append(format!("record {:02} with some padding", i).as_bytes())
+                .unwrap();
+        }
+        log.sync().unwrap();
+        let segs = rotated_segments(&path).unwrap();
+        assert!(segs.len() >= 3);
+
+        // Remove a middle segment.
+        let (_, middle) = &segs[1];
+        let saved = std::fs::read(middle).unwrap();
+        std::fs::remove_file(middle).unwrap();
+        let err = verify_chain(&path).unwrap_err();
+        assert!(err.contains("does not continue"), "{}", err);
+        std::fs::write(middle, &saved).unwrap();
+        assert!(verify_chain(&path).is_ok());
+
+        // Edit a byte inside a rotated segment.
+        let (_, first) = &segs[0];
+        let mut bytes = std::fs::read(first).unwrap();
+        bytes[HEADER_LEN + 3] ^= 1;
+        std::fs::write(first, &bytes).unwrap();
+        assert!(verify_chain(&path)
+            .unwrap_err()
+            .contains("hash chain mismatch"));
+    }
+
+    #[test]
+    fn crash_between_rename_and_header_continues_the_chain() {
+        let path = temp_path("rotate-crash");
+        {
+            let mut log = AuditLog::open_with(&path, Some(SMALL)).unwrap();
+            for i in 0..5 {
+                log.append(format!("record {:02} with some padding", i).as_bytes())
+                    .unwrap();
+            }
+            log.sync().unwrap();
+        }
+        // Simulate the crash: the active file was renamed, the new one never written.
+        let head_before = verify_chain(&path).unwrap();
+        let seg_name = rotated_path(&path, 999);
+        std::fs::rename(&path, &seg_name).unwrap();
+        std::fs::write(&path, b"").unwrap();
+
+        let mut log = AuditLog::open_with(&path, Some(SMALL)).unwrap();
+        assert_eq!(log.append(b"next").unwrap(), head_before.next_seq);
+        log.sync().unwrap();
+        let _ = std::fs::remove_file(&seg_name);
     }
 
     #[test]

@@ -201,6 +201,8 @@ check "root IPC DROP_IMMEDIATE blocks $ALLOWED_IP" bash -c "! ip netns exec $NS 
 stop_orchestrator
 start_orchestrator --drop-ipv4-fragments
 check "orchestrator restarts on the same interface" orchestrator_up
+MONITOR_BIN="$(dirname "$BIN")/monitor"
+check "monitor --verify accepts the audit chain" bash -c "'$MONITOR_BIN' --verify '$WORK/events.sntl' | grep -q '^OK'"
 check "audit log from the first run is re-verified on restart" \
     grep -qE "Audit log .* opened: [1-9][0-9]* records verified" "$LOG"
 check "strict mode: unfragmented traffic from $ALLOWED_IP passes" ping_from "$ALLOWED_IP"
@@ -215,12 +217,19 @@ check "--xdp-mode native attaches in driver mode (veth supports it)" bash -c "ip
 check "native mode: blocked source is dropped" bash -c "! ip netns exec $NS ping -c 1 -W 1 -I $BLOCKED_IP $HOST_IP >/dev/null 2>&1"
 
 stop_orchestrator
-start_orchestrator --block-ttl 2
+start_orchestrator --block-ttl 2 --audit-max-bytes 600 --audit-keep 50
 ipc "DROP_IMMEDIATE:$ALLOWED_IP"
 sleep 0.5
 check "TTL: dynamic block of $ALLOWED_IP is enforced" bash -c "! ip netns exec $NS ping -c 1 -W 1 -I $ALLOWED_IP $HOST_IP >/dev/null 2>&1"
 sleep 3
 check "TTL: dynamic block expires after --block-ttl" ping_from "$ALLOWED_IP"
+check "audit log rotated into segments" bash -c "ls '$WORK'/events.sntl.0* >/dev/null 2>&1"
+check "monitor --verify accepts the chain across rotated segments" bash -c "'$MONITOR_BIN' --verify '$WORK/events.sntl' | grep -q '^OK'"
+FIRST_SEGMENT=$(ls "$WORK"/events.sntl.0* | head -1)
+cp "$FIRST_SEGMENT" "$WORK/segment.bak"
+printf 'X' | dd of="$FIRST_SEGMENT" bs=1 seek=40 conv=notrunc 2>/dev/null
+check "monitor --verify detects an edited segment" bash -c "! '$MONITOR_BIN' --verify '$WORK/events.sntl' >/dev/null"
+cp "$WORK/segment.bak" "$FIRST_SEGMENT"
 check "TTL: static --block stays in force" bash -c "! ip netns exec $NS ping -c 1 -W 1 -I $BLOCKED_IP $HOST_IP >/dev/null 2>&1"
 
 stop_orchestrator

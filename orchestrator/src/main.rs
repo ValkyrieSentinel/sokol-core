@@ -23,7 +23,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc, watch};
 
 use common::atp::AtpBudgetController;
-use common::audit_log::AuditLog;
+use common::audit_log::{AuditLog, Rotation};
 use common::canonical::CanonicalParser;
 use common::{DropEvent, NodeTelemetry};
 
@@ -50,8 +50,8 @@ impl SentinelDb {
     const SYNC_INTERVAL: Duration = Duration::from_millis(100);
     const SYNC_BATCH: usize = 64;
 
-    pub fn init(path: &str) -> anyhow::Result<Self> {
-        let mut log = AuditLog::open(std::path::Path::new(path))
+    pub fn init(path: &str, rotation: Option<Rotation>) -> anyhow::Result<Self> {
+        let mut log = AuditLog::open_with(std::path::Path::new(path), rotation)
             .map_err(|e| anyhow::anyhow!("{} ({})", e, path))?;
         log::info!("Audit log {} opened: {} records verified", path, log.len());
 
@@ -232,6 +232,14 @@ struct Args {
     /// `generic` (SKB mode, works everywhere, much slower), or `auto` (kernel's choice).
     #[arg(long, value_enum, default_value = "auto")]
     xdp_mode: XdpMode,
+
+    /// Rotate the audit log when it reaches this size (bytes); 0 disables rotation.
+    #[arg(long, default_value = "104857600")]
+    audit_max_bytes: u64,
+
+    /// Rotated audit segments to keep (older ones are deleted).
+    #[arg(long, default_value = "10")]
+    audit_keep: usize,
 }
 
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
@@ -485,7 +493,11 @@ async fn main() -> Result<(), anyhow::Error> {
 
     let atp_controller = AtpBudgetController::new(10_000_000);
 
-    let sntl_db = Arc::new(SentinelDb::init(&args.db_path)?);
+    let rotation = (args.audit_max_bytes > 0).then_some(Rotation {
+        max_bytes: args.audit_max_bytes,
+        keep: args.audit_keep,
+    });
+    let sntl_db = Arc::new(SentinelDb::init(&args.db_path, rotation)?);
 
     #[cfg(debug_assertions)]
     let mut bpf = Bpf::load(include_bytes_aligned!(concat!(

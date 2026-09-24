@@ -6,7 +6,7 @@ use std::process::Command;
 use std::thread;
 use std::time::Duration;
 
-use common::audit_log::AuditReader;
+use common::audit_log::{verify_chain, AuditReader};
 
 const DB_FILE: &str = "/var/lib/sokol/audit.log";
 
@@ -154,7 +154,39 @@ fn get_ebpf_active_blocks() -> Vec<String> {
     banned_ips
 }
 
+fn to_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+/// `monitor --verify [path]`: checks every retained segment and the active log as one chain.
+/// Exit code 0 = intact, 1 = broken. Record the printed head somewhere the node cannot write
+/// to make later rewrites of the whole chain detectable.
+fn verify(path: &str) -> ! {
+    match verify_chain(Path::new(path)) {
+        Ok(s) => {
+            println!(
+                "OK {}: {} file(s), records {}..{}, head {}",
+                path,
+                s.segments,
+                s.first_seq,
+                s.next_seq,
+                to_hex(&s.head)
+            );
+            std::process::exit(0);
+        }
+        Err(e) => {
+            println!("BROKEN {}: {}", path, e);
+            std::process::exit(1);
+        }
+    }
+}
+
 fn main() -> io::Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("--verify") {
+        verify(args.get(2).map(String::as_str).unwrap_or(DB_FILE));
+    }
+
     let mut reader: Option<Reader> = None;
     let mut events: Vec<AuditEvent> = Vec::new();
     let mut read_error: Option<String> = None;

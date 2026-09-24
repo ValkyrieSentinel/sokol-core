@@ -166,6 +166,23 @@ dropping `CAP_PERFMON` does not), `ProtectSystem=strict` and related hardening
 `SOKOL_IPC_SOCKET=/run/sokol/sokol.sock` (it also needs `CAP_NET_BIND_SERVICE` for ports below
 1024). SIGTERM shuts down gracefully and flushes the audit log.
 
+## Audit log
+
+Blocks, unblocks, trap hits and sampled kernel drop events go to `--db-path`
+(`/var/lib/sokol/audit.log`), an append-only log whose records are chained with BLAKE3. It
+rotates at `--audit-max-bytes` (default 100 MiB) into `audit.log.<first sequence number>`,
+keeping `--audit-keep` segments (default 10); each segment starts where the previous one ended,
+so the chain stays verifiable across files:
+
+```shell
+./target/release/monitor --verify /var/lib/sokol/audit.log
+# OK /var/lib/sokol/audit.log: 4 file(s), records 1200..5210, head 3f9c...
+```
+
+A missing, reordered or edited segment makes it print `BROKEN` and exit 1. Someone with write
+access could rebuild the whole chain; to detect that, record the printed head somewhere the node
+cannot write (another host, a ticket, a timestamping service).
+
 ## Metrics
 
 `--metrics-bind 127.0.0.1:9469` serves Prometheus metrics at `/metrics`:
