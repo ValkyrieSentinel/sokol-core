@@ -6,6 +6,8 @@
 //! stayed blocked forever and the 65 536-entry maps eventually filled up.
 use std::collections::HashMap;
 use std::net::IpAddr;
+
+use ipnet::IpNet;
 use std::time::{Duration, Instant};
 
 use aya::maps::lpm_trie::Key;
@@ -13,6 +15,50 @@ use aya::maps::{LpmTrie, MapData, MapError};
 
 /// How long an address's past blocks count towards escalation.
 pub const STRIKE_MEMORY: Duration = Duration::from_secs(24 * 3600);
+
+/// A single address as a host network (/32 or /128); `::ffff:a.b.c.d` becomes `a.b.c.d/32`.
+pub fn host(ip: IpAddr) -> IpNet {
+    IpNet::from(ip.to_canonical())
+}
+
+/// Network address with host bits cleared; IPv4-mapped IPv6 prefixes become IPv4 ones.
+pub fn canonical(net: IpNet) -> IpNet {
+    if let IpNet::V6(v6) = net {
+        if let Some(v4) = v6.network().to_ipv4_mapped() {
+            if v6.prefix_len() >= 96 {
+                if let Ok(n) = ipnet::Ipv4Net::new(v4, v6.prefix_len() - 96) {
+                    return IpNet::V4(n.trunc());
+                }
+            }
+        }
+    }
+    net.trunc()
+}
+
+/// An address or a CIDR prefix, as accepted from the CLI, the IPC and control sockets and the mesh.
+pub fn parse_target(raw: &str) -> Option<IpNet> {
+    let raw = raw.trim();
+    if let Ok(ip) = raw.parse::<IpAddr>() {
+        return Some(host(ip));
+    }
+    raw.parse::<IpNet>().ok().map(canonical)
+}
+
+/// Addresses print without a prefix length, so logs and audit records stay as before.
+pub fn show(net: &IpNet) -> String {
+    if net.prefix_len() == net.max_prefix_len() {
+        net.addr().to_string()
+    } else {
+        net.to_string()
+    }
+}
+
+pub fn family_tag(net: &IpNet) -> &'static str {
+    match net {
+        IpNet::V4(_) => "V4",
+        IpNet::V6(_) => "V6",
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Lifetime {
@@ -45,7 +91,7 @@ struct Entry {
 #[derive(Debug)]
 pub struct ExpiryTracker {
     policy: TtlPolicy,
-    entries: HashMap<IpAddr, Entry>,
+    entries: HashMap<IpNet, Entry>,
 }
 
 impl ExpiryTracker {
@@ -57,7 +103,7 @@ impl ExpiryTracker {
     }
 
     /// Records a block and returns its lifetime (`None` = permanent).
-    pub fn record(&mut self, ip: IpAddr, lifetime: Lifetime, now: Instant) -> Option<Duration> {
+    pub fn record(&mut self, ip: IpNet, lifetime: Lifetime, now: Instant) -> Option<Duration> {
         let entry = self.entries.entry(ip).or_insert(Entry {
             state: State::Expired,
             strikes: 0,
@@ -90,7 +136,7 @@ impl ExpiryTracker {
     /// Adopts a block learned from a peer's snapshot until `now + remaining` (capped at the local
     /// maximum, so a peer cannot impose an endless block). Does not count as a strike. Returns
     /// true if the address was not blocked before.
-    pub fn record_until(&mut self, ip: IpAddr, remaining: Duration, now: Instant) -> bool {
+    pub fn record_until(&mut self, ip: IpNet, remaining: Duration, now: Instant) -> bool {
         let until = now + remaining.min(self.policy.max);
         let entry = self.entries.entry(ip).or_insert(Entry {
             state: State::Expired,
@@ -113,8 +159,8 @@ impl ExpiryTracker {
     }
 
     /// Running dynamic blocks and their remaining time, for a peer that just (re)connected.
-    pub fn dynamic_snapshot(&self, now: Instant) -> Vec<(IpAddr, Duration)> {
-        let mut out: Vec<(IpAddr, Duration)> = self
+    pub fn dynamic_snapshot(&self, now: Instant) -> Vec<(IpNet, Duration)> {
+        let mut out: Vec<(IpNet, Duration)> = self
             .entries
             .iter()
             .filter_map(|(ip, e)| match e.state {
@@ -126,14 +172,14 @@ impl ExpiryTracker {
         out
     }
 
-    pub fn is_permanent(&self, ip: &IpAddr) -> bool {
+    pub fn is_permanent(&self, ip: &IpNet) -> bool {
         self.entries
             .get(ip)
             .is_some_and(|e| e.state == State::Permanent)
     }
 
     /// Forgets a dynamic block and returns true; a permanent block is kept and false returned.
-    pub fn release_dynamic(&mut self, ip: &IpAddr) -> bool {
+    pub fn release_dynamic(&mut self, ip: &IpNet) -> bool {
         if self.is_permanent(ip) {
             return false;
         }
@@ -141,12 +187,12 @@ impl ExpiryTracker {
         true
     }
 
-    pub fn forget(&mut self, ip: &IpAddr) {
+    pub fn forget(&mut self, ip: &IpNet) {
         self.entries.remove(ip);
     }
 
     /// Ends every running dynamic block now (keeping strike history); returns their addresses.
-    pub fn take_all_dynamic(&mut self) -> Vec<IpAddr> {
+    pub fn take_all_dynamic(&mut self) -> Vec<IpNet> {
         let mut released = Vec::new();
         for (ip, entry) in self.entries.iter_mut() {
             if let State::Until(_) = entry.state {
@@ -158,7 +204,7 @@ impl ExpiryTracker {
     }
 
     /// Addresses whose block ran out at `now`. Their strike history is kept for escalation.
-    pub fn take_expired(&mut self, now: Instant) -> Vec<IpAddr> {
+    pub fn take_expired(&mut self, now: Instant) -> Vec<IpNet> {
         let mut expired = Vec::new();
         for (ip, entry) in self.entries.iter_mut() {
             if let State::Until(until) = entry.state {
@@ -181,7 +227,7 @@ impl ExpiryTracker {
             .count()
     }
 
-    pub fn active_ips(&self) -> std::collections::HashSet<IpAddr> {
+    pub fn active_ips(&self) -> std::collections::HashSet<IpNet> {
         self.entries
             .iter()
             .filter(|(_, e)| e.state != State::Expired)
@@ -196,8 +242,8 @@ impl ExpiryTracker {
             .iter()
             .filter(|(_, e)| e.state != State::Expired);
         active.fold((0, 0), |(v4, v6), (ip, _)| match ip {
-            IpAddr::V4(_) => (v4 + 1, v6),
-            IpAddr::V6(_) => (v4, v6 + 1),
+            IpNet::V4(_) => (v4 + 1, v6),
+            IpNet::V6(_) => (v4, v6 + 1),
         })
     }
 }
@@ -261,21 +307,19 @@ impl BlockTable {
     /// Adds `ip` (as a /32 or /128) to the kernel blocklist. Returns the lifetime applied.
     pub fn insert(
         &mut self,
-        ip: IpAddr,
+        ip: IpNet,
         lifetime: Lifetime,
         now: Instant,
     ) -> Result<Option<Duration>, MapError> {
-        match ip.to_canonical() {
-            IpAddr::V4(v4) => self.v4.insert(&Key::new(32, v4.octets()), 1u32, 0)?,
-            IpAddr::V6(v6) => self.v6.insert(&Key::new(128, v6.octets()), 1u32, 0)?,
-        }
-        Ok(self.expiry.record(ip.to_canonical(), lifetime, now))
+        let net = canonical(ip);
+        self.insert_into_map(net)?;
+        Ok(self.expiry.record(net, lifetime, now))
     }
 
     /// Unblocks a dynamic block. Returns `Ok(false)` for a permanent (operator) block, which
     /// only the operator's own configuration may lift.
-    pub fn remove_dynamic(&mut self, ip: IpAddr) -> Result<bool, MapError> {
-        let ip = ip.to_canonical();
+    pub fn remove_dynamic(&mut self, ip: IpNet) -> Result<bool, MapError> {
+        let ip = canonical(ip);
         if !self.expiry.release_dynamic(&ip) {
             return Ok(false);
         }
@@ -284,14 +328,14 @@ impl BlockTable {
     }
 
     /// Lifts any block of `ip`, permanent ones included (operator authority).
-    pub fn remove(&mut self, ip: IpAddr) -> Result<(), MapError> {
-        let ip = ip.to_canonical();
+    pub fn remove(&mut self, ip: IpNet) -> Result<(), MapError> {
+        let ip = canonical(ip);
         self.expiry.forget(&ip);
         self.remove_from_map(ip)
     }
 
     /// Lifts all dynamic blocks; operator and `--block` bans stay.
-    pub fn flush_dynamic(&mut self) -> Vec<IpAddr> {
+    pub fn flush_dynamic(&mut self) -> Vec<IpNet> {
         let released = self.expiry.take_all_dynamic();
         for ip in &released {
             if let Err(e) = self.remove_from_map(*ip) {
@@ -305,15 +349,34 @@ impl BlockTable {
         released
     }
 
-    fn remove_from_map(&mut self, ip: IpAddr) -> Result<(), MapError> {
-        match ip {
-            IpAddr::V4(v4) => self.v4.remove(&Key::new(32, v4.octets())),
-            IpAddr::V6(v6) => self.v6.remove(&Key::new(128, v6.octets())),
+    fn insert_into_map(&mut self, net: IpNet) -> Result<(), MapError> {
+        match net {
+            IpNet::V4(n) => self.v4.insert(
+                &Key::new(n.prefix_len() as u32, n.network().octets()),
+                1u32,
+                0,
+            ),
+            IpNet::V6(n) => self.v6.insert(
+                &Key::new(n.prefix_len() as u32, n.network().octets()),
+                1u32,
+                0,
+            ),
+        }
+    }
+
+    fn remove_from_map(&mut self, net: IpNet) -> Result<(), MapError> {
+        match net {
+            IpNet::V4(n) => self
+                .v4
+                .remove(&Key::new(n.prefix_len() as u32, n.network().octets())),
+            IpNet::V6(n) => self
+                .v6
+                .remove(&Key::new(n.prefix_len() as u32, n.network().octets())),
         }
     }
 
     /// Removes blocks whose lifetime ended; returns the addresses that were released.
-    pub fn expire(&mut self, now: Instant) -> Vec<IpAddr> {
+    pub fn expire(&mut self, now: Instant) -> Vec<IpNet> {
         let expired = self.expiry.take_expired(now);
         for ip in &expired {
             if let Err(e) = self.remove_from_map(*ip) {
@@ -338,26 +401,23 @@ impl BlockTable {
     /// Installs a block from a peer's snapshot; see [`ExpiryTracker::record_until`].
     pub fn insert_until(
         &mut self,
-        ip: IpAddr,
+        ip: IpNet,
         remaining: Duration,
         now: Instant,
     ) -> Result<bool, MapError> {
-        let ip = ip.to_canonical();
+        let ip = canonical(ip);
         let new = self.expiry.record_until(ip, remaining, now);
         if new {
-            match ip {
-                IpAddr::V4(v4) => self.v4.insert(&Key::new(32, v4.octets()), 1u32, 0)?,
-                IpAddr::V6(v6) => self.v6.insert(&Key::new(128, v6.octets()), 1u32, 0)?,
-            }
+            self.insert_into_map(ip)?;
         }
         Ok(new)
     }
 
-    pub fn dynamic_snapshot(&self, now: Instant) -> Vec<(IpAddr, Duration)> {
+    pub fn dynamic_snapshot(&self, now: Instant) -> Vec<(IpNet, Duration)> {
         self.expiry.dynamic_snapshot(now)
     }
 
-    pub fn active_ips(&self) -> std::collections::HashSet<IpAddr> {
+    pub fn active_ips(&self) -> std::collections::HashSet<IpNet> {
         self.expiry.active_ips()
     }
 }
@@ -371,8 +431,8 @@ mod tests {
         max: Duration::from_secs(600),
     };
 
-    fn ip(s: &str) -> IpAddr {
-        s.parse().unwrap()
+    fn ip(s: &str) -> IpNet {
+        parse_target(s).unwrap()
     }
 
     #[test]
@@ -559,6 +619,40 @@ mod tests {
         b.record(ip("203.0.113.23"), Lifetime::Permanent, t0);
         assert!(!b.record_until(ip("203.0.113.23"), s(1), t0));
         assert!(b.is_permanent(&ip("203.0.113.23")));
+    }
+
+    #[test]
+    fn targets_parse_canonically_and_print_like_before() {
+        assert_eq!(show(&ip("203.0.113.5")), "203.0.113.5");
+        assert_eq!(show(&ip("::ffff:203.0.113.5")), "203.0.113.5");
+        assert_eq!(
+            show(&ip("198.51.100.77/24")),
+            "198.51.100.0/24",
+            "host bits cleared"
+        );
+        assert_eq!(
+            show(&ip("::ffff:198.51.100.0/120")),
+            "198.51.100.0/24",
+            "mapped prefix becomes IPv4"
+        );
+        assert_eq!(show(&ip("2001:db8::1/48")), "2001:db8::/48");
+        assert!(parse_target("10.0.0.0/33").is_none());
+        assert!(parse_target("example.com").is_none());
+        assert_eq!(family_tag(&ip("2001:db8::/48")), "V6");
+    }
+
+    #[test]
+    fn prefixes_and_hosts_are_tracked_separately() {
+        let t0 = Instant::now();
+        let mut tracker = ExpiryTracker::new(POLICY);
+        tracker.record(ip("198.51.100.0/24"), Lifetime::Dynamic, t0);
+        tracker.record(ip("198.51.100.9"), Lifetime::Permanent, t0);
+        assert_eq!(tracker.active_by_family(), (2, 0));
+        assert_eq!(
+            tracker.take_expired(t0 + Duration::from_secs(60)),
+            vec![ip("198.51.100.0/24")]
+        );
+        assert!(tracker.is_permanent(&ip("198.51.100.9")));
     }
 
     #[test]

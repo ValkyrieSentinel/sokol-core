@@ -11,7 +11,9 @@
 //!
 //! By default only local decisions are forwarded (origins `crowdsec` and `cscli`). Community
 //! blocklists (`CAPI`, `lists`) can hold tens of thousands of addresses; add them to `--origins`
-//! only if the mesh should carry them. Decisions CrowdSec deletes are not lifted automatically:
+//! only if the mesh should carry them. Range decisions are forwarded as prefixes; the node
+//! refuses ones wider than its --min-block-prefix or covering protected addresses. Decisions
+//! CrowdSec deletes are not lifted automatically:
 //! Sokol's own TTL ends them, and an operator can lift one early with UNBAN_IP on the control
 //! socket.
 use std::io::{self, Write};
@@ -56,7 +58,7 @@ struct Batch {
     signals: Vec<String>,
     skipped_origin: usize,
     skipped_not_ban: usize,
-    skipped_range: usize,
+    skipped_scope: usize,
     deleted: usize,
 }
 
@@ -87,13 +89,21 @@ fn batch_from(body: &str, origins: &[String]) -> Result<Batch, String> {
             batch.skipped_not_ban += 1;
             continue;
         }
-        let ip = match field("value").parse::<IpAddr>() {
-            Ok(ip) if field("scope").eq_ignore_ascii_case("ip") => ip,
-            _ => {
-                // Ranges need prefix blocks, which the node does not support yet.
-                batch.skipped_range += 1;
-                continue;
-            }
+        let value = field("value");
+        let target = if field("scope").eq_ignore_ascii_case("ip") {
+            value.parse::<IpAddr>().ok().map(|ip| ip.to_string())
+        } else if field("scope").eq_ignore_ascii_case("range") {
+            value
+                .parse::<ipnet::IpNet>()
+                .ok()
+                .map(|net| net.to_string())
+        } else {
+            None
+        };
+        let Some(ip) = target else {
+            // Other scopes (country, AS) have no address to block.
+            batch.skipped_scope += 1;
+            continue;
         };
         let reason: String = format!(
             "{} (origin {}, crowdsec duration {})",
@@ -172,12 +182,12 @@ fn main() {
         match poll(&args, startup).and_then(|body| batch_from(&body, &args.origins)) {
             Ok(batch) => {
                 startup = false;
-                if batch.skipped_origin + batch.skipped_not_ban + batch.skipped_range > 0 {
+                if batch.skipped_origin + batch.skipped_not_ban + batch.skipped_scope > 0 {
                     log::info!(
-                        "[sokol-crowdsec] skipped {} other-origin, {} non-ban, {} range decisions",
+                        "[sokol-crowdsec] skipped {} other-origin, {} non-ban, {} non-address decisions",
                         batch.skipped_origin,
                         batch.skipped_not_ban,
-                        batch.skipped_range
+                        batch.skipped_scope
                     );
                 }
                 if batch.deleted > 0 {
@@ -234,20 +244,25 @@ mod tests {
             {"origin":"CAPI","type":"ban","scope":"Ip","value":"198.51.100.2","scenario":"community"},
             {"origin":"crowdsec","type":"captcha","scope":"Ip","value":"198.51.100.3","scenario":"http"},
             {"origin":"crowdsec","type":"ban","scope":"Range","value":"198.51.100.0/24","scenario":"x"},
+            {"origin":"crowdsec","type":"ban","scope":"Country","value":"XX","scenario":"geo"},
             {"origin":"crowdsec","type":"ban","scope":"Ip","value":"2001:db8::7","scenario":"crowdsecurity/ssh-bf"}
         ]}"#;
         let batch = batch_from(body, &local()).unwrap();
         assert_eq!(batch.skipped_origin, 1);
         assert_eq!(batch.skipped_not_ban, 1);
-        assert_eq!(batch.skipped_range, 1);
+        assert_eq!(batch.skipped_scope, 1, "country scope has no address");
         assert_eq!(batch.deleted, 1);
-        assert_eq!(batch.signals.len(), 1);
-        assert!(batch.signals[0].starts_with("SIGNAL:crowdsec|2001:db8::7|-|crowdsecurity/ssh-bf"));
+        assert_eq!(batch.signals.len(), 2);
+        assert!(
+            batch.signals[0].starts_with("SIGNAL:crowdsec|198.51.100.0/24|-|x"),
+            "ranges become prefixes"
+        );
+        assert!(batch.signals[1].starts_with("SIGNAL:crowdsec|2001:db8::7|-|crowdsecurity/ssh-bf"));
 
         let with_capi = batch_from(body, &["crowdsec".into(), "CAPI".into()]).unwrap();
         assert_eq!(
             with_capi.signals.len(),
-            2,
+            3,
             "community decisions only when asked for"
         );
     }

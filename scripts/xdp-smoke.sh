@@ -181,6 +181,22 @@ sleep 0.5
 check "loopback is never blocked" grep -q "Refusing to block 127.0.0.1 (loopback)" "$LOG"
 check "the node's own address is never blocked" grep -q "Refusing to block $HOST_IP (address of this node)" "$LOG"
 
+# CIDR blocks through the control socket, under the prefix rules.
+CIDR_IP=10.231.0.130
+ip netns exec "$NS" ip addr add "$CIDR_IP/24" dev "$PEER_IF"
+check "an address in 10.231.0.128/26 reaches the node before the prefix block" \
+    ip netns exec "$NS" ping -c 1 -W 1 -I "$CIDR_IP" "$HOST_IP"
+check "control socket bans a /26 prefix" bash -c "printf 'BAN_IP:10.231.0.128/26\\n' | nc -U -q1 '$WORK/control.sock' | grep -q '^OK banned 10.231.0.128/26'"
+check "an address inside the banned prefix is dropped in XDP" \
+    bash -c "! ip netns exec $NS ping -c 2 -W 1 -I $CIDR_IP $HOST_IP >/dev/null 2>&1"
+check "an address outside the prefix still passes" ping_from "$ALLOWED_IP"
+check "a prefix covering this node is refused" bash -c "printf 'BAN_IP:10.231.0.0/24\\n' | nc -U -q1 '$WORK/control.sock' | grep -q '^ERR 10.231.0.0/24 is protected (address of this node)'"
+check "a prefix wider than /16 is refused" bash -c "printf 'BAN_IP:198.0.0.0/8\\n' | nc -U -q1 '$WORK/control.sock' | grep -q 'wider than'"
+printf 'UNBAN_IP:10.231.0.128/26\n' | nc -U -q1 "$WORK/control.sock" >/dev/null
+sleep 0.3
+check "lifting the prefix lets its addresses through again" \
+    ip netns exec "$NS" ping -c 1 -W 1 -I "$CIDR_IP" "$HOST_IP"
+
 # Operator dashboard -> node control socket -> XDP, end to end.
 ctl() {
     printf '%s\n' "$1" | nc -U -q1 "$WORK/control.sock"

@@ -7,8 +7,13 @@ use ipnet::IpNet;
 /// Reason given for this host's own interface addresses.
 pub const LOCAL_ADDRESS: &str = "address of this node";
 
+pub const PREFIX_TOO_WIDE: &str = "prefix wider than --min-block-prefix-v4/-v6 allows";
+
 pub struct BlockPolicy {
     protected: Vec<(IpNet, &'static str)>,
+    /// Shortest prefix a block may have: a detector mistake must not cut off half the internet.
+    min_prefix_v4: u8,
+    min_prefix_v6: u8,
 }
 
 impl BlockPolicy {
@@ -29,6 +34,37 @@ impl BlockPolicy {
                 .iter()
                 .map(|(net, why)| (net.parse().expect("builtin CIDR"), *why))
                 .collect(),
+            min_prefix_v4: 16,
+            min_prefix_v6: 48,
+        }
+    }
+
+    pub fn set_min_prefix(&mut self, v4: u8, v6: u8) {
+        self.min_prefix_v4 = v4.min(32);
+        self.min_prefix_v6 = v6.min(128);
+    }
+
+    /// Checks a block target. A prefix is refused if it is wider than the minimum, or if it
+    /// contains, or lies inside, any protected address or range.
+    pub fn check_net(&self, net: IpNet) -> Result<(), &'static str> {
+        if net.prefix_len() == net.max_prefix_len() {
+            return self.check(net.addr());
+        }
+        let min = match net {
+            IpNet::V4(_) => self.min_prefix_v4,
+            IpNet::V6(_) => self.min_prefix_v6,
+        };
+        if net.prefix_len() < min {
+            return Err(PREFIX_TOO_WIDE);
+        }
+        // Two prefixes overlap exactly when one contains the other's network address.
+        match self
+            .protected
+            .iter()
+            .find(|(p, _)| net.contains(&p.network()) || p.contains(&net.network()))
+        {
+            Some((_, why)) => Err(why),
+            None => Ok(()),
         }
     }
 
@@ -193,6 +229,52 @@ mod tests {
         );
         assert_eq!(policy.check(ip("::ffff:198.51.100.7")), Err("mesh peer"));
         assert!(policy.check(ip("10.21.0.1")).is_ok());
+    }
+
+    #[test]
+    fn prefixes_must_not_cover_protected_addresses_or_be_too_wide() {
+        let mut policy = BlockPolicy::builtin();
+        policy.protect_ip(ip("10.231.0.1"), LOCAL_ADDRESS);
+        policy.protect(
+            "192.0.2.0/28".parse().unwrap(),
+            "operator never-block range",
+        );
+        let net = |s: &str| s.parse::<IpNet>().unwrap();
+
+        assert_eq!(policy.check_net(net("198.51.100.0/24")), Ok(()));
+        assert_eq!(
+            policy.check_net(net("10.231.0.0/24")),
+            Err(LOCAL_ADDRESS),
+            "contains this node"
+        );
+        assert_eq!(
+            policy.check_net(net("192.0.2.0/29")),
+            Err("operator never-block range"),
+            "inside a protected range"
+        );
+        assert_eq!(
+            policy.check_net(net("192.0.2.0/24")),
+            Err("operator never-block range"),
+            "covers a protected range"
+        );
+        assert_eq!(policy.check_net(net("127.0.0.0/16")), Err("loopback"));
+        // Strictly inside a protected range, not containing its network address.
+        assert_eq!(
+            policy.check_net(net("192.0.2.8/29")),
+            Err("operator never-block range")
+        );
+        assert_eq!(policy.check_net(net("127.1.0.0/16")), Err("loopback"));
+        assert_eq!(policy.check_net(net("198.0.0.0/8")), Err(PREFIX_TOO_WIDE));
+        assert_eq!(policy.check_net(net("2001:db8::/32")), Err(PREFIX_TOO_WIDE));
+        assert_eq!(policy.check_net(net("2001:db8:1::/48")), Ok(()));
+        assert_eq!(
+            policy.check_net(net("10.231.0.1/32")),
+            Err(LOCAL_ADDRESS),
+            "hosts use the address check"
+        );
+
+        policy.set_min_prefix(8, 32);
+        assert_eq!(policy.check_net(net("198.0.0.0/8")), Ok(()));
     }
 
     #[test]

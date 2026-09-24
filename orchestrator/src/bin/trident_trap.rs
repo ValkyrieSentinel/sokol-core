@@ -226,14 +226,14 @@ async fn handle_trident_connection(
                 "[TIER-1] Bot/Scanner detected from IP: {} on port {} | Hash: {:016X}",
                 ip, port, fingerprint.fingerprint_hash
             );
-            run_tier1_bot_tarpit(stream, &ip).await?;
+            run_tier1_bot_tarpit(stream).await?;
         }
         TridentTier::Tier1_5SlowDrip => {
             println!(
                 "[TIER-1.5 SLOW DRIP] Binary flood from IP: {} on port {} | holding the connection with a slow drip",
                 ip, port
             );
-            run_slow_drip_tarpit(stream, &ip, fingerprint.fingerprint_hash).await?;
+            run_slow_drip_tarpit(stream, fingerprint.fingerprint_hash).await?;
         }
         TridentTier::Tier2PayloadCapture => {
             println!(
@@ -336,10 +336,7 @@ fn calculate_shannon_entropy(data: &[u8]) -> f64 {
     entropy
 }
 
-async fn run_tier1_bot_tarpit(
-    mut stream: TcpStream,
-    ip: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_tier1_bot_tarpit(mut stream: TcpStream) -> Result<(), Box<dyn std::error::Error>> {
     let _ = stream
         .write_all(
             b"HTTP/1.1 200 OK\r\n\
@@ -371,7 +368,6 @@ async fn run_tier1_bot_tarpit(
 /// uplink on the attacker.
 async fn run_slow_drip_tarpit(
     mut stream: TcpStream,
-    ip: &str,
     seed_hash: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut seed: u64 = seed_hash ^ 0xDEADBEEFCAFEBABE;
@@ -391,7 +387,6 @@ async fn run_slow_drip_tarpit(
         sleep(Duration::from_millis(500)).await;
     }
 
-    let _ = ip;
     let _ = stream.shutdown().await;
     Ok(())
 }
