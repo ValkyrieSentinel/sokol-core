@@ -418,6 +418,9 @@ FLOWSPEC_ARGS=()
 if command -v gobgpd >/dev/null; then
     check "BGP session between node gobgpd and upstream gobgpd is established" start_gobgp_pair
     FLOWSPEC_ARGS=(--flowspec-gobgp "$(command -v gobgp)" --flowspec-gobgp-arg=-p --flowspec-gobgp-arg=50051)
+    # Another system's rule on the same gobgpd (no Sokol community): Sokol must never touch it.
+    FOREIGN_RULE=192.0.2.99/32
+    gobgp -p 50051 global rib -a ipv4-flowspec add match source "$FOREIGN_RULE" then discard
 else
     echo "SKIP  BGP Flowspec checks (gobgpd not installed)"
 fi
@@ -447,7 +450,20 @@ check "TTL: static --block stays in force" bash -c "! ip netns exec $NS ping -c 
 stop_orchestrator
 if [ ${#FLOWSPEC_ARGS[@]} -gt 0 ]; then
     sleep 1
-    check "Flowspec: shutdown withdraws the node's rules upstream" bash -c "! gobgp -p 50052 global rib -a ipv4-flowspec | grep -q source"
+    check "Flowspec: shutdown withdraws the node's rules upstream" bash -c "! gobgp -p 50052 global rib -a ipv4-flowspec | grep -q 'source: $BLOCKED_IP/32'"
+    check "Flowspec: another system's rule is left alone" bash -c "gobgp -p 50052 global rib -a ipv4-flowspec | grep -q 'source: $FOREIGN_RULE'"
+    # F03: a crashed orchestrator leaves its rules in gobgpd; the next run reads the RIB and
+    # withdraws what it no longer wants (it remembers nothing of the previous run).
+    start_orchestrator --block-ttl 3600 "${FLOWSPEC_ARGS[@]}"
+    ipc "DROP_IMMEDIATE:$ALLOWED_IP"
+    sleep 2
+    kill -9 "$ORCH_PID"; wait "$ORCH_PID" 2>/dev/null || true; ORCH_PID=""
+    check "Flowspec: a crashed node's rule stays upstream" bash -c "gobgp -p 50052 global rib -a ipv4-flowspec | grep -q 'source: $ALLOWED_IP/32'"
+    start_orchestrator "${FLOWSPEC_ARGS[@]}"
+    sleep 3
+    check "Flowspec: the next run withdraws the crashed run's stale rule" bash -c "! gobgp -p 50052 global rib -a ipv4-flowspec | grep -q 'source: $ALLOWED_IP/32'"
+    check "Flowspec: the next run keeps announcing its wanted rules" bash -c "gobgp -p 50052 global rib -a ipv4-flowspec | grep -q 'source: $BLOCKED_IP/32'"
+    stop_orchestrator
 fi
 check "SIGINT/SIGTERM shutdown is graceful" grep -q "terminated gracefully" "$LOG"
 
