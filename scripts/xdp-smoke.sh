@@ -119,6 +119,8 @@ check "root IPC DROP_IMMEDIATE blocks $ALLOWED_IP" bash -c "! ip netns exec $NS 
 stop_orchestrator
 start_orchestrator --drop-ipv4-fragments
 check "orchestrator restarts on the same interface" orchestrator_up
+check "audit log from the first run is re-verified on restart" \
+    grep -qE "Audit log .* opened: [1-9][0-9]* records verified" "$LOG"
 check "strict mode: unfragmented traffic from $ALLOWED_IP passes" ping_from "$ALLOWED_IP"
 check "strict mode: fragmented IPv4 is dropped" bash -c "! ip netns exec $NS ping -c 2 -W 1 -s 3000 -I $ALLOWED_IP $HOST_IP >/dev/null 2>&1"
 

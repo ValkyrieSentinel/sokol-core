@@ -452,7 +452,7 @@ const HTML_DASHBOARD: &str = r###"
             </div>
             <div class="bg-zinc-900 border border-zinc-800 p-4 rounded-xl flex items-center justify-between">
                 <div>
-                    <div class="text-[10px] text-zinc-500">SNTL_DB STORAGE (ZIG)</div>
+                    <div class="text-[10px] text-zinc-500">AUDIT LOG STORAGE</div>
                     <div class="font-bold text-zinc-100">Latency: <span id="m-dblat" class="text-amber-400">0 ms</span> | Banned IPs: <span id="trap-banned" class="text-red-400">0</span></div>
                 </div>
             </div>

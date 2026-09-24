@@ -83,4 +83,7 @@ pub mod crypto;
 pub mod dag;
 
 #[cfg(feature = "std")]
+pub mod audit_log;
+
+#[cfg(feature = "std")]
 pub mod pqc;

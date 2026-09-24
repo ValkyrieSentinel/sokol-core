@@ -21,6 +21,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc, watch};
 
 use common::atp::AtpBudgetController;
+use common::audit_log::AuditLog;
 use common::canonical::CanonicalParser;
 use common::{DropEvent, NodeTelemetry};
 
@@ -28,47 +29,74 @@ use crate::block_policy::BlockPolicy;
 use crate::cluster_state::BirdEyeView;
 use crate::p2p::{connect_to_peer, DagTracker, NodeCrypto, P2PNetwork, PeerRegistry, TrustStore};
 
-#[link(name = "sntl_db", kind = "static")]
-extern "C" {
-    fn sntl_db_init(path_ptr: *const u8, path_len: usize) -> bool;
-    fn sntl_db_append_request(data_ptr: *const u8, data_len: usize) -> u64;
-    fn sntl_db_version() -> u32;
-}
-
+/// Audit trail writer. Records are queued (bounded, so a flood cannot exhaust memory) and
+/// written by one thread, fsynced every 100 ms or 64 records: a crash loses at most that window.
 pub struct SentinelDb {
-    tx: std::sync::mpsc::Sender<String>,
+    tx: std::sync::mpsc::SyncSender<String>,
+    dropped: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl SentinelDb {
-    pub fn init(path: &str) -> Result<Self, &'static str> {
-        let success = unsafe { sntl_db_init(path.as_ptr(), path.len()) };
-        if !success {
-            return Err("Failed to initialize Zig DB Engine");
-        }
-        log::info!("Zig DB Engine initialized successfully (v{})", Self::version());
+    const QUEUE_CAPACITY: usize = 10_000;
+    const SYNC_INTERVAL: Duration = Duration::from_millis(100);
+    const SYNC_BATCH: usize = 64;
 
-        let (tx, rx) = std::sync::mpsc::channel::<String>();
+    pub fn init(path: &str) -> anyhow::Result<Self> {
+        let mut log = AuditLog::open(std::path::Path::new(path))
+            .map_err(|e| anyhow::anyhow!("{} ({})", e, path))?;
+        log::info!("Audit log {} opened: {} records verified", path, log.len());
+
+        let (tx, rx) = std::sync::mpsc::sync_channel::<String>(Self::QUEUE_CAPACITY);
+        let dropped = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let dropped_writer = dropped.clone();
 
         std::thread::spawn(move || {
-            while let Ok(payload) = rx.recv() {
-                unsafe {
-                    sntl_db_append_request(payload.as_ptr(), payload.len());
+            use std::sync::atomic::Ordering;
+            use std::sync::mpsc::RecvTimeoutError;
+            loop {
+                match rx.recv_timeout(Self::SYNC_INTERVAL) {
+                    Ok(payload) => {
+                        let lost = dropped_writer.swap(0, Ordering::Relaxed);
+                        if lost > 0 {
+                            let note = format!("AUDIT_QUEUE_OVERFLOW|Dropped:{}", lost);
+                            if let Err(e) = log.append(note.as_bytes()) {
+                                log::error!("[Audit] Failed to record queue overflow: {}", e);
+                            }
+                        }
+                        if let Err(e) = log.append(payload.as_bytes()) {
+                            log::error!("[Audit] Failed to append record: {}", e);
+                        }
+                        if log.unsynced() >= Self::SYNC_BATCH {
+                            if let Err(e) = log.sync() {
+                                log::error!("[Audit] fsync failed: {}", e);
+                            }
+                        }
+                    }
+                    Err(RecvTimeoutError::Timeout) => {
+                        if let Err(e) = log.sync() {
+                            log::error!("[Audit] fsync failed: {}", e);
+                        }
+                    }
+                    Err(RecvTimeoutError::Disconnected) => break,
                 }
             }
+            let _ = log.sync();
             log::info!("SentinelDb persistence thread terminated.");
         });
 
-        Ok(Self { tx })
+        Ok(Self { tx, dropped })
     }
 
     pub fn append(&self, data: String) {
-        if let Err(e) = self.tx.send(data) {
-            log::error!("Failed to enqueue log to SentinelDb: {}", e);
+        match self.tx.try_send(data) {
+            Ok(()) => {}
+            Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                self.dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                log::error!("Audit writer thread is gone; record lost");
+            }
         }
-    }
-
-    pub fn version() -> u32 {
-        unsafe { sntl_db_version() }
     }
 }
 
@@ -90,7 +118,7 @@ struct Args {
     #[arg(long, value_name = "PORT")]
     trap_port: Vec<u16>,
 
-    #[arg(long, default_value = "/var/lib/sokol/sntl_events.sntl")]
+    #[arg(long, default_value = "/var/lib/sokol/audit.log")]
     db_path: String,
 
     #[arg(long, default_value = "1")]
@@ -281,9 +309,7 @@ async fn main() -> Result<(), anyhow::Error> {
 
     let  atp_controller = AtpBudgetController::new(10_000_000);
 
-    let sntl_db = Arc::new(SentinelDb::init(&args.db_path).map_err(|e| {
-        anyhow::anyhow!("Failed to initialize sntl_db: {}", e)
-    })?);
+    let sntl_db = Arc::new(SentinelDb::init(&args.db_path)?);
 
     #[cfg(debug_assertions)]
     let mut bpf = Bpf::load(include_bytes_aligned!(concat!(

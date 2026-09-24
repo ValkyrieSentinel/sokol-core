@@ -2,9 +2,9 @@
 
 > **Status:** Pilot / Active Testing
 
-A high-performance network security and traffic filtering system running at the Linux kernel level. Built with **Rust** (eBPF/XDP) and **Zig**.
+A high-performance network security and traffic filtering system running at the Linux kernel level. Built entirely in **Rust** (eBPF/XDP kernel program and user-space daemon).
 
-The program intercepts and drops garbage (attacks, malicious traffic) right at the network interface card before it even reaches the OS. For internal states and logs, it uses a custom high-speed database written in Zig (`sntl_db`).
+The program intercepts and drops garbage (attacks, malicious traffic) right at the network interface card before it even reaches the OS. Blocks, trap hits and kernel drop events are recorded in an append-only, hash-chained audit log.
 
 ---
 
@@ -14,7 +14,6 @@ The program intercepts and drops garbage (attacks, malicious traffic) right at t
 - **Toolchain:** 
   - Rust Nightly (needed for building eBPF target `bpfel-unknown-none`)
   - [`bpf-linker`](https://github.com/aya-rs/bpf-linker) (links the eBPF object)
-  - Zig compiler (v0.14+; `sntl_db/build.zig` uses the 0.14 build API)
   - A C compiler (`gcc` or `clang`; `pqcrypto-dilithium` builds C sources)
 
 ---
@@ -35,7 +34,7 @@ Build the eBPF program first. The orchestrator embeds the compiled object
 cd ebpf && cargo +nightly build --release && cd ..
 ```
 
-Build the orchestrator and tools (this also builds the Zig `sntl_db` library via `orchestrator/build.rs`):
+Build the orchestrator and tools:
 
 ```shell
 cargo +nightly build --release
@@ -103,7 +102,7 @@ sudo ./target/release/orchestrator -i eth0 --never-block 203.0.113.0/24 --never-
 
 `orchestrator/` — main user-space daemon managing maps and logic.
 
-`sntl_db/` — fast Zig database for events and metrics.
+`common/src/audit_log.rs` — append-only audit log (BLAKE3 hash chain, torn-write recovery), written by the orchestrator and read by `monitor`.
 
 `common/` — shared data structures and protocol definitions.
 
