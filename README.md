@@ -278,9 +278,16 @@ With `--flowspec-gobgp /usr/local/bin/gobgp` every active block is announced as 
 Flowspec rule `match source <ip>/32 then discard` through a local
 [GoBGP](https://github.com/osrg/gobgp) daemon, so routers that accept Flowspec drop the traffic
 before it reaches this node's link. Expired or lifted blocks are withdrawn, and all of the node's
-rules are withdrawn when it shuts down. Announcements are reconciled every second (at most 64
-changes per second), so a gobgpd outage only delays them. `sokol_flowspec_announced` shows how
-many rules are live.
+rules are withdrawn when it shuts down.
+
+Every rule carries the node's ownership community (`--flowspec-community`, default
+`64512:<node-id>`; give each node that shares a gobgpd its own). Every second a separate worker
+reads gobgpd's RIB and makes this node's rules, and only those, equal to its active blocks (at
+most 64 changes per round). So rules left behind by a crashed run are withdrawn by the next one,
+rules a restarted gobgpd lost are announced again, a gobgp call that timed out (it is killed) is
+settled by the next read, and other systems' rules or rules learned from peers are never
+touched. A slow or hung gobgpd never delays the main loop. `sokol_flowspec_announced` is the
+number of the node's rules last seen in the RIB.
 
 Run gobgpd with a neighbor for each upstream router and the `ipv4-flowspec` / `ipv6-flowspec`
 address families enabled, then point the orchestrator at its API:

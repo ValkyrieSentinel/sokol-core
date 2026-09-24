@@ -261,6 +261,11 @@ struct Args {
     #[arg(long, value_name = "ARG", allow_hyphen_values = true)]
     flowspec_gobgp_arg: Vec<String>,
 
+    /// BGP community `asn:value` marking this node's Flowspec rules (default 64512:<node-id>).
+    /// Only rules with it are withdrawn; give every node sharing a gobgpd its own.
+    #[arg(long, value_name = "ASN:VALUE")]
+    flowspec_community: Option<String>,
+
     /// Drops per second at which this node reports itself under attack to the mesh.
     #[arg(long, default_value = "1000")]
     attack_drops_per_sec: u64,
@@ -1367,11 +1372,45 @@ async fn main() -> Result<(), anyhow::Error> {
     let mut telemetry_window_start = std::time::Instant::now();
     let mut window_rx = 0u64;
     let mut window_dropped = 0u64;
-    let flowspec_cli = args.flowspec_gobgp.clone().map(|bin| flowspec::GobgpCli {
-        bin,
-        args: args.flowspec_gobgp_arg.clone(),
-    });
-    let mut flowspec_state = flowspec::Reconciler::default();
+    let flowspec_announced = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (flowspec_tx, flowspec_rx) = watch::channel(std::collections::HashSet::<IpNet>::new());
+    let flowspec_worker = match args.flowspec_gobgp.clone() {
+        Some(bin) => {
+            let community = match &args.flowspec_community {
+                Some(raw) => {
+                    let parsed = raw
+                        .split_once(':')
+                        .and_then(|(a, v)| Some((a.parse::<u16>().ok()?, v.parse::<u16>().ok()?)));
+                    parsed.ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "--flowspec-community {} is not <asn>:<value> (16-bit each)",
+                            raw
+                        )
+                    })?
+                }
+                None => (64512, (args.node_id & 0xFFFF) as u16),
+            };
+            let cli = flowspec::GobgpCli {
+                bin,
+                args: args.flowspec_gobgp_arg.clone(),
+                community,
+            };
+            log::info!(
+                "[Flowspec] Mirroring blocks upstream with community {}:{}",
+                community.0,
+                community.1
+            );
+            Some(tokio::spawn(flowspec::run_worker(
+                cli,
+                flowspec_rx,
+                shutdown_rx.clone(),
+                sntl_db.clone(),
+                flowspec_announced.clone(),
+            )))
+        }
+        None => None,
+    };
+    let mut last_tick = std::time::Instant::now();
 
     loop {
         tokio::select! {
@@ -1461,24 +1500,10 @@ async fn main() -> Result<(), anyhow::Error> {
                 snapshot.cluster_attacked = cluster.attacked;
                 snapshot.cluster_storm_engaged = cluster.storm_engaged;
 
-                if let Some(cli) = &flowspec_cli {
-                    let active = blocks.lock().await.active_ips();
-                    let (announce, withdraw) = flowspec_state.plan(&active);
-                    for (is_announce, ip) in withdraw.into_iter().map(|ip| (false, ip)).chain(announce.into_iter().map(|ip| (true, ip))) {
-                        match cli.apply(is_announce, ip).await {
-                            Ok(()) => {
-                                let verb = if is_announce { "announced" } else { "withdrew" };
-                                log::info!("[Flowspec] {} discard rule for {}", verb, show(&ip));
-                                sntl_db.append(format!("FLOWSPEC_{}|IP:{}", if is_announce { "ANNOUNCE" } else { "WITHDRAW" }, show(&ip)));
-                                if is_announce { flowspec_state.announced(ip) } else { flowspec_state.withdrawn(ip) }
-                            }
-                            Err(e) => {
-                                log::error!("[Flowspec] gobgp failed for {}: {}; retrying next tick", show(&ip), e);
-                                break;
-                            }
-                        }
-                    }
-                    snapshot.flowspec_announced = flowspec_state.announced_count();
+                if flowspec_worker.is_some() {
+                    let _ = flowspec_tx.send(blocks.lock().await.active_ips());
+                    snapshot.flowspec_announced =
+                        flowspec_announced.load(std::sync::atomic::Ordering::Relaxed);
                 }
                 *metrics_snapshot.write().unwrap_or_else(|p| p.into_inner()) = snapshot;
 
@@ -1486,7 +1511,9 @@ async fn main() -> Result<(), anyhow::Error> {
                 let delta_bytes = total_rx_bytes.saturating_sub(prev_bytes);
                 let delta_dropped = total_dropped.saturating_sub(prev_dropped);
 
-                let dt = 1.0;
+                // Measured, not assumed: a delayed tick must not inflate the rates.
+                let dt = last_tick.elapsed().as_secs_f64().max(0.001);
+                last_tick = std::time::Instant::now();
                 let is_anomaly = sokol_engine.detect_anomaly(
                     total_rx_packets as f64,
                     prev_packets as f64,
@@ -1524,20 +1551,13 @@ async fn main() -> Result<(), anyhow::Error> {
     }
 
     log::info!("Sokol-Core main loop terminated gracefully. Cleaning up resources...");
-    if let Some(cli) = &flowspec_cli {
-        // The node's blocks vanish with it; do not leave its rules behind upstream.
-        'withdraw_all: loop {
-            let (_, withdraw) = flowspec_state.plan(&std::collections::HashSet::new());
-            if withdraw.is_empty() {
-                break;
-            }
-            for ip in withdraw {
-                if let Err(e) = cli.apply(false, ip).await {
-                    log::error!("[Flowspec] Could not withdraw {} on shutdown: {}", ip, e);
-                    break 'withdraw_all;
-                }
-                flowspec_state.withdrawn(ip);
-            }
+    if let Some(worker) = flowspec_worker {
+        // The worker withdraws this node's rules on shutdown, within its own budget.
+        if tokio::time::timeout(flowspec::SHUTDOWN_BUDGET + Duration::from_secs(2), worker)
+            .await
+            .is_err()
+        {
+            log::error!("[Flowspec] Worker did not finish withdrawing in time");
         }
     }
     sntl_db.append("NODE_SHUTDOWN".to_string());
