@@ -7,7 +7,7 @@ mod p2p;
 mod sokol;
 
 use aya::maps::lpm_trie::Key;
-use aya::maps::{LpmTrie, MapData, PerCpuArray, RingBuf};
+use aya::maps::{Array, LpmTrie, MapData, PerCpuArray, RingBuf};
 use aya::programs::{tc, SchedClassifier, TcAttachType, Xdp};
 use aya::{include_bytes_aligned, Bpf, Pod};
 use clap::Parser;
@@ -130,6 +130,10 @@ struct Args {
     /// Without it the socket is root-only (0600).
     #[arg(long)]
     ipc_group: Option<String>,
+
+    /// Drop all IPv4 fragments in XDP (default: fragments pass, subject to the blocklist).
+    #[arg(long)]
+    drop_ipv4_fragments: bool,
 }
 
 const IPC_SOCKET_PATH: &str = "/run/sokol.sock";
@@ -298,6 +302,21 @@ async fn main() -> Result<(), anyhow::Error> {
         .ok_or_else(|| anyhow::anyhow!("Critical: Program sentinel_vfr_filter not found in ELF"))?;
     let program: &mut Xdp = prog_mut.try_into()?;
     program.load()?;
+
+    let mut config_flags = 0u32;
+    if args.drop_ipv4_fragments {
+        config_flags |= common::config_flags::DROP_IPV4_FRAGMENTS;
+    }
+    {
+        let config_map = bpf.map_mut("CONFIG").ok_or_else(|| anyhow::anyhow!("CONFIG map missing"))?;
+        let mut config = Array::<_, u32>::try_from(config_map)?;
+        config.set(0, config_flags, 0)?;
+    }
+
+    let prog_mut = bpf
+        .program_mut("sentinel_vfr_filter")
+        .ok_or_else(|| anyhow::anyhow!("Critical: Program sentinel_vfr_filter not found in ELF"))?;
+    let program: &mut Xdp = prog_mut.try_into()?;
     let _link = program.attach(&args.interface, Default::default())?;
     log::info!("XDP program successfully locked and attached to interface: {}", args.interface);
 

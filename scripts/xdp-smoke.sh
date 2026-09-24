@@ -17,6 +17,8 @@ WORK="$(mktemp -d)"
 LOG="$WORK/orchestrator.log"
 ORCH_PID=""
 FAILED=0
+# Logged after XDP/TC attach, IPC socket and P2P setup all succeeded.
+READY="Sokol-Core running with SokolEngine"
 
 cleanup() {
     [ -n "$ORCH_PID" ] && kill "$ORCH_PID" 2>/dev/null && wait "$ORCH_PID" 2>/dev/null || true
@@ -50,22 +52,47 @@ ip netns exec "$NS" ip addr add "$BLOCKED_IP/24" dev "$PEER_IF"
 ip netns exec "$NS" ip link set "$PEER_IF" up
 ip netns exec "$NS" ip link set lo up
 
-RUST_LOG=info "$BIN" \
-    --interface "$HOST_IF" \
-    --block "$BLOCKED_IP" \
-    --db-path "$WORK/events.sntl" \
-    --key-file "$WORK/node.key" \
-    --p2p-bind "127.0.0.1:0" \
-    >"$LOG" 2>&1 &
-ORCH_PID=$!
+start_orchestrator() {
+    : >"$LOG"
+    RUST_LOG=info "$BIN" \
+        --interface "$HOST_IF" \
+        --block "$BLOCKED_IP" \
+        --db-path "$WORK/events.sntl" \
+        --key-file "$WORK/node.key" \
+        --p2p-bind "127.0.0.1:0" \
+        "$@" \
+        >"$LOG" 2>&1 &
+    ORCH_PID=$!
+    for _ in $(seq 1 50); do
+        grep -q "$READY" "$LOG" && break
+        kill -0 "$ORCH_PID" 2>/dev/null || break
+        sleep 0.2
+    done
+}
 
-for _ in $(seq 1 50); do
-    grep -q "XDP program successfully locked and attached" "$LOG" && break
-    kill -0 "$ORCH_PID" 2>/dev/null || break
-    sleep 0.2
-done
+stop_orchestrator() {
+    kill -INT "$ORCH_PID" 2>/dev/null || true
+    for _ in $(seq 1 50); do
+        kill -0 "$ORCH_PID" 2>/dev/null || break
+        sleep 0.2
+    done
+    kill -9 "$ORCH_PID" 2>/dev/null || true
+    wait "$ORCH_PID" 2>/dev/null || true
+    ORCH_PID=""
+}
 
-check "orchestrator attaches XDP to $HOST_IF" grep -q "XDP program successfully locked and attached" "$LOG"
+ping_fragmented_from() {
+    ip netns exec "$NS" ping -c 2 -W 1 -s 3000 -I "$1" "$HOST_IP" >/dev/null 2>&1
+}
+
+start_orchestrator
+
+orchestrator_up() {
+    grep -q "$READY" "$LOG" && kill -0 "$ORCH_PID" 2>/dev/null
+}
+
+check "orchestrator starts on $HOST_IF" orchestrator_up
+check "fragmented IPv4 from $ALLOWED_IP passes (issue #5)" ping_fragmented_from "$ALLOWED_IP"
 check "traffic from $ALLOWED_IP passes" ping_from "$ALLOWED_IP"
 check "traffic from blocked $BLOCKED_IP is dropped" bash -c "! ip netns exec $NS ping -c 2 -W 1 -I $BLOCKED_IP $HOST_IP >/dev/null 2>&1"
 
@@ -88,6 +115,12 @@ check "the node's own address is never blocked" grep -q "Refusing to block $HOST
 ipc "DROP_IMMEDIATE:$ALLOWED_IP"
 sleep 0.5
 check "root IPC DROP_IMMEDIATE blocks $ALLOWED_IP" bash -c "! ip netns exec $NS ping -c 2 -W 1 -I $ALLOWED_IP $HOST_IP >/dev/null 2>&1"
+
+stop_orchestrator
+start_orchestrator --drop-ipv4-fragments
+check "orchestrator restarts on the same interface" orchestrator_up
+check "strict mode: unfragmented traffic from $ALLOWED_IP passes" ping_from "$ALLOWED_IP"
+check "strict mode: fragmented IPv4 is dropped" bash -c "! ip netns exec $NS ping -c 2 -W 1 -s 3000 -I $ALLOWED_IP $HOST_IP >/dev/null 2>&1"
 
 if [ "$FAILED" -ne 0 ]; then
     echo "--- orchestrator log ---"

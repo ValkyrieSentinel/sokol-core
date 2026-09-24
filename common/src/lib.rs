@@ -68,6 +68,13 @@ pub mod drop_reason {
     pub const TRAP_INTERCEPTED: u16 = 6;
     pub const SOCK_REDIRECTED: u16 = 7;
     pub const MANUAL_BLOCK: u16 = 8;
+    pub const FRAGMENT_BLOCKED: u16 = 9;
+}
+
+/// Bits of the eBPF `CONFIG` map (index 0).
+pub mod config_flags {
+    /// Drop every IPv4 fragment (for hosts whose policy forbids fragmentation).
+    pub const DROP_IPV4_FRAGMENTS: u32 = 1 << 0;
 }
 
 pub mod atp;

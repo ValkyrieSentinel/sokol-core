@@ -4,12 +4,12 @@
 use aya_ebpf::{
     bindings::{xdp_action, BPF_F_NO_PREALLOC},
     macros::{classifier, map, xdp},
-    maps::{lpm_trie::Key, LpmTrie, PerCpuArray, RingBuf},
+    maps::{lpm_trie::Key, Array, LpmTrie, PerCpuArray, RingBuf},
     programs::{TcContext, XdpContext},
 };
 use core::mem;
 
-use common::{drop_reason, DropEvent, PacketStats};
+use common::{config_flags, drop_reason, DropEvent, PacketStats};
 
 const ETH_P_IP: u16 = 0x0800;
 const ETH_P_IPV6: u16 = 0x86DD;
@@ -21,6 +21,9 @@ const IPPROTO_TCP: u8 = 6;
 const IPPROTO_ROUTING: u8 = 43;
 const IPPROTO_FRAGMENT: u8 = 44;
 const IPPROTO_DSTOPTS: u8 = 60;
+
+const IP_MF: u16 = 0x2000;
+const IP_OFFSET_MASK: u16 = 0x1FFF;
 
 const TRAP_PORT: u16 = 44333;
 const ADMIN_SSH_PORT: u16 = 2222;
@@ -75,6 +78,15 @@ pub struct Ip6ExtHdr {
 
 #[repr(C, packed)]
 #[derive(Clone, Copy)]
+pub struct Ip6FragHdr {
+    pub next_header: u8,
+    pub reserved: u8,
+    pub frag_off: u16,
+    pub id: u32,
+}
+
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
 pub struct TcpHdr {
     pub src_port: u16,
     pub dst_port: u16,
@@ -95,6 +107,10 @@ static BLOCKLIST_V6: LpmTrie<[u8; 16], u32> = LpmTrie::with_max_entries(65536, B
 
 #[map]
 static STATS: PerCpuArray<PacketStats> = PerCpuArray::with_max_entries(1, 0);
+
+/// Index 0: `common::config_flags` bits, written by the orchestrator before attach.
+#[map]
+static CONFIG: Array<u32> = Array::with_max_entries(1, 0);
 
 #[map]
 static EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
@@ -167,9 +183,10 @@ pub fn sentinel_vfr_filter(ctx: XdpContext) -> u32 {
 }
 
 #[inline(always)]
-fn parse_v6_next_header(ctx: &XdpContext, initial_offset: usize, initial_next: u8) -> Result<(u8, usize), ()> {
+fn parse_v6_next_header(ctx: &XdpContext, initial_offset: usize, initial_next: u8) -> Result<(u8, usize, bool), ()> {
     let mut curr_next = initial_next;
     let mut curr_offset = initial_offset;
+    let mut non_first_fragment = false;
 
     for _ in 0..4 {
         match curr_next {
@@ -183,16 +200,22 @@ fn parse_v6_next_header(ctx: &XdpContext, initial_offset: usize, initial_next: u
                 curr_offset += len_bytes;
             }
             IPPROTO_FRAGMENT => {
-                let ext_ptr = ptr_at::<Ip6ExtHdr>(ctx, curr_offset)?;
+                let ext_ptr = ptr_at::<Ip6FragHdr>(ctx, curr_offset)?;
                 let next = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*ext_ptr).next_header)) };
+                let off_raw = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*ext_ptr).frag_off)) };
                 curr_next = next;
                 curr_offset += 8;
+                if u16::from_be(off_raw) & 0xFFF8 != 0 {
+                    // Non-first fragment: no L4 header follows.
+                    non_first_fragment = true;
+                    break;
+                }
             }
             _ => break,
         }
     }
 
-    Ok((curr_next, curr_offset))
+    Ok((curr_next, curr_offset, non_first_fragment))
 }
 
 #[inline(always)]
@@ -219,6 +242,8 @@ fn try_sentinel_vfr_filter(ctx: &XdpContext) -> Result<u32, ()> {
     let protocol: u8;
     let l4_offset: usize;
     let ip_version: u8;
+    // Only the first fragment carries the L4 header; later ones must not be parsed as TCP.
+    let non_first_fragment: bool;
 
     let mut src_ip_16 = [0u8; 16];
     let mut dst_ip_16 = [0u8; 16];
@@ -246,11 +271,8 @@ fn try_sentinel_vfr_filter(ctx: &XdpContext) -> Result<u32, ()> {
 
             let frag_off_raw = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*ip_ptr).frag_off)) };
             let frag_off = u16::from_be(frag_off_raw);
-            if (frag_off & 0x3FFF) != 0 {
-                record_drop(packet_len, drop_reason::MALFORMED_HEADER);
-                emit_drop_event_sampled(ctx, &[0u8; 16], &[0u8; 16], packet_len as u32, drop_reason::MALFORMED_HEADER, 0, 4);
-                return Ok(xdp_action::XDP_DROP);
-            }
+            let is_fragment = (frag_off & (IP_MF | IP_OFFSET_MASK)) != 0;
+            non_first_fragment = (frag_off & IP_OFFSET_MASK) != 0;
 
             let src_u32 = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*ip_ptr).src_addr)) };
             let dst_u32 = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*ip_ptr).dst_addr)) };
@@ -267,6 +289,12 @@ fn try_sentinel_vfr_filter(ctx: &XdpContext) -> Result<u32, ()> {
 
             src_ip_16[..4].copy_from_slice(&src_bytes);
             dst_ip_16[..4].copy_from_slice(&dst_bytes);
+
+            if is_fragment && !is_blocked && config_enabled(config_flags::DROP_IPV4_FRAGMENTS) {
+                record_drop(packet_len, drop_reason::FRAGMENT_BLOCKED);
+                emit_drop_event_sampled(ctx, &src_ip_16, &dst_ip_16, packet_len as u32, drop_reason::FRAGMENT_BLOCKED, protocol, ip_version);
+                return Ok(xdp_action::XDP_DROP);
+            }
         }
         ETH_P_IPV6 => {
             let ip6_ptr = match ptr_at::<Ip6Hdr>(ctx, ip_offset) {
@@ -294,11 +322,12 @@ fn try_sentinel_vfr_filter(ctx: &XdpContext) -> Result<u32, ()> {
             is_blocked = BLOCKLIST_V6.get(&key).is_some();
 
             let next_hdr = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*ip6_ptr).next_header)) };
-            let (real_proto, real_l4_offset) = parse_v6_next_header(ctx, ip_offset + mem::size_of::<Ip6Hdr>(), next_hdr)?;
+            let (real_proto, real_l4_offset, v6_non_first) = parse_v6_next_header(ctx, ip_offset + mem::size_of::<Ip6Hdr>(), next_hdr)?;
 
             protocol = real_proto;
             l4_offset = real_l4_offset;
             ip_version = 6;
+            non_first_fragment = v6_non_first;
         }
         _ => {
             record_rx(packet_len);
@@ -312,7 +341,7 @@ fn try_sentinel_vfr_filter(ctx: &XdpContext) -> Result<u32, ()> {
         return Ok(xdp_action::XDP_DROP);
     }
 
-    if protocol == IPPROTO_TCP {
+    if protocol == IPPROTO_TCP && !non_first_fragment {
         if let Ok(tcp_ptr) = ptr_at::<TcpHdr>(ctx, l4_offset) {
             let dst_port = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*tcp_ptr).dst_port)) };
             let port = u16::from_be(dst_port);
@@ -346,6 +375,14 @@ pub fn sentinel_vfr_tc(ctx: TcContext) -> i32 {
 fn try_sentinel_vfr_tc(_ctx: &TcContext) -> Result<i32, ()> {
     const TC_ACT_OK: i32 = 0;
     Ok(TC_ACT_OK)
+}
+
+#[inline(always)]
+fn config_enabled(flag: u32) -> bool {
+    match CONFIG.get(0) {
+        Some(flags) => flags & flag != 0,
+        None => false,
+    }
 }
 
 #[inline(always)]
