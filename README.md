@@ -121,7 +121,10 @@ A peers file that fails to parse is rejected and the previous trust stays in for
 The mesh protocol authenticates but does not encrypt. Run it inside a WireGuard tunnel between
 the nodes (see `deploy/wireguard-mesh.conf.example`) and bind the P2P listener to the tunnel
 address only, e.g. `--p2p-bind 10.99.0.1:7946 --seed-peer 10.99.0.2:7946`. The smoke test runs
-two nodes this way. Add every peer's tunnel address to `--never-block`.
+two nodes this way. Add every peer's tunnel address **and its WireGuard endpoint** (the public
+address in `Endpoint =`) to `--never-block`. XDP runs on the physical interface, where a peer's
+packets carry its endpoint address: blocking that address, by a detector's mistake or a peer's
+`BlockIp`, cuts the tunnel and the mesh with it, and protecting the tunnel address does not prevent it.
 
 ### Cluster telemetry
 
