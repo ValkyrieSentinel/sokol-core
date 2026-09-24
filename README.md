@@ -203,6 +203,10 @@ seconds (default 900), each repeat within 24 hours doubles it up to `--block-ttl
 86400). `--block-ttl 0` makes them permanent. `--block` addresses are always permanent, and a mesh
 `UnblockIp` cannot lift them.
 
+An operator `UNBAN_IP` or `FLUSH_BANS` holds against the mesh's catch-up: for `--block-ttl-max`
+the node does not re-adopt the address from a reconnecting peer's `BlockSync`. A new detection, or
+a peer's live block, blocks it again. The unban is local; peers keep their own copies until their TTL.
+
 Blocks can be single addresses or CIDR prefixes (`--block 198.51.100.0/24`, `BAN_IP:198.51.100.0/24`
 on the control socket, `SIGNAL:<source>|<prefix>|-|<reason>`, CrowdSec range decisions, mesh and
 Flowspec). A prefix is refused if it is wider than `--min-block-prefix-v4` (default 16) or
