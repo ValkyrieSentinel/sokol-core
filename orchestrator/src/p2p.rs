@@ -779,7 +779,14 @@ async fn handle_reader_loop(
             (Some(_), NetworkMessage::Handshake { .. }) => {
                 debug!("[P2P] Ignoring repeated handshake from {}", peer_addr);
             }
-            (Some(_), NetworkMessage::Command(command)) => {
+            (Some(peer_id), NetworkMessage::Command(command)) => {
+                // A peer reports only its own load; otherwise it could fake other nodes and
+                // tip the cluster into (or out of) a storm.
+                if let MeshCommand::Telemetry { node_id, .. } = &command {
+                    if *node_id != peer_id {
+                        bail!("node {} sent telemetry claiming node {}", peer_id, node_id);
+                    }
+                }
                 if let Err(e) = cmd_tx.send(command).await {
                     bail!("local orchestrator channel closed: {}", e);
                 }
@@ -1093,6 +1100,60 @@ mod tests {
                 _ => panic!("broadcast for {} was not delivered", want),
             }
         }
+    }
+
+    /// A peer may report only its own telemetry.
+    #[tokio::test]
+    async fn telemetry_must_describe_the_sender() {
+        let server = Arc::new(NodeCrypto::generate());
+        let peer = NodeCrypto::generate();
+        let mut trust = TrustStore::default();
+        trust.insert(2, peer.public_key);
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(8);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let net = P2PNetwork::new(
+            addr,
+            1,
+            server,
+            Arc::new(dag()),
+            cmd_tx,
+            8,
+            shutdown_rx,
+            PeerRegistry::new(trust),
+        );
+        tokio::spawn(async move { net.serve(listener).await });
+
+        let report = |node_id| {
+            NetworkMessage::Command(MeshCommand::Telemetry {
+                node_id,
+                rx_pps: 1,
+                drops_per_sec: 5000,
+                under_attack: true,
+                blocks_active: 0,
+            })
+        };
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let d = dag();
+        for msg in [
+            NetworkMessage::Handshake { node_id: 2 },
+            report(2),
+            report(9),
+        ] {
+            let bytes = bincode::serialize(&seal(&peer, 2, &msg, &d).await.unwrap()).unwrap();
+            let _ = stream.write_all(&(bytes.len() as u32).to_be_bytes()).await;
+            let _ = stream.write_all(&bytes).await;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        match cmd_rx.try_recv() {
+            Ok(MeshCommand::Telemetry { node_id: 2, .. }) => {}
+            other => panic!("own telemetry should arrive: {:?}", other.is_ok()),
+        }
+        assert!(
+            cmd_rx.try_recv().is_err(),
+            "telemetry for node 9 from node 2 must be rejected"
+        );
     }
 
     /// A connection authenticated as one pinned peer cannot carry another peer's envelopes.

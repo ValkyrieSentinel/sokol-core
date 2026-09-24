@@ -4,7 +4,7 @@ use std::net::Ipv6Addr;
 use std::sync::Arc;
 use tokio::sync::{mpsc, watch};
 
-use crate::cluster_state::BirdEyeView;
+use crate::cluster_state::{BirdEyeView, StormLatch, StormTransition};
 use crate::SentinelDb;
 use common::NodeTelemetry;
 
@@ -17,11 +17,60 @@ pub enum AlertLevel {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum MeshCommand {
-    BlockIp { ip: String, reason: String },
-    UnblockIp { ip: String },
+    BlockIp {
+        ip: String,
+        reason: String,
+    },
+    UnblockIp {
+        ip: String,
+    },
     EngageDefense,
     DisengageDefense,
-    Alert { level: AlertLevel, message: String },
+    Alert {
+        level: AlertLevel,
+        message: String,
+    },
+    /// Periodic load report of `node_id` (must be the authenticated sender).
+    Telemetry {
+        node_id: u64,
+        rx_pps: u64,
+        drops_per_sec: u64,
+        under_attack: bool,
+        blocks_active: u64,
+    },
+}
+
+impl MeshCommand {
+    pub fn telemetry_record(&self) -> Option<NodeTelemetry> {
+        match *self {
+            MeshCommand::Telemetry {
+                node_id,
+                rx_pps,
+                drops_per_sec,
+                under_attack,
+                ..
+            } => Some(NodeTelemetry {
+                node_id,
+                rx_packets: rx_pps,
+                dropped_packets: drops_per_sec,
+                anomaly_score: 0.0,
+                under_attack: under_attack as u8,
+                has_attacker_ip: 0,
+                attacker_ip: [0; 16],
+                _pad: [0; 6],
+            }),
+            _ => None,
+        }
+    }
+}
+
+/// What the telemetry processor last concluded, for metrics.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ClusterSummary {
+    pub status_code: u8,
+    pub nodes: usize,
+    pub attacked: usize,
+    pub storm_engaged: bool,
 }
 
 pub struct UpstreamBgpIntegration {
@@ -73,9 +122,12 @@ pub struct MeshOrchestrator {
     shutdown_rx: watch::Receiver<bool>,
     bgp_integration: UpstreamBgpIntegration,
     local_node_ipv6_prefix: String,
+    latch: StormLatch,
+    summary_out: Arc<std::sync::RwLock<ClusterSummary>>,
 }
 
 impl MeshOrchestrator {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         bird_eye: BirdEyeView,
         telemetry_rx: mpsc::Receiver<NodeTelemetry>,
@@ -84,6 +136,8 @@ impl MeshOrchestrator {
         shutdown_rx: watch::Receiver<bool>,
         upstream_router_addr: std::net::SocketAddr,
         local_node_ipv6_prefix: String,
+        storm_hold: std::time::Duration,
+        summary_out: Arc<std::sync::RwLock<ClusterSummary>>,
     ) -> Self {
         Self {
             bird_eye,
@@ -93,13 +147,14 @@ impl MeshOrchestrator {
             shutdown_rx,
             bgp_integration: UpstreamBgpIntegration::new(upstream_router_addr),
             local_node_ipv6_prefix,
+            latch: StormLatch::new(storm_hold),
+            summary_out,
         }
     }
 
     pub async fn run_telemetry_processor(&mut self) -> anyhow::Result<()> {
         info!("[MeshOrchestrator] Telemetry processor started (BGP Flowspec dispatch is not implemented; storms are only logged).");
 
-        let mut storm_active = false;
         let mut shutdown_rx = self.shutdown_rx.clone();
 
         loop {
@@ -133,31 +188,41 @@ impl MeshOrchestrator {
                         let _ = self.cmd_tx.send(block_cmd).await;
                     }
 
-                    let global_storm = self.bird_eye.is_global_storm_detected().await;
+                    let (status, nodes, attacked) = self.bird_eye.summary().await;
+                    let transition = self.latch.update(status, std::time::Instant::now());
+                    *self.summary_out.write().unwrap_or_else(|p| p.into_inner()) = ClusterSummary {
+                        status_code: status.code(),
+                        nodes,
+                        attacked,
+                        storm_engaged: self.latch.engaged(),
+                    };
 
-                    if global_storm && !storm_active {
-                        storm_active = true;
-                        warn!("[MeshOrchestrator] CRITICAL: Mesh-wide traffic storm or Anycast channel capacity limit breached!");
+                    match transition {
+                        Some(StormTransition::Engage) => {
+                            warn!(
+                                "[MeshOrchestrator] Distributed storm: {}/{} nodes under attack; defense engaged",
+                                attacked, nodes
+                            );
+                            self.sntl_db.append(format!("CLUSTER_STORM_ENGAGED|Nodes:{}|Attacked:{}", nodes, attacked));
 
-                        self.sntl_db.append("GLOBAL_STORM_ENGAGED_BGP_FLOWSPEC".to_string());
-
-                        let prefix = self.local_node_ipv6_prefix.clone();
-                        if let Err(e) = self.bgp_integration.dispatch_flowspec_v6(&prefix, 64, true).await {
-                            error!("[MeshOrchestrator] Failed to dispatch BGP Flowspec drop: {:?}", e);
+                            let prefix = self.local_node_ipv6_prefix.clone();
+                            if let Err(e) = self.bgp_integration.dispatch_flowspec_v6(&prefix, 64, true).await {
+                                error!("[MeshOrchestrator] Failed to dispatch BGP Flowspec drop: {:?}", e);
+                            }
+                            let _ = self.cmd_tx.send(MeshCommand::EngageDefense).await;
                         }
+                        Some(StormTransition::Disengage) => {
+                            info!(
+                                "[MeshOrchestrator] Storm over: {}/{} nodes under attack; defense disengaged",
+                                attacked, nodes
+                            );
+                            self.sntl_db.append(format!("CLUSTER_STORM_CLEARED|Nodes:{}|Attacked:{}", nodes, attacked));
 
-                        let _ = self.cmd_tx.send(MeshCommand::EngageDefense).await;
-
-                    } else if !global_storm && storm_active {
-                        storm_active = false;
-                        info!("[MeshOrchestrator] Traffic normalized across Anycast mesh. Disengaging upstream BGP limits.");
-
-                        self.sntl_db.append("GLOBAL_STORM_CLEARED".to_string());
-
-                        let prefix = self.local_node_ipv6_prefix.clone();
-                        let _ = self.bgp_integration.dispatch_flowspec_v6(&prefix, 64, false).await;
-
-                        let _ = self.cmd_tx.send(MeshCommand::DisengageDefense).await;
+                            let prefix = self.local_node_ipv6_prefix.clone();
+                            let _ = self.bgp_integration.dispatch_flowspec_v6(&prefix, 64, false).await;
+                            let _ = self.cmd_tx.send(MeshCommand::DisengageDefense).await;
+                        }
+                        None => {}
                     }
                 }
             }

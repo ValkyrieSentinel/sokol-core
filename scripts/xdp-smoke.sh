@@ -25,6 +25,8 @@ cleanup() {
     [ -n "$ORCH_PID" ] && kill "$ORCH_PID" 2>/dev/null && wait "$ORCH_PID" 2>/dev/null || true
     [ -n "$OPERATOR_PID" ] && kill "$OPERATOR_PID" 2>/dev/null || true
     pkill -f "gobgpd -f $WORK" 2>/dev/null || true
+    [ -n "${NODE2_PID:-}" ] && kill "$NODE2_PID" 2>/dev/null || true
+    ip link del sokol-wg0 2>/dev/null || true
     ip link del "$HOST_IF" 2>/dev/null || true
     ip netns del "$NS" 2>/dev/null || true
     rm -rf "$WORK"
@@ -62,7 +64,7 @@ start_orchestrator() {
         --block "$BLOCKED_IP" \
         --db-path "$WORK/events.sntl" \
         --key-file "$WORK/node.key" \
-        --p2p-bind "127.0.0.1:0" \
+        --p2p-bind "${P2P_BIND:-127.0.0.1:0}" \
         --metrics-bind "127.0.0.1:9469" \
         --control-socket "$WORK/control.sock" \
         "$@" \
@@ -315,6 +317,73 @@ run_nonroot "-all,+net_admin,+bpf,+perfmon"
 check "non-root with CAP_NET_ADMIN+CAP_BPF+CAP_PERFMON starts" orchestrator_up
 check "non-root: traffic still flows" ping_from "$ALLOWED_IP"
 stop_orchestrator
+
+# Two-node mesh over WireGuard: node 1 on the host, node 2 inside the peer namespace.
+if command -v wg >/dev/null && ip link add sokol-wgprobe type wireguard 2>/dev/null; then
+    ip link del sokol-wgprobe
+    WG1_KEY=$(wg genkey); WG2_KEY=$(wg genkey)
+    WG1_PUB=$(echo "$WG1_KEY" | wg pubkey); WG2_PUB=$(echo "$WG2_KEY" | wg pubkey)
+    ip link add sokol-wg0 type wireguard
+    wg set sokol-wg0 private-key <(echo "$WG1_KEY") listen-port 51820 \
+        peer "$WG2_PUB" allowed-ips 10.99.0.2/32 endpoint "$ALLOWED_IP:51821"
+    ip addr add 10.99.0.1/24 dev sokol-wg0 && ip link set sokol-wg0 up
+    ip netns exec "$NS" ip link add sokol-wg1 type wireguard
+    ip netns exec "$NS" wg set sokol-wg1 private-key <(echo "$WG2_KEY") listen-port 51821 \
+        peer "$WG1_PUB" allowed-ips 10.99.0.1/32 endpoint "$HOST_IP:51820"
+    ip netns exec "$NS" ip addr add 10.99.0.2/24 dev sokol-wg1
+    ip netns exec "$NS" ip link set sokol-wg1 up
+    check "WireGuard tunnel between the nodes is up" ping -c 2 -W 1 10.99.0.2
+
+    mkdir -p "$WORK/n2"
+    N1_PUB=$("$BIN" --key-file "$WORK/node.key" --print-public-key)
+    N2_PUB=$("$BIN" --key-file "$WORK/n2/node.key" --print-public-key)
+    printf '[{"node_id": 2, "public_key": "%s"}]' "$N2_PUB" >"$WORK/peers-n1.json"
+    printf '[{"node_id": 1, "public_key": "%s"}]' "$N1_PUB" >"$WORK/n2/peers.json"
+    # Node 2 drops everything from this extra host address; flooding from it puts node 2 under attack.
+    ATTACK_SRC=10.231.0.9
+    ip addr add "$ATTACK_SRC/24" dev "$HOST_IF"
+
+    P2P_BIND=10.99.0.1:7946 start_orchestrator --node-id 1 --peers-file "$WORK/peers-n1.json" \
+        --storm-threshold 0.4 --never-block 10.99.0.2
+    ip netns exec "$NS" "$BIN" --interface "$PEER_IF" --node-id 2 --block "$ATTACK_SRC" \
+        --db-path "$WORK/n2/events.log" --key-file "$WORK/n2/node.key" \
+        --ipc-socket "$WORK/n2/ipc.sock" --control-socket "$WORK/n2/control.sock" \
+        --p2p-bind 10.99.0.2:7946 --seed-peer 10.99.0.1:7946 --peers-file "$WORK/n2/peers.json" \
+        --metrics-bind 127.0.0.1:9470 --attack-drops-per-sec 20 >"$WORK/n2/node.log" 2>&1 &
+    NODE2_PID=$!
+    n2_metric() {
+        ip netns exec "$NS" curl -s http://127.0.0.1:9470/metrics | awk -v m="$1" '$1 == m { print $2 }'
+    }
+    for _ in $(seq 1 40); do
+        [ "$(metric sokol_cluster_nodes)" = "2" ] && break
+        sleep 0.5
+    done
+    check "mesh over WireGuard: both nodes authenticated each other" \
+        bash -c "test \"\$(curl -s http://127.0.0.1:9469/metrics | awk '\$1==\"sokol_p2p_active_peers\"{print \$2}')\" = 1"
+    check "telemetry: node 1 sees both nodes in the cluster" test "$(metric sokol_cluster_nodes)" = 2
+    check "telemetry: cluster is stable before the attack" test "$(metric sokol_cluster_status)" = 1
+
+    ipc "DROP_IMMEDIATE:203.0.113.77"
+    sleep 1.5
+    check "mesh: a block on node 1 reaches node 2" grep -q "Synchronized block for 203.0.113.77" "$WORK/n2/node.log"
+
+    timeout 8 ping -f -I "$ATTACK_SRC" "$ALLOWED_IP" >/dev/null 2>&1 || true
+    for _ in $(seq 1 30); do
+        [ "$(metric sokol_cluster_nodes_under_attack)" = "1" ] && break
+        sleep 0.5
+    done
+    echo "      node 2 drops by blocklist: $(n2_metric 'sokol_xdp_dropped_packets_total{reason="blocklist"}')"
+    check "telemetry: node 1 learns that node 2 is under attack" test "$(metric sokol_cluster_nodes_under_attack)" = 1
+    check "cluster: 1 of 2 nodes over a 0.4 threshold is a distributed storm" test "$(metric sokol_cluster_status)" = 3
+    check "cluster: storm latch engaged and audited" bash -c "grep -q 'Distributed storm: 1/2 nodes under attack' '$LOG'"
+    check "node 2 (threshold 0.5) counts itself under attack: local incident, not a storm" \
+        test "$(n2_metric sokol_cluster_status)" = 2
+    kill "$NODE2_PID" 2>/dev/null || true
+    NODE2_PID=""
+    stop_orchestrator
+else
+    echo "SKIP  two-node WireGuard mesh checks (no wireguard support)"
+fi
 
 if [ "$FAILED" -ne 0 ]; then
     echo "--- orchestrator log ---"

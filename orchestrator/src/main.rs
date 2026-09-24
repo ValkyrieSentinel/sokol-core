@@ -251,7 +251,18 @@ struct Args {
     /// --flowspec-gobgp-arg=-p --flowspec-gobgp-arg=50051
     #[arg(long, value_name = "ARG", allow_hyphen_values = true)]
     flowspec_gobgp_arg: Vec<String>,
+
+    /// Drops per second at which this node reports itself under attack to the mesh.
+    #[arg(long, default_value = "1000")]
+    attack_drops_per_sec: u64,
+
+    /// Share of live nodes under attack above which the cluster is in a distributed storm.
+    #[arg(long, default_value = "0.5")]
+    storm_threshold: f64,
 }
+
+/// How often each node reports its load to itself and its mesh peers.
+const TELEMETRY_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
 enum XdpMode {
@@ -754,8 +765,11 @@ async fn main() -> Result<(), anyhow::Error> {
         }
     }
 
-    let bird_eye = BirdEyeView::new(0.5, Duration::from_secs(300));
-    let (_telemetry_tx, telemetry_rx) = mpsc::channel::<NodeTelemetry>(1000);
+    // Nodes report every TELEMETRY_INTERVAL; one missed report is tolerated, three are not.
+    let bird_eye = BirdEyeView::new(args.storm_threshold, TELEMETRY_INTERVAL * 3);
+    let (telemetry_tx, telemetry_rx) = mpsc::channel::<NodeTelemetry>(1000);
+    let telemetry_tx_mesh = telemetry_tx.clone();
+    let cluster_summary = Arc::new(std::sync::RwLock::new(mesh_sync::ClusterSummary::default()));
 
     let blocks_mesh = blocks.clone();
     let sntl_db_mesh = sntl_db.clone();
@@ -850,6 +864,11 @@ async fn main() -> Result<(), anyhow::Error> {
                 MeshCommand::Alert { level, message } => {
                     log::info!("[MESH ALERT {:?}] {}", level, message);
                 }
+                telemetry @ MeshCommand::Telemetry { .. } => {
+                    if let Some(record) = telemetry.telemetry_record() {
+                        let _ = telemetry_tx_mesh.try_send(record);
+                    }
+                }
             }
         }
     });
@@ -866,6 +885,8 @@ async fn main() -> Result<(), anyhow::Error> {
         shutdown_rx.clone(),
         upstream_router_addr,
         args.ipv6_prefix.clone(),
+        Duration::from_secs(30),
+        cluster_summary.clone(),
     );
 
     let mut orchestrator_task = mesh_orchestrator;
@@ -1202,6 +1223,9 @@ async fn main() -> Result<(), anyhow::Error> {
     let p2p_bind_hb = args.p2p_bind.clone();
     let control_socket_hb = args.control_socket.clone();
     let mut watermark = Watermark::default();
+    let mut telemetry_window_start = std::time::Instant::now();
+    let mut window_rx = 0u64;
+    let mut window_dropped = 0u64;
     let flowspec_cli = args.flowspec_gobgp.clone().map(|bin| flowspec::GobgpCli {
         bin,
         args: args.flowspec_gobgp_arg.clone(),
@@ -1263,6 +1287,33 @@ async fn main() -> Result<(), anyhow::Error> {
                 }
                 snapshot.p2p_peers = peer_registry.peer_count().await;
                 snapshot.audit_queue_overflow = sntl_db.overflow_total();
+
+                if telemetry_window_start.elapsed() >= TELEMETRY_INTERVAL {
+                    let secs = telemetry_window_start.elapsed().as_secs_f64().max(1.0);
+                    let rx_pps = (total_rx_packets.saturating_sub(window_rx) as f64 / secs) as u64;
+                    let drops_per_sec = (total_dropped.saturating_sub(window_dropped) as f64 / secs) as u64;
+                    let report = MeshCommand::Telemetry {
+                        node_id: node_id_hb,
+                        rx_pps,
+                        drops_per_sec,
+                        under_attack: drops_per_sec >= args.attack_drops_per_sec,
+                        blocks_active: (v4_active + v6_active) as u64,
+                    };
+                    if let Some(record) = report.telemetry_record() {
+                        let _ = telemetry_tx.try_send(record);
+                    }
+                    if let Err(e) = peer_registry.broadcast(&report, node_id_hb, &node_crypto, &dag_tracker).await {
+                        log::warn!("[Mesh] Telemetry broadcast failed: {:#}", e);
+                    }
+                    telemetry_window_start = std::time::Instant::now();
+                    window_rx = total_rx_packets;
+                    window_dropped = total_dropped;
+                }
+                let cluster = *cluster_summary.read().unwrap_or_else(|p| p.into_inner());
+                snapshot.cluster_status = cluster.status_code;
+                snapshot.cluster_nodes = cluster.nodes;
+                snapshot.cluster_attacked = cluster.attacked;
+                snapshot.cluster_storm_engaged = cluster.storm_engaged;
 
                 if let Some(cli) = &flowspec_cli {
                     let active = blocks.lock().await.active_ips();

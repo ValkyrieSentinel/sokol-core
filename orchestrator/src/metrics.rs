@@ -16,6 +16,10 @@ pub struct Snapshot {
     pub p2p_peers: usize,
     pub audit_queue_overflow: u64,
     pub flowspec_announced: usize,
+    pub cluster_status: u8,
+    pub cluster_nodes: usize,
+    pub cluster_attacked: usize,
+    pub cluster_storm_engaged: bool,
 }
 
 fn family(out: &mut String, name: &str, kind: &str, help: &str) {
@@ -117,6 +121,42 @@ pub fn render(s: &Snapshot) -> String {
         "Blocks announced upstream as BGP Flowspec discard rules.",
     );
     let _ = writeln!(out, "sokol_flowspec_announced {}", s.flowspec_announced);
+    family(
+        &mut out,
+        "sokol_cluster_status",
+        "gauge",
+        "Cluster status: 0 unknown, 1 stable, 2 local incident, 3 distributed storm.",
+    );
+    let _ = writeln!(out, "sokol_cluster_status {}", s.cluster_status);
+    family(
+        &mut out,
+        "sokol_cluster_nodes",
+        "gauge",
+        "Nodes (this one included) that reported telemetry recently.",
+    );
+    let _ = writeln!(out, "sokol_cluster_nodes {}", s.cluster_nodes);
+    family(
+        &mut out,
+        "sokol_cluster_nodes_under_attack",
+        "gauge",
+        "Nodes reporting drops above their --attack-drops-per-sec.",
+    );
+    let _ = writeln!(
+        out,
+        "sokol_cluster_nodes_under_attack {}",
+        s.cluster_attacked
+    );
+    family(
+        &mut out,
+        "sokol_cluster_storm_engaged",
+        "gauge",
+        "1 while the distributed-storm latch is engaged.",
+    );
+    let _ = writeln!(
+        out,
+        "sokol_cluster_storm_engaged {}",
+        s.cluster_storm_engaged as u8
+    );
 
     out
 }

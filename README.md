@@ -116,6 +116,30 @@ To rotate a node's key without downtime:
 
 A peers file that fails to parse is rejected and the previous trust stays in force.
 
+### Encrypt the mesh with WireGuard
+
+The mesh protocol authenticates but does not encrypt. Run it inside a WireGuard tunnel between
+the nodes (see `deploy/wireguard-mesh.conf.example`) and bind the P2P listener to the tunnel
+address only, e.g. `--p2p-bind 10.99.0.1:7946 --seed-peer 10.99.0.2:7946`. The smoke test runs
+two nodes this way. Add every peer's tunnel address to `--never-block`.
+
+### Cluster telemetry
+
+Every 5 s each node sends its peers a signed load report (packets and drops per second, active
+blocks, and whether drops exceed `--attack-drops-per-sec`, default 1000). A node may only report
+about itself. Nodes silent for 15 s drop out of the view. The cluster status is:
+
+| nodes under attack                          | `sokol_cluster_status` |
+|---------------------------------------------|------------------------|
+| no reports                                  | 0 unknown              |
+| none                                        | 1 stable               |
+| some, at most `--storm-threshold` (0.5)     | 2 local incident       |
+| more than `--storm-threshold`               | 3 distributed storm    |
+
+A storm engages a latch at once (logged and audited); the latch disengages only after 30 s
+without a storm, so a flickering storm is one event. Reports travel only between directly
+connected peers, so connect the nodes as a full mesh (`--seed-peer` to every other node).
+
 Envelopes are signed over sender, timestamp, nonce and payload; they are rejected outside a
 ±30 s clock window (keep nodes NTP-synced) and accepted at most once. Mesh traffic is
 authenticated but not encrypted.
@@ -221,7 +245,9 @@ instances.
 `--metrics-bind 127.0.0.1:9469` serves Prometheus metrics at `/metrics`:
 `sokol_xdp_rx_packets_total`, `sokol_xdp_rx_bytes_total`,
 `sokol_xdp_dropped_packets_total{reason=...}` (e.g. `blocklist`, `invalid_tcp_flags`, `fragment_blocked`), `sokol_xdp_events_suppressed_total`,
-`sokol_blocks_active`, `sokol_p2p_active_peers`, `sokol_audit_queue_overflow_total`.
+`sokol_blocks_active`, `sokol_p2p_active_peers`, `sokol_audit_queue_overflow_total`,
+`sokol_flowspec_announced`, `sokol_cluster_status`, `sokol_cluster_nodes`,
+`sokol_cluster_nodes_under_attack`, `sokol_cluster_storm_engaged`.
 
 Kernel drop events reach user space at most 64 times per second per CPU (trap-port events only
 for connection attempts); the rest are counted in `sokol_xdp_events_suppressed_total`.
