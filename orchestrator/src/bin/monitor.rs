@@ -181,10 +181,42 @@ fn verify(path: &str) -> ! {
     }
 }
 
+/// `monitor --dump [path]`: every verified record of the active file as
+/// `<seq>\t<timestamp_ms>\t<payload>`, for scripts and investigations.
+fn dump(path: &str) -> ! {
+    let mut reader = match AuditReader::open(Path::new(path)) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("cannot open {}: {}", path, e);
+            std::process::exit(1);
+        }
+    };
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    loop {
+        match reader.next_record() {
+            Ok(Some(r)) => {
+                let text: String = String::from_utf8_lossy(&r.payload)
+                    .chars()
+                    .filter(|c| !c.is_control())
+                    .collect();
+                let _ = writeln!(out, "{}\t{}\t{}", r.seq, r.timestamp_ms, text);
+            }
+            Ok(None) => std::process::exit(0),
+            Err(e) => {
+                eprintln!("{}: {}", path, e);
+                std::process::exit(1);
+            }
+        }
+    }
+}
+
 fn main() -> io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
-    if args.get(1).map(String::as_str) == Some("--verify") {
-        verify(args.get(2).map(String::as_str).unwrap_or(DB_FILE));
+    match args.get(1).map(String::as_str) {
+        Some("--verify") => verify(args.get(2).map(String::as_str).unwrap_or(DB_FILE)),
+        Some("--dump") => dump(args.get(2).map(String::as_str).unwrap_or(DB_FILE)),
+        _ => {}
     }
 
     let mut reader: Option<Reader> = None;

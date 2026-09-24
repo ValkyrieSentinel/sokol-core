@@ -271,6 +271,22 @@ instances.
 Kernel drop events reach user space at most 64 times per second per CPU (trap-port events only
 for connection attempts); the rest are counted in `sokol_xdp_events_suppressed_total`.
 
+## Measurements
+
+`bench/` reproduces the numbers in the project's evaluation (Linux, root; timings come from the
+nodes' own audit logs, read with `monitor --dump`):
+
+```shell
+sudo bench/local.sh latency target/release/orchestrator 20      # signal -> first dropped packet
+sudo bench/local.sh fill    target/release/orchestrator 65536   # map capacity, rate, memory, expiry
+sudo bench/mesh.sh propagation target/release/orchestrator target/release/monitor 10 20
+sudo bench/mesh.sh propagation target/release/orchestrator target/release/monitor 5 20 delay 100ms 20ms loss 5%
+sudo bench/mesh.sh partition   target/release/orchestrator target/release/monitor 4 45
+```
+
+These run on virtual interfaces in one kernel (generic XDP). They measure the control path and
+the mesh, not line-rate packet processing on a physical NIC.
+
 # Project Structure
 
 `ebpf/` — kernel space code (Rust XDP program).
