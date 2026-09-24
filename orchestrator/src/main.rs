@@ -375,7 +375,7 @@ async fn execute_control(cmd: control::ControlCommand, ctx: &ControlCtx) -> Stri
         }
         ControlCommand::Unban(ip) => {
             let shown = show(&ip);
-            let result = blocks.lock().await.remove(ip);
+            let result = blocks.lock().await.remove(ip, std::time::Instant::now());
             match result {
                 Ok(()) => {
                     log::warn!("[Control] Operator unban for {}", shown);
@@ -389,7 +389,7 @@ async fn execute_control(cmd: control::ControlCommand, ctx: &ControlCtx) -> Stri
             }
         }
         ControlCommand::FlushDynamic => {
-            let released = blocks.lock().await.flush_dynamic();
+            let released = blocks.lock().await.flush_dynamic(std::time::Instant::now());
             log::warn!(
                 "[Control] Operator flushed {} dynamic blocks",
                 released.len()

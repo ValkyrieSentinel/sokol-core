@@ -4,6 +4,10 @@
 //! block of an address lasts `base`, each repeat within `STRIKE_MEMORY` doubles it, up to `max`.
 //! Without expiry every trap hit was a permanent ban, so dynamic addresses of legitimate users
 //! stayed blocked forever and the 65 536-entry maps eventually filled up.
+//!
+//! An operator unban or flush leaves the address *lifted* for `max`: peers may still hold their
+//! copy of the block that long, and their catch-up (`BlockSync`) must not quietly reinstate it.
+//! A fresh block (a local detection or a peer's live `BlockIp`) overrides the lift.
 use std::collections::HashMap;
 use std::net::IpAddr;
 
@@ -78,6 +82,14 @@ enum State {
     Permanent,
     Until(Instant),
     Expired,
+    /// Lifted by the operator; peers' snapshots are not adopted before this instant.
+    Lifted(Instant),
+}
+
+impl State {
+    fn is_active(self) -> bool {
+        matches!(self, State::Permanent | State::Until(_))
+    }
 }
 
 #[derive(Debug)]
@@ -145,17 +157,40 @@ impl ExpiryTracker {
         });
         match entry.state {
             State::Permanent => false,
+            State::Lifted(lifted) if lifted > now => false,
             State::Until(existing) => {
                 if until > existing {
                     entry.state = State::Until(until);
                 }
                 false
             }
-            State::Expired => {
+            State::Expired | State::Lifted(_) => {
                 entry.state = State::Until(until);
                 true
             }
         }
+    }
+
+    /// Whether [`Self::record_until`] would adopt `ip` as a new block.
+    pub fn adoptable(&self, ip: &IpNet, now: Instant) -> bool {
+        match self.entries.get(ip).map(|e| e.state) {
+            None | Some(State::Expired) => true,
+            Some(State::Lifted(lifted)) => lifted <= now,
+            Some(State::Permanent | State::Until(_)) => false,
+        }
+    }
+
+    /// Operator unban: ends any block of `ip`, permanent ones included, forgets its strikes, and
+    /// refuses peers' copies of it for `max`.
+    pub fn lift(&mut self, ip: IpNet, now: Instant) {
+        self.entries.insert(
+            ip,
+            Entry {
+                state: State::Lifted(now + self.policy.max),
+                strikes: 0,
+                last_strike: now,
+            },
+        );
     }
 
     /// Running dynamic blocks and their remaining time, for a peer that just (re)connected.
@@ -191,12 +226,14 @@ impl ExpiryTracker {
         self.entries.remove(ip);
     }
 
-    /// Ends every running dynamic block now (keeping strike history); returns their addresses.
-    pub fn take_all_dynamic(&mut self) -> Vec<IpNet> {
+    /// Ends every running dynamic block now (keeping strike history) and lifts it, see
+    /// [`Self::lift`]; returns their addresses.
+    pub fn take_all_dynamic(&mut self, now: Instant) -> Vec<IpNet> {
+        let lifted = State::Lifted(now + self.policy.max);
         let mut released = Vec::new();
         for (ip, entry) in self.entries.iter_mut() {
             if let State::Until(_) = entry.state {
-                entry.state = State::Expired;
+                entry.state = lifted;
                 released.push(*ip);
             }
         }
@@ -214,8 +251,10 @@ impl ExpiryTracker {
                 }
             }
         }
-        self.entries.retain(|_, e| {
-            e.state != State::Expired || now.duration_since(e.last_strike) <= STRIKE_MEMORY
+        self.entries.retain(|_, e| match e.state {
+            State::Lifted(lifted) if lifted > now => true,
+            State::Expired | State::Lifted(_) => now.duration_since(e.last_strike) <= STRIKE_MEMORY,
+            _ => true,
         });
         expired
     }
@@ -223,24 +262,21 @@ impl ExpiryTracker {
     pub fn active(&self) -> usize {
         self.entries
             .values()
-            .filter(|e| e.state != State::Expired)
+            .filter(|e| e.state.is_active())
             .count()
     }
 
     pub fn active_ips(&self) -> std::collections::HashSet<IpNet> {
         self.entries
             .iter()
-            .filter(|(_, e)| e.state != State::Expired)
+            .filter(|(_, e)| e.state.is_active())
             .map(|(ip, _)| *ip)
             .collect()
     }
 
     /// Active blocks as (IPv4, IPv6) — each family has its own kernel map.
     pub fn active_by_family(&self) -> (usize, usize) {
-        let active = self
-            .entries
-            .iter()
-            .filter(|(_, e)| e.state != State::Expired);
+        let active = self.entries.iter().filter(|(_, e)| e.state.is_active());
         active.fold((0, 0), |(v4, v6), (ip, _)| match ip {
             IpNet::V4(_) => (v4 + 1, v6),
             IpNet::V6(_) => (v4, v6 + 1),
@@ -285,21 +321,65 @@ impl Watermark {
     }
 }
 
-pub struct BlockTable {
+/// The kernel side of the table: one entry per blocked network.
+pub trait Blocklist {
+    fn add(&mut self, net: IpNet) -> Result<(), MapError>;
+    fn delete(&mut self, net: IpNet) -> Result<(), MapError>;
+}
+
+/// The XDP program's LPM tries.
+pub struct KernelBlocklist {
     v4: LpmTrie<MapData, [u8; 4], u32>,
     v6: LpmTrie<MapData, [u8; 16], u32>,
+}
+
+impl Blocklist for KernelBlocklist {
+    fn add(&mut self, net: IpNet) -> Result<(), MapError> {
+        match net {
+            IpNet::V4(n) => self.v4.insert(
+                &Key::new(n.prefix_len() as u32, n.network().octets()),
+                1u32,
+                0,
+            ),
+            IpNet::V6(n) => self.v6.insert(
+                &Key::new(n.prefix_len() as u32, n.network().octets()),
+                1u32,
+                0,
+            ),
+        }
+    }
+
+    fn delete(&mut self, net: IpNet) -> Result<(), MapError> {
+        match net {
+            IpNet::V4(n) => self
+                .v4
+                .remove(&Key::new(n.prefix_len() as u32, n.network().octets())),
+            IpNet::V6(n) => self
+                .v6
+                .remove(&Key::new(n.prefix_len() as u32, n.network().octets())),
+        }
+    }
+}
+
+pub struct BlockTable<B = KernelBlocklist> {
+    lists: B,
     expiry: ExpiryTracker,
 }
 
-impl BlockTable {
+impl BlockTable<KernelBlocklist> {
     pub fn new(
         v4: LpmTrie<MapData, [u8; 4], u32>,
         v6: LpmTrie<MapData, [u8; 16], u32>,
         policy: TtlPolicy,
     ) -> Self {
+        Self::with_lists(KernelBlocklist { v4, v6 }, policy)
+    }
+}
+
+impl<B: Blocklist> BlockTable<B> {
+    pub fn with_lists(lists: B, policy: TtlPolicy) -> Self {
         Self {
-            v4,
-            v6,
+            lists,
             expiry: ExpiryTracker::new(policy),
         }
     }
@@ -327,16 +407,17 @@ impl BlockTable {
         Ok(true)
     }
 
-    /// Lifts any block of `ip`, permanent ones included (operator authority).
-    pub fn remove(&mut self, ip: IpNet) -> Result<(), MapError> {
+    /// Lifts any block of `ip`, permanent ones included (operator authority); see
+    /// [`ExpiryTracker::lift`].
+    pub fn remove(&mut self, ip: IpNet, now: Instant) -> Result<(), MapError> {
         let ip = canonical(ip);
-        self.expiry.forget(&ip);
+        self.expiry.lift(ip, now);
         self.remove_from_map(ip)
     }
 
     /// Lifts all dynamic blocks; operator and `--block` bans stay.
-    pub fn flush_dynamic(&mut self) -> Vec<IpNet> {
-        let released = self.expiry.take_all_dynamic();
+    pub fn flush_dynamic(&mut self, now: Instant) -> Vec<IpNet> {
+        let released = self.expiry.take_all_dynamic(now);
         for ip in &released {
             if let Err(e) = self.remove_from_map(*ip) {
                 log::error!(
@@ -350,29 +431,11 @@ impl BlockTable {
     }
 
     fn insert_into_map(&mut self, net: IpNet) -> Result<(), MapError> {
-        match net {
-            IpNet::V4(n) => self.v4.insert(
-                &Key::new(n.prefix_len() as u32, n.network().octets()),
-                1u32,
-                0,
-            ),
-            IpNet::V6(n) => self.v6.insert(
-                &Key::new(n.prefix_len() as u32, n.network().octets()),
-                1u32,
-                0,
-            ),
-        }
+        self.lists.add(net)
     }
 
     fn remove_from_map(&mut self, net: IpNet) -> Result<(), MapError> {
-        match net {
-            IpNet::V4(n) => self
-                .v4
-                .remove(&Key::new(n.prefix_len() as u32, n.network().octets())),
-            IpNet::V6(n) => self
-                .v6
-                .remove(&Key::new(n.prefix_len() as u32, n.network().octets())),
-        }
+        self.lists.delete(net)
     }
 
     /// Removes blocks whose lifetime ended; returns the addresses that were released.
@@ -398,7 +461,9 @@ impl BlockTable {
         self.expiry.active_by_family()
     }
 
-    /// Installs a block from a peer's snapshot; see [`ExpiryTracker::record_until`].
+    /// Installs a block from a peer's snapshot; see [`ExpiryTracker::record_until`]. The kernel
+    /// map is written first: when it is full the address must not be counted (and passed on to
+    /// other peers) as blocked while the XDP program lets it through.
     pub fn insert_until(
         &mut self,
         ip: IpNet,
@@ -406,11 +471,10 @@ impl BlockTable {
         now: Instant,
     ) -> Result<bool, MapError> {
         let ip = canonical(ip);
-        let new = self.expiry.record_until(ip, remaining, now);
-        if new {
+        if self.expiry.adoptable(&ip, now) {
             self.insert_into_map(ip)?;
         }
-        Ok(new)
+        Ok(self.expiry.record_until(ip, remaining, now))
     }
 
     pub fn dynamic_snapshot(&self, now: Instant) -> Vec<(IpNet, Duration)> {
@@ -553,8 +617,8 @@ mod tests {
         let (operator, dynamic) = (ip("203.0.113.9"), ip("203.0.113.10"));
         tracker.record(operator, Lifetime::Permanent, t0);
         tracker.record(dynamic, Lifetime::Dynamic, t0);
-        assert_eq!(tracker.take_all_dynamic(), vec![dynamic]);
-        assert!(tracker.take_all_dynamic().is_empty());
+        assert_eq!(tracker.take_all_dynamic(t0), vec![dynamic]);
+        assert!(tracker.take_all_dynamic(t0).is_empty());
         assert_eq!(tracker.active(), 1);
         assert!(tracker.is_permanent(&operator));
         // Strike history survives a flush: the next block escalates.
@@ -684,5 +748,131 @@ mod tests {
             tracker.record(a, Lifetime::Dynamic, t0),
             Some(Duration::from_secs(60))
         );
+    }
+
+    #[test]
+    fn an_operator_lift_is_not_undone_by_a_peer_snapshot() {
+        let t0 = Instant::now();
+        let s = Duration::from_secs;
+        let mut tracker = ExpiryTracker::new(POLICY);
+        let a = ip("203.0.113.30");
+        tracker.record(a, Lifetime::Dynamic, t0);
+        tracker.lift(a, t0 + s(5));
+        assert_eq!(tracker.active(), 0);
+        assert!(tracker.dynamic_snapshot(t0 + s(5)).is_empty());
+        assert!(
+            !tracker.record_until(a, s(55), t0 + s(10)),
+            "a peer's copy of the block must not reinstate it"
+        );
+        assert_eq!(tracker.active(), 0);
+        assert!(!tracker.adoptable(&a, t0 + s(10)));
+        // Peers' copies are capped at `max`, so after that the lift ends.
+        assert!(tracker.adoptable(&a, t0 + s(5) + POLICY.max));
+        assert!(tracker.record_until(a, s(30), t0 + s(5) + POLICY.max));
+        // The lift survives expiry sweeps while it lasts.
+        let b = ip("203.0.113.31");
+        tracker.lift(b, t0);
+        assert!(tracker.take_expired(t0 + s(1)).is_empty());
+        assert!(!tracker.record_until(b, s(30), t0 + s(1)));
+    }
+
+    #[test]
+    fn a_fresh_block_overrides_a_lift_and_starts_from_base() {
+        let t0 = Instant::now();
+        let mut tracker = ExpiryTracker::new(POLICY);
+        let a = ip("203.0.113.32");
+        tracker.record(a, Lifetime::Dynamic, t0);
+        tracker.record(a, Lifetime::Dynamic, t0);
+        tracker.lift(a, t0);
+        assert_eq!(
+            tracker.record(a, Lifetime::Dynamic, t0),
+            Some(Duration::from_secs(60)),
+            "an unban forgives past strikes"
+        );
+        assert_eq!(tracker.active(), 1);
+    }
+
+    #[test]
+    fn a_flush_lifts_the_released_blocks() {
+        let t0 = Instant::now();
+        let mut tracker = ExpiryTracker::new(POLICY);
+        let a = ip("203.0.113.33");
+        tracker.record(a, Lifetime::Dynamic, t0);
+        assert_eq!(tracker.take_all_dynamic(t0), vec![a]);
+        assert!(!tracker.record_until(a, Duration::from_secs(50), t0));
+        assert_eq!(tracker.active(), 0);
+    }
+
+    /// A kernel map stand-in with a fixed capacity, like the XDP LPM tries.
+    struct FakeLists {
+        nets: std::collections::HashSet<IpNet>,
+        capacity: usize,
+    }
+
+    impl Blocklist for FakeLists {
+        fn add(&mut self, net: IpNet) -> Result<(), MapError> {
+            if !self.nets.contains(&net) && self.nets.len() >= self.capacity {
+                return Err(MapError::OutOfBounds {
+                    index: self.nets.len() as u32,
+                    max_entries: self.capacity as u32,
+                });
+            }
+            self.nets.insert(net);
+            Ok(())
+        }
+
+        fn delete(&mut self, net: IpNet) -> Result<(), MapError> {
+            if self.nets.remove(&net) {
+                Ok(())
+            } else {
+                Err(MapError::KeyNotFound)
+            }
+        }
+    }
+
+    fn table(capacity: usize) -> BlockTable<FakeLists> {
+        BlockTable::with_lists(
+            FakeLists {
+                nets: Default::default(),
+                capacity,
+            },
+            POLICY,
+        )
+    }
+
+    #[test]
+    fn a_peer_block_that_does_not_fit_the_map_is_not_counted() {
+        let t0 = Instant::now();
+        let s = Duration::from_secs;
+        let mut t = table(1);
+        t.insert(ip("198.51.100.1"), Lifetime::Dynamic, t0).unwrap();
+        let synced = ip("198.51.100.2");
+        assert!(t.insert_until(synced, s(50), t0).is_err());
+        assert!(!t.lists.nets.contains(&synced));
+        assert_eq!(t.active(), 1, "only what the kernel enforces");
+        assert!(
+            !t.dynamic_snapshot(t0).iter().any(|(n, _)| *n == synced),
+            "not passed on to other peers as blocked"
+        );
+        // Once there is room, the next sync installs it.
+        t.expire(t0 + s(60));
+        assert!(t.insert_until(synced, s(50), t0 + s(60)).unwrap());
+        assert!(t.lists.nets.contains(&synced));
+    }
+
+    #[test]
+    fn an_operator_unban_holds_against_a_peer_snapshot() {
+        let t0 = Instant::now();
+        let s = Duration::from_secs;
+        let mut t = table(8);
+        let a = ip("198.51.100.3");
+        t.insert(a, Lifetime::Dynamic, t0).unwrap();
+        t.remove(a, t0).unwrap();
+        assert!(!t.insert_until(a, s(50), t0 + s(1)).unwrap());
+        assert!(!t.lists.nets.contains(&a), "the kernel map stays clear");
+        assert_eq!(t.active(), 0);
+        // A new detection blocks it again.
+        t.insert(a, Lifetime::Dynamic, t0 + s(2)).unwrap();
+        assert!(t.lists.nets.contains(&a));
     }
 }
