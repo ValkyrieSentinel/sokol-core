@@ -108,6 +108,19 @@ per-node control sockets.
 on an interface the orchestrator already uses. It refuses to start without `SOKOL_CLIENT_TOKEN`
 (16+ characters). Only the IPv4 blacklist is backed by an eBPF map.
 
+## Trident trap
+
+`trident_trap` listens on decoy ports and asks the orchestrator to block every source that
+connects, so run it on a decoy host or only on ports with no real service.
+
+- `SOKOL_TRAP_PORTS` — comma-separated ports (default `22,80,443,3306,6379,8443`; `8080` is the
+  orchestrator's P2P port and `2222` the operator SSH port, which is refused)
+- `SOKOL_JAIL_ADDR` — optional external interactive jail for SSH attackers; without it an
+  embedded mock jail answers. It must not be the operator SSH port.
+
+At most 256 trap connections are handled at once; binary floods get a slow 32 B/s drip for up
+to 30 s instead of a burst.
+
 # Project Structure
 
 `ebpf/` — kernel space code (Rust XDP program).

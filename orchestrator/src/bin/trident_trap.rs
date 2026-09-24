@@ -1,12 +1,62 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::net::SocketAddr;
+use std::sync::Arc;
+use tokio::sync::Semaphore;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{sleep, timeout, Duration};
 
+/// Ports that decoy services listen on. 8080 is left out: it is the orchestrator's P2P port.
+const DEFAULT_TRAP_PORTS: [u16; 6] = [22, 80, 443, 3306, 6379, 8443];
+/// The XDP program always passes this port as the operator's real SSH (ADMIN_SSH_PORT).
+const ADMIN_SSH_PORT: u16 = 2222;
+const MAX_CONCURRENT_CONNECTIONS: usize = 256;
+
+pub struct TrapConfig {
+    pub ports: Vec<u16>,
+    /// External interactive jail to proxy SSH attackers to. None = embedded mock jail.
+    pub jail_addr: Option<SocketAddr>,
+}
+
+impl TrapConfig {
+    /// SOKOL_TRAP_PORTS="22,80,3306" and SOKOL_JAIL_ADDR="127.0.0.1:2022".
+    pub fn from_env() -> Result<Self, String> {
+        Self::parse(
+            std::env::var("SOKOL_TRAP_PORTS").ok().as_deref(),
+            std::env::var("SOKOL_JAIL_ADDR").ok().as_deref(),
+        )
+    }
+
+    fn parse(ports: Option<&str>, jail: Option<&str>) -> Result<Self, String> {
+        let ports = match ports {
+            None => DEFAULT_TRAP_PORTS.to_vec(),
+            Some(list) => list
+                .split(',')
+                .map(|p| p.trim().parse::<u16>().map_err(|_| format!("invalid trap port '{}'", p.trim())))
+                .collect::<Result<Vec<_>, _>>()?,
+        };
+        if ports.contains(&ADMIN_SSH_PORT) {
+            return Err(format!("port {} is the operator SSH port and cannot be a trap", ADMIN_SSH_PORT));
+        }
+        let jail_addr = match jail {
+            None | Some("") => None,
+            Some(raw) => {
+                let addr: SocketAddr = raw.parse().map_err(|_| format!("invalid SOKOL_JAIL_ADDR '{}'", raw))?;
+                // Proxying into the real sshd would hand attackers a login prompt that
+                // appears to come from localhost.
+                if addr.port() == ADMIN_SSH_PORT {
+                    return Err(format!("SOKOL_JAIL_ADDR must not point at the operator SSH port {}", ADMIN_SSH_PORT));
+                }
+                Some(addr)
+            }
+        };
+        Ok(Self { ports, jail_addr })
+    }
+}
+
 pub struct UltimateTridentOrchestrator {
-    #[allow(dead_code)]
-    pub db_path: String,
+    config: Arc<TrapConfig>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -42,18 +92,25 @@ impl ConnectionFingerprint {
 }
 
 impl UltimateTridentOrchestrator {
-    pub fn new(db_path: &str) -> Self {
+    pub fn new(config: TrapConfig) -> Self {
         Self {
-            db_path: db_path.to_string(),
+            config: Arc::new(config),
         }
     }
 
-    pub async fn run(&self, ports: &[u16]) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
         println!("[*] Sokol-Core Trident Node initializing (Single-Writer via Unix Socket)...");
+        match self.config.jail_addr {
+            Some(addr) => println!("[*] Tier-3 attackers are proxied to external jail {}", addr),
+            None => println!("[*] Tier-3 attackers are handled by the embedded mock jail"),
+        }
 
         let mut handles = vec![];
+        let permits = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
 
-        for &port in ports {
+        for &port in &self.config.ports {
+            let config = self.config.clone();
+            let permits = permits.clone();
             let addr = format!("0.0.0.0:{}", port);
 
             let handle = tokio::spawn(async move {
@@ -69,13 +126,18 @@ impl UltimateTridentOrchestrator {
                 };
 
                 while let Ok((stream, peer_addr)) = listener.accept().await {
-                    let ip = peer_addr.ip().to_string();
-                    let peer_port = peer_addr.port();
+                    // Over the limit the connection is simply closed: the trap must not let a
+                    // flood exhaust this host's memory or file descriptors.
+                    let Ok(permit) = permits.clone().try_acquire_owned() else {
+                        drop(stream);
+                        continue;
+                    };
+                    let ip = peer_addr.ip().to_canonical().to_string();
+                    let config = config.clone();
 
                     tokio::spawn(async move {
-                        if let Err(e) = handle_trident_connection(stream, ip, peer_port).await {
-                            let _ = e;
-                        }
+                        let _ = handle_trident_connection(stream, ip, port, &config).await;
+                        drop(permit);
                     });
                 }
             });
@@ -95,6 +157,7 @@ async fn handle_trident_connection(
     mut stream: TcpStream,
     ip: String,
     port: u16,
+    config: &TrapConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut buf = vec![0u8; 2048];
 
@@ -156,7 +219,7 @@ async fn handle_trident_connection(
                 "[TIER-3 JAIL] SSH interaction detected from IP: {} on port {}! Engaging bait and proxying to Jail...",
                 ip, port
             );
-            run_tier3_interactive_jail(stream, payload, &ip).await?;
+            run_tier3_interactive_jail(stream, payload, &ip, config.jail_addr).await?;
         }
     }
 
@@ -270,25 +333,29 @@ async fn run_tier1_bot_tarpit(
     Ok(())
 }
 
+/// Binary floods get a slow drip of noise: the connection is held for up to 30 s at 32 bytes
+/// per second. Answering with a burst (formerly 1 MiB per connection) spent this host's own
+/// uplink on the attacker.
 async fn run_counter_strike_revenge(
     mut stream: TcpStream,
     ip: &str,
     seed_hash: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut rng_chunk = [0u8; 4096];
     let mut seed: u64 = seed_hash ^ 0xDEADBEEFCAFEBABE;
+    let mut chunk = [0u8; 16];
 
-    for _ in 0..256 {
-        for byte in rng_chunk.iter_mut() {
+    for _ in 0..60 {
+        for byte in chunk.iter_mut() {
             seed ^= seed << 13;
             seed ^= seed >> 7;
             seed ^= seed << 17;
             *byte = (seed & 0xFF) as u8;
         }
-        if stream.write_all(&rng_chunk).await.is_err() {
+        if stream.write_all(&chunk).await.is_err() {
             break;
         }
         let _ = stream.flush().await;
+        sleep(Duration::from_millis(500)).await;
     }
 
     let _ = trigger_xdp_drop(ip).await;
@@ -343,11 +410,15 @@ async fn run_tier3_interactive_jail(
     mut attacker_stream: TcpStream,
     initial_payload: &[u8],
     ip: &str,
+    jail_addr: Option<SocketAddr>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let jail_addr = "127.0.0.1:2222";
+    let jail = match jail_addr {
+        Some(addr) => TcpStream::connect(addr).await.ok(),
+        None => None,
+    };
 
-    match TcpStream::connect(jail_addr).await {
-        Ok(mut jail_stream) => {
+    match jail {
+        Some(mut jail_stream) => {
             let juicy_bait_banner = b"SSH-2.0-OpenSSH_7.4p1 Debian-10+deb9u7\r\n";
             if attacker_stream.write_all(juicy_bait_banner).await.is_ok() {
                 let _ = attacker_stream.flush().await;
@@ -371,7 +442,7 @@ async fn run_tier3_interactive_jail(
                 }
             }
         }
-        Err(_) => {
+        None => {
             let _ = run_embedded_mock_jail(&mut attacker_stream, initial_payload, ip).await;
         }
     };
@@ -540,9 +611,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("    SOKOL-CORE: MULTI-PORT ULTIMATE TRIDENT ENGINE    ");
     println!("======================================================");
 
-    let orchestrator = UltimateTridentOrchestrator::new("sokol_audit.sntl");
-    let target_ports = vec![22, 80, 443, 3306, 6379, 8080, 8443];
-    orchestrator.run(&target_ports).await?;
+    let config = match TrapConfig::from_env() {
+        Ok(config) => config,
+        Err(e) => {
+            eprintln!("[!] {}", e);
+            std::process::exit(1);
+        }
+    };
+    UltimateTridentOrchestrator::new(config).run().await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn defaults_avoid_the_p2p_and_admin_ssh_ports() {
+        let config = TrapConfig::parse(None, None).unwrap();
+        assert!(!config.ports.contains(&8080), "8080 is the orchestrator P2P port");
+        assert!(!config.ports.contains(&ADMIN_SSH_PORT));
+        assert!(config.jail_addr.is_none(), "no external jail unless configured");
+    }
+
+    #[test]
+    fn admin_ssh_port_can_be_neither_trap_nor_jail() {
+        assert!(TrapConfig::parse(Some("22,2222"), None).is_err());
+        assert!(TrapConfig::parse(None, Some("127.0.0.1:2222")).is_err());
+        let config = TrapConfig::parse(Some("23, 3389"), Some("127.0.0.1:2022")).unwrap();
+        assert_eq!(config.ports, vec![23, 3389]);
+        assert_eq!(config.jail_addr, Some("127.0.0.1:2022".parse().unwrap()));
+        assert!(TrapConfig::parse(Some("22,http"), None).is_err());
+    }
 }
