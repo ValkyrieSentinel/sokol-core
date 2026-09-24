@@ -142,6 +142,14 @@ impl ExpiryTracker {
             .count()
     }
 
+    pub fn active_ips(&self) -> std::collections::HashSet<IpAddr> {
+        self.entries
+            .iter()
+            .filter(|(_, e)| e.state != State::Expired)
+            .map(|(ip, _)| *ip)
+            .collect()
+    }
+
     /// Active blocks as (IPv4, IPv6) — each family has its own kernel map.
     pub fn active_by_family(&self) -> (usize, usize) {
         let active = self
@@ -286,6 +294,10 @@ impl BlockTable {
 
     pub fn active_by_family(&self) -> (usize, usize) {
         self.expiry.active_by_family()
+    }
+
+    pub fn active_ips(&self) -> std::collections::HashSet<IpAddr> {
+        self.expiry.active_ips()
     }
 }
 

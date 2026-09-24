@@ -24,6 +24,7 @@ READY="Sokol-Core running with SokolEngine"
 cleanup() {
     [ -n "$ORCH_PID" ] && kill "$ORCH_PID" 2>/dev/null && wait "$ORCH_PID" 2>/dev/null || true
     [ -n "$OPERATOR_PID" ] && kill "$OPERATOR_PID" 2>/dev/null || true
+    pkill -f "gobgpd -f $WORK" 2>/dev/null || true
     ip link del "$HOST_IF" 2>/dev/null || true
     ip netns del "$NS" 2>/dev/null || true
     rm -rf "$WORK"
@@ -226,10 +227,43 @@ start_orchestrator --xdp-mode native
 check "--xdp-mode native attaches in driver mode (veth supports it)" bash -c "ip -d link show $HOST_IF | grep -qw xdp && ! ip -d link show $HOST_IF | grep -q xdpgeneric"
 check "native mode: blocked source is dropped" bash -c "! ip netns exec $NS ping -c 1 -W 1 -I $BLOCKED_IP $HOST_IP >/dev/null 2>&1"
 
+# BGP Flowspec: this node's gobgpd (AS 65001) peers with an "upstream" gobgpd (AS 65002).
+gobgp_config() {
+    local as=$1 local_addr=$2 port=$3 peer_addr=$4 peer_port=$5 peer_as=$6
+    printf '[global.config]\n  as = %s\n  router-id = "%s"\n  port = %s\n  local-address-list = ["%s"]\n' \
+        "$as" "$local_addr" "$port" "$local_addr"
+    printf '[[neighbors]]\n  [neighbors.config]\n    neighbor-address = "%s"\n    peer-as = %s\n' "$peer_addr" "$peer_as"
+    printf '  [neighbors.transport.config]\n    local-address = "%s"\n    remote-port = %s\n' "$local_addr" "$peer_port"
+    printf '  [[neighbors.afi-safis]]\n    [neighbors.afi-safis.config]\n      afi-safi-name = "ipv4-flowspec"\n'
+}
+start_gobgp_pair() {
+    gobgp_config 65001 127.0.0.1 1790 127.0.0.2 1791 65002 >"$WORK/gobgp-node.toml"
+    gobgp_config 65002 127.0.0.2 1791 127.0.0.1 1790 65001 >"$WORK/gobgp-upstream.toml"
+    gobgpd -f "$WORK/gobgp-node.toml" --api-hosts 127.0.0.1:50051 >"$WORK/gobgpd-node.log" 2>&1 &
+    gobgpd -f "$WORK/gobgp-upstream.toml" --api-hosts 127.0.0.1:50052 >"$WORK/gobgpd-upstream.log" 2>&1 &
+    for _ in $(seq 1 40); do
+        gobgp -p 50051 neighbor 2>/dev/null | grep -q Establ && return 0
+        sleep 0.5
+    done
+    return 1
+}
+
 stop_orchestrator
-start_orchestrator --block-ttl 2 --audit-max-bytes 600 --audit-keep 50
+FLOWSPEC_ARGS=()
+if command -v gobgpd >/dev/null; then
+    check "BGP session between node gobgpd and upstream gobgpd is established" start_gobgp_pair
+    FLOWSPEC_ARGS=(--flowspec-gobgp "$(command -v gobgp)" --flowspec-gobgp-arg=-p --flowspec-gobgp-arg=50051)
+else
+    echo "SKIP  BGP Flowspec checks (gobgpd not installed)"
+fi
+start_orchestrator --block-ttl 2 --audit-max-bytes 600 --audit-keep 50 "${FLOWSPEC_ARGS[@]}"
 ipc "DROP_IMMEDIATE:$ALLOWED_IP"
 sleep 0.5
+if [ ${#FLOWSPEC_ARGS[@]} -gt 0 ]; then
+    sleep 1.2
+    check "Flowspec: upstream receives a discard rule for the dynamic block" bash -c "gobgp -p 50052 global rib -a ipv4-flowspec | grep -q 'source: $ALLOWED_IP/32'"
+    check "Flowspec: upstream receives a discard rule for the static block" bash -c "gobgp -p 50052 global rib -a ipv4-flowspec | grep -q 'source: $BLOCKED_IP/32'"
+fi
 check "TTL: dynamic block of $ALLOWED_IP is enforced" bash -c "! ip netns exec $NS ping -c 1 -W 1 -I $ALLOWED_IP $HOST_IP >/dev/null 2>&1"
 sleep 3
 check "TTL: dynamic block expires after --block-ttl" ping_from "$ALLOWED_IP"
@@ -240,9 +274,16 @@ cp "$FIRST_SEGMENT" "$WORK/segment.bak"
 printf 'X' | dd of="$FIRST_SEGMENT" bs=1 seek=40 conv=notrunc 2>/dev/null
 check "monitor --verify detects an edited segment" bash -c "! '$MONITOR_BIN' --verify '$WORK/events.sntl' >/dev/null"
 cp "$WORK/segment.bak" "$FIRST_SEGMENT"
+if [ ${#FLOWSPEC_ARGS[@]} -gt 0 ]; then
+    check "Flowspec: expired block is withdrawn upstream" bash -c "! gobgp -p 50052 global rib -a ipv4-flowspec | grep -q 'source: $ALLOWED_IP/32'"
+fi
 check "TTL: static --block stays in force" bash -c "! ip netns exec $NS ping -c 1 -W 1 -I $BLOCKED_IP $HOST_IP >/dev/null 2>&1"
 
 stop_orchestrator
+if [ ${#FLOWSPEC_ARGS[@]} -gt 0 ]; then
+    sleep 1
+    check "Flowspec: shutdown withdraws the node's rules upstream" bash -c "! gobgp -p 50052 global rib -a ipv4-flowspec | grep -q source"
+fi
 check "SIGINT/SIGTERM shutdown is graceful" grep -q "terminated gracefully" "$LOG"
 
 # Unprivileged run: only the capabilities the systemd unit grants.

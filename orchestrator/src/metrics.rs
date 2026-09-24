@@ -15,6 +15,7 @@ pub struct Snapshot {
     pub blocks_capacity: usize,
     pub p2p_peers: usize,
     pub audit_queue_overflow: u64,
+    pub flowspec_announced: usize,
 }
 
 fn family(out: &mut String, name: &str, kind: &str, help: &str) {
@@ -108,6 +109,14 @@ pub fn render(s: &Snapshot) -> String {
         "sokol_audit_queue_overflow_total {}",
         s.audit_queue_overflow
     );
+
+    family(
+        &mut out,
+        "sokol_flowspec_announced",
+        "gauge",
+        "Blocks announced upstream as BGP Flowspec discard rules.",
+    );
+    let _ = writeln!(out, "sokol_flowspec_announced {}", s.flowspec_announced);
 
     out
 }

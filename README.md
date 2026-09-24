@@ -194,6 +194,28 @@ A missing, reordered or edited segment makes it print `BROKEN` and exit 1. Someo
 access could rebuild the whole chain; to detect that, record the printed head somewhere the node
 cannot write (another host, a ticket, a timestamping service).
 
+## BGP Flowspec (upstream drops)
+
+With `--flowspec-gobgp /usr/local/bin/gobgp` every active block is announced as an RFC 8955
+Flowspec rule `match source <ip>/32 then discard` through a local
+[GoBGP](https://github.com/osrg/gobgp) daemon, so routers that accept Flowspec drop the traffic
+before it reaches this node's link. Expired or lifted blocks are withdrawn, and all of the node's
+rules are withdrawn when it shuts down. Announcements are reconciled every second (at most 64
+changes per second), so a gobgpd outage only delays them. `sokol_flowspec_announced` shows how
+many rules are live.
+
+Run gobgpd with a neighbor for each upstream router and the `ipv4-flowspec` / `ipv6-flowspec`
+address families enabled, then point the orchestrator at its API:
+
+```shell
+sudo ./target/release/orchestrator -i eth0 --flowspec-gobgp /usr/local/bin/gobgp \
+    --flowspec-gobgp-arg=-p --flowspec-gobgp-arg=50051
+```
+
+Only accept this on sessions where the upstream operator agreed to take Flowspec from you and
+filters it to your own address space; the smoke test checks the whole path between two gobgpd
+instances.
+
 ## Metrics
 
 `--metrics-bind 127.0.0.1:9469` serves Prometheus metrics at `/metrics`:

@@ -4,6 +4,7 @@ mod block_policy;
 mod block_table;
 pub mod cluster_state;
 mod control;
+mod flowspec;
 mod mesh_sync;
 mod metrics;
 mod p2p;
@@ -240,6 +241,16 @@ struct Args {
     /// Rotated audit segments to keep (older ones are deleted).
     #[arg(long, default_value = "10")]
     audit_keep: usize,
+
+    /// Announce every block upstream as a BGP Flowspec "discard source" rule through this
+    /// GoBGP CLI binary (the gobgpd it talks to must peer with the upstream routers).
+    #[arg(long, value_name = "PATH")]
+    flowspec_gobgp: Option<std::path::PathBuf>,
+
+    /// Argument passed to the GoBGP CLI before the command (repeatable), e.g.
+    /// --flowspec-gobgp-arg=-p --flowspec-gobgp-arg=50051
+    #[arg(long, value_name = "ARG", allow_hyphen_values = true)]
+    flowspec_gobgp_arg: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
@@ -1191,6 +1202,11 @@ async fn main() -> Result<(), anyhow::Error> {
     let p2p_bind_hb = args.p2p_bind.clone();
     let control_socket_hb = args.control_socket.clone();
     let mut watermark = Watermark::default();
+    let flowspec_cli = args.flowspec_gobgp.clone().map(|bin| flowspec::GobgpCli {
+        bin,
+        args: args.flowspec_gobgp_arg.clone(),
+    });
+    let mut flowspec_state = flowspec::Reconciler::default();
 
     loop {
         tokio::select! {
@@ -1247,6 +1263,26 @@ async fn main() -> Result<(), anyhow::Error> {
                 }
                 snapshot.p2p_peers = peer_registry.peer_count().await;
                 snapshot.audit_queue_overflow = sntl_db.overflow_total();
+
+                if let Some(cli) = &flowspec_cli {
+                    let active = blocks.lock().await.active_ips();
+                    let (announce, withdraw) = flowspec_state.plan(&active);
+                    for (is_announce, ip) in withdraw.into_iter().map(|ip| (false, ip)).chain(announce.into_iter().map(|ip| (true, ip))) {
+                        match cli.apply(is_announce, ip).await {
+                            Ok(()) => {
+                                let verb = if is_announce { "announced" } else { "withdrew" };
+                                log::info!("[Flowspec] {} discard rule for {}", verb, ip);
+                                sntl_db.append(format!("FLOWSPEC_{}|IP:{}", if is_announce { "ANNOUNCE" } else { "WITHDRAW" }, ip));
+                                if is_announce { flowspec_state.announced(ip) } else { flowspec_state.withdrawn(ip) }
+                            }
+                            Err(e) => {
+                                log::error!("[Flowspec] gobgp failed for {}: {}; retrying next tick", ip, e);
+                                break;
+                            }
+                        }
+                    }
+                    snapshot.flowspec_announced = flowspec_state.announced_count();
+                }
                 *metrics_snapshot.write().unwrap_or_else(|p| p.into_inner()) = snapshot;
 
                 let delta_packets = total_rx_packets.saturating_sub(prev_packets);
@@ -1291,6 +1327,22 @@ async fn main() -> Result<(), anyhow::Error> {
     }
 
     log::info!("Sokol-Core main loop terminated gracefully. Cleaning up resources...");
+    if let Some(cli) = &flowspec_cli {
+        // The node's blocks vanish with it; do not leave its rules behind upstream.
+        'withdraw_all: loop {
+            let (_, withdraw) = flowspec_state.plan(&std::collections::HashSet::new());
+            if withdraw.is_empty() {
+                break;
+            }
+            for ip in withdraw {
+                if let Err(e) = cli.apply(false, ip).await {
+                    log::error!("[Flowspec] Could not withdraw {} on shutdown: {}", ip, e);
+                    break 'withdraw_all;
+                }
+                flowspec_state.withdrawn(ip);
+            }
+        }
+    }
     sntl_db.append("NODE_SHUTDOWN".to_string());
     sntl_db.flush(Duration::from_secs(2));
     let _ = std::fs::remove_file(socket_path);

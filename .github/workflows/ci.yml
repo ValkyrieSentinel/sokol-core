@@ -26,6 +26,11 @@ jobs:
             | tar --zstd -x -C /usr/local/bin
           bpf-linker --version
 
+      - name: Install GoBGP (BGP Flowspec smoke checks)
+        run: |
+          curl -sSfL "https://github.com/osrg/gobgp/releases/download/v4.9.0/gobgp_4.9.0_linux_amd64.tar.gz" \
+            | sudo tar -xz -C /usr/local/bin gobgp gobgpd
+
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: |
