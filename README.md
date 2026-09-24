@@ -83,6 +83,20 @@ Envelopes are signed over sender, timestamp, nonce and payload; they are rejecte
 ±30 s clock window (keep nodes NTP-synced) and accepted at most once. Mesh traffic is
 authenticated but not encrypted.
 
+## Local control socket and protected addresses
+
+`/run/sokol.sock` accepts `DROP_IMMEDIATE:<ip>` from local tools such as `trident_trap`.
+It is root-only (`0600`) unless `--ipc-group <group>` is given, in which case members of that
+group may write to it (`0660`).
+
+Some addresses are never blocked, whether the request comes from `--block`, the control
+socket, a trap or the mesh: loopback, multicast, IPv6 link-local, every address of this node,
+its default gateways and its `--seed-peer`s. Add operator and bastion networks explicitly:
+
+```shell
+sudo ./target/release/orchestrator -i eth0 --never-block 203.0.113.0/24 --never-block 2001:db8:ad::/48
+```
+
 # Project Structure
 
 `ebpf/` — kernel space code (Rust XDP program).

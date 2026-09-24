@@ -69,6 +69,26 @@ check "orchestrator attaches XDP to $HOST_IF" grep -q "XDP program successfully 
 check "traffic from $ALLOWED_IP passes" ping_from "$ALLOWED_IP"
 check "traffic from blocked $BLOCKED_IP is dropped" bash -c "! ip netns exec $NS ping -c 2 -W 1 -I $BLOCKED_IP $HOST_IP >/dev/null 2>&1"
 
+ipc() {
+    printf '%s\n' "$1" | nc -U -q1 /run/sokol.sock
+}
+
+check "control socket is root-only (0600)" test "$(stat -c %a /run/sokol.sock)" = 600
+check "unprivileged user cannot write to the control socket" \
+    bash -c "! su nobody -s /bin/bash -c 'printf \"DROP_IMMEDIATE:$ALLOWED_IP\\n\" | nc -U -q1 /run/sokol.sock' 2>/dev/null"
+sleep 0.5
+check "traffic from $ALLOWED_IP still passes after the unprivileged attempt" ping_from "$ALLOWED_IP"
+
+ipc "DROP_IMMEDIATE:127.0.0.1"
+ipc "DROP_IMMEDIATE:$HOST_IP"
+sleep 0.5
+check "loopback is never blocked" grep -q "Refusing to block 127.0.0.1 (loopback)" "$LOG"
+check "the node's own address is never blocked" grep -q "Refusing to block $HOST_IP (address of this node)" "$LOG"
+
+ipc "DROP_IMMEDIATE:$ALLOWED_IP"
+sleep 0.5
+check "root IPC DROP_IMMEDIATE blocks $ALLOWED_IP" bash -c "! ip netns exec $NS ping -c 2 -W 1 -I $ALLOWED_IP $HOST_IP >/dev/null 2>&1"
+
 if [ "$FAILED" -ne 0 ]; then
     echo "--- orchestrator log ---"
     cat "$LOG"

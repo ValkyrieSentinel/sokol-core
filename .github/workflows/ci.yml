@@ -51,4 +51,6 @@ jobs:
         run: cargo clippy --release --all-targets
 
       - name: XDP smoke test (veth + netns)
-        run: sudo scripts/xdp-smoke.sh target/release/orchestrator
+        run: |
+          sudo apt-get install -y -qq netcat-openbsd
+          sudo scripts/xdp-smoke.sh target/release/orchestrator

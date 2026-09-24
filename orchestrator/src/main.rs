@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 pub use mesh_sync::{AlertLevel, MeshCommand, MeshOrchestrator};
 pub mod cluster_state;
+mod block_policy;
 mod mesh_sync;
 mod p2p;
 mod sokol;
@@ -16,13 +17,14 @@ use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::unix::AsyncFd;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc, watch};
 
 use common::atp::AtpBudgetController;
 use common::canonical::CanonicalParser;
 use common::{DropEvent, NodeTelemetry};
 
+use crate::block_policy::BlockPolicy;
 use crate::cluster_state::BirdEyeView;
 use crate::p2p::{connect_to_peer, DagTracker, NodeCrypto, P2PNetwork, PeerRegistry, TrustStore};
 
@@ -118,6 +120,52 @@ struct Args {
     /// Print this node's public key (hex) for other nodes' peers files, then exit.
     #[arg(long)]
     print_public_key: bool,
+
+    /// Address or CIDR that must never be blocked (operator/bastion networks, mesh peers).
+    /// Loopback, this node's addresses, default gateways and seed peers are always protected.
+    #[arg(long, value_name = "CIDR")]
+    never_block: Vec<String>,
+
+    /// Group allowed to send commands on the control socket (mode 0660).
+    /// Without it the socket is root-only (0600).
+    #[arg(long)]
+    ipc_group: Option<String>,
+}
+
+const IPC_SOCKET_PATH: &str = "/run/sokol.sock";
+const MAX_IPC_LINE: u64 = 4096;
+
+fn build_block_policy(args: &Args) -> anyhow::Result<BlockPolicy> {
+    let mut policy = BlockPolicy::builtin();
+    policy.protect_host_addresses();
+    for seed in &args.seed_peer {
+        if let Ok(addr) = seed.trim().parse::<std::net::SocketAddr>() {
+            policy.protect_ip(addr.ip(), "mesh seed peer");
+        }
+    }
+    for raw in &args.never_block {
+        let raw = raw.trim();
+        let net = match raw.parse::<ipnet::IpNet>() {
+            Ok(net) => net,
+            Err(_) => raw
+                .parse::<IpAddr>()
+                .map(ipnet::IpNet::from)
+                .map_err(|_| anyhow::anyhow!("--never-block '{}' is not an IP address or CIDR", raw))?,
+        };
+        policy.protect(net, "operator never-block range");
+    }
+    Ok(policy)
+}
+
+fn resolve_group(name: &str) -> anyhow::Result<u32> {
+    let c_name = std::ffi::CString::new(name)?;
+    // SAFETY: getgrnam returns a pointer into static storage; we only read gr_gid before any
+    // other call could overwrite it.
+    let group = unsafe { libc::getgrnam(c_name.as_ptr()) };
+    if group.is_null() {
+        anyhow::bail!("--ipc-group '{}' does not exist", name);
+    }
+    Ok(unsafe { (*group).gr_gid })
 }
 
 async fn push_telemetry(msg: &str) {
@@ -139,7 +187,14 @@ async fn enforce_block_local(
     node_id: u64,
     node_crypto: &Arc<NodeCrypto>,
     dag_tracker: &Arc<tokio::sync::Mutex<DagTracker>>,
+    policy: &BlockPolicy,
 ) {
+    let ip = ip.to_canonical();
+    if let Err(why) = policy.check(ip) {
+        log::error!("[Local Security] Refusing to block {} ({}) | Requested for: {}", ip, why, reason);
+        sntl_db.append(format!("BLOCK_REFUSED|IP:{}|Protected:{}|Reason:{}", ip, why, reason));
+        return;
+    }
     match ip {
         IpAddr::V4(v4) => {
             let key = Key::new(32, v4.octets());
@@ -214,6 +269,9 @@ async fn main() -> Result<(), anyhow::Error> {
             TrustStore::default()
         }
     };
+
+    let block_policy = Arc::new(build_block_policy(&args)?);
+    let ipc_gid = args.ipc_group.as_deref().map(resolve_group).transpose()?;
 
     log::info!("Initializing Sokol-Core Production Daemon on interface: {} [Node ID: {}]", args.interface, args.node_id);
 
@@ -316,6 +374,10 @@ async fn main() -> Result<(), anyhow::Error> {
     for ip_str in &args.block {
         let clean_str = ip_str.trim();
         if let Ok(ip) = clean_str.parse::<IpAddr>() {
+            let ip = ip.to_canonical();
+            if let Err(why) = block_policy.check(ip) {
+                anyhow::bail!("--block {} refused: address is protected ({})", ip, why);
+            }
             match ip {
                 IpAddr::V4(v4) => {
                     let key = Key::new(32, v4.octets());
@@ -398,6 +460,7 @@ async fn main() -> Result<(), anyhow::Error> {
     let blocklist_v6_mesh = blocklist_v6_map.clone();
     let sntl_db_mesh = sntl_db.clone();
     let node_id_mesh = args.node_id;
+    let policy_mesh = block_policy.clone();
 
     tokio::spawn(async move {
         while let Some(cmd) = mesh_cmd_rx.recv().await {
@@ -405,6 +468,12 @@ async fn main() -> Result<(), anyhow::Error> {
                 MeshCommand::BlockIp { ip, reason } => {
                     let clean_ip = ip.trim();
                     if let Ok(ip_addr) = clean_ip.parse::<IpAddr>() {
+                        let ip_addr = ip_addr.to_canonical();
+                        if let Err(why) = policy_mesh.check(ip_addr) {
+                            log::error!("[Mesh] Refusing mesh BlockIp for protected {} ({}): {}", ip_addr, why, reason);
+                            sntl_db_mesh.append(format!("MESH_BLOCK_REFUSED|IP:{}|Protected:{}|Reason:{}", ip_addr, why, reason));
+                            continue;
+                        }
                         match ip_addr {
                             IpAddr::V4(v4) => {
                                 let key = Key::new(32, v4.octets());
@@ -508,6 +577,7 @@ async fn main() -> Result<(), anyhow::Error> {
         let crypto_trap = node_crypto.clone();
         let dag_trap = dag_tracker.clone();
         let node_id_trap = args.node_id;
+        let policy_trap = block_policy.clone();
 
         let bind_addr = format!("0.0.0.0:{}", port);
 
@@ -532,6 +602,7 @@ async fn main() -> Result<(), anyhow::Error> {
                                     node_id_trap,
                                     &crypto_trap,
                                     &dag_trap,
+                                    &policy_trap,
                                 ).await;
                                 db_trap.append(format!("TRAP_HIT|Port:{}|IP:{}|Action:EnforcedDrop", port, ip));
                                 
@@ -552,13 +623,21 @@ async fn main() -> Result<(), anyhow::Error> {
         });
     }
 
-    let socket_path = "/run/sokol.sock";
+    let socket_path = IPC_SOCKET_PATH;
     let _ = std::fs::remove_file(socket_path);
 
     let unix_listener = tokio::net::UnixListener::bind(socket_path)
         .map_err(|e| anyhow::anyhow!("Failed to bind Unix socket at {}: {}", socket_path, e))?;
-    
-    std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o666))?;
+
+    // Anyone who can write to this socket can make the node drop arbitrary sources and push
+    // the block to the whole mesh, so it is root-only unless an operator group is named.
+    match ipc_gid {
+        Some(gid) => {
+            std::os::unix::fs::chown(socket_path, None, Some(gid))?;
+            std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o660))?;
+        }
+        None => std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600))?,
+    }
 
     let blocklist_v4_unix = blocklist_v4_map.clone();
     let blocklist_v6_unix = blocklist_v6_map.clone();
@@ -568,6 +647,7 @@ async fn main() -> Result<(), anyhow::Error> {
     let crypto_unix = node_crypto.clone();
     let dag_unix = dag_tracker.clone();
     let node_id_unix = args.node_id;
+    let policy_unix = block_policy.clone();
 
     tokio::spawn(async move {
         log::info!("[UNIX SOCKET] Listening for trap events on {}", socket_path);
@@ -581,6 +661,8 @@ async fn main() -> Result<(), anyhow::Error> {
 
                     let crypto_stream = crypto_unix.clone();
                     let dag_stream = dag_unix.clone();
+                    let policy_stream = policy_unix.clone();
+                    let peer_uid = stream.peer_cred().map(|c| c.uid()).ok();
 
                     tokio::spawn(async move {
                         let mut reader = BufReader::new(stream);
@@ -588,9 +670,14 @@ async fn main() -> Result<(), anyhow::Error> {
 
                         loop {
                             line.clear();
-                            match reader.read_line(&mut line).await {
+                            match (&mut reader).take(MAX_IPC_LINE).read_line(&mut line).await {
                                 Ok(0) => break,
+                                Ok(_) if !line.ends_with('\n') && line.len() as u64 >= MAX_IPC_LINE => {
+                                    log::error!("[UNIX IPC FAULT] Line over {} bytes from uid {:?}; closing connection", MAX_IPC_LINE, peer_uid);
+                                    break;
+                                }
                                 Ok(_) => {
+                                    log::debug!("[UNIX IPC] command from uid {:?}: {}", peer_uid, line.trim());
                                     let content = line.trim();
                                     if content.is_empty() {
                                         continue;
@@ -618,6 +705,7 @@ async fn main() -> Result<(), anyhow::Error> {
                                                     node_id_unix,
                                                     &crypto_stream,
                                                     &dag_stream,
+                                                    &policy_stream,
                                                 ).await;
                                             }
                                             Err(e) => {
@@ -648,6 +736,7 @@ async fn main() -> Result<(), anyhow::Error> {
                                                     node_id_unix,
                                                     &crypto_stream,
                                                     &dag_stream,
+                                                    &policy_stream,
                                                 ).await;
                                             }
                                             Err(e) => {
