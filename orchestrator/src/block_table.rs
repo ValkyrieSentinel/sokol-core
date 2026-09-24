@@ -991,7 +991,10 @@ mod tests {
         n4.retract(1, &[c.id()], T0);
         n4.retract(3, &[c.id()], T0);
         n4.adopt(c, true, T0);
-        assert!(!n4.is_blocked(ip("203.0.113.18")), "the claim came back to life");
+        assert!(
+            !n4.is_blocked(ip("203.0.113.18")),
+            "the claim came back to life"
+        );
     }
 
     #[test]
@@ -1038,7 +1041,11 @@ mod tests {
             let mut restarted = table(1, 64);
             restarted.restore(n1.take_persisted(now), |_| true, now);
             restarted.adopt(long.clone(), true, now);
-            assert!(!restarted.is_blocked(a), "day {}: back after a restart", day);
+            assert!(
+                !restarted.is_blocked(a),
+                "day {}: back after a restart",
+                day
+            );
         }
         let fresh = detect(&mut peer, "203.0.113.12", T0 + 3 * S);
         assert_eq!(n1.adopt(fresh, true, T0 + 3 * S), Adoption::Enforced);
