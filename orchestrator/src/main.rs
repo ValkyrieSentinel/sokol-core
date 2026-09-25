@@ -732,7 +732,8 @@ fn ttl_label(ttl: Option<Duration>) -> String {
 enum Enforcement {
     Enforced,
     Refused,
-    Failed,
+    /// Recorded, but the kernel map refused it for now; retried every second.
+    Pending,
 }
 
 impl Enforcement {
@@ -741,7 +742,7 @@ impl Enforcement {
         match self {
             Enforcement::Enforced => "EnforcedDrop",
             Enforcement::Refused => "Refused",
-            Enforcement::Failed => "Failed",
+            Enforcement::Pending => "Pending",
         }
     }
 }
@@ -814,10 +815,10 @@ async fn enforce_block_local(
                 e
             );
             sntl_db.append(format!(
-                "BLOCK_FAILED|IP:{}|Error:{:?}|Reason:{}",
+                "BLOCK_PENDING|IP:{}|Error:{:?}|Reason:{}",
                 shown, e, reason
             ));
-            Enforcement::Failed
+            Enforcement::Pending
         }
     }
 }
@@ -1729,14 +1730,14 @@ async fn main() -> Result<(), anyhow::Error> {
     let p2p_bind_hb = args.p2p_bind.clone();
     let control_socket_hb = args.control_socket.clone();
     let mut watermark = Watermark::default();
-    let (_registry_tick, _crypto_tick, _dag_tick) = (
+    let (registry_tick, crypto_tick, dag_tick) = (
         peer_registry.clone(),
         node_crypto.clone(),
         dag_tracker.clone(),
     );
-    let _node_id_tick = args.node_id;
-    let _last_digest = std::time::Instant::now();
-    let _state_error = false;
+    let node_id_tick = args.node_id;
+    let mut last_digest = std::time::Instant::now();
+    let mut state_error = false;
     let mut telemetry_window_start = std::time::Instant::now();
     let mut window_rx = 0u64;
     let mut window_dropped = 0u64;
@@ -1796,6 +1797,32 @@ async fn main() -> Result<(), anyhow::Error> {
                 for ip in released {
                     log::info!("[BlockTable] Block for {} expired; traffic allowed again", show(&ip));
                     sntl_db.append(format!("BLOCK_EXPIRED_{}|IP:{}", ip_tag(ip), show(&ip)));
+                }
+
+                // ADR-4: this node's decisions and lifts survive a restart.
+                let state = {
+                    let mut table = blocks.lock().await;
+                    table.dirty().then(|| table.take_persisted(now_ms()))
+                };
+                if let Some(state) = state {
+                    match save_state(&state_file, &state) {
+                        Ok(()) => state_error = false,
+                        Err(e) => {
+                            if !state_error {
+                                log::error!("[State] Cannot write {}: {}; retrying", state_file.display(), e);
+                            }
+                            state_error = true;
+                            blocks.lock().await.mark_dirty();
+                        }
+                    }
+                }
+
+                // ADR-3 anti-entropy: a peer whose digest differs answers with its state.
+                if last_digest.elapsed() >= mesh_sync::DIGEST_INTERVAL {
+                    last_digest = std::time::Instant::now();
+                    let digest = blocks.lock().await.digest(now_ms());
+                    let cmd = MeshCommand::Digest { issuer: node_id_tick, digest };
+                    let _ = registry_tick.broadcast(&cmd, node_id_tick, &crypto_tick, &dag_tick).await;
                 }
 
                 let mode = if sntl_db.status().healthy { "NORMAL" } else { "DEGRADED" };
