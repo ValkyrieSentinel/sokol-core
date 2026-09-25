@@ -143,6 +143,14 @@ A storm engages a latch at once (logged and audited); the latch disengages only 
 without a storm, so a flickering storm is one event. Reports travel only between directly
 connected peers, so connect the nodes as a full mesh (`--seed-peer` to every other node).
 
+While the latch is engaged, `--storm-mode strict` (the default) tightens XDP on this node: packets
+whose headers do not parse are dropped instead of passed to the stack (`malformed_header`), and
+IPv4 fragments are dropped. When the latch disengages, exactly the flags the operator configured
+(e.g. `--drop-ipv4-fragments`) are restored. Both transitions are audited (`DEFENSE_MODE|Strict`,
+`DEFENSE_MODE|Normal`) and shown as `sokol_defense_strict`. `--storm-mode observe` only logs the
+storm. Only a node's own latch switches its mode: a peer's EngageDefense/DisengageDefense is
+refused.
+
 Envelopes are signed over sender, timestamp, nonce and payload; they are rejected outside a
 ±30 s clock window (keep nodes NTP-synced) and accepted at most once. Mesh traffic is
 authenticated but not encrypted.

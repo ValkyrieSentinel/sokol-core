@@ -16,6 +16,7 @@ pub struct Snapshot {
     pub blocks_pending: usize,
     pub p2p_peers: usize,
     pub audit_queue_overflow: u64,
+    pub defense_strict: bool,
     pub audit_healthy: bool,
     pub audit_write_errors: u64,
     pub audit_lost: u64,
@@ -163,6 +164,13 @@ pub fn render(s: &Snapshot) -> String {
         "sokol_audit_last_sync_age_seconds {:.3}",
         s.audit_sync_age_ms as f64 / 1000.0
     );
+    family(
+        &mut out,
+        "sokol_defense_strict",
+        "gauge",
+        "1 while a distributed storm has XDP in strict mode (--storm-mode strict).",
+    );
+    let _ = writeln!(out, "sokol_defense_strict {}", s.defense_strict as u8);
     family(
         &mut out,
         "sokol_flowspec_announced",

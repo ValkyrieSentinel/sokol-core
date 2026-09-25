@@ -110,6 +110,9 @@ pub mod drop_reason {
 pub mod config_flags {
     /// Drop every IPv4 fragment (for hosts whose policy forbids fragmentation).
     pub const DROP_IPV4_FRAGMENTS: u32 = 1 << 0;
+    /// Drop packets whose headers do not parse, instead of passing them to the stack
+    /// (set while a distributed storm is engaged, ADR-6).
+    pub const STRICT_PARSE: u32 = 1 << 1;
 }
 
 pub mod tcp_flags {

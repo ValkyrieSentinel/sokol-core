@@ -575,6 +575,32 @@ if command -v wg >/dev/null && ip link add sokol-wgprobe type wireguard 2>/dev/n
     check "cluster: storm latch engaged and audited" bash -c "grep -q 'Distributed storm: 1/2 nodes under attack' '$LOG'"
     check "node 2 (threshold 0.5) counts itself under attack: local incident, not a storm" \
         test "$(n2_metric sokol_cluster_status)" = 2
+    # ADR-6: while the storm is engaged node 1's XDP drops packets whose headers do not parse.
+    # A bare IPv6 header whose Hop-by-Hop header is missing, from an address nobody blocks: in
+    # normal mode XDP cannot parse it and passes it to the stack; in strict mode it is dropped.
+    # (A truncated IPv4 header would not do: it is dropped as malformed in every mode.)
+    send_truncated_v6() {
+        ip netns exec "$NS" python3 - "$PEER_IF" "$1" <<'PY'
+import socket, struct, sys
+s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW)
+s.bind((sys.argv[1], 0))
+eth = b"\xff" * 6 + s.getsockname()[4][:6] + struct.pack("!H", 0x86DD)
+ip6 = struct.pack("!IHBB", 6 << 28, 0, 0, 64) + socket.inet_pton(socket.AF_INET6, "2001:db8:bad::77") \
+    + socket.inet_pton(socket.AF_INET6, "2001:db8::1")
+for _ in range(int(sys.argv[2])):
+    s.send(eth + ip6)
+PY
+    }
+    malformed() { metric 'sokol_xdp_dropped_packets_total{reason="malformed_header"}'; }
+    check "storm: node 1 switched XDP to strict mode" grep -aq "DEFENSE_MODE|Strict" "$WORK/events.sntl"
+    check "storm: strict mode is reported" wait_metric sokol_defense_strict 1
+    BEFORE=$(malformed); send_truncated_v6 10; sleep 1.2
+    check "storm: unparsable headers from an unblocked source are dropped in strict mode ($BEFORE -> $(malformed))" \
+        test $(( $(malformed) - BEFORE )) -eq 10
+    for _ in $(seq 1 75); do grep -aq "DEFENSE_MODE|Normal" "$WORK/events.sntl" && break; sleep 1; done
+    check "storm over: node 1 returns to normal mode" grep -aq "DEFENSE_MODE|Normal" "$WORK/events.sntl"
+    BEFORE=$(malformed); send_truncated_v6 10; sleep 1.2
+    check "normal mode: unparsable headers pass to the stack again" test "$(malformed)" -eq "$BEFORE"
     kill "$NODE2_PID" 2>/dev/null || true
     NODE2_PID=""
     stop_orchestrator
