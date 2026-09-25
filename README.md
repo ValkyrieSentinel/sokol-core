@@ -229,6 +229,15 @@ claim keeps its own expiry but is enforced here for at most `--block-ttl-max`.
 - The kernel map follows the claims. A map write or delete that fails (e.g. the map is full) stays
   pending, is retried every second and is shown as `sokol_blocks_pending`; `sokol_blocks_active`
   counts only entries the kernel holds.
+- What a peer can impose here is bounded (ADR-7). A peer's claims enforced at once are capped
+  (`--peer-max-active`, default 16384; more wait for a free slot), each for at most
+  `--peer-max-ttl` (default `--block-ttl-max`) from when it starts. A prefix wider than /24
+  (IPv4) or /64 (IPv6) is enforced only once `--quorum` distinct nodes (default 2, this node's own
+  claim included) claim it, so one compromised peer cannot cut off a network. Per peer, the peers
+  file can tighten this: `"envelope": {"max_active": 1000, "max_ttl_secs": 3600,
+  "min_prefix_v4": 32, "min_prefix_v6": 128}` (unknown fields are refused; `RELOAD_PEERS` applies
+  changes). Held claims are audited as `MESH_BLOCK_HELD` with the reason, and are still shared,
+  so the mesh state converges whatever each node enforces.
 - Nodes exchange a digest of their shared claims every 15 s; a node whose digest differs sends its
   state, so a node that missed messages (a partition, a full send queue) converges without waiting
   for a reconnect. All nodes of a mesh must run this protocol version.

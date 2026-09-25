@@ -563,6 +563,13 @@ if command -v wg >/dev/null && ip link add sokol-wgprobe type wireguard 2>/dev/n
     ipc "DROP_IMMEDIATE:203.0.113.77"
     sleep 1.5
     check "mesh: a block on node 1 reaches node 2" grep -q "Synchronized block for 203.0.113.77" "$WORK/n2/node.log"
+    # ADR-7: one peer alone cannot impose a wide prefix; node 1 holds it until a second node agrees.
+    printf 'DROP_IMMEDIATE:198.18.0.0/20\n' | ip netns exec "$NS" nc -U -q1 "$WORK/n2/ipc.sock" >/dev/null
+    sleep 1.5
+    check "quorum: node 1 holds node 2's /20 until a second node agrees" \
+        grep -q "Holding block for 198.18.0.0/20 from node 2 (quorum)" "$LOG"
+    check "quorum: node 1 does not enforce it" \
+        bash -c "! grep -q 'Synchronized block for 198.18.0.0/20' '$LOG'"
 
     timeout 8 ping -f -I "$ATTACK_SRC" "$ALLOWED_IP" >/dev/null 2>&1 || true
     for _ in $(seq 1 30); do
