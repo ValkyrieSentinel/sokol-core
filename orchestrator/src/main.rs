@@ -695,6 +695,24 @@ async fn execute_control(cmd: control::ControlCommand, ctx: &ControlCtx) -> Stri
             sntl_db.append(format!("OPERATOR_FLUSH|Released:{}", released.len()));
             format!("OK released {} dynamic blocks", released.len())
         }
+        ControlCommand::FlushAll => {
+            let (released, lifted) = blocks.lock().await.flush_all(now_ms());
+            broadcast_retraction(ctx, lifted.retracted).await;
+            log::warn!(
+                "[Control] Operator flushed {} blocks (operator and dynamic)",
+                released.len()
+            );
+            sntl_db.append(format!("OPERATOR_FLUSH_ALL|Released:{}", released.len()));
+            format!("OK released {} blocks", released.len())
+        }
+        ControlCommand::ListBans => {
+            let bans = blocks.lock().await.operator_targets(now_ms());
+            let shown: Vec<String> = bans.iter().take(LIST_BANS_MAX).map(show).collect();
+            // "OK <total> <target>..."; at most LIST_BANS_MAX targets on the line.
+            format!("OK {} {}", bans.len(), shown.join(" "))
+                .trim_end()
+                .to_string()
+        }
         ControlCommand::ReloadPeers => match &ctx.peers_file {
             None => "ERR no --peers-file configured".to_string(),
             Some(path) => match TrustStore::load(path) {
@@ -802,6 +820,8 @@ type SharedBlockTable = Arc<tokio::sync::Mutex<BlockTable>>;
 const IPC_MAX_CONNS: usize = 64;
 const IPC_IDLE: Duration = Duration::from_secs(300);
 const CONTROL_MAX_CONNS: usize = 16;
+/// Targets listed per LIST_BANS reply.
+const LIST_BANS_MAX: usize = 4096;
 const CONTROL_IDLE: Duration = Duration::from_secs(60);
 
 fn ip_tag(net: IpNet) -> &'static str {
