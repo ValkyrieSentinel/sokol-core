@@ -797,6 +797,13 @@ async fn push_telemetry(msg: &str) {
 
 type SharedBlockTable = Arc<tokio::sync::Mutex<BlockTable>>;
 
+/// Open connections per local socket (F11): a local producer cannot make the node spawn tasks
+/// without bound, and idle connections are closed.
+const IPC_MAX_CONNS: usize = 64;
+const IPC_IDLE: Duration = Duration::from_secs(300);
+const CONTROL_MAX_CONNS: usize = 16;
+const CONTROL_IDLE: Duration = Duration::from_secs(60);
+
 fn ip_tag(net: IpNet) -> &'static str {
     family_tag(&net)
 }
@@ -1548,6 +1555,7 @@ async fn main() -> Result<(), anyhow::Error> {
     let unix_listener = bind_private_socket(socket_path, ipc_gid)?;
 
     let control_listener = bind_private_socket(&args.control_socket, control_gid)?;
+    let control_slots = Arc::new(tokio::sync::Semaphore::new(CONTROL_MAX_CONNS));
     let ctl_ctx = Arc::new(ControlCtx {
         peer_limits,
         blocks: blocks.clone(),
@@ -1569,20 +1577,25 @@ async fn main() -> Result<(), anyhow::Error> {
                     continue;
                 }
             };
+            let Ok(permit) = control_slots.clone().try_acquire_owned() else {
+                log::warn!(
+                    "[Control] {} connections open; refusing another",
+                    CONTROL_MAX_CONNS
+                );
+                continue;
+            };
             let ctx = ctl_ctx.clone();
             tokio::spawn(async move {
+                let _permit = permit;
                 let (read_half, mut write_half) = stream.into_split();
                 let mut reader = BufReader::new(read_half);
                 let mut line = String::new();
                 loop {
                     line.clear();
-                    match (&mut reader)
-                        .take(control::MAX_LINE)
-                        .read_line(&mut line)
-                        .await
-                    {
-                        Ok(0) | Err(_) => break,
-                        Ok(_) => {}
+                    let mut limited = (&mut reader).take(control::MAX_LINE);
+                    match tokio::time::timeout(CONTROL_IDLE, limited.read_line(&mut line)).await {
+                        Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+                        Ok(Ok(_)) => {}
                     }
                     let reply = match control::parse(&line) {
                         Ok(cmd) => execute_control(cmd, &ctx).await,
@@ -1616,9 +1629,18 @@ async fn main() -> Result<(), anyhow::Error> {
             "[UNIX SOCKET] Listening for trap events on {}",
             socket_path_log
         );
+        let ipc_slots = Arc::new(tokio::sync::Semaphore::new(IPC_MAX_CONNS));
         loop {
             match unix_listener.accept().await {
                 Ok((stream, _)) => {
+                    let Ok(permit) = ipc_slots.clone().try_acquire_owned() else {
+                        log::warn!(
+                            "[UNIX IPC] {} connections open; refusing another (uid {:?})",
+                            IPC_MAX_CONNS,
+                            stream.peer_cred().map(|c| c.uid()).ok()
+                        );
+                        continue;
+                    };
                     let blocks_stream = blocks_unix.clone();
                     let db = db_unix.clone();
                     let registry = registry_unix.clone();
@@ -1630,12 +1652,23 @@ async fn main() -> Result<(), anyhow::Error> {
                     let peer_uid = stream.peer_cred().map(|c| c.uid()).ok();
 
                     tokio::spawn(async move {
+                        let _permit = permit;
                         let mut reader = BufReader::new(stream);
                         let mut line = String::new();
 
                         loop {
                             line.clear();
-                            match (&mut reader).take(MAX_IPC_LINE).read_line(&mut line).await {
+                            let mut limited = (&mut reader).take(MAX_IPC_LINE);
+                            let Ok(read) =
+                                tokio::time::timeout(IPC_IDLE, limited.read_line(&mut line)).await
+                            else {
+                                log::info!(
+                                    "[UNIX IPC] Closing idle connection from uid {:?}",
+                                    peer_uid
+                                );
+                                break;
+                            };
+                            match read {
                                 Ok(0) => break,
                                 Ok(_)
                                     if !line.ends_with('\n')

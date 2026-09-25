@@ -365,6 +365,19 @@ kill "$TRAP_PID" 2>/dev/null || true; TRAP_PID=""
 ipc "DROP_IMMEDIATE:$ALLOWED_IP"
 sleep 0.5
 check "root IPC DROP_IMMEDIATE blocks $ALLOWED_IP" bash -c "! ip netns exec $NS ping -c 2 -W 1 -I $ALLOWED_IP $HOST_IP >/dev/null 2>&1"
+# F11: a local producer cannot make the node hold connections (and tasks) without bound.
+HOLDERS=()
+for _ in $(seq 1 70); do
+    (sleep 15 | nc -U /run/sokol.sock >/dev/null 2>&1) &
+    HOLDERS+=($!)
+done
+sleep 1.5
+check "IPC: connections beyond the limit are refused" grep -q "connections open; refusing another" "$LOG"
+for p in "${HOLDERS[@]}"; do kill "$p" 2>/dev/null || true; done
+pkill -f "nc -U /run/sokol.sock" 2>/dev/null || true
+sleep 0.5
+check "IPC: the socket serves again once they close" \
+    bash -c "printf 'DB_LOG:after the limit\\n' | nc -U -q1 /run/sokol.sock; sleep 1.5; grep -aq 'after the limit' '$WORK/events.sntl'"
 
 # ADR-4: an operator ban survives a restart; --block is lifted only by the configuration.
 PERSIST_IP=10.231.0.11
