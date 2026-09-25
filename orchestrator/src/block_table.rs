@@ -501,6 +501,32 @@ impl<B: Blocklist> BlockTable<B> {
         Ok(lifted)
     }
 
+    /// Targets of the operator bans in force, sorted.
+    pub fn operator_targets(&self, now_ms: u64) -> Vec<IpNet> {
+        let mut out: Vec<IpNet> = self
+            .claims
+            .iter()
+            .filter(|(id, h)| h.claim.kind == ClaimKind::Operator && self.effective(id, h, now_ms))
+            .map(|(_, h)| h.net)
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// Lifts operator bans and detector claims at once; `--block` stays.
+    pub fn flush_all(&mut self, now_ms: u64) -> (Vec<IpNet>, Lifted) {
+        let ids: Vec<ClaimId> = self
+            .claims
+            .iter()
+            .filter(|(id, h)| h.claim.kind != ClaimKind::Static && self.effective(id, h, now_ms))
+            .map(|(id, _)| id.clone())
+            .collect();
+        let nets: Vec<IpNet> = ids.iter().map(|id| self.claims[id].net).collect();
+        let lifted = self.lift_ids(ids);
+        (self.settle(nets, now_ms), lifted)
+    }
+
     /// Operator flush: lifts every detector claim (any issuer); operator and `--block` stay.
     pub fn flush_detector(&mut self, now_ms: u64) -> (Vec<IpNet>, Lifted) {
         let ids: Vec<ClaimId> = self
@@ -1218,6 +1244,24 @@ mod tests {
         );
         assert_eq!((ok, refused), (1, 1));
         assert!(!guarded.is_blocked(ip("203.0.113.51")));
+    }
+
+    #[test]
+    fn operator_bans_can_be_listed_and_flushed_with_everything_but_static() {
+        let mut t = table(1, 64);
+        t.add_local(ip("198.51.100.1"), ClaimKind::Static, "--block", T0);
+        t.add_local(ip("198.51.100.2"), ClaimKind::Operator, "op", T0);
+        t.add_local(ip("198.51.100.0/24"), ClaimKind::Operator, "op", T0);
+        detect(&mut t, "198.51.100.3", T0);
+        assert_eq!(
+            t.operator_targets(T0),
+            vec![ip("198.51.100.0/24"), ip("198.51.100.2")]
+        );
+        let (lifted, _) = t.flush_all(T0);
+        assert_eq!(lifted.len(), 3);
+        assert!(t.operator_targets(T0).is_empty());
+        assert!(t.is_blocked(ip("198.51.100.1")), "--block stays");
+        assert_eq!(t.active(), 1);
     }
 
     #[test]

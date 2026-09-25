@@ -38,6 +38,9 @@ struct ClientNode {
     /// must keep coming from it.
     #[serde(skip)]
     uid: u32,
+    /// When its last heartbeat arrived; the view marks the node STALE after NODE_STALE_AFTER.
+    #[serde(skip)]
+    seen_at: Option<std::time::Instant>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -82,6 +85,12 @@ struct AppState {
 
 const SESSION_COOKIE: &str = "sokol_operator";
 const TELEMETRY_MAX_CONNS: usize = 32;
+/// Heartbeats come every second; a node silent this long is shown as STALE.
+const NODE_STALE_AFTER: Duration = Duration::from_secs(15);
+/// A node silent this long is dropped from the view.
+const NODE_FORGET_AFTER: Duration = Duration::from_secs(3600);
+/// How often the dashboard re-reads each node's bans from the node itself.
+const BANS_REFRESH: Duration = Duration::from_secs(5);
 const TELEMETRY_MAX_LINE: u64 = 8192;
 const TELEMETRY_IDLE: Duration = Duration::from_secs(10);
 
@@ -313,6 +322,7 @@ async fn main() {
         }
     });
 
+    tokio::spawn(refresh_all(state.clone()));
     let app = build_router(state);
 
     let bind_addr =
@@ -368,6 +378,7 @@ async fn process_trident_telemetry(state: &AppState, uid: u32, raw_msg: &str) {
                     packets_dropped: 0,
                     blacklist: HashSet::new(),
                     uid,
+                    seen_at: Some(std::time::Instant::now()),
                 });
                 metrics.p2p_active_peers = nodes.len() as u32;
             } else if let Some(node) = nodes.iter_mut().find(|n| n.id == id) {
@@ -381,6 +392,7 @@ async fn process_trident_telemetry(state: &AppState, uid: u32, raw_msg: &str) {
                     continue;
                 }
                 node.last_seen = Utc::now().format("%H:%M:%S").to_string();
+                node.seen_at = Some(std::time::Instant::now());
                 if let Some(ctl) = extract_value(data, "CTL=") {
                     node.control_socket = ctl;
                 }
@@ -435,13 +447,29 @@ async fn dashboard_handler() -> Html<&'static str> {
     Html(HTML_DASHBOARD)
 }
 
+/// The nodes as the operator should see them: health from the heartbeat's age, not a flag set
+/// once and never cleared.
+fn observed_nodes(nodes: &[ClientNode]) -> Vec<ClientNode> {
+    nodes
+        .iter()
+        .map(|n| {
+            let mut n = n.clone();
+            if n.seen_at.is_none_or(|t| t.elapsed() > NODE_STALE_AFTER) {
+                n.health_status = "STALE".into();
+                n.xdp_loaded = false;
+            }
+            n
+        })
+        .collect()
+}
+
 async fn api_get_all_data(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let nodes = state.nodes.read().await;
+    let nodes = observed_nodes(&state.nodes.read().await);
     let alerts = state.alerts.read().await;
     let metrics = state.metrics.read().await;
 
     Json(serde_json::json!({
-        "nodes": *nodes,
+        "nodes": nodes,
         "alerts": *alerts,
         "metrics": *metrics,
         "timestamp": Utc::now().to_rfc3339()
@@ -464,8 +492,7 @@ async fn api_update_blacklist(
         "remove" => false,
         other => return result_json(Err(format!("unknown action '{}'", other))),
     };
-    let mut nodes = state.nodes.write().await;
-    let Some(node) = nodes.iter_mut().find(|n| n.id == id) else {
+    let Some((ctl, uid)) = route(&state, id).await else {
         return result_json(Err(format!("unknown node {}", id)));
     };
     let cmd = if adding {
@@ -473,15 +500,8 @@ async fn api_update_blacklist(
     } else {
         format!("UNBAN_IP:{}\n", target)
     };
-    let res =
-        send_command_to_node(&node.control_socket, Some(node.uid), &state.node_uids, &cmd).await;
-    if res.is_ok() {
-        if adding {
-            node.blacklist.insert(target);
-        } else {
-            node.blacklist.remove(&target);
-        }
-    }
+    let res = send_command_to_node(&ctl, Some(uid), &state.node_uids, &cmd).await;
+    refresh_bans(&state, id).await;
     result_json(res)
 }
 
@@ -489,81 +509,100 @@ async fn api_flush_blacklist(
     State(state): State<AppState>,
     Path(id): Path<u32>,
 ) -> Json<serde_json::Value> {
-    let mut nodes = state.nodes.write().await;
-    let Some(node) = nodes.iter_mut().find(|n| n.id == id) else {
+    let Some((ctl, uid)) = route(&state, id).await else {
         return result_json(Err(format!("unknown node {}", id)));
     };
-    // Operator bans are permanent on the node; lift each one, then the dynamic blocks.
-    let banned: Vec<String> = node.blacklist.iter().cloned().collect();
-    for ip in banned {
-        if let Err(e) = send_command_to_node(
-            &node.control_socket,
-            Some(node.uid),
-            &state.node_uids,
-            &format!("UNBAN_IP:{}\n", ip),
-        )
+    // One command on the node: operator bans and dynamic blocks, whatever this dashboard knew.
+    let res = send_command_to_node(&ctl, Some(uid), &state.node_uids, "FLUSH_ALL\n").await;
+    refresh_bans(&state, id).await;
+    result_json(res)
+}
+
+/// The node's control socket and uid, read without holding the lock during socket I/O.
+async fn route(state: &AppState, id: u32) -> Option<(String, u32)> {
+    state
+        .nodes
+        .read()
         .await
-        {
-            return result_json(Err(format!("unban {} failed: {}", ip, e)));
+        .iter()
+        .find(|n| n.id == id)
+        .map(|n| (n.control_socket.clone(), n.uid))
+}
+
+/// Re-reads a node's operator bans from the node (LIST_BANS): the node, not this dashboard, is
+/// the source of truth, so a dashboard restart or another operator's change shows up here.
+async fn refresh_bans(state: &AppState, id: u32) {
+    let Some((ctl, uid)) = route(state, id).await else {
+        return;
+    };
+    match query_node(&ctl, Some(uid), &state.node_uids, "LIST_BANS\n").await {
+        Ok(reply) => {
+            let bans: HashSet<String> =
+                reply.split_whitespace().skip(1).map(String::from).collect();
+            if let Some(node) = state.nodes.write().await.iter_mut().find(|n| n.id == id) {
+                node.blacklist = bans;
+            }
         }
-        node.blacklist.remove(&ip);
+        Err(e) => log::warn!("[!] Cannot read bans of node {}: {}", id, e),
     }
-    result_json(
-        send_command_to_node(
-            &node.control_socket,
-            Some(node.uid),
-            &state.node_uids,
-            "FLUSH_BANS\n",
-        )
-        .await,
-    )
+}
+
+/// Keeps every node's ban list in line with the node, and forgets nodes gone for long.
+async fn refresh_all(state: AppState) {
+    loop {
+        state
+            .nodes
+            .write()
+            .await
+            .retain(|n| n.seen_at.is_some_and(|t| t.elapsed() < NODE_FORGET_AFTER));
+        let ids: Vec<u32> = state.nodes.read().await.iter().map(|n| n.id).collect();
+        for id in ids {
+            refresh_bans(&state, id).await;
+        }
+        tokio::time::sleep(BANS_REFRESH).await;
+    }
 }
 
 async fn api_toggle_xdp(
     State(state): State<AppState>,
     Path(id): Path<u32>,
 ) -> Json<serde_json::Value> {
-    let mut nodes = state.nodes.write().await;
-    let Some(node) = nodes.iter_mut().find(|n| n.id == id) else {
+    let Some((ctl, uid)) = route(&state, id).await else {
         return result_json(Err(format!("unknown node {}", id)));
     };
-    let cmd = if node.xdp_loaded {
-        "XDP_UNLOAD\n"
-    } else {
-        "XDP_LOAD\n"
-    };
-    let res =
-        send_command_to_node(&node.control_socket, Some(node.uid), &state.node_uids, cmd).await;
-    if res.is_ok() {
-        node.xdp_loaded = !node.xdp_loaded;
-    }
-    result_json(res)
+    let loaded = state
+        .nodes
+        .read()
+        .await
+        .iter()
+        .any(|n| n.id == id && n.xdp_loaded);
+    let cmd = if loaded { "XDP_UNLOAD\n" } else { "XDP_LOAD\n" };
+    result_json(send_command_to_node(&ctl, Some(uid), &state.node_uids, cmd).await)
 }
 
 async fn api_toggle_shield(
     State(state): State<AppState>,
     Path(id): Path<u32>,
 ) -> Json<serde_json::Value> {
-    let mut nodes = state.nodes.write().await;
-    let Some(node) = nodes.iter_mut().find(|n| n.id == id) else {
+    let Some((ctl, uid)) = route(&state, id).await else {
         return result_json(Err(format!("unknown node {}", id)));
     };
-    let next_mode = if node.defense_mode == "NORMAL" {
-        "MAX_SHIELD"
-    } else {
-        "NORMAL"
-    };
-    let res = send_command_to_node(
-        &node.control_socket,
-        Some(node.uid),
-        &state.node_uids,
-        &format!("SET_DEFENSE:{}\n", next_mode),
+    let normal = state
+        .nodes
+        .read()
+        .await
+        .iter()
+        .any(|n| n.id == id && n.defense_mode == "NORMAL");
+    let next_mode = if normal { "MAX_SHIELD" } else { "NORMAL" };
+    result_json(
+        send_command_to_node(
+            &ctl,
+            Some(uid),
+            &state.node_uids,
+            &format!("SET_DEFENSE:{}\n", next_mode),
+        )
+        .await,
     )
-    .await;
-    if res.is_ok() {
-        node.defense_mode = next_mode.into();
-    }
-    result_json(res)
 }
 
 async fn api_broadcast_command(
@@ -599,6 +638,18 @@ async fn send_command_to_node(
     allowed: &HashSet<u32>,
     cmd: &str,
 ) -> Result<(), String> {
+    query_node(socket_path, node_uid, allowed, cmd)
+        .await
+        .map(|_| ())
+}
+
+/// Like [`send_command_to_node`], returning the text after "OK".
+async fn query_node(
+    socket_path: &str,
+    node_uid: Option<u32>,
+    allowed: &HashSet<u32>,
+    cmd: &str,
+) -> Result<String, String> {
     use tokio::io::AsyncBufReadExt;
     if !StdPath::new(socket_path).exists() {
         log::warn!("[!] Socket missing for command routing: {}", socket_path);
@@ -637,7 +688,7 @@ async fn send_command_to_node(
         .await
         .map_err(|_| "node did not answer within 3 s".to_string())??;
     match reply.strip_prefix("OK") {
-        Some(_) => Ok(()),
+        Some(rest) => Ok(rest.trim().to_string()),
         None => Err(reply.strip_prefix("ERR ").unwrap_or(&reply).to_string()),
     }
 }
@@ -1175,24 +1226,42 @@ mod tests {
     }
 
     /// A fake node that answers like the orchestrator's control socket.
+    /// A node control socket that keeps its operator bans, like the orchestrator's.
     async fn fake_node(path: std::path::PathBuf, log: Arc<RwLock<Vec<String>>>) {
         use tokio::io::AsyncBufReadExt;
         let _ = std::fs::remove_file(&path);
         let listener = UnixListener::bind(&path).unwrap();
+        let bans: Arc<RwLock<HashSet<String>>> = Arc::default();
         tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
                 let log = log.clone();
+                let bans = bans.clone();
                 tokio::spawn(async move {
                     let (r, mut w) = stream.into_split();
                     let mut lines = tokio::io::BufReader::new(r).lines();
                     while let Ok(Some(line)) = lines.next_line().await {
                         log.write().await.push(line.clone());
+                        let mut bans = bans.write().await;
                         let reply = if line.starts_with("BAN_IP:10.") {
-                            "ERR 10.0.0.1 is protected (loopback)\n"
+                            "ERR 10.0.0.1 is protected (loopback)".to_string()
+                        } else if let Some(ip) = line.strip_prefix("BAN_IP:") {
+                            bans.insert(ip.to_string());
+                            "OK banned".to_string()
+                        } else if let Some(ip) = line.strip_prefix("UNBAN_IP:") {
+                            bans.remove(ip);
+                            "OK unbanned".to_string()
+                        } else if line == "FLUSH_ALL" {
+                            bans.clear();
+                            "OK released".to_string()
+                        } else if line == "LIST_BANS" {
+                            let mut list: Vec<&String> = bans.iter().collect();
+                            list.sort();
+                            let list: Vec<&str> = list.iter().map(|s| s.as_str()).collect();
+                            format!("OK {} {}", list.len(), list.join(" "))
                         } else {
-                            "OK done\n"
+                            "OK done".to_string()
                         };
-                        let _ = w.write_all(reply.as_bytes()).await;
+                        let _ = w.write_all(format!("{}\n", reply).as_bytes()).await;
                     }
                 });
             }
@@ -1235,6 +1304,61 @@ mod tests {
             seen.read().await.is_empty(),
             "the command reached the socket"
         );
+    }
+
+    /// F08: the node, not the dashboard, holds the bans: a restarted dashboard shows them again,
+    /// and a flush is one command on the node whatever the dashboard knew.
+    #[tokio::test]
+    async fn the_ban_list_is_read_from_the_node() {
+        let dir = std::env::temp_dir().join(format!("sokol-op-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("ctl.sock");
+        let seen = Arc::new(RwLock::new(Vec::new()));
+        fake_node(sock.clone(), seen.clone()).await;
+        let hb = format!(
+            "HEARTBEAT:ID=4|NAME=n4|EP=x|MODE=NORMAL|CTL={}\n",
+            sock.display()
+        );
+
+        let first = state();
+        process_trident_telemetry(&first, me(), &hb).await;
+        let (_, _, body) = call(
+            build_router(first.clone()),
+            post_json(
+                "/api/nodes/4/blacklist",
+                serde_json::json!({ "ip": "203.0.113.9", "action": "add" }),
+            ),
+        )
+        .await;
+        assert_eq!(body["success"], true, "{}", body);
+
+        // A new dashboard process knows nothing, until it reads the node.
+        let restarted = state();
+        process_trident_telemetry(&restarted, me(), &hb).await;
+        assert!(restarted.nodes.read().await[0].blacklist.is_empty());
+        refresh_bans(&restarted, 4).await;
+        assert!(
+            restarted.nodes.read().await[0]
+                .blacklist
+                .contains("203.0.113.9"),
+            "a restarted dashboard lost the node's ban"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_silent_node_is_shown_stale() {
+        let st = state();
+        process_trident_telemetry(&st, me(), "HEARTBEAT:ID=8|NAME=n8|EP=x|MODE=NORMAL\n").await;
+        assert_eq!(
+            observed_nodes(&st.nodes.read().await)[0].health_status,
+            "HEALTHY"
+        );
+        st.nodes.write().await[0].seen_at =
+            std::time::Instant::now().checked_sub(NODE_STALE_AFTER + Duration::from_secs(1));
+        let view = observed_nodes(&st.nodes.read().await);
+        assert_eq!(view[0].health_status, "STALE");
+        assert!(!view[0].xdp_loaded);
     }
 
     /// F11: telemetry is framed by lines, so a heartbeat split across writes is not lost.
@@ -1304,9 +1428,11 @@ mod tests {
             *seen.read().await,
             vec![
                 "BAN_IP:203.0.113.7",
+                "LIST_BANS",
                 "BAN_IP:10.0.0.1",
-                "UNBAN_IP:203.0.113.7",
-                "FLUSH_BANS"
+                "LIST_BANS",
+                "FLUSH_ALL",
+                "LIST_BANS"
             ]
         );
         std::fs::remove_dir_all(dir).unwrap();
