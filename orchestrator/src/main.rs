@@ -732,7 +732,8 @@ fn ttl_label(ttl: Option<Duration>) -> String {
 enum Enforcement {
     Enforced,
     Refused,
-    Failed,
+    /// Recorded, but the kernel map refused it for now; retried every second.
+    Pending,
 }
 
 impl Enforcement {
@@ -741,7 +742,7 @@ impl Enforcement {
         match self {
             Enforcement::Enforced => "EnforcedDrop",
             Enforcement::Refused => "Refused",
-            Enforcement::Failed => "Failed",
+            Enforcement::Pending => "Pending",
         }
     }
 }
@@ -814,10 +815,10 @@ async fn enforce_block_local(
                 e
             );
             sntl_db.append(format!(
-                "BLOCK_FAILED|IP:{}|Error:{:?}|Reason:{}",
+                "BLOCK_PENDING|IP:{}|Error:{:?}|Reason:{}",
                 shown, e, reason
             ));
-            Enforcement::Failed
+            Enforcement::Pending
         }
     }
 }
