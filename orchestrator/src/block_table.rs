@@ -1459,7 +1459,10 @@ mod tests {
         // The same peer repeating itself is still one node.
         let again = detect(&mut n2, wide, T0 + 1);
         assert_eq!(n1.adopt(again, true, T0), Adoption::Held("quorum"));
-        assert!(!n1.is_blocked(ip(wide)), "one peer reached the quorum alone");
+        assert!(
+            !n1.is_blocked(ip(wide)),
+            "one peer reached the quorum alone"
+        );
         assert_eq!(
             n1.adopt(c3.clone(), true, T0),
             Adoption::Enforced,
