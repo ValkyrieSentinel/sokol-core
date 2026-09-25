@@ -16,13 +16,14 @@
 //! CrowdSec deletes are not lifted automatically:
 //! Sokol's own TTL ends them, and an operator can lift one early with UNBAN_IP on the control
 //! socket.
-use std::io::{self, Write};
 use std::net::IpAddr;
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use clap::Parser;
+
+#[path = "../delivery.rs"]
+mod delivery;
 
 #[derive(Parser, Debug)]
 #[command(about = "Forward CrowdSec ban decisions to Sokol-Core as block signals")]
@@ -141,32 +142,45 @@ fn poll(args: &Args, startup: bool) -> Result<String, String> {
         .map_err(|e| e.to_string())
 }
 
-fn send(conn: &mut Option<UnixStream>, socket: &Path, line: &str) -> io::Result<()> {
-    for attempt in 0..2 {
-        if conn.is_none() {
-            *conn = Some(UnixStream::connect(socket)?);
-        }
-        let stream = conn.as_mut().unwrap();
-        match stream
-            .write_all(line.as_bytes())
-            .and_then(|()| stream.flush())
-        {
-            Ok(()) => return Ok(()),
-            Err(e) => {
-                *conn = None;
-                if attempt == 1 {
-                    return Err(e);
+/// Decisions kept while the node cannot be reached.
+const OUTBOX_CAP: usize = 100_000;
+
+/// Sends what is queued at `pause` per signal; a decision leaves the queue only when the node
+/// has answered it. Stops at the first transport failure (retried on the next round).
+fn deliver(outbox: &mut delivery::Outbox, socket: &Path, pause: Duration) {
+    while outbox.pending() > 0 {
+        let was_failing = outbox.failing;
+        let (done, err) = outbox.flush(1);
+        for (line, outcome) in done {
+            match outcome {
+                delivery::Outcome::Refused(why) => {
+                    log::warn!("[sokol-crowdsec] {}: refused by the node: {}", line, why)
                 }
+                delivery::Outcome::Rejected(why) => {
+                    log::error!("[sokol-crowdsec] {}: rejected by the node: {}", line, why)
+                }
+                ok => log::info!("[sokol-crowdsec] {} ({:?})", line, ok),
             }
         }
+        if let Some(e) = err {
+            if !was_failing {
+                log::error!(
+                    "[sokol-crowdsec] cannot deliver to {}: {}; {} decisions queued, retrying",
+                    socket.display(),
+                    e,
+                    outbox.pending()
+                );
+            }
+            return;
+        }
+        std::thread::sleep(pause);
     }
-    unreachable!()
 }
 
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let args = Args::parse();
-    let mut conn: Option<UnixStream> = None;
+    let mut outbox = delivery::Outbox::new(&args.ipc_socket, OUTBOX_CAP);
     // The first successful poll asks for all current decisions, later ones only for changes.
     let mut startup = true;
     let pause = Duration::from_secs_f64(1.0 / f64::from(args.max_signals_per_sec.max(1)));
@@ -196,20 +210,22 @@ fn main() {
                         batch.deleted
                     );
                 }
+                // Queued, not yet delivered: the outbox keeps them until the node answers, so a
+                // batch fetched while the node is down is not lost.
+                let lost = outbox.lost;
                 for line in &batch.signals {
-                    match send(&mut conn, &args.ipc_socket, line) {
-                        Ok(()) => log::info!("[sokol-crowdsec] {}", line.trim()),
-                        Err(e) => log::error!(
-                            "[sokol-crowdsec] cannot reach {}: {}",
-                            args.ipc_socket.display(),
-                            e
-                        ),
-                    }
-                    std::thread::sleep(pause);
+                    outbox.push(line);
+                }
+                if outbox.lost > lost {
+                    log::error!(
+                        "[sokol-crowdsec] outbox full: {} oldest decisions dropped",
+                        outbox.lost - lost
+                    );
                 }
             }
             Err(e) => log::warn!("[sokol-crowdsec] LAPI poll failed: {}", e),
         }
+        deliver(&mut outbox, &args.ipc_socket, pause);
         std::thread::sleep(Duration::from_secs(args.poll_secs));
     }
 }
