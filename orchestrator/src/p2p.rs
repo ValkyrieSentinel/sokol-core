@@ -152,12 +152,26 @@ struct PeerEntry {
     /// Several keys during a rotation: the node may sign with any of them.
     #[serde(default)]
     public_keys: Vec<String>,
+    /// What this peer may impose on this node (ADR-7); unset fields take the command-line defaults.
+    #[serde(default)]
+    envelope: Option<EnvelopeSpec>,
+}
+
+/// Per-peer overrides of the envelope defaults, from the peers file.
+#[derive(Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct EnvelopeSpec {
+    pub max_active: Option<usize>,
+    pub max_ttl_secs: Option<u64>,
+    pub min_prefix_v4: Option<u8>,
+    pub min_prefix_v6: Option<u8>,
 }
 
 /// Pinned `(node_id, public_key)` pairs. A peer absent from the store cannot be heard.
 #[derive(Default)]
 pub struct TrustStore {
     keys: HashMap<u64, Vec<DilithiumPublic>>,
+    envelopes: HashMap<u64, EnvelopeSpec>,
 }
 
 impl TrustStore {
@@ -191,6 +205,14 @@ impl TrustStore {
                 keys.push(key);
             }
             store.keys.insert(id, keys);
+            if let Some(spec) = entry.envelope {
+                if spec.min_prefix_v4.is_some_and(|p| p > 32)
+                    || spec.min_prefix_v6.is_some_and(|p| p > 128)
+                {
+                    bail!("peer {}: envelope prefix length out of range", id);
+                }
+                store.envelopes.insert(id, spec);
+            }
         }
         Ok(store)
     }
@@ -201,6 +223,11 @@ impl TrustStore {
 
     pub fn get(&self, node_id: u64) -> Option<&[DilithiumPublic]> {
         self.keys.get(&node_id).map(Vec::as_slice)
+    }
+
+    /// Envelope overrides listed in the peers file.
+    pub fn envelopes(&self) -> &HashMap<u64, EnvelopeSpec> {
+        &self.envelopes
     }
 
     /// Number of pinned nodes.
@@ -965,6 +992,44 @@ mod tests {
         let mut trust = TrustStore::default();
         trust.insert(node_id, crypto.public_key);
         trust
+    }
+
+    #[test]
+    fn peers_file_envelopes_are_parsed_and_checked() {
+        let dir = std::env::temp_dir().join(format!("sokol-envelope-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let key = NodeCrypto::generate().public_key_hex();
+        let path = dir.join("peers.json");
+        let write = |body: String| std::fs::write(&path, body).unwrap();
+        write(format!(
+            r#"[{{"node_id": 2, "public_key": "{k}", "envelope": {{"max_active": 10, "min_prefix_v4": 24}}}},
+               {{"node_id": 3, "public_key": "{k}"}}]"#,
+            k = key
+        ));
+        let store = TrustStore::load(&path).unwrap();
+        assert_eq!(
+            store.envelopes().get(&2),
+            Some(&EnvelopeSpec {
+                max_active: Some(10),
+                min_prefix_v4: Some(24),
+                ..Default::default()
+            })
+        );
+        assert!(!store.envelopes().contains_key(&3));
+        write(format!(
+            r#"[{{"node_id": 2, "public_key": "{}", "envelope": {{"max_actve": 10}}}}]"#,
+            key
+        ));
+        assert!(
+            TrustStore::load(&path).is_err(),
+            "a misspelt limit must not be ignored"
+        );
+        write(format!(
+            r#"[{{"node_id": 2, "public_key": "{}", "envelope": {{"min_prefix_v4": 33}}}}]"#,
+            key
+        ));
+        assert!(TrustStore::load(&path).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]

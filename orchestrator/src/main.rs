@@ -33,8 +33,8 @@ use common::{DropEvent, NodeTelemetry};
 
 use crate::block_policy::BlockPolicy;
 use crate::block_table::{
-    family_tag, host, parse_target, show, Adoption, BlockTable, ClaimKind, LiftError, Persisted,
-    TtlPolicy, Watermark,
+    family_tag, host, parse_target, show, Adoption, BlockTable, ClaimKind, Envelope, LiftError,
+    Persisted, Quorum, TtlPolicy, Watermark,
 };
 use crate::cluster_state::BirdEyeView;
 use crate::p2p::{
@@ -352,6 +352,28 @@ struct Args {
     /// and IPv4 fragments (restored when it ends); `observe` only logs it.
     #[arg(long, value_enum, default_value = "strict")]
     storm_mode: defense::StormMode,
+    /// A peer's claims enforced here at once (ADR-7); further ones wait for a free slot.
+    /// A peer can be given its own limits in the peers file: "envelope": {"max_active": ..,
+    /// "max_ttl_secs": .., "min_prefix_v4": .., "min_prefix_v6": ..}.
+    #[arg(long, default_value = "16384")]
+    peer_max_active: usize,
+
+    /// Longest a peer's claim is enforced here, in seconds (default: --block-ttl-max).
+    #[arg(long)]
+    peer_max_ttl: Option<u64>,
+
+    /// Distinct nodes that must claim a wide prefix before a peer's claim on it is enforced
+    /// here (this node's own claim counts); 1 disables it.
+    #[arg(long, default_value = "2")]
+    quorum: usize,
+
+    /// IPv4 prefixes shorter than this are "wide" for --quorum.
+    #[arg(long, default_value = "24")]
+    quorum_prefix_v4: u8,
+
+    /// IPv6 prefixes shorter than this are "wide" for --quorum.
+    #[arg(long, default_value = "64")]
+    quorum_prefix_v6: u8,
 
     #[arg(long, default_value = "1")]
     node_id: u64,
@@ -532,7 +554,53 @@ fn bind_private_socket(path: &str, gid: Option<u32>) -> anyhow::Result<tokio::ne
     Ok(listener)
 }
 
+/// What peers may impose, from the command line; per-peer overrides come from the peers file.
+#[derive(Clone, Copy)]
+struct PeerLimits {
+    default: Envelope,
+    quorum: Quorum,
+}
+
+impl PeerLimits {
+    fn from_args(args: &Args) -> Self {
+        Self {
+            default: Envelope {
+                max_active: args.peer_max_active,
+                max_ttl: Duration::from_secs(args.peer_max_ttl.unwrap_or(args.block_ttl_max)),
+                min_prefix_v4: 0,
+                min_prefix_v6: 0,
+            },
+            quorum: Quorum {
+                k: args.quorum.max(1),
+                wide_v4: args.quorum_prefix_v4,
+                wide_v6: args.quorum_prefix_v6,
+            },
+        }
+    }
+
+    fn per_peer(&self, trust: &TrustStore) -> std::collections::HashMap<u64, Envelope> {
+        trust
+            .envelopes()
+            .iter()
+            .map(|(id, spec)| {
+                (
+                    *id,
+                    Envelope {
+                        max_active: spec.max_active.unwrap_or(self.default.max_active),
+                        max_ttl: spec
+                            .max_ttl_secs
+                            .map_or(self.default.max_ttl, Duration::from_secs),
+                        min_prefix_v4: spec.min_prefix_v4.unwrap_or(self.default.min_prefix_v4),
+                        min_prefix_v6: spec.min_prefix_v6.unwrap_or(self.default.min_prefix_v6),
+                    },
+                )
+            })
+            .collect()
+    }
+}
+
 struct ControlCtx {
+    peer_limits: PeerLimits,
     blocks: SharedBlockTable,
     policy: Arc<BlockPolicy>,
     sntl_db: Arc<SentinelDb>,
@@ -631,6 +699,13 @@ async fn execute_control(cmd: control::ControlCommand, ctx: &ControlCtx) -> Stri
             None => "ERR no --peers-file configured".to_string(),
             Some(path) => match TrustStore::load(path) {
                 Ok(trust) => {
+                    let per_peer = ctx.peer_limits.per_peer(&trust);
+                    ctx.blocks.lock().await.configure_peers(
+                        ctx.peer_limits.default,
+                        per_peer,
+                        ctx.peer_limits.quorum,
+                        now_ms(),
+                    );
                     let pinned = ctx.registry.reload(trust);
                     log::warn!(
                         "[Control] Reloaded {}: {} pinned peers",
@@ -946,6 +1021,13 @@ async fn main() -> Result<(), anyhow::Error> {
         ttl_policy,
         args.node_id,
     )));
+    let peer_limits = PeerLimits::from_args(&args);
+    blocks.lock().await.configure_peers(
+        peer_limits.default,
+        peer_limits.per_peer(&trust_store),
+        peer_limits.quorum,
+        now_ms(),
+    );
     let state_file = args
         .state_file
         .clone()
@@ -1201,7 +1283,20 @@ async fn main() -> Result<(), anyhow::Error> {
                             );
                             push_telemetry(&telemetry_msg).await;
                         }
-                        (Adoption::Held, Some(why)) => {
+                        (Adoption::Held(held @ ("quorum" | "quota" | "envelope")), _) => {
+                            log::warn!(
+                                "[Mesh] Holding block for {} from node {} ({}): {}",
+                                shown,
+                                issuer,
+                                held,
+                                reason
+                            );
+                            sntl_db_mesh.append(format!(
+                                "MESH_BLOCK_HELD|IP:{}|Issuer:{}|Why:{}|Reason:{}",
+                                shown, issuer, held, reason
+                            ));
+                        }
+                        (Adoption::Held(_), Some(why)) => {
                             log::error!(
                                 "[Mesh] Refusing mesh block for protected {} ({}): {}",
                                 shown,
@@ -1454,6 +1549,7 @@ async fn main() -> Result<(), anyhow::Error> {
 
     let control_listener = bind_private_socket(&args.control_socket, control_gid)?;
     let ctl_ctx = Arc::new(ControlCtx {
+        peer_limits,
         blocks: blocks.clone(),
         policy: block_policy.clone(),
         sntl_db: sntl_db.clone(),
