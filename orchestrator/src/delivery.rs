@@ -1,0 +1,295 @@
+//! Delivery of detector adapters' signals to the node's IPC socket (review finding F09).
+//!
+//! A signal leaves the outbox only when the node has answered it: the connection is switched to
+//! ACK mode, and the node replies to each line with `OK applied`, `OK pending`, `OK recorded`,
+//! `OK refused <why>` or `ERR <why>`. Refusals and errors are final (retrying a protected address
+//! or a malformed line would not change the answer). A node that is down, restarting or not
+//! answering leaves the signal queued; delivery is retried with a growing pause. The queue is
+//! bounded: when it is full the oldest signal is dropped and counted.
+use std::collections::VecDeque;
+use std::io::{self, BufRead, BufReader, Write};
+use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+pub const ANSWER_TIMEOUT: Duration = Duration::from_secs(2);
+const BACKOFF_MIN: Duration = Duration::from_millis(500);
+const BACKOFF_MAX: Duration = Duration::from_secs(10);
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum Outcome {
+    Applied,
+    /// Recorded by the node; its kernel map refused the entry for now and the node retries it.
+    Pending,
+    Recorded,
+    /// Final: the node will not act on it (e.g. a protected address).
+    Refused(String),
+    /// Final: the node could not parse it.
+    Rejected(String),
+}
+
+impl Outcome {
+    fn parse(reply: &str) -> Outcome {
+        let reply = reply.trim();
+        match reply {
+            "OK applied" => Outcome::Applied,
+            "OK pending" => Outcome::Pending,
+            "OK recorded" => Outcome::Recorded,
+            _ => {
+                if let Some(why) = reply.strip_prefix("OK refused") {
+                    Outcome::Refused(why.trim().to_string())
+                } else if let Some(why) = reply.strip_prefix("ERR") {
+                    Outcome::Rejected(why.trim().to_string())
+                } else {
+                    Outcome::Rejected(format!("unexpected reply '{}'", reply))
+                }
+            }
+        }
+    }
+}
+
+struct Conn {
+    stream: UnixStream,
+    reader: BufReader<UnixStream>,
+}
+
+impl Conn {
+    fn open(socket: &Path) -> io::Result<Conn> {
+        let stream = UnixStream::connect(socket)?;
+        stream.set_read_timeout(Some(ANSWER_TIMEOUT))?;
+        stream.set_write_timeout(Some(ANSWER_TIMEOUT))?;
+        let mut conn = Conn {
+            reader: BufReader::new(stream.try_clone()?),
+            stream,
+        };
+        let hello = conn.exchange("ACK")?;
+        if hello.trim() != "OK ack" {
+            return Err(io::Error::other(format!(
+                "node does not confirm signals (answered '{}'); upgrade the node",
+                hello.trim()
+            )));
+        }
+        Ok(conn)
+    }
+
+    fn exchange(&mut self, line: &str) -> io::Result<String> {
+        self.stream
+            .write_all(format!("{}\n", line.trim_end()).as_bytes())?;
+        self.stream.flush()?;
+        let mut reply = String::new();
+        if self.reader.read_line(&mut reply)? == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "node closed the connection without answering",
+            ));
+        }
+        Ok(reply)
+    }
+}
+
+pub struct Outbox {
+    socket: PathBuf,
+    queue: VecDeque<String>,
+    cap: usize,
+    conn: Option<Conn>,
+    backoff: Duration,
+    retry_at: Option<Instant>,
+    /// Signals dropped because the queue was full.
+    pub lost: u64,
+    /// Whether the last attempt failed (for logging an outage once).
+    pub failing: bool,
+}
+
+impl Outbox {
+    pub fn new(socket: &Path, cap: usize) -> Self {
+        Self {
+            socket: socket.to_path_buf(),
+            queue: VecDeque::new(),
+            cap: cap.max(1),
+            conn: None,
+            backoff: BACKOFF_MIN,
+            retry_at: None,
+            lost: 0,
+            failing: false,
+        }
+    }
+
+    pub fn push(&mut self, line: &str) {
+        if self.queue.len() >= self.cap {
+            self.queue.pop_front();
+            self.lost += 1;
+        }
+        self.queue.push_back(line.trim_end().to_string());
+    }
+
+    pub fn pending(&self) -> usize {
+        self.queue.len()
+    }
+
+    /// Delivers up to `max` queued signals, in order. Stops at the first transport failure; the
+    /// rest (and the failed one) stay queued and are retried after a growing pause. Returns the
+    /// node's answer for each signal that left the queue, and the transport error if any.
+    pub fn flush(&mut self, max: usize) -> (Vec<(String, Outcome)>, Option<String>) {
+        let mut done = Vec::new();
+        if self.retry_at.is_some_and(|t| Instant::now() < t) {
+            return (done, None);
+        }
+        while done.len() < max {
+            let Some(line) = self.queue.front().cloned() else {
+                break;
+            };
+            let reply = match self.conn.as_mut() {
+                Some(conn) => conn.exchange(&line),
+                None => Conn::open(&self.socket).and_then(|mut c| {
+                    let r = c.exchange(&line);
+                    self.conn = Some(c);
+                    r
+                }),
+            };
+            match reply {
+                Ok(reply) => {
+                    self.queue.pop_front();
+                    self.failing = false;
+                    self.backoff = BACKOFF_MIN;
+                    self.retry_at = None;
+                    done.push((line, Outcome::parse(&reply)));
+                }
+                Err(e) => {
+                    // The line may or may not have reached the node; it is sent again later.
+                    self.conn = None;
+                    self.failing = true;
+                    self.retry_at = Some(Instant::now() + self.backoff);
+                    self.backoff = (self.backoff * 2).min(BACKOFF_MAX);
+                    return (done, Some(e.to_string()));
+                }
+            }
+        }
+        (done, None)
+    }
+
+    #[cfg(test)]
+    fn retry_now(&mut self) {
+        self.retry_at = None;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::net::UnixListener;
+
+    fn temp_socket(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("sokol-delivery-{}-{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("ipc.sock")
+    }
+
+    /// A node that answers every line with `answer(line)`, after the ACK handshake.
+    fn fake_node(
+        path: &Path,
+        answer: fn(&str) -> Option<&'static str>,
+    ) -> std::thread::JoinHandle<()> {
+        let listener = UnixListener::bind(path).unwrap();
+        std::thread::spawn(move || {
+            if let Ok((stream, _)) = listener.accept() {
+                let mut w = stream.try_clone().unwrap();
+                for line in BufReader::new(stream).lines() {
+                    let Ok(line) = line else { break };
+                    let reply = if line == "ACK" {
+                        Some("OK ack")
+                    } else {
+                        answer(&line)
+                    };
+                    match reply {
+                        Some(r) => {
+                            let _ = w.write_all(format!("{}\n", r).as_bytes());
+                        }
+                        None => break,
+                    }
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn a_signal_waits_while_the_node_is_down_and_is_delivered_after() {
+        let path = temp_socket("down");
+        let mut out = Outbox::new(&path, 16);
+        out.push("SIGNAL:test|203.0.113.1|-|x\n");
+        let (done, err) = out.flush(8);
+        assert!(done.is_empty() && err.is_some());
+        assert_eq!(out.pending(), 1, "kept for later, not lost");
+        let node = fake_node(&path, |_| Some("OK applied"));
+        out.retry_now();
+        let (done, err) = out.flush(8);
+        assert_eq!(err, None);
+        assert_eq!(
+            done,
+            vec![("SIGNAL:test|203.0.113.1|-|x".to_string(), Outcome::Applied)]
+        );
+        assert_eq!(out.pending(), 0);
+        drop(out);
+        node.join().unwrap();
+    }
+
+    #[test]
+    fn refusals_and_errors_are_final() {
+        let path = temp_socket("final");
+        let node = fake_node(&path, |l| {
+            Some(if l.contains("protected") {
+                "OK refused source 10.0.0.1 is protected"
+            } else {
+                "ERR bad line"
+            })
+        });
+        let mut out = Outbox::new(&path, 16);
+        out.push("SIGNAL:test|10.0.0.1|-|protected");
+        out.push("garbage");
+        let (done, _) = out.flush(8);
+        assert_eq!(
+            done[0].1,
+            Outcome::Refused("source 10.0.0.1 is protected".into())
+        );
+        assert_eq!(done[1].1, Outcome::Rejected("bad line".into()));
+        assert_eq!(out.pending(), 0, "not retried");
+        drop(out);
+        node.join().unwrap();
+    }
+
+    #[test]
+    fn a_node_that_does_not_answer_keeps_the_signal() {
+        let path = temp_socket("silent");
+        let node = fake_node(&path, |_| None); // closes after the handshake
+        let mut out = Outbox::new(&path, 16);
+        out.push("SIGNAL:test|203.0.113.2|-|x");
+        let (done, err) = out.flush(8);
+        assert!(done.is_empty());
+        assert!(err.is_some());
+        assert_eq!(out.pending(), 1);
+        node.join().unwrap();
+    }
+
+    #[test]
+    fn a_full_queue_drops_the_oldest_and_counts_it() {
+        let mut out = Outbox::new(Path::new("/nonexistent/ipc.sock"), 2);
+        out.push("a");
+        out.push("b");
+        out.push("c");
+        assert_eq!(out.pending(), 2);
+        assert_eq!(out.lost, 1);
+        assert_eq!(out.queue.front().map(String::as_str), Some("b"));
+    }
+
+    #[test]
+    fn replies_map_to_outcomes() {
+        assert_eq!(Outcome::parse("OK applied\n"), Outcome::Applied);
+        assert_eq!(Outcome::parse("OK pending"), Outcome::Pending);
+        assert_eq!(Outcome::parse("OK recorded"), Outcome::Recorded);
+        assert_eq!(
+            Outcome::parse("OK something else"),
+            Outcome::Rejected("unexpected reply 'OK something else'".into())
+        );
+    }
+}
