@@ -945,7 +945,13 @@ async fn handle_reader_loop(
                         bail!("node {} sent a command claiming node {}", peer_id, claimed);
                     }
                 }
-                if let MeshCommand::LocalDetection { .. } = &command {
+                // Only this node's own storm latch may switch its defense mode.
+                if matches!(
+                    command,
+                    MeshCommand::LocalDetection { .. }
+                        | MeshCommand::EngageDefense
+                        | MeshCommand::DisengageDefense
+                ) {
                     bail!("node {} sent a local-only command", peer_id);
                 }
                 if let Err(e) = cmd_tx.send(command).await {
@@ -1038,6 +1044,54 @@ mod tests {
             msg,
             NetworkMessage::Command(MeshCommand::Alert { .. })
         ));
+    }
+
+    /// ADR-6: only this node's own storm latch may switch its defense mode; a pinned peer that
+    /// sends EngageDefense is disconnected before the command reaches the node.
+    #[tokio::test]
+    async fn a_peer_cannot_switch_this_nodes_defense_mode() {
+        let server = Arc::new(NodeCrypto::generate());
+        let friend = Arc::new(NodeCrypto::generate());
+        let mut trust = TrustStore::default();
+        trust.insert(2, friend.public_key);
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(8);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let net = P2PNetwork::new(
+            addr,
+            1,
+            server,
+            Arc::new(dag()),
+            cmd_tx,
+            8,
+            shutdown_rx,
+            PeerRegistry::new(trust),
+        );
+        tokio::spawn(async move { net.serve(listener).await });
+        for (msg, delivered) in [
+            (NetworkMessage::Command(MeshCommand::EngageDefense), false),
+            (
+                NetworkMessage::Command(MeshCommand::DisengageDefense),
+                false,
+            ),
+            (block_cmd("still heard"), true),
+        ] {
+            let mut stream = TcpStream::connect(addr).await.unwrap();
+            let d = dag();
+            for m in [NetworkMessage::Handshake { node_id: 2 }, msg] {
+                let env = seal(&friend, 2, &m, &d).await.unwrap();
+                let bytes = bincode::serialize(&env).unwrap();
+                let _ = stream.write_all(&(bytes.len() as u32).to_be_bytes()).await;
+                let _ = stream.write_all(&bytes).await;
+            }
+            let got = timeout(Duration::from_millis(500), cmd_rx.recv()).await;
+            match (got, delivered) {
+                (Ok(Some(MeshCommand::Alert { .. })), true) => {}
+                (Err(_), false) => {}
+                (other, _) => panic!("unexpected delivery: {:?}", other.is_ok()),
+            }
+        }
     }
 
     /// ADR-1 at the transport: a pinned peer may send its own block decisions, not another

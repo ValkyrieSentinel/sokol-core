@@ -191,6 +191,14 @@ fn emit_drop_event_sampled(
 pub fn sentinel_vfr_filter(ctx: XdpContext) -> u32 {
     match try_sentinel_vfr_filter(&ctx) {
         Ok(ret) => ret,
+        // Headers that do not parse: passed to the stack normally, dropped in strict mode.
+        Err(_) if config_enabled(config_flags::STRICT_PARSE) => {
+            record_drop(
+                (ctx.data_end() - ctx.data()) as u64,
+                drop_reason::MALFORMED_HEADER,
+            );
+            xdp_action::XDP_DROP
+        }
         Err(_) => xdp_action::XDP_PASS,
     }
 }
