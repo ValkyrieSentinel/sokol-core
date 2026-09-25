@@ -465,6 +465,14 @@ if [ ${#FLOWSPEC_ARGS[@]} -gt 0 ]; then
     sleep 1.2
     check "Flowspec: upstream receives a discard rule for the dynamic block" bash -c "gobgp -p 50052 global rib -a ipv4-flowspec | grep -q 'source: $ALLOWED_IP/32'"
     check "Flowspec: upstream receives a discard rule for the static block" bash -c "gobgp -p 50052 global rib -a ipv4-flowspec | grep -q 'source: $BLOCKED_IP/32'"
+    if ! gobgp -p 50052 global rib -a ipv4-flowspec | grep -q "source: $BLOCKED_IP/32"; then
+        echo "--- Flowspec diagnostics: node gobgpd neighbors / RIB, upstream RIB, logs"
+        gobgp -p 50051 neighbor || true
+        gobgp -p 50051 global rib -a ipv4-flowspec || true
+        gobgp -p 50052 global rib -a ipv4-flowspec || true
+        grep -i flowspec "$LOG" | tail -5 || true
+        tail -5 "$WORK/gobgpd-node.log" "$WORK/gobgpd-upstream.log" 2>/dev/null || true
+    fi
 fi
 check "TTL: dynamic block of $ALLOWED_IP is enforced" bash -c "! ip netns exec $NS ping -c 1 -W 1 -I $ALLOWED_IP $HOST_IP >/dev/null 2>&1"
 sleep 3
