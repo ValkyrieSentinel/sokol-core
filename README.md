@@ -256,7 +256,11 @@ token it prints at startup; the dashboard asks for it and keeps it in an `HttpOn
 (`--control-socket`, announced in its heartbeat): operator bans are permanent until lifted,
 "Flush" lifts the operator's bans and all dynamic blocks, `--block` addresses stay, and protected
 addresses are refused. The operator needs access to that socket (`--control-group`, e.g.
-`sokol-ops`). XDP toggle and shield mode are reported as unsupported.
+`sokol-ops`). The dashboard takes node heartbeats on `/run/sokol_telemetry.sock` (mode 0660, group
+`SOKOL_TELEMETRY_GROUP` if set) only from the uids in `SOKOL_NODE_UIDS` (default: root and its own
+uid). A node is bound to the uid that first announced it: heartbeats for it from another uid are
+ignored, and a control socket is used only if the process serving it runs as that uid, so a
+local process cannot re-point the operator's commands to a socket of its own. XDP toggle and shield mode are reported as unsupported.
 
 `sokol-client` (`127.0.0.1:3001`) attaches its own XDP program to `SOKOL_IFACE`, so do not run it
 on an interface the orchestrator already uses. It refuses to start without `SOKOL_CLIENT_TOKEN`

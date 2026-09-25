@@ -34,6 +34,10 @@ struct ClientNode {
     defense_mode: String,
     packets_dropped: u64,
     blacklist: HashSet<String>,
+    /// uid of the process that first announced this node; its heartbeats (and control socket)
+    /// must keep coming from it.
+    #[serde(skip)]
+    uid: u32,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -72,9 +76,63 @@ struct AppState {
     alerts: Arc<RwLock<Vec<SecurityAlert>>>,
     metrics: Arc<RwLock<SystemMetrics>>,
     token: Arc<String>,
+    /// uids allowed to send telemetry and to serve node control sockets.
+    node_uids: Arc<HashSet<u32>>,
 }
 
 const SESSION_COOKIE: &str = "sokol_operator";
+const TELEMETRY_MAX_CONNS: usize = 32;
+const TELEMETRY_MAX_LINE: u64 = 8192;
+const TELEMETRY_IDLE: Duration = Duration::from_secs(10);
+
+/// uids allowed to send telemetry and serve node control sockets: `SOKOL_NODE_UIDS`
+/// (comma-separated), by default root and the operator's own uid.
+fn node_uids_from_env() -> HashSet<u32> {
+    match std::env::var("SOKOL_NODE_UIDS") {
+        Ok(list) => list
+            .split(',')
+            .filter_map(|u| u.trim().parse().ok())
+            .collect(),
+        Err(_) => [0, unsafe { libc::getuid() }].into_iter().collect(),
+    }
+}
+
+/// Mode 0660, and group `SOKOL_TELEMETRY_GROUP` if set (so a node running as another user in
+/// that group can write). Without the group only the operator's own uid (and root) can connect.
+fn restrict_telemetry_socket(path: &str) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    if let Ok(group) = std::env::var("SOKOL_TELEMETRY_GROUP") {
+        let name = std::ffi::CString::new(group.clone()).map_err(|e| e.to_string())?;
+        let gr = unsafe { libc::getgrnam(name.as_ptr()) };
+        if gr.is_null() {
+            return Err(format!("group {} does not exist", group));
+        }
+        let gid = unsafe { (*gr).gr_gid };
+        let cpath = std::ffi::CString::new(path).map_err(|e| e.to_string())?;
+        if unsafe { libc::chown(cpath.as_ptr(), u32::MAX, gid) } != 0 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+    }
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o660))
+        .map_err(|e| e.to_string())
+}
+
+/// Reads newline-framed telemetry until EOF, idle timeout or an over-long line: a heartbeat split
+/// across reads is not lost, and a silent or flooding writer cannot hold a slot forever.
+async fn read_telemetry(state: &AppState, uid: u32, stream: UnixStream) {
+    use tokio::io::AsyncBufReadExt;
+    let mut reader = tokio::io::BufReader::new(stream);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let mut limited = (&mut reader).take(TELEMETRY_MAX_LINE);
+        match tokio::time::timeout(TELEMETRY_IDLE, limited.read_line(&mut line)).await {
+            Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+            Ok(Ok(_)) if !line.ends_with('\n') && line.len() as u64 >= TELEMETRY_MAX_LINE => break,
+            Ok(Ok(_)) => process_trident_telemetry(state, uid, &line).await,
+        }
+    }
+}
 const MESH_COMMANDS: [&str; 3] = ["SYNC_DAG", "RELOAD_RULES", "FLUSH_ALL_BANS"];
 
 /// Every API route needs this token, even on loopback: without it any web page the operator
@@ -201,37 +259,57 @@ async fn main() {
         alerts: Arc::new(RwLock::new(Vec::new())),
         metrics: Arc::new(RwLock::new(SystemMetrics::default())),
         token: Arc::new(token),
+        node_uids: Arc::new(node_uids_from_env()),
     };
 
     let state_clone = state.clone();
     tokio::spawn(async move {
-        let socket_path = "/run/sokol_telemetry.sock";
-        if StdPath::new(socket_path).exists() {
-            let _ = std::fs::remove_file(socket_path);
+        // The node writes to this fixed path (push_telemetry in the orchestrator).
+        let socket_path = "/run/sokol_telemetry.sock".to_string();
+        if StdPath::new(&socket_path).exists() {
+            let _ = std::fs::remove_file(&socket_path);
         }
-
-        if let Ok(listener) = UnixListener::bind(socket_path) {
-            log::info!(
-                "[*] Global Trident Telemetry Unix Socket active on {}",
-                socket_path
-            );
-            while let Ok((mut stream, _)) = listener.accept().await {
-                let state_inner = state_clone.clone();
-                tokio::spawn(async move {
-                    let mut buf = vec![0u8; 8192];
-                    if let Ok(n) = stream.read(&mut buf).await {
-                        if n > 0 {
-                            let msg = String::from_utf8_lossy(&buf[..n]);
-                            process_trident_telemetry(&state_inner, &msg).await;
-                        }
-                    }
-                });
+        let listener = match UnixListener::bind(&socket_path) {
+            Ok(l) => l,
+            Err(e) => {
+                log::error!(
+                    "[!] Cannot create the telemetry socket {}: {}",
+                    socket_path,
+                    e
+                );
+                return;
             }
-        } else {
-            log::error!(
-                "[!] Не вдалося створити телеметричний сокет: {}",
-                socket_path
-            );
+        };
+        if let Err(e) = restrict_telemetry_socket(&socket_path) {
+            log::error!("[!] Telemetry socket {}: {}", socket_path, e);
+            return;
+        }
+        log::info!(
+            "[*] Telemetry socket {} accepts uids {:?}",
+            socket_path,
+            state_clone.node_uids
+        );
+        let slots = Arc::new(tokio::sync::Semaphore::new(TELEMETRY_MAX_CONNS));
+        while let Ok((stream, _)) = listener.accept().await {
+            let Ok(uid) = stream.peer_cred().map(|c| c.uid()) else {
+                continue;
+            };
+            if !state_clone.node_uids.contains(&uid) {
+                log::warn!("[!] Telemetry from uid {} refused (not a node uid)", uid);
+                continue;
+            }
+            let Ok(permit) = slots.clone().try_acquire_owned() else {
+                log::warn!(
+                    "[!] {} telemetry connections open; refusing another",
+                    TELEMETRY_MAX_CONNS
+                );
+                continue;
+            };
+            let state_inner = state_clone.clone();
+            tokio::spawn(async move {
+                let _permit = permit;
+                read_telemetry(&state_inner, uid, stream).await;
+            });
         }
     });
 
@@ -262,7 +340,10 @@ fn build_router(state: AppState) -> Router {
         .with_state(state)
 }
 
-async fn process_trident_telemetry(state: &AppState, raw_msg: &str) {
+/// Applies telemetry sent by a process running as `uid` (already checked against the allowed
+/// uids). A node stays bound to the uid that first announced it: a heartbeat for the same node id
+/// from another uid is ignored, so it cannot redirect the operator's commands (CTL=).
+async fn process_trident_telemetry(state: &AppState, uid: u32, raw_msg: &str) {
     let mut metrics = state.metrics.write().await;
     let mut alerts = state.alerts.write().await;
     let mut nodes = state.nodes.write().await;
@@ -286,9 +367,19 @@ async fn process_trident_telemetry(state: &AppState, raw_msg: &str) {
                     defense_mode: extract_value(data, "MODE=").unwrap_or("NORMAL".into()),
                     packets_dropped: 0,
                     blacklist: HashSet::new(),
+                    uid,
                 });
                 metrics.p2p_active_peers = nodes.len() as u32;
             } else if let Some(node) = nodes.iter_mut().find(|n| n.id == id) {
+                if node.uid != uid {
+                    log::warn!(
+                        "[!] Heartbeat for node {} from uid {} ignored: the node belongs to uid {}",
+                        id,
+                        uid,
+                        node.uid
+                    );
+                    continue;
+                }
                 node.last_seen = Utc::now().format("%H:%M:%S").to_string();
                 if let Some(ctl) = extract_value(data, "CTL=") {
                     node.control_socket = ctl;
@@ -382,7 +473,8 @@ async fn api_update_blacklist(
     } else {
         format!("UNBAN_IP:{}\n", target)
     };
-    let res = send_command_to_node(&node.control_socket, &cmd).await;
+    let res =
+        send_command_to_node(&node.control_socket, Some(node.uid), &state.node_uids, &cmd).await;
     if res.is_ok() {
         if adding {
             node.blacklist.insert(target);
@@ -404,14 +496,27 @@ async fn api_flush_blacklist(
     // Operator bans are permanent on the node; lift each one, then the dynamic blocks.
     let banned: Vec<String> = node.blacklist.iter().cloned().collect();
     for ip in banned {
-        if let Err(e) =
-            send_command_to_node(&node.control_socket, &format!("UNBAN_IP:{}\n", ip)).await
+        if let Err(e) = send_command_to_node(
+            &node.control_socket,
+            Some(node.uid),
+            &state.node_uids,
+            &format!("UNBAN_IP:{}\n", ip),
+        )
+        .await
         {
             return result_json(Err(format!("unban {} failed: {}", ip, e)));
         }
         node.blacklist.remove(&ip);
     }
-    result_json(send_command_to_node(&node.control_socket, "FLUSH_BANS\n").await)
+    result_json(
+        send_command_to_node(
+            &node.control_socket,
+            Some(node.uid),
+            &state.node_uids,
+            "FLUSH_BANS\n",
+        )
+        .await,
+    )
 }
 
 async fn api_toggle_xdp(
@@ -427,7 +532,8 @@ async fn api_toggle_xdp(
     } else {
         "XDP_LOAD\n"
     };
-    let res = send_command_to_node(&node.control_socket, cmd).await;
+    let res =
+        send_command_to_node(&node.control_socket, Some(node.uid), &state.node_uids, cmd).await;
     if res.is_ok() {
         node.xdp_loaded = !node.xdp_loaded;
     }
@@ -449,6 +555,8 @@ async fn api_toggle_shield(
     };
     let res = send_command_to_node(
         &node.control_socket,
+        Some(node.uid),
+        &state.node_uids,
         &format!("SET_DEFENSE:{}\n", next_mode),
     )
     .await;
@@ -459,7 +567,7 @@ async fn api_toggle_shield(
 }
 
 async fn api_broadcast_command(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Json(req): Json<MeshCommandReq>,
 ) -> Json<serde_json::Value> {
     if !MESH_COMMANDS.contains(&req.command.as_str()) {
@@ -472,6 +580,8 @@ async fn api_broadcast_command(
     result_json(
         send_command_to_node(
             "/run/sokol_p2p.sock",
+            None,
+            &state.node_uids,
             &format!("BROADCAST:{}\n", req.command),
         )
         .await,
@@ -480,7 +590,15 @@ async fn api_broadcast_command(
 
 /// Sends one command to the node's control socket (announced as CTL= in its heartbeat) and
 /// returns its reply. The node answers "OK ..." or "ERR ..."; anything else is a failure.
-async fn send_command_to_node(socket_path: &str, cmd: &str) -> Result<(), String> {
+/// The control socket must be served by `node_uid` (the uid the node announced itself from) or,
+/// for sockets not tied to a node, by one of `allowed`: a socket path learned from telemetry is
+/// not trusted on its own.
+async fn send_command_to_node(
+    socket_path: &str,
+    node_uid: Option<u32>,
+    allowed: &HashSet<u32>,
+    cmd: &str,
+) -> Result<(), String> {
     use tokio::io::AsyncBufReadExt;
     if !StdPath::new(socket_path).exists() {
         log::warn!("[!] Socket missing for command routing: {}", socket_path);
@@ -493,6 +611,17 @@ async fn send_command_to_node(socket_path: &str, cmd: &str) -> Result<(), String
         let mut socket = UnixStream::connect(socket_path)
             .await
             .map_err(|e| e.to_string())?;
+        let served_by = socket.peer_cred().map_err(|e| e.to_string())?.uid();
+        let trusted = match node_uid {
+            Some(uid) => served_by == uid,
+            None => allowed.contains(&served_by),
+        };
+        if !trusted {
+            return Err(format!(
+                "control socket {} is served by uid {}, not by the node's uid",
+                socket_path, served_by
+            ));
+        }
         socket
             .write_all(cmd.as_bytes())
             .await
@@ -880,7 +1009,12 @@ mod tests {
             alerts: Arc::new(RwLock::new(Vec::new())),
             metrics: Arc::new(RwLock::new(SystemMetrics::default())),
             token: Arc::new(TOKEN.to_string()),
+            node_uids: Arc::new([me()].into_iter().collect()),
         }
+    }
+
+    fn me() -> u32 {
+        unsafe { libc::getuid() }
     }
 
     async fn call(
@@ -999,7 +1133,7 @@ mod tests {
     #[tokio::test]
     async fn control_actions_validate_input_and_report_real_outcome() {
         let st = state();
-        process_trident_telemetry(&st, "HEARTBEAT:ID=7|NAME=n7|EP=x|MODE=NORMAL\n").await;
+        process_trident_telemetry(&st, me(), "HEARTBEAT:ID=7|NAME=n7|EP=x|MODE=NORMAL\n").await;
         let app = build_router(st.clone());
 
         let (_, _, body) = call(
@@ -1065,6 +1199,63 @@ mod tests {
         });
     }
 
+    /// F11: a node is bound to the uid that announced it; another uid cannot re-point its
+    /// control socket, and a control socket served by another uid is not used.
+    #[tokio::test]
+    async fn a_node_is_bound_to_the_uid_that_announced_it() {
+        let dir = std::env::temp_dir().join(format!("sokol-op-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("ctl.sock");
+        let seen = Arc::new(RwLock::new(Vec::new()));
+        fake_node(sock.clone(), seen.clone()).await;
+        let st = state();
+        let hb = |ctl: &str| format!("HEARTBEAT:ID=5|NAME=n5|EP=x|MODE=NORMAL|CTL={}\n", ctl);
+        process_trident_telemetry(&st, me(), &hb(&sock.display().to_string())).await;
+        process_trident_telemetry(&st, me() + 1, &hb("/tmp/attacker.sock")).await;
+        assert_eq!(
+            st.nodes.read().await[0].control_socket,
+            sock.display().to_string(),
+            "another uid re-pointed the node's control socket"
+        );
+
+        // The same node, recorded as another uid: the socket (served by us) is refused.
+        st.nodes.write().await[0].uid = me() + 1;
+        let app = build_router(st.clone());
+        let (_, _, body) = call(
+            app,
+            post_json(
+                "/api/nodes/5/blacklist",
+                serde_json::json!({ "ip": "203.0.113.8", "action": "add" }),
+            ),
+        )
+        .await;
+        assert_eq!(body["success"], false, "{}", body);
+        assert!(body["error"].as_str().unwrap().contains("served by uid"));
+        assert!(
+            seen.read().await.is_empty(),
+            "the command reached the socket"
+        );
+    }
+
+    /// F11: telemetry is framed by lines, so a heartbeat split across writes is not lost.
+    #[tokio::test]
+    async fn telemetry_split_across_writes_is_read_whole() {
+        let st = state();
+        let (mut writer, reader) = UnixStream::pair().unwrap();
+        let task = tokio::spawn({
+            let st = st.clone();
+            async move { read_telemetry(&st, me(), reader).await }
+        });
+        writer.write_all(b"HEARTBEAT:ID=9|NAME=n").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        writer.write_all(b"9|EP=x|MODE=NORMAL\n").await.unwrap();
+        drop(writer);
+        task.await.unwrap();
+        let nodes = st.nodes.read().await;
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].name, "n9");
+    }
+
     #[tokio::test]
     async fn commands_reach_the_node_socket_and_its_reply_decides_the_outcome() {
         let dir = std::env::temp_dir().join(format!("sokol-op-{}", rand::random::<u64>()));
@@ -1076,6 +1267,7 @@ mod tests {
         let st = state();
         process_trident_telemetry(
             &st,
+            me(),
             &format!(
                 "HEARTBEAT:ID=3|NAME=n3|EP=x|MODE=NORMAL|CTL={}\n",
                 sock.display()
