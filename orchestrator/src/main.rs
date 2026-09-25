@@ -5,6 +5,7 @@ mod block_policy;
 mod block_table;
 pub mod cluster_state;
 mod control;
+mod defense;
 mod flowspec;
 mod mesh_sync;
 mod metrics;
@@ -369,6 +370,11 @@ struct Args {
     /// IPv6 prefixes shorter than this are "wide" for --quorum.
     #[arg(long, default_value = "64")]
     quorum_prefix_v6: u8,
+
+    /// While a distributed storm is engaged: `strict` drops packets whose headers do not parse
+    /// and IPv4 fragments (restored when it ends); `observe` only logs it.
+    #[arg(long, value_enum, default_value = "strict")]
+    storm_mode: defense::StormMode,
 
     #[arg(long, default_value = "1")]
     node_id: u64,
@@ -967,13 +973,15 @@ async fn main() -> Result<(), anyhow::Error> {
     if args.drop_ipv4_fragments {
         config_flags |= common::config_flags::DROP_IPV4_FRAGMENTS;
     }
-    {
+    let defense = {
         let config_map = bpf
-            .map_mut("CONFIG")
+            .take_map("CONFIG")
             .ok_or_else(|| anyhow::anyhow!("CONFIG map missing"))?;
-        let mut config = Array::<_, u32>::try_from(config_map)?;
-        config.set(0, config_flags, 0)?;
-    }
+        let config = Array::<MapData, u32>::try_from(config_map)?;
+        let defense = Arc::new(defense::Defense::new(config, config_flags, args.storm_mode));
+        defense.set(false)?;
+        defense
+    };
 
     let prog_mut = bpf
         .program_mut("sentinel_vfr_filter")
@@ -1230,6 +1238,7 @@ async fn main() -> Result<(), anyhow::Error> {
     let sntl_db_mesh = sntl_db.clone();
     let node_id_mesh = args.node_id;
     let policy_mesh = block_policy.clone();
+    let defense_mesh = defense.clone();
     let (registry_mesh, crypto_mesh, dag_mesh) = (
         peer_registry.clone(),
         node_crypto.clone(),
@@ -1408,11 +1417,26 @@ async fn main() -> Result<(), anyhow::Error> {
                         .await;
                     }
                 }
-                MeshCommand::EngageDefense => {
-                    log::warn!("[CRITICAL] Global mesh defense mode engaged (no enforcement is attached to this mode yet).");
-                }
-                MeshCommand::DisengageDefense => {
-                    log::info!("[CRITICAL] Global mesh defense mode disengaged.");
+                c @ (MeshCommand::EngageDefense | MeshCommand::DisengageDefense) => {
+                    let engaged = matches!(c, MeshCommand::EngageDefense);
+                    match defense_mesh.set(engaged) {
+                        Ok(flags) if defense_mesh.mode() == defense::StormMode::Strict => {
+                            let label = if engaged { "Strict" } else { "Normal" };
+                            log::warn!(
+                                "[Defense] Distributed storm {}: XDP mode {} (flags {:#x})",
+                                if engaged { "engaged" } else { "over" },
+                                label,
+                                flags
+                            );
+                            sntl_db_mesh
+                                .append(format!("DEFENSE_MODE|{}|Flags:{:#x}", label, flags));
+                        }
+                        Ok(_) => log::warn!(
+                            "[Defense] Distributed storm {} (--storm-mode observe: XDP unchanged)",
+                            if engaged { "engaged" } else { "over" }
+                        ),
+                        Err(e) => log::error!("[Defense] Cannot update the XDP config: {:?}", e),
+                    }
                 }
                 MeshCommand::Alert { level, message } => {
                     log::info!("[MESH ALERT {:?}] {}", level, message);
@@ -1961,6 +1985,7 @@ async fn main() -> Result<(), anyhow::Error> {
                 }
                 snapshot.p2p_peers = peer_registry.peer_count().await;
                 snapshot.audit_queue_overflow = sntl_db.overflow_total();
+                snapshot.defense_strict = defense.strict();
                 let audit = sntl_db.status();
                 snapshot.audit_healthy = audit.healthy;
                 snapshot.audit_write_errors = audit.write_errors + audit.sync_errors;
