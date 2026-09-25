@@ -10,14 +10,16 @@
 //! ```
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, Seek, SeekFrom, Write};
+use std::io::{self, BufRead, BufReader, Seek, SeekFrom};
 use std::net::IpAddr;
 use std::os::unix::fs::MetadataExt;
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use clap::Parser;
+
+#[path = "../delivery.rs"]
+mod delivery;
 
 #[derive(Parser, Debug)]
 #[command(about = "Forward Suricata alerts to Sokol-Core as block signals")]
@@ -228,28 +230,43 @@ impl Follower {
     }
 }
 
-/// Writes one line, reconnecting once: a node restart leaves a dead connection behind, and the
-/// first write to it may fail only after the alert is gone.
-fn send(conn: &mut Option<UnixStream>, socket: &Path, line: &str) -> io::Result<()> {
-    for attempt in 0..2 {
-        if conn.is_none() {
-            *conn = Some(UnixStream::connect(socket)?);
-        }
-        let stream = conn.as_mut().unwrap();
-        match stream
-            .write_all(line.as_bytes())
-            .and_then(|()| stream.flush())
-        {
-            Ok(()) => return Ok(()),
-            Err(e) => {
-                *conn = None;
-                if attempt == 1 {
-                    return Err(e);
-                }
+/// Alerts kept while the node cannot be reached.
+const OUTBOX_CAP: usize = 10_000;
+
+/// Sends what is queued; an alert leaves the queue only when the node has answered it.
+fn deliver(outbox: &mut delivery::Outbox, socket: &Path) {
+    let was_failing = outbox.failing;
+    let (done, err) = outbox.flush(64);
+    for (line, outcome) in done {
+        match outcome {
+            delivery::Outcome::Applied
+            | delivery::Outcome::Pending
+            | delivery::Outcome::Recorded => {
+                log::info!("[sokol-suricata] {} ({:?})", line, outcome)
+            }
+            delivery::Outcome::Refused(why) => {
+                log::warn!("[sokol-suricata] {}: refused by the node: {}", line, why)
+            }
+            delivery::Outcome::Rejected(why) => {
+                log::error!("[sokol-suricata] {}: rejected by the node: {}", line, why)
             }
         }
     }
-    unreachable!()
+    match err {
+        Some(e) if !was_failing => log::error!(
+            "[sokol-suricata] cannot deliver to {}: {}; {} alerts queued, retrying",
+            socket.display(),
+            e,
+            outbox.pending()
+        ),
+        None if was_failing && !outbox.failing => {
+            log::warn!(
+                "[sokol-suricata] node reachable again; queue drained to {}",
+                outbox.pending()
+            )
+        }
+        _ => {}
+    }
 }
 
 fn main() {
@@ -264,7 +281,7 @@ fn main() {
         args.max_signals_per_sec,
     );
     let mut follower = Follower::new(&args.eve, args.from_start);
-    let mut conn: Option<UnixStream> = None;
+    let mut outbox = delivery::Outbox::new(&args.ipc_socket, OUTBOX_CAP);
     log::info!(
         "[sokol-suricata] following {} (severity <= {}), signalling {}",
         args.eve.display(),
@@ -282,20 +299,19 @@ fn main() {
                     if !gate.admit(alert.src, Instant::now()) {
                         continue;
                     }
-                    let signal = alert.signal_line();
-                    match send(&mut conn, &args.ipc_socket, &signal) {
-                        Ok(()) => log::info!("[sokol-suricata] {}", signal.trim()),
-                        Err(e) => log::error!(
-                            "[sokol-suricata] cannot reach {}: {}; alert for {} lost",
-                            args.ipc_socket.display(),
-                            e,
-                            alert.src
-                        ),
+                    let lost = outbox.lost;
+                    outbox.push(&alert.signal_line());
+                    if outbox.lost > lost {
+                        log::error!(
+                            "[sokol-suricata] outbox full ({} queued): oldest alert dropped",
+                            OUTBOX_CAP
+                        );
                     }
                 }
             }
             Err(e) => log::error!("[sokol-suricata] reading {}: {}", args.eve.display(), e),
         }
+        deliver(&mut outbox, &args.ipc_socket);
         std::thread::sleep(Duration::from_millis(50));
     }
 }
@@ -303,6 +319,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     // Captured from Suricata 7.0.10 for the test rule used in scripts/xdp-smoke.sh.
     const ALERT: &str = r#"{"timestamp":"2026-09-24T11:48:23.712804+0000","flow_id":2217047500658694,"in_iface":"v0","event_type":"alert","src_ip":"10.7.0.2","src_port":49786,"dest_ip":"10.7.0.1","dest_port":23,"proto":"TCP","pkt_src":"wire/pcap","alert":{"action":"allowed","gid":1,"signature_id":1000001,"rev":1,"signature":"SOKOL TEST telnet probe","category":"Attempted Information Leak","severity":2},"direction":"to_server"}"#;

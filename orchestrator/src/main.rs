@@ -805,6 +805,144 @@ fn save_state(path: &std::path::Path, state: &Persisted) -> std::io::Result<()> 
     std::fs::rename(&tmp, path)
 }
 
+struct IpcCtx {
+    blocks: SharedBlockTable,
+    db: Arc<SentinelDb>,
+    registry: PeerRegistry,
+    node_id: u64,
+    crypto: Arc<NodeCrypto>,
+    dag: Arc<tokio::sync::Mutex<DagTracker>>,
+    policy: Arc<BlockPolicy>,
+    reports: Arc<std::sync::Mutex<attack_reports::AttackReports>>,
+}
+
+/// One IPC command; returns the reply a client in ACK mode gets (F09): `OK applied`,
+/// `OK refused <why>` (final, do not retry), `OK pending` (recorded, kernel write retried by the
+/// node), `OK recorded`, or `ERR <why>` (malformed, do not retry).
+async fn handle_ipc_line(content: &str, c: &IpcCtx) -> String {
+    let outcome = |e: Enforcement| match e {
+        Enforcement::Enforced => "OK applied".to_string(),
+        Enforcement::Refused => "OK refused protected".to_string(),
+        Enforcement::Pending => "OK pending".to_string(),
+    };
+    if content.starts_with('{') {
+        if let Err(e) = CanonicalParser::validate_strict_json_object(content) {
+            log::error!("[CANONICAL FAULT] Rejected malformed IPC payload: {:?}", e);
+            return "ERR malformed JSON".to_string();
+        }
+    }
+    if let Some(raw_ip_str) = content.strip_prefix("DROP_IMMEDIATE:") {
+        match parse_target(raw_ip_str.trim()) {
+            Some(ip) => {
+                log::warn!("[XDP_ACTION] Trap triggered ban for IP: {}", show(&ip));
+                outcome(
+                    enforce_block_local(
+                        ip,
+                        "Unix IPC DROP_IMMEDIATE trigger",
+                        &c.blocks,
+                        &c.db,
+                        &c.registry,
+                        c.node_id,
+                        &c.crypto,
+                        &c.dag,
+                        &c.policy,
+                    )
+                    .await,
+                )
+            }
+            None => {
+                log::error!(
+                    "[UNIX IPC FAULT] Failed to parse IP from 'DROP_IMMEDIATE:{}'",
+                    raw_ip_str
+                );
+                "ERR not an IP address or CIDR prefix".to_string()
+            }
+        }
+    } else if let Some(payload) = content.strip_prefix("ATTACK:") {
+        match attack_reports::parse(payload) {
+            Ok(report) => {
+                c.reports
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .apply(&report, std::time::Instant::now());
+                let (tag, verb) = if report.active {
+                    ("ATTACK_REPORTED", "under attack")
+                } else {
+                    ("ATTACK_CLEARED", "attack cleared")
+                };
+                log::warn!(
+                    "[Attack] {} reports {} {} ({} pps, {})",
+                    report.source,
+                    report.victim,
+                    verb,
+                    report.pps,
+                    report.direction
+                );
+                c.db.append(format!(
+                    "{}|Source:{}|Victim:{}|Direction:{}|PPS:{}",
+                    tag, report.source, report.victim, report.direction, report.pps
+                ));
+                "OK recorded".to_string()
+            }
+            Err(e) => {
+                log::error!("[UNIX IPC FAULT] Bad ATTACK line: {}", e);
+                format!("ERR {}", e)
+            }
+        }
+    } else if let Some(payload) = content.strip_prefix("SIGNAL:") {
+        match signal::parse(payload) {
+            Ok(sig) => match signal::target(&sig, &c.policy) {
+                Ok(ip) => {
+                    c.db.append(format!(
+                        "SIGNAL|Source:{}|Src:{}|Dst:{}|Target:{}|Reason:{}",
+                        sig.source,
+                        show(&sig.src),
+                        sig.dst.map(|d| show(&d)).unwrap_or_else(|| "-".into()),
+                        show(&ip),
+                        sig.reason
+                    ));
+                    let reason = format!("{}: {}", sig.source, sig.reason);
+                    outcome(
+                        enforce_block_local(
+                            ip,
+                            &reason,
+                            &c.blocks,
+                            &c.db,
+                            &c.registry,
+                            c.node_id,
+                            &c.crypto,
+                            &c.dag,
+                            &c.policy,
+                        )
+                        .await,
+                    )
+                }
+                Err(why) => {
+                    log::warn!("[Signal] {} signal not enforced: {}", sig.source, why);
+                    c.db.append(format!(
+                        "SIGNAL_REFUSED|Source:{}|Src:{}|Why:{}",
+                        sig.source,
+                        show(&sig.src),
+                        why
+                    ));
+                    format!("OK refused {}", why)
+                }
+            },
+            Err(e) => {
+                log::error!("[UNIX IPC FAULT] Bad SIGNAL line: {}", e);
+                format!("ERR {}", e)
+            }
+        }
+    } else if let Some(log_content) = content.strip_prefix("DB_LOG:") {
+        c.db.append(log_content.trim().to_string());
+        let telemetry_msg = format!("DB_LOG:NODE={}|{}\n", c.node_id, log_content.trim());
+        push_telemetry(&telemetry_msg).await;
+        "OK recorded".to_string()
+    } else {
+        "ERR unknown command".to_string()
+    }
+}
+
 async fn push_telemetry(msg: &str) {
     let telemetry_socket = "/run/sokol_telemetry.sock";
     if let Ok(mut stream) = tokio::net::UnixStream::connect(telemetry_socket).await {
@@ -1671,10 +1809,22 @@ async fn main() -> Result<(), anyhow::Error> {
                     let reports_stream = reports_unix.clone();
                     let peer_uid = stream.peer_cred().map(|c| c.uid()).ok();
 
+                    let ipc = IpcCtx {
+                        blocks: blocks_stream,
+                        db,
+                        registry,
+                        node_id: node_id_unix,
+                        crypto: crypto_stream,
+                        dag: dag_stream,
+                        policy: policy_stream,
+                        reports: reports_stream,
+                    };
                     tokio::spawn(async move {
                         let _permit = permit;
-                        let mut reader = BufReader::new(stream);
+                        let (read_half, mut writer) = stream.into_split();
+                        let mut reader = BufReader::new(read_half);
                         let mut line = String::new();
+                        let mut ack = false;
 
                         loop {
                             line.clear();
@@ -1707,139 +1857,22 @@ async fn main() -> Result<(), anyhow::Error> {
                                     if content.is_empty() {
                                         continue;
                                     }
-
-                                    if content.starts_with('{') {
-                                        if let Err(e) =
-                                            CanonicalParser::validate_strict_json_object(content)
-                                        {
-                                            log::error!("[CANONICAL FAULT] Rejected malformed IPC payload: {:?}", e);
-                                            continue;
+                                    if content == "ACK" {
+                                        // The client wants a reply per command (F09).
+                                        ack = true;
+                                        if writer.write_all(b"OK ack\n").await.is_err() {
+                                            break;
                                         }
+                                        continue;
                                     }
-
-                                    if let Some(raw_ip_str) =
-                                        content.strip_prefix("DROP_IMMEDIATE:")
+                                    let reply = handle_ipc_line(content, &ipc).await;
+                                    if ack
+                                        && writer
+                                            .write_all(format!("{}\n", reply).as_bytes())
+                                            .await
+                                            .is_err()
                                     {
-                                        let clean_ip_str = raw_ip_str.trim();
-                                        match parse_target(clean_ip_str)
-                                            .ok_or("not an IP address or CIDR prefix")
-                                        {
-                                            Ok(ip) => {
-                                                log::warn!(
-                                                    "[XDP_ACTION] Trap triggered ban for IP: {}",
-                                                    show(&ip)
-                                                );
-                                                let _ = enforce_block_local(
-                                                    ip,
-                                                    "Unix IPC DROP_IMMEDIATE trigger",
-                                                    &blocks_stream,
-                                                    &db,
-                                                    &registry,
-                                                    node_id_unix,
-                                                    &crypto_stream,
-                                                    &dag_stream,
-                                                    &policy_stream,
-                                                )
-                                                .await;
-                                            }
-                                            Err(e) => {
-                                                log::error!(
-                                                    "[UNIX IPC FAULT] Failed to parse IP from 'DROP_IMMEDIATE:{}': {}",
-                                                    raw_ip_str,
-                                                    e
-                                                );
-                                            }
-                                        }
-                                    } else if let Some(payload) = content.strip_prefix("ATTACK:") {
-                                        match attack_reports::parse(payload) {
-                                            Ok(report) => {
-                                                reports_stream
-                                                    .lock()
-                                                    .unwrap_or_else(|p| p.into_inner())
-                                                    .apply(&report, std::time::Instant::now());
-                                                let (tag, verb) = if report.active {
-                                                    ("ATTACK_REPORTED", "under attack")
-                                                } else {
-                                                    ("ATTACK_CLEARED", "attack cleared")
-                                                };
-                                                log::warn!(
-                                                    "[Attack] {} reports {} {} ({} pps, {})",
-                                                    report.source,
-                                                    report.victim,
-                                                    verb,
-                                                    report.pps,
-                                                    report.direction
-                                                );
-                                                db.append(format!(
-                                                    "{}|Source:{}|Victim:{}|Direction:{}|PPS:{}",
-                                                    tag,
-                                                    report.source,
-                                                    report.victim,
-                                                    report.direction,
-                                                    report.pps
-                                                ));
-                                            }
-                                            Err(e) => log::error!(
-                                                "[UNIX IPC FAULT] Bad ATTACK line: {}",
-                                                e
-                                            ),
-                                        }
-                                    } else if let Some(payload) = content.strip_prefix("SIGNAL:") {
-                                        match signal::parse(payload) {
-                                            Ok(sig) => match signal::target(&sig, &policy_stream) {
-                                                Ok(ip) => {
-                                                    db.append(format!(
-                                                        "SIGNAL|Source:{}|Src:{}|Dst:{}|Target:{}|Reason:{}",
-                                                        sig.source,
-                                                        show(&sig.src),
-                                                        sig.dst.map(|d| show(&d)).unwrap_or_else(|| "-".into()),
-                                                        show(&ip),
-                                                        sig.reason
-                                                    ));
-                                                    let reason =
-                                                        format!("{}: {}", sig.source, sig.reason);
-                                                    let _ = enforce_block_local(
-                                                        ip,
-                                                        &reason,
-                                                        &blocks_stream,
-                                                        &db,
-                                                        &registry,
-                                                        node_id_unix,
-                                                        &crypto_stream,
-                                                        &dag_stream,
-                                                        &policy_stream,
-                                                    )
-                                                    .await;
-                                                }
-                                                Err(why) => {
-                                                    log::warn!(
-                                                        "[Signal] {} signal not enforced: {}",
-                                                        sig.source,
-                                                        why
-                                                    );
-                                                    db.append(format!(
-                                                        "SIGNAL_REFUSED|Source:{}|Src:{}|Why:{}",
-                                                        sig.source,
-                                                        show(&sig.src),
-                                                        why
-                                                    ));
-                                                }
-                                            },
-                                            Err(e) => log::error!(
-                                                "[UNIX IPC FAULT] Bad SIGNAL line: {}",
-                                                e
-                                            ),
-                                        }
-                                    } else if let Some(log_content) =
-                                        content.strip_prefix("DB_LOG:")
-                                    {
-                                        db.append(log_content.trim().to_string());
-                                        let telemetry_msg = format!(
-                                            "DB_LOG:NODE={}|{}\n",
-                                            node_id_unix,
-                                            log_content.trim()
-                                        );
-                                        push_telemetry(&telemetry_msg).await;
+                                        break;
                                     }
                                 }
                                 Err(e) => {

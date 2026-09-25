@@ -206,6 +206,11 @@ Other detectors can use the same line protocol on the IPC socket:
 ## Local control socket and protected addresses
 
 `/run/sokol.sock` accepts `DROP_IMMEDIATE:<ip>` from local tools such as `trident_trap`.
+A client that first sends the line `ACK` gets one reply per command: `OK applied`, `OK pending`
+(recorded; the node retries the kernel write), `OK recorded` (reports, logs), `OK refused <why>`
+or `ERR <why>`. `sokol-suricata` and `sokol-crowdsec` use it: a signal stays in their bounded
+queue until the node has answered it, so alerts and decisions that arrive while the node is down
+or restarting are delivered when it is back (refusals and errors are final, not retried).
 It is root-only (`0600`) unless `--ipc-group <group>` is given, in which case members of that
 group may write to it (`0660`).
 

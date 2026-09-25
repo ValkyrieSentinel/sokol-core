@@ -355,6 +355,24 @@ if command -v cscli >/dev/null && command -v crowdsec >/dev/null; then
     check "CrowdSec ban blocks the address in XDP" \
         bash -c "! ip netns exec $NS ping -c 2 -W 1 -I $CS_IP $HOST_IP >/dev/null 2>&1"
     check "the block reason names CrowdSec and the scenario" grep -q "Dynamic block enforced in XDP: $CS_IP.*crowdsec: sokol smoke ban" "$LOG"
+    # F09: a decision made while the node is down is delivered once it is back (the adapter keeps
+    # it until the node answers), instead of being lost.
+    CS_IP2=10.231.0.13
+    ip netns exec "$NS" ip addr add "$CS_IP2/24" dev "$PEER_IF"
+    STATE_FILE=$LAST_STATE stop_orchestrator
+    cscli decisions add --ip "$CS_IP2" --reason "made while the node was down" --duration 5m >/dev/null 2>&1
+    sleep 3
+    check "the adapter reports the node unreachable and keeps the decision" \
+        grep -q "decisions queued, retrying" "$WORK/crowdsec-adapter.log"
+    STATE_FILE=$LAST_STATE start_orchestrator
+    for _ in $(seq 1 75); do
+        grep -q "Dynamic block enforced in XDP: $CS_IP2" "$LOG" && break
+        sleep 0.2
+    done
+    check "a decision made while the node was down is enforced once it is back" \
+        bash -c "! ip netns exec $NS ping -c 2 -W 1 -I $CS_IP2 $HOST_IP >/dev/null 2>&1"
+    check "the node's answer is logged by the adapter" grep -q "$CS_IP2.*(Applied)" "$WORK/crowdsec-adapter.log"
+    cscli decisions delete --ip "$CS_IP2" >/dev/null 2>&1 || true
     cscli decisions delete --ip "$CS_IP" >/dev/null 2>&1 || true
     kill "$CS_ADAPTER_PID" 2>/dev/null || true
     cscli bouncers delete "$CS_BOUNCER" >/dev/null 2>&1 || true
@@ -475,6 +493,14 @@ if [ ${#FLOWSPEC_ARGS[@]} -gt 0 ]; then
     sleep 1.2
     check "Flowspec: upstream receives a discard rule for the dynamic block" bash -c "gobgp -p 50052 global rib -a ipv4-flowspec | grep -q 'source: $ALLOWED_IP/32'"
     check "Flowspec: upstream receives a discard rule for the static block" bash -c "gobgp -p 50052 global rib -a ipv4-flowspec | grep -q 'source: $BLOCKED_IP/32'"
+    if ! gobgp -p 50052 global rib -a ipv4-flowspec | grep -q "source: $BLOCKED_IP/32"; then
+        echo "--- Flowspec diagnostics: node gobgpd neighbors / RIB, upstream RIB, logs"
+        gobgp -p 50051 neighbor || true
+        gobgp -p 50051 global rib -a ipv4-flowspec || true
+        gobgp -p 50052 global rib -a ipv4-flowspec || true
+        grep -i flowspec "$LOG" | tail -5 || true
+        tail -5 "$WORK/gobgpd-node.log" "$WORK/gobgpd-upstream.log" 2>/dev/null || true
+    fi
 fi
 check "TTL: dynamic block of $ALLOWED_IP is enforced" bash -c "! ip netns exec $NS ping -c 1 -W 1 -I $ALLOWED_IP $HOST_IP >/dev/null 2>&1"
 sleep 3
