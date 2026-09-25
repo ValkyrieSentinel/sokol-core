@@ -152,12 +152,26 @@ struct PeerEntry {
     /// Several keys during a rotation: the node may sign with any of them.
     #[serde(default)]
     public_keys: Vec<String>,
+    /// What this peer may impose on this node (ADR-7); unset fields take the command-line defaults.
+    #[serde(default)]
+    envelope: Option<EnvelopeSpec>,
+}
+
+/// Per-peer overrides of the envelope defaults, from the peers file.
+#[derive(Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct EnvelopeSpec {
+    pub max_active: Option<usize>,
+    pub max_ttl_secs: Option<u64>,
+    pub min_prefix_v4: Option<u8>,
+    pub min_prefix_v6: Option<u8>,
 }
 
 /// Pinned `(node_id, public_key)` pairs. A peer absent from the store cannot be heard.
 #[derive(Default)]
 pub struct TrustStore {
     keys: HashMap<u64, Vec<DilithiumPublic>>,
+    envelopes: HashMap<u64, EnvelopeSpec>,
 }
 
 impl TrustStore {
@@ -191,6 +205,14 @@ impl TrustStore {
                 keys.push(key);
             }
             store.keys.insert(id, keys);
+            if let Some(spec) = entry.envelope {
+                if spec.min_prefix_v4.is_some_and(|p| p > 32)
+                    || spec.min_prefix_v6.is_some_and(|p| p > 128)
+                {
+                    bail!("peer {}: envelope prefix length out of range", id);
+                }
+                store.envelopes.insert(id, spec);
+            }
         }
         Ok(store)
     }
@@ -201,6 +223,11 @@ impl TrustStore {
 
     pub fn get(&self, node_id: u64) -> Option<&[DilithiumPublic]> {
         self.keys.get(&node_id).map(Vec::as_slice)
+    }
+
+    /// Envelope overrides listed in the peers file.
+    pub fn envelopes(&self) -> &HashMap<u64, EnvelopeSpec> {
+        &self.envelopes
     }
 
     /// Number of pinned nodes.
@@ -918,7 +945,13 @@ async fn handle_reader_loop(
                         bail!("node {} sent a command claiming node {}", peer_id, claimed);
                     }
                 }
-                if let MeshCommand::LocalDetection { .. } = &command {
+                // Only this node's own storm latch may switch its defense mode.
+                if matches!(
+                    command,
+                    MeshCommand::LocalDetection { .. }
+                        | MeshCommand::EngageDefense
+                        | MeshCommand::DisengageDefense
+                ) {
                     bail!("node {} sent a local-only command", peer_id);
                 }
                 if let Err(e) = cmd_tx.send(command).await {
@@ -961,6 +994,44 @@ mod tests {
         trust
     }
 
+    #[test]
+    fn peers_file_envelopes_are_parsed_and_checked() {
+        let dir = std::env::temp_dir().join(format!("sokol-envelope-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let key = NodeCrypto::generate().public_key_hex();
+        let path = dir.join("peers.json");
+        let write = |body: String| std::fs::write(&path, body).unwrap();
+        write(format!(
+            r#"[{{"node_id": 2, "public_key": "{k}", "envelope": {{"max_active": 10, "min_prefix_v4": 24}}}},
+               {{"node_id": 3, "public_key": "{k}"}}]"#,
+            k = key
+        ));
+        let store = TrustStore::load(&path).unwrap();
+        assert_eq!(
+            store.envelopes().get(&2),
+            Some(&EnvelopeSpec {
+                max_active: Some(10),
+                min_prefix_v4: Some(24),
+                ..Default::default()
+            })
+        );
+        assert!(!store.envelopes().contains_key(&3));
+        write(format!(
+            r#"[{{"node_id": 2, "public_key": "{}", "envelope": {{"max_actve": 10}}}}]"#,
+            key
+        ));
+        assert!(
+            TrustStore::load(&path).is_err(),
+            "a misspelt limit must not be ignored"
+        );
+        write(format!(
+            r#"[{{"node_id": 2, "public_key": "{}", "envelope": {{"min_prefix_v4": 33}}}}]"#,
+            key
+        ));
+        assert!(TrustStore::load(&path).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[tokio::test]
     async fn pinned_peer_envelope_opens() {
         let peer = NodeCrypto::generate();
@@ -973,6 +1044,54 @@ mod tests {
             msg,
             NetworkMessage::Command(MeshCommand::Alert { .. })
         ));
+    }
+
+    /// ADR-6: only this node's own storm latch may switch its defense mode; a pinned peer that
+    /// sends EngageDefense is disconnected before the command reaches the node.
+    #[tokio::test]
+    async fn a_peer_cannot_switch_this_nodes_defense_mode() {
+        let server = Arc::new(NodeCrypto::generate());
+        let friend = Arc::new(NodeCrypto::generate());
+        let mut trust = TrustStore::default();
+        trust.insert(2, friend.public_key);
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(8);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let net = P2PNetwork::new(
+            addr,
+            1,
+            server,
+            Arc::new(dag()),
+            cmd_tx,
+            8,
+            shutdown_rx,
+            PeerRegistry::new(trust),
+        );
+        tokio::spawn(async move { net.serve(listener).await });
+        for (msg, delivered) in [
+            (NetworkMessage::Command(MeshCommand::EngageDefense), false),
+            (
+                NetworkMessage::Command(MeshCommand::DisengageDefense),
+                false,
+            ),
+            (block_cmd("still heard"), true),
+        ] {
+            let mut stream = TcpStream::connect(addr).await.unwrap();
+            let d = dag();
+            for m in [NetworkMessage::Handshake { node_id: 2 }, msg] {
+                let env = seal(&friend, 2, &m, &d).await.unwrap();
+                let bytes = bincode::serialize(&env).unwrap();
+                let _ = stream.write_all(&(bytes.len() as u32).to_be_bytes()).await;
+                let _ = stream.write_all(&bytes).await;
+            }
+            let got = timeout(Duration::from_millis(500), cmd_rx.recv()).await;
+            match (got, delivered) {
+                (Ok(Some(MeshCommand::Alert { .. })), true) => {}
+                (Err(_), false) => {}
+                (other, _) => panic!("unexpected delivery: {:?}", other.is_ok()),
+            }
+        }
     }
 
     /// ADR-1 at the transport: a pinned peer may send its own block decisions, not another

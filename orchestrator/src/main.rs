@@ -5,6 +5,7 @@ mod block_policy;
 mod block_table;
 pub mod cluster_state;
 mod control;
+mod defense;
 mod flowspec;
 mod mesh_sync;
 mod metrics;
@@ -32,8 +33,8 @@ use common::{DropEvent, NodeTelemetry};
 
 use crate::block_policy::BlockPolicy;
 use crate::block_table::{
-    family_tag, host, parse_target, show, Adoption, BlockTable, ClaimKind, LiftError, Persisted,
-    TtlPolicy, Watermark,
+    family_tag, host, parse_target, show, Adoption, BlockTable, ClaimKind, Envelope, LiftError,
+    Persisted, Quorum, TtlPolicy, Watermark,
 };
 use crate::cluster_state::BirdEyeView;
 use crate::p2p::{
@@ -347,6 +348,33 @@ struct Args {
     #[arg(long)]
     state_file: Option<std::path::PathBuf>,
 
+    /// While a distributed storm is engaged: `strict` drops packets whose headers do not parse
+    /// and IPv4 fragments (restored when it ends); `observe` only logs it.
+    #[arg(long, value_enum, default_value = "strict")]
+    storm_mode: defense::StormMode,
+    /// A peer's claims enforced here at once (ADR-7); further ones wait for a free slot.
+    /// A peer can be given its own limits in the peers file: "envelope": {"max_active": ..,
+    /// "max_ttl_secs": .., "min_prefix_v4": .., "min_prefix_v6": ..}.
+    #[arg(long, default_value = "16384")]
+    peer_max_active: usize,
+
+    /// Longest a peer's claim is enforced here, in seconds (default: --block-ttl-max).
+    #[arg(long)]
+    peer_max_ttl: Option<u64>,
+
+    /// Distinct nodes that must claim a wide prefix before a peer's claim on it is enforced
+    /// here (this node's own claim counts); 1 disables it.
+    #[arg(long, default_value = "2")]
+    quorum: usize,
+
+    /// IPv4 prefixes shorter than this are "wide" for --quorum.
+    #[arg(long, default_value = "24")]
+    quorum_prefix_v4: u8,
+
+    /// IPv6 prefixes shorter than this are "wide" for --quorum.
+    #[arg(long, default_value = "64")]
+    quorum_prefix_v6: u8,
+
     #[arg(long, default_value = "1")]
     node_id: u64,
 
@@ -526,7 +554,53 @@ fn bind_private_socket(path: &str, gid: Option<u32>) -> anyhow::Result<tokio::ne
     Ok(listener)
 }
 
+/// What peers may impose, from the command line; per-peer overrides come from the peers file.
+#[derive(Clone, Copy)]
+struct PeerLimits {
+    default: Envelope,
+    quorum: Quorum,
+}
+
+impl PeerLimits {
+    fn from_args(args: &Args) -> Self {
+        Self {
+            default: Envelope {
+                max_active: args.peer_max_active,
+                max_ttl: Duration::from_secs(args.peer_max_ttl.unwrap_or(args.block_ttl_max)),
+                min_prefix_v4: 0,
+                min_prefix_v6: 0,
+            },
+            quorum: Quorum {
+                k: args.quorum.max(1),
+                wide_v4: args.quorum_prefix_v4,
+                wide_v6: args.quorum_prefix_v6,
+            },
+        }
+    }
+
+    fn per_peer(&self, trust: &TrustStore) -> std::collections::HashMap<u64, Envelope> {
+        trust
+            .envelopes()
+            .iter()
+            .map(|(id, spec)| {
+                (
+                    *id,
+                    Envelope {
+                        max_active: spec.max_active.unwrap_or(self.default.max_active),
+                        max_ttl: spec
+                            .max_ttl_secs
+                            .map_or(self.default.max_ttl, Duration::from_secs),
+                        min_prefix_v4: spec.min_prefix_v4.unwrap_or(self.default.min_prefix_v4),
+                        min_prefix_v6: spec.min_prefix_v6.unwrap_or(self.default.min_prefix_v6),
+                    },
+                )
+            })
+            .collect()
+    }
+}
+
 struct ControlCtx {
+    peer_limits: PeerLimits,
     blocks: SharedBlockTable,
     policy: Arc<BlockPolicy>,
     sntl_db: Arc<SentinelDb>,
@@ -621,10 +695,35 @@ async fn execute_control(cmd: control::ControlCommand, ctx: &ControlCtx) -> Stri
             sntl_db.append(format!("OPERATOR_FLUSH|Released:{}", released.len()));
             format!("OK released {} dynamic blocks", released.len())
         }
+        ControlCommand::FlushAll => {
+            let (released, lifted) = blocks.lock().await.flush_all(now_ms());
+            broadcast_retraction(ctx, lifted.retracted).await;
+            log::warn!(
+                "[Control] Operator flushed {} blocks (operator and dynamic)",
+                released.len()
+            );
+            sntl_db.append(format!("OPERATOR_FLUSH_ALL|Released:{}", released.len()));
+            format!("OK released {} blocks", released.len())
+        }
+        ControlCommand::ListBans => {
+            let bans = blocks.lock().await.operator_targets(now_ms());
+            let shown: Vec<String> = bans.iter().take(LIST_BANS_MAX).map(show).collect();
+            // "OK <total> <target>..."; at most LIST_BANS_MAX targets on the line.
+            format!("OK {} {}", bans.len(), shown.join(" "))
+                .trim_end()
+                .to_string()
+        }
         ControlCommand::ReloadPeers => match &ctx.peers_file {
             None => "ERR no --peers-file configured".to_string(),
             Some(path) => match TrustStore::load(path) {
                 Ok(trust) => {
+                    let per_peer = ctx.peer_limits.per_peer(&trust);
+                    ctx.blocks.lock().await.configure_peers(
+                        ctx.peer_limits.default,
+                        per_peer,
+                        ctx.peer_limits.quorum,
+                        now_ms(),
+                    );
                     let pinned = ctx.registry.reload(trust);
                     log::warn!(
                         "[Control] Reloaded {}: {} pinned peers",
@@ -854,6 +953,15 @@ async fn push_telemetry(msg: &str) {
 
 type SharedBlockTable = Arc<tokio::sync::Mutex<BlockTable>>;
 
+/// Open connections per local socket (F11): a local producer cannot make the node spawn tasks
+/// without bound, and idle connections are closed.
+const IPC_MAX_CONNS: usize = 64;
+const IPC_IDLE: Duration = Duration::from_secs(300);
+const CONTROL_MAX_CONNS: usize = 16;
+/// Targets listed per LIST_BANS reply.
+const LIST_BANS_MAX: usize = 4096;
+const CONTROL_IDLE: Duration = Duration::from_secs(60);
+
 fn ip_tag(net: IpNet) -> &'static str {
     family_tag(&net)
 }
@@ -1029,13 +1137,15 @@ async fn main() -> Result<(), anyhow::Error> {
     if args.drop_ipv4_fragments {
         config_flags |= common::config_flags::DROP_IPV4_FRAGMENTS;
     }
-    {
+    let defense = {
         let config_map = bpf
-            .map_mut("CONFIG")
+            .take_map("CONFIG")
             .ok_or_else(|| anyhow::anyhow!("CONFIG map missing"))?;
-        let mut config = Array::<_, u32>::try_from(config_map)?;
-        config.set(0, config_flags, 0)?;
-    }
+        let config = Array::<MapData, u32>::try_from(config_map)?;
+        let defense = Arc::new(defense::Defense::new(config, config_flags, args.storm_mode));
+        defense.set(false)?;
+        defense
+    };
 
     let prog_mut = bpf
         .program_mut("sentinel_vfr_filter")
@@ -1076,6 +1186,13 @@ async fn main() -> Result<(), anyhow::Error> {
         ttl_policy,
         args.node_id,
     )));
+    let peer_limits = PeerLimits::from_args(&args);
+    blocks.lock().await.configure_peers(
+        peer_limits.default,
+        peer_limits.per_peer(&trust_store),
+        peer_limits.quorum,
+        now_ms(),
+    );
     let state_file = args
         .state_file
         .clone()
@@ -1285,6 +1402,7 @@ async fn main() -> Result<(), anyhow::Error> {
     let sntl_db_mesh = sntl_db.clone();
     let node_id_mesh = args.node_id;
     let policy_mesh = block_policy.clone();
+    let defense_mesh = defense.clone();
     let (registry_mesh, crypto_mesh, dag_mesh) = (
         peer_registry.clone(),
         node_crypto.clone(),
@@ -1330,7 +1448,20 @@ async fn main() -> Result<(), anyhow::Error> {
                             );
                             push_telemetry(&telemetry_msg).await;
                         }
-                        (Adoption::Held, Some(why)) => {
+                        (Adoption::Held(held @ ("quorum" | "quota" | "envelope")), _) => {
+                            log::warn!(
+                                "[Mesh] Holding block for {} from node {} ({}): {}",
+                                shown,
+                                issuer,
+                                held,
+                                reason
+                            );
+                            sntl_db_mesh.append(format!(
+                                "MESH_BLOCK_HELD|IP:{}|Issuer:{}|Why:{}|Reason:{}",
+                                shown, issuer, held, reason
+                            ));
+                        }
+                        (Adoption::Held(_), Some(why)) => {
                             log::error!(
                                 "[Mesh] Refusing mesh block for protected {} ({}): {}",
                                 shown,
@@ -1450,11 +1581,26 @@ async fn main() -> Result<(), anyhow::Error> {
                         .await;
                     }
                 }
-                MeshCommand::EngageDefense => {
-                    log::warn!("[CRITICAL] Global mesh defense mode engaged (no enforcement is attached to this mode yet).");
-                }
-                MeshCommand::DisengageDefense => {
-                    log::info!("[CRITICAL] Global mesh defense mode disengaged.");
+                c @ (MeshCommand::EngageDefense | MeshCommand::DisengageDefense) => {
+                    let engaged = matches!(c, MeshCommand::EngageDefense);
+                    match defense_mesh.set(engaged) {
+                        Ok(flags) if defense_mesh.mode() == defense::StormMode::Strict => {
+                            let label = if engaged { "Strict" } else { "Normal" };
+                            log::warn!(
+                                "[Defense] Distributed storm {}: XDP mode {} (flags {:#x})",
+                                if engaged { "engaged" } else { "over" },
+                                label,
+                                flags
+                            );
+                            sntl_db_mesh
+                                .append(format!("DEFENSE_MODE|{}|Flags:{:#x}", label, flags));
+                        }
+                        Ok(_) => log::warn!(
+                            "[Defense] Distributed storm {} (--storm-mode observe: XDP unchanged)",
+                            if engaged { "engaged" } else { "over" }
+                        ),
+                        Err(e) => log::error!("[Defense] Cannot update the XDP config: {:?}", e),
+                    }
                 }
                 MeshCommand::Alert { level, message } => {
                     log::info!("[MESH ALERT {:?}] {}", level, message);
@@ -1567,7 +1713,9 @@ async fn main() -> Result<(), anyhow::Error> {
     let unix_listener = bind_private_socket(socket_path, ipc_gid)?;
 
     let control_listener = bind_private_socket(&args.control_socket, control_gid)?;
+    let control_slots = Arc::new(tokio::sync::Semaphore::new(CONTROL_MAX_CONNS));
     let ctl_ctx = Arc::new(ControlCtx {
+        peer_limits,
         blocks: blocks.clone(),
         policy: block_policy.clone(),
         sntl_db: sntl_db.clone(),
@@ -1587,20 +1735,25 @@ async fn main() -> Result<(), anyhow::Error> {
                     continue;
                 }
             };
+            let Ok(permit) = control_slots.clone().try_acquire_owned() else {
+                log::warn!(
+                    "[Control] {} connections open; refusing another",
+                    CONTROL_MAX_CONNS
+                );
+                continue;
+            };
             let ctx = ctl_ctx.clone();
             tokio::spawn(async move {
+                let _permit = permit;
                 let (read_half, mut write_half) = stream.into_split();
                 let mut reader = BufReader::new(read_half);
                 let mut line = String::new();
                 loop {
                     line.clear();
-                    match (&mut reader)
-                        .take(control::MAX_LINE)
-                        .read_line(&mut line)
-                        .await
-                    {
-                        Ok(0) | Err(_) => break,
-                        Ok(_) => {}
+                    let mut limited = (&mut reader).take(control::MAX_LINE);
+                    match tokio::time::timeout(CONTROL_IDLE, limited.read_line(&mut line)).await {
+                        Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+                        Ok(Ok(_)) => {}
                     }
                     let reply = match control::parse(&line) {
                         Ok(cmd) => execute_control(cmd, &ctx).await,
@@ -1634,9 +1787,18 @@ async fn main() -> Result<(), anyhow::Error> {
             "[UNIX SOCKET] Listening for trap events on {}",
             socket_path_log
         );
+        let ipc_slots = Arc::new(tokio::sync::Semaphore::new(IPC_MAX_CONNS));
         loop {
             match unix_listener.accept().await {
                 Ok((stream, _)) => {
+                    let Ok(permit) = ipc_slots.clone().try_acquire_owned() else {
+                        log::warn!(
+                            "[UNIX IPC] {} connections open; refusing another (uid {:?})",
+                            IPC_MAX_CONNS,
+                            stream.peer_cred().map(|c| c.uid()).ok()
+                        );
+                        continue;
+                    };
                     let blocks_stream = blocks_unix.clone();
                     let db = db_unix.clone();
                     let registry = registry_unix.clone();
@@ -1658,6 +1820,7 @@ async fn main() -> Result<(), anyhow::Error> {
                         reports: reports_stream,
                     };
                     tokio::spawn(async move {
+                        let _permit = permit;
                         let (read_half, mut writer) = stream.into_split();
                         let mut reader = BufReader::new(read_half);
                         let mut line = String::new();
@@ -1665,7 +1828,17 @@ async fn main() -> Result<(), anyhow::Error> {
 
                         loop {
                             line.clear();
-                            match (&mut reader).take(MAX_IPC_LINE).read_line(&mut line).await {
+                            let mut limited = (&mut reader).take(MAX_IPC_LINE);
+                            let Ok(read) =
+                                tokio::time::timeout(IPC_IDLE, limited.read_line(&mut line)).await
+                            else {
+                                log::info!(
+                                    "[UNIX IPC] Closing idle connection from uid {:?}",
+                                    peer_uid
+                                );
+                                break;
+                            };
+                            match read {
                                 Ok(0) => break,
                                 Ok(_)
                                     if !line.ends_with('\n')
@@ -1897,6 +2070,7 @@ async fn main() -> Result<(), anyhow::Error> {
                 }
                 snapshot.p2p_peers = peer_registry.peer_count().await;
                 snapshot.audit_queue_overflow = sntl_db.overflow_total();
+                snapshot.defense_strict = defense.strict();
                 let audit = sntl_db.status();
                 snapshot.audit_healthy = audit.healthy;
                 snapshot.audit_write_errors = audit.write_errors + audit.sync_errors;

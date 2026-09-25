@@ -128,6 +128,62 @@ pub const MAX_RETRIES_PER_TICK: usize = 256;
 /// Distinct nodes remembered per retracted id (the issuer plus a few others).
 const MAX_RETRACTORS: usize = 4;
 
+/// What one peer may impose on this node (ADR-7). Claims outside it are known and shared but
+/// not enforced here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Envelope {
+    /// The peer's claims enforced here at once; further ones wait for a free slot.
+    pub max_active: usize,
+    /// Longest a claim of the peer is enforced here, from when its enforcement starts.
+    pub max_ttl: Duration,
+    /// Widest prefixes (shortest length) the peer may block here at all.
+    pub min_prefix_v4: u8,
+    pub min_prefix_v6: u8,
+}
+
+impl Envelope {
+    pub fn unlimited(max_ttl: Duration) -> Self {
+        Self {
+            max_active: usize::MAX,
+            max_ttl,
+            min_prefix_v4: 0,
+            min_prefix_v6: 0,
+        }
+    }
+
+    fn admits(&self, net: &IpNet) -> bool {
+        match net {
+            IpNet::V4(n) => n.prefix_len() >= self.min_prefix_v4,
+            IpNet::V6(n) => n.prefix_len() >= self.min_prefix_v6,
+        }
+    }
+}
+
+/// Prefixes wider than these need claims from `k` distinct nodes before a peer's claim is
+/// enforced (this node's own claims count as one). `k <= 1` disables it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Quorum {
+    pub k: usize,
+    pub wide_v4: u8,
+    pub wide_v6: u8,
+}
+
+impl Quorum {
+    pub const OFF: Quorum = Quorum {
+        k: 1,
+        wide_v4: 0,
+        wide_v6: 0,
+    };
+
+    fn applies(&self, net: &IpNet) -> bool {
+        self.k > 1
+            && match net {
+                IpNet::V4(n) => n.prefix_len() < self.wide_v4,
+                IpNet::V6(n) => n.prefix_len() < self.wide_v6,
+            }
+    }
+}
+
 /// Known claims (and retraction records) beyond this are refused (a flooding peer cannot exhaust memory).
 pub const MAX_KNOWN_CLAIMS: usize = 4 * common::BLOCKLIST_CAPACITY as usize;
 
@@ -138,6 +194,8 @@ struct Held {
     until_ms: Option<u64>,
     /// Passed the local never-block policy.
     allowed: bool,
+    /// Holds one of its issuer's enforcement slots (always true for this node's claims).
+    in_quota: bool,
 }
 
 #[derive(Default)]
@@ -179,8 +237,9 @@ pub struct Added {
 pub enum Adoption {
     /// New and now enforced here.
     Enforced,
-    /// New; known but not enforced here (retracted, protected, expired, or map error pending).
-    Held,
+    /// New; known but not enforced here, and why: "protected", "retracted", "quota",
+    /// "envelope", "quorum", "map" (kernel write pending) or "already blocked".
+    Held(&'static str),
     Known,
     Refused(&'static str),
 }
@@ -211,6 +270,11 @@ pub struct BlockTable<B = KernelBlocklist> {
     pending: HashSet<IpNet>,
     strikes: HashMap<IpNet, (u32, u64)>,
     dirty: bool,
+    default_envelope: Envelope,
+    envelopes: HashMap<u64, Envelope>,
+    quorum: Quorum,
+    active_by_issuer: HashMap<u64, usize>,
+    waiting: HashMap<u64, std::collections::VecDeque<ClaimId>>,
 }
 
 fn ms(d: Duration) -> u64 {
@@ -241,7 +305,35 @@ impl<B: Blocklist> BlockTable<B> {
             pending: HashSet::new(),
             strikes: HashMap::new(),
             dirty: false,
+            default_envelope: Envelope::unlimited(policy.max),
+            envelopes: HashMap::new(),
+            quorum: Quorum::OFF,
+            active_by_issuer: HashMap::new(),
+            waiting: HashMap::new(),
         }
+    }
+
+    /// Sets what peers may impose (ADR-7): `default` for every peer, `per_peer` overrides, and
+    /// the quorum for wide prefixes. Applies to enforcement from now on; slot counts and local
+    /// ends of claims already adopted are kept.
+    pub fn configure_peers(
+        &mut self,
+        default: Envelope,
+        per_peer: HashMap<u64, Envelope>,
+        quorum: Quorum,
+        now_ms: u64,
+    ) {
+        self.default_envelope = default;
+        self.envelopes = per_peer;
+        self.quorum = quorum;
+        let nets: Vec<IpNet> = self.by_target.keys().copied().collect();
+        self.settle(nets, now_ms);
+    }
+
+    fn envelope(&self, issuer: u64) -> &Envelope {
+        self.envelopes
+            .get(&issuer)
+            .unwrap_or(&self.default_envelope)
     }
 
     fn retracted(&self, id: &ClaimId, held: &Held) -> bool {
@@ -250,8 +342,66 @@ impl<B: Blocklist> BlockTable<B> {
             .is_some_and(|r| r.operator || r.by_nodes.contains(&held.claim.issuer))
     }
 
+    /// Everything but the quorum: this claim alone may count towards enforcing its target.
+    fn counts(&self, id: &ClaimId, held: &Held, now_ms: u64) -> bool {
+        held.allowed
+            && held.in_quota
+            && held.until_ms.is_none_or(|u| u > now_ms)
+            && !self.retracted(id, held)
+            && (held.claim.issuer == self.node_id
+                || self.envelope(held.claim.issuer).admits(&held.net))
+    }
+
+    /// Distinct nodes with a counting claim on `net` (this node included).
+    fn issuers_on(&self, net: &IpNet, now_ms: u64) -> usize {
+        let mut issuers = HashSet::new();
+        for id in self.by_target.get(net).into_iter().flatten() {
+            if let Some(h) = self.claims.get(id) {
+                if self.counts(id, h, now_ms) {
+                    issuers.insert(h.claim.issuer);
+                }
+            }
+        }
+        issuers.len()
+    }
+
     fn effective(&self, id: &ClaimId, held: &Held, now_ms: u64) -> bool {
-        held.allowed && held.until_ms.is_none_or(|u| u > now_ms) && !self.retracted(id, held)
+        self.counts(id, held, now_ms)
+            && (held.claim.issuer == self.node_id
+                || !self.quorum.applies(&held.net)
+                || self.issuers_on(&held.net, now_ms) >= self.quorum.k)
+    }
+
+    /// Why a known claim is not enforced here (for the audit); `None` if it is effective.
+    fn hold_reason(&self, id: &ClaimId, held: &Held, now_ms: u64) -> Option<&'static str> {
+        if !held.allowed {
+            Some("protected")
+        } else if self.retracted(id, held) {
+            Some("retracted")
+        } else if held.claim.issuer != self.node_id
+            && !self.envelope(held.claim.issuer).admits(&held.net)
+        {
+            Some("envelope")
+        } else if !held.in_quota {
+            Some("quota")
+        } else if held.until_ms.is_some_and(|u| u <= now_ms) {
+            Some("expired")
+        } else if !self.effective(id, held, now_ms) {
+            Some("quorum")
+        } else {
+            None
+        }
+    }
+
+    fn release_slot(&mut self, id: &ClaimId) {
+        if let Some(h) = self.claims.get_mut(id) {
+            if h.in_quota && h.claim.issuer != self.node_id {
+                h.in_quota = false;
+                if let Some(n) = self.active_by_issuer.get_mut(&h.claim.issuer) {
+                    *n = n.saturating_sub(1);
+                }
+            }
+        }
     }
 
     fn wanted(&self, net: &IpNet, now_ms: u64) -> bool {
@@ -331,6 +481,7 @@ impl<B: Blocklist> BlockTable<B> {
                 claim: claim.clone(),
                 net,
                 allowed: true,
+                in_quota: true,
             },
         );
         if kind != ClaimKind::Static {
@@ -365,8 +516,20 @@ impl<B: Blocklist> BlockTable<B> {
         if self.claims.len() >= MAX_KNOWN_CLAIMS {
             return Adoption::Refused("too many known claims");
         }
-        let cap = now_ms.saturating_add(ms(self.policy.max));
+        let envelope = *self.envelope(claim.issuer);
+        let cap = now_ms.saturating_add(ms(self.policy.max.min(envelope.max_ttl)));
         let until_ms = Some(claim.expires_ms.map_or(cap, |e| e.min(cap)));
+        let issuer = claim.issuer;
+        let active = self.active_by_issuer.entry(issuer).or_insert(0);
+        let in_quota = *active < envelope.max_active;
+        if in_quota {
+            *active += 1;
+        } else {
+            self.waiting
+                .entry(issuer)
+                .or_default()
+                .push_back(id.clone());
+        }
         self.insert_held(
             id.clone(),
             Held {
@@ -374,13 +537,17 @@ impl<B: Blocklist> BlockTable<B> {
                 net,
                 until_ms,
                 allowed,
+                in_quota,
             },
         );
         let was = self.applied.contains(&net);
         let result = self.reconcile(net, now_ms);
-        match result {
-            Ok(()) if !was && self.applied.contains(&net) => Adoption::Enforced,
-            _ => Adoption::Held,
+        let held = &self.claims[&id];
+        match (result, self.hold_reason(&id, held, now_ms)) {
+            (Ok(()), None) if !was && self.applied.contains(&net) => Adoption::Enforced,
+            (Ok(()), None) => Adoption::Held("already blocked"),
+            (Err(_), None) => Adoption::Held("map"),
+            (_, Some(why)) => Adoption::Held(why),
         }
     }
 
@@ -409,6 +576,7 @@ impl<B: Blocklist> BlockTable<B> {
                 (Some(a), Some(b)) => Some(a.max(b)),
                 _ => None,
             };
+            self.release_slot(id);
         }
         self.settle(touched, now_ms)
     }
@@ -457,6 +625,8 @@ impl<B: Blocklist> BlockTable<B> {
                     r.by_nodes.push(self.node_id);
                 }
                 out.retracted.push(id);
+            } else {
+                self.release_slot(&id);
             }
         }
         self.dirty = true;
@@ -501,6 +671,32 @@ impl<B: Blocklist> BlockTable<B> {
         Ok(lifted)
     }
 
+    /// Targets of the operator bans in force, sorted.
+    pub fn operator_targets(&self, now_ms: u64) -> Vec<IpNet> {
+        let mut out: Vec<IpNet> = self
+            .claims
+            .iter()
+            .filter(|(id, h)| h.claim.kind == ClaimKind::Operator && self.effective(id, h, now_ms))
+            .map(|(_, h)| h.net)
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// Lifts operator bans and detector claims at once; `--block` stays.
+    pub fn flush_all(&mut self, now_ms: u64) -> (Vec<IpNet>, Lifted) {
+        let ids: Vec<ClaimId> = self
+            .claims
+            .iter()
+            .filter(|(id, h)| h.claim.kind != ClaimKind::Static && self.effective(id, h, now_ms))
+            .map(|(id, _)| id.clone())
+            .collect();
+        let nets: Vec<IpNet> = ids.iter().map(|id| self.claims[id].net).collect();
+        let lifted = self.lift_ids(ids);
+        (self.settle(nets, now_ms), lifted)
+    }
+
     /// Operator flush: lifts every detector claim (any issuer); operator and `--block` stay.
     pub fn flush_detector(&mut self, now_ms: u64) -> (Vec<IpNet>, Lifted) {
         let ids: Vec<ClaimId> = self
@@ -531,7 +727,18 @@ impl<B: Blocklist> BlockTable<B> {
             .filter(|(_, h)| !h.claim.live_at(now_ms))
             .map(|(id, _)| id.clone())
             .collect();
+        // A peer's claim that ended here frees its slot, even while it lives elsewhere.
+        let ended: Vec<ClaimId> = self
+            .claims
+            .iter()
+            .filter(|(_, h)| h.in_quota && h.until_ms.is_some_and(|u| u <= now_ms))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in &ended {
+            self.release_slot(id);
+        }
         for id in dead {
+            self.release_slot(&id);
             if let Some(h) = self.claims.remove(&id) {
                 if let Some(set) = self.by_target.get_mut(&h.net) {
                     set.remove(&id);
@@ -544,6 +751,31 @@ impl<B: Blocklist> BlockTable<B> {
                 }
             }
         }
+        // Waiting claims take freed slots, oldest first.
+        let issuers: Vec<u64> = self.waiting.keys().copied().collect();
+        for issuer in issuers {
+            let max = self.envelope(issuer).max_active;
+            loop {
+                if self.active_by_issuer.get(&issuer).copied().unwrap_or(0) >= max {
+                    break;
+                }
+                let Some(id) = self.waiting.get_mut(&issuer).and_then(|q| q.pop_front()) else {
+                    break;
+                };
+                // Enforcement starts now, so the local end is counted from now.
+                let cap =
+                    now_ms.saturating_add(ms(self.policy.max.min(self.envelope(issuer).max_ttl)));
+                if let Some(h) = self.claims.get_mut(&id) {
+                    if !h.in_quota && h.claim.live_at(now_ms) {
+                        h.in_quota = true;
+                        h.until_ms = Some(h.claim.expires_ms.map_or(cap, |e| e.min(cap)));
+                        *self.active_by_issuer.entry(issuer).or_insert(0) += 1;
+                        touched.push(h.net);
+                    }
+                }
+            }
+        }
+        self.waiting.retain(|_, q| !q.is_empty());
         self.retractions
             .retain(|_, r| r.forget_ms.is_none_or(|f| f > now_ms));
         self.strikes
@@ -714,6 +946,7 @@ impl<B: Blocklist> BlockTable<B> {
                     claim,
                     net,
                     allowed: ok,
+                    in_quota: true,
                 },
             );
             nets.push(net);
@@ -1003,7 +1236,7 @@ mod tests {
         let c = detect(&mut n1, "203.0.113.11", T0);
         let mut n2 = table(2, 64);
         n2.retract(1, &[c.id()], T0);
-        assert_eq!(n2.adopt(c, true, T0), Adoption::Held);
+        assert_eq!(n2.adopt(c, true, T0), Adoption::Held("retracted"));
         assert!(!n2.is_blocked(ip("203.0.113.11")));
     }
 
@@ -1033,7 +1266,7 @@ mod tests {
             n1.tick(now);
             assert!(matches!(
                 n1.adopt(long.clone(), true, now),
-                Adoption::Known | Adoption::Held
+                Adoption::Known | Adoption::Held(_)
             ));
             assert!(!n1.is_blocked(a), "day {}: the lifted claim came back", day);
             // After a restart the peer's copy arrives as new (peer claims are not persisted):
@@ -1115,7 +1348,7 @@ mod tests {
         let mut n2 = table(2, 8);
         let c = detect(&mut n2, "203.0.113.14", T0);
         let mut n1 = table(1, 8);
-        assert_eq!(n1.adopt(c, false, T0), Adoption::Held);
+        assert_eq!(n1.adopt(c, false, T0), Adoption::Held("protected"));
         assert!(!n1.is_blocked(ip("203.0.113.14")));
         assert_eq!(
             n1.digest(T0),
@@ -1207,7 +1440,10 @@ mod tests {
         assert_eq!(again.restore(restored, |_| true, T0 + S), (2, 0));
         assert!(again.is_blocked(ip("203.0.113.51")));
         assert!(again.is_blocked(ip("203.0.113.52")));
-        assert_eq!(again.adopt(theirs, true, T0 + S), Adoption::Held);
+        assert_eq!(
+            again.adopt(theirs, true, T0 + S),
+            Adoption::Held("retracted")
+        );
         assert!(!again.is_blocked(ip("203.0.113.50")));
         // A target protected since the last run is not re-enforced.
         let mut guarded = table(1, 64);
@@ -1218,6 +1454,149 @@ mod tests {
         );
         assert_eq!((ok, refused), (1, 1));
         assert!(!guarded.is_blocked(ip("203.0.113.51")));
+    }
+
+    const QUORUM2: Quorum = Quorum {
+        k: 2,
+        wide_v4: 24,
+        wide_v6: 64,
+    };
+
+    fn limited(
+        node: u64,
+        default: Envelope,
+        per_peer: &[(u64, Envelope)],
+    ) -> BlockTable<FakeLists> {
+        let mut t = table(node, 64);
+        t.configure_peers(default, per_peer.iter().copied().collect(), QUORUM2, T0);
+        t
+    }
+
+    #[test]
+    fn a_wide_prefix_from_one_peer_waits_for_a_second_node() {
+        // ADR-7: a single (possibly compromised) peer cannot cut a /20 off this node.
+        let (mut n2, mut n3) = (table(2, 64), table(3, 64));
+        let wide = "198.51.96.0/20";
+        let c2 = detect(&mut n2, wide, T0);
+        let c3 = detect(&mut n3, wide, T0);
+        let mut n1 = limited(1, Envelope::unlimited(POLICY.max), &[]);
+        assert_eq!(n1.adopt(c2.clone(), true, T0), Adoption::Held("quorum"));
+        assert!(!n1.is_blocked(ip(wide)));
+        // The same peer repeating itself is still one node.
+        let again = detect(&mut n2, wide, T0 + 1);
+        assert_eq!(n1.adopt(again, true, T0), Adoption::Held("quorum"));
+        assert!(
+            !n1.is_blocked(ip(wide)),
+            "one peer reached the quorum alone"
+        );
+        assert_eq!(
+            n1.adopt(c3.clone(), true, T0),
+            Adoption::Enforced,
+            "two nodes agree"
+        );
+        n1.retract(3, &[c3.id()], T0 + S);
+        assert!(!n1.is_blocked(ip(wide)), "back below the quorum");
+        // This node's own claim counts as one node.
+        let mut n4 = limited(4, Envelope::unlimited(POLICY.max), &[]);
+        n4.adopt(c2, true, T0);
+        detect(&mut n4, wide, T0);
+        assert!(n4.is_blocked(ip(wide)));
+        // Narrow targets need no quorum.
+        let host = detect(&mut n2, "198.51.100.5", T0);
+        assert_eq!(n1.adopt(host, true, T0), Adoption::Enforced);
+    }
+
+    #[test]
+    fn a_local_wide_block_needs_no_quorum() {
+        let mut n1 = limited(1, Envelope::unlimited(POLICY.max), &[]);
+        detect(&mut n1, "198.51.96.0/20", T0);
+        assert!(n1.is_blocked(ip("198.51.96.0/20")));
+    }
+
+    #[test]
+    fn a_peers_envelope_bounds_what_it_can_block_here() {
+        let mut n2 = table(2, 64);
+        let (a, b, c) = (
+            detect(&mut n2, "203.0.113.70", T0),
+            detect(&mut n2, "203.0.113.71", T0),
+            detect(&mut n2, "203.0.113.72", T0),
+        );
+        let wide = detect(&mut n2, "203.0.113.0/24", T0);
+        let tight = Envelope {
+            max_active: 2,
+            max_ttl: Duration::from_secs(30),
+            min_prefix_v4: 32,
+            min_prefix_v6: 128,
+        };
+        let mut n1 = limited(1, Envelope::unlimited(POLICY.max), &[(2, tight)]);
+        assert_eq!(n1.adopt(a, true, T0), Adoption::Enforced);
+        assert_eq!(n1.adopt(b, true, T0), Adoption::Enforced);
+        assert_eq!(
+            n1.adopt(c, true, T0),
+            Adoption::Held("quota"),
+            "third of two slots"
+        );
+        assert_eq!(n1.adopt(wide, true, T0), Adoption::Held("envelope"));
+        // max_ttl: the 60 s claims end here after 30 s, and the waiting claim takes a slot.
+        n1.tick(T0 + 31 * S);
+        assert!(!n1.is_blocked(ip("203.0.113.70")));
+        assert!(
+            n1.is_blocked(ip("203.0.113.72")),
+            "promoted into the freed slot"
+        );
+        // Other peers keep the default envelope.
+        let mut n3 = table(3, 64);
+        assert_eq!(
+            n1.adopt(detect(&mut n3, "203.0.113.73", T0), true, T0 + 31 * S),
+            Adoption::Enforced
+        );
+    }
+
+    #[test]
+    fn a_retraction_frees_the_issuers_slot() {
+        let mut n2 = table(2, 64);
+        let (a, b) = (
+            detect(&mut n2, "203.0.113.80", T0),
+            detect(&mut n2, "203.0.113.81", T0),
+        );
+        let one = Envelope {
+            max_active: 1,
+            ..Envelope::unlimited(POLICY.max)
+        };
+        let mut n1 = limited(1, one, &[]);
+        n1.adopt(a.clone(), true, T0);
+        assert_eq!(n1.adopt(b, true, T0), Adoption::Held("quota"));
+        n1.retract(2, &[a.id()], T0 + S);
+        n1.tick(T0 + 2 * S);
+        assert!(n1.is_blocked(ip("203.0.113.81")));
+    }
+
+    #[test]
+    fn envelopes_do_not_change_the_shared_mesh_state() {
+        // Held claims are still known and shared: digests converge whatever each node enforces.
+        let mut n2 = table(2, 64);
+        let wide = detect(&mut n2, "198.51.96.0/20", T0);
+        let mut n1 = limited(1, Envelope::unlimited(POLICY.max), &[]);
+        n1.adopt(wide, true, T0);
+        assert_eq!(n1.digest(T0), n2.digest(T0));
+    }
+
+    #[test]
+    fn operator_bans_can_be_listed_and_flushed_with_everything_but_static() {
+        let mut t = table(1, 64);
+        t.add_local(ip("198.51.100.1"), ClaimKind::Static, "--block", T0);
+        t.add_local(ip("198.51.100.2"), ClaimKind::Operator, "op", T0);
+        t.add_local(ip("198.51.100.0/24"), ClaimKind::Operator, "op", T0);
+        detect(&mut t, "198.51.100.3", T0);
+        assert_eq!(
+            t.operator_targets(T0),
+            vec![ip("198.51.100.0/24"), ip("198.51.100.2")]
+        );
+        let (lifted, _) = t.flush_all(T0);
+        assert_eq!(lifted.len(), 3);
+        assert!(t.operator_targets(T0).is_empty());
+        assert!(t.is_blocked(ip("198.51.100.1")), "--block stays");
+        assert_eq!(t.active(), 1);
     }
 
     #[test]

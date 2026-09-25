@@ -273,6 +273,21 @@ check "operator ban is enforced in XDP" bash -c "! ip netns exec $NS ping -c 1 -
 op /api/nodes/1/blacklist "{\"ip\":\"$ALLOWED_IP\",\"action\":\"remove\"}" >/dev/null
 sleep 0.3
 check "operator unban lifts the block" ping_from "$ALLOWED_IP"
+# F08: the node holds the bans. A ban made on the control socket directly (the dashboard never
+# saw it) shows up in a restarted dashboard, and the dashboard's flush lifts it.
+DIRECT_BAN=10.231.0.12
+printf 'BAN_IP:%s\n' "$DIRECT_BAN" | nc -U -q1 "$WORK/control.sock" >/dev/null
+kill "$OPERATOR_PID" 2>/dev/null || true; wait "$OPERATOR_PID" 2>/dev/null || true
+SOKOL_OPERATOR_TOKEN=$OP_TOKEN SOKOL_OPERATOR_BIND=127.0.0.1:3900 "$OPERATOR_BIN" >"$WORK/operator2.log" 2>&1 &
+OPERATOR_PID=$!
+for _ in $(seq 1 40); do
+    curl -s -H "Authorization: Bearer $OP_TOKEN" http://127.0.0.1:3900/api/data | grep -q "$DIRECT_BAN" && break
+    sleep 0.3
+done
+check "a restarted dashboard shows a ban it never made (read from the node)" \
+    bash -c "curl -s -H 'Authorization: Bearer $OP_TOKEN' http://127.0.0.1:3900/api/data | grep -q '$DIRECT_BAN'"
+check "dashboard flush lifts operator bans it did not make" \
+    bash -c "curl -s -X POST -H 'Authorization: Bearer $OP_TOKEN' http://127.0.0.1:3900/api/nodes/1/flush | grep -q '\"success\":true' && printf 'LIST_BANS\\n' | nc -U -q1 '$WORK/control.sock' | grep -q '^OK 0'"
 kill "$OPERATOR_PID" 2>/dev/null || true
 OPERATOR_PID=""
 
@@ -383,6 +398,19 @@ kill "$TRAP_PID" 2>/dev/null || true; TRAP_PID=""
 ipc "DROP_IMMEDIATE:$ALLOWED_IP"
 sleep 0.5
 check "root IPC DROP_IMMEDIATE blocks $ALLOWED_IP" bash -c "! ip netns exec $NS ping -c 2 -W 1 -I $ALLOWED_IP $HOST_IP >/dev/null 2>&1"
+# F11: a local producer cannot make the node hold connections (and tasks) without bound.
+HOLDERS=()
+for _ in $(seq 1 70); do
+    (sleep 15 | nc -U /run/sokol.sock >/dev/null 2>&1) &
+    HOLDERS+=($!)
+done
+sleep 1.5
+check "IPC: connections beyond the limit are refused" grep -q "connections open; refusing another" "$LOG"
+for p in "${HOLDERS[@]}"; do kill "$p" 2>/dev/null || true; done
+pkill -f "nc -U /run/sokol.sock" 2>/dev/null || true
+sleep 0.5
+check "IPC: the socket serves again once they close" \
+    bash -c "printf 'DB_LOG:after the limit\\n' | nc -U -q1 /run/sokol.sock; sleep 1.5; grep -aq 'after the limit' '$WORK/events.sntl'"
 
 # ADR-4: an operator ban survives a restart; --block is lifted only by the configuration.
 PERSIST_IP=10.231.0.11
@@ -589,6 +617,13 @@ if command -v wg >/dev/null && ip link add sokol-wgprobe type wireguard 2>/dev/n
     ipc "DROP_IMMEDIATE:203.0.113.77"
     sleep 1.5
     check "mesh: a block on node 1 reaches node 2" grep -q "Synchronized block for 203.0.113.77" "$WORK/n2/node.log"
+    # ADR-7: one peer alone cannot impose a wide prefix; node 1 holds it until a second node agrees.
+    printf 'DROP_IMMEDIATE:198.18.0.0/20\n' | ip netns exec "$NS" nc -U -q1 "$WORK/n2/ipc.sock" >/dev/null
+    sleep 1.5
+    check "quorum: node 1 holds node 2's /20 until a second node agrees" \
+        grep -q "Holding block for 198.18.0.0/20 from node 2 (quorum)" "$LOG"
+    check "quorum: node 1 does not enforce it" \
+        bash -c "! grep -q 'Synchronized block for 198.18.0.0/20' '$LOG'"
 
     timeout 8 ping -f -I "$ATTACK_SRC" "$ALLOWED_IP" >/dev/null 2>&1 || true
     for _ in $(seq 1 30); do
@@ -601,6 +636,32 @@ if command -v wg >/dev/null && ip link add sokol-wgprobe type wireguard 2>/dev/n
     check "cluster: storm latch engaged and audited" bash -c "grep -q 'Distributed storm: 1/2 nodes under attack' '$LOG'"
     check "node 2 (threshold 0.5) counts itself under attack: local incident, not a storm" \
         test "$(n2_metric sokol_cluster_status)" = 2
+    # ADR-6: while the storm is engaged node 1's XDP drops packets whose headers do not parse.
+    # A bare IPv6 header whose Hop-by-Hop header is missing, from an address nobody blocks: in
+    # normal mode XDP cannot parse it and passes it to the stack; in strict mode it is dropped.
+    # (A truncated IPv4 header would not do: it is dropped as malformed in every mode.)
+    send_truncated_v6() {
+        ip netns exec "$NS" python3 - "$PEER_IF" "$1" <<'PY'
+import socket, struct, sys
+s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW)
+s.bind((sys.argv[1], 0))
+eth = b"\xff" * 6 + s.getsockname()[4][:6] + struct.pack("!H", 0x86DD)
+ip6 = struct.pack("!IHBB", 6 << 28, 0, 0, 64) + socket.inet_pton(socket.AF_INET6, "2001:db8:bad::77") \
+    + socket.inet_pton(socket.AF_INET6, "2001:db8::1")
+for _ in range(int(sys.argv[2])):
+    s.send(eth + ip6)
+PY
+    }
+    malformed() { metric 'sokol_xdp_dropped_packets_total{reason="malformed_header"}'; }
+    check "storm: node 1 switched XDP to strict mode" grep -aq "DEFENSE_MODE|Strict" "$WORK/events.sntl"
+    check "storm: strict mode is reported" wait_metric sokol_defense_strict 1
+    BEFORE=$(malformed); send_truncated_v6 10; sleep 1.2
+    check "storm: unparsable headers from an unblocked source are dropped in strict mode ($BEFORE -> $(malformed))" \
+        test $(( $(malformed) - BEFORE )) -eq 10
+    for _ in $(seq 1 75); do grep -aq "DEFENSE_MODE|Normal" "$WORK/events.sntl" && break; sleep 1; done
+    check "storm over: node 1 returns to normal mode" grep -aq "DEFENSE_MODE|Normal" "$WORK/events.sntl"
+    BEFORE=$(malformed); send_truncated_v6 10; sleep 1.2
+    check "normal mode: unparsable headers pass to the stack again" test "$(malformed)" -eq "$BEFORE"
     kill "$NODE2_PID" 2>/dev/null || true
     NODE2_PID=""
     stop_orchestrator

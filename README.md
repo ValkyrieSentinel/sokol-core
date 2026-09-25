@@ -143,6 +143,14 @@ A storm engages a latch at once (logged and audited); the latch disengages only 
 without a storm, so a flickering storm is one event. Reports travel only between directly
 connected peers, so connect the nodes as a full mesh (`--seed-peer` to every other node).
 
+While the latch is engaged, `--storm-mode strict` (the default) tightens XDP on this node: packets
+whose headers do not parse are dropped instead of passed to the stack (`malformed_header`), and
+IPv4 fragments are dropped. When the latch disengages, exactly the flags the operator configured
+(e.g. `--drop-ipv4-fragments`) are restored. Both transitions are audited (`DEFENSE_MODE|Strict`,
+`DEFENSE_MODE|Normal`) and shown as `sokol_defense_strict`. `--storm-mode observe` only logs the
+storm. Only a node's own latch switches its mode: a peer's EngageDefense/DisengageDefense is
+refused.
+
 Envelopes are signed over sender, timestamp, nonce and payload; they are rejected outside a
 ±30 s clock window (keep nodes NTP-synced) and accepted at most once. Mesh traffic is
 authenticated but not encrypted.
@@ -234,6 +242,15 @@ claim keeps its own expiry but is enforced here for at most `--block-ttl-max`.
 - The kernel map follows the claims. A map write or delete that fails (e.g. the map is full) stays
   pending, is retried every second and is shown as `sokol_blocks_pending`; `sokol_blocks_active`
   counts only entries the kernel holds.
+- What a peer can impose here is bounded (ADR-7). A peer's claims enforced at once are capped
+  (`--peer-max-active`, default 16384; more wait for a free slot), each for at most
+  `--peer-max-ttl` (default `--block-ttl-max`) from when it starts. A prefix wider than /24
+  (IPv4) or /64 (IPv6) is enforced only once `--quorum` distinct nodes (default 2, this node's own
+  claim included) claim it, so one compromised peer cannot cut off a network. Per peer, the peers
+  file can tighten this: `"envelope": {"max_active": 1000, "max_ttl_secs": 3600,
+  "min_prefix_v4": 32, "min_prefix_v6": 128}` (unknown fields are refused; `RELOAD_PEERS` applies
+  changes). Held claims are audited as `MESH_BLOCK_HELD` with the reason, and are still shared,
+  so the mesh state converges whatever each node enforces.
 - Nodes exchange a digest of their shared claims every 15 s; a node whose digest differs sends its
   state, so a node that missed messages (a partition, a full send queue) converges without waiting
   for a reconnect. All nodes of a mesh must run this protocol version.
@@ -259,9 +276,16 @@ token on every API call. Set `SOKOL_OPERATOR_TOKEN` (16+ characters), or read th
 token it prints at startup; the dashboard asks for it and keeps it in an `HttpOnly`,
 `SameSite=Strict` cookie. Ban/unban/flush buttons go to the node's control socket
 (`--control-socket`, announced in its heartbeat): operator bans are permanent until lifted,
-"Flush" lifts the operator's bans and all dynamic blocks, `--block` addresses stay, and protected
-addresses are refused. The operator needs access to that socket (`--control-group`, e.g.
-`sokol-ops`). XDP toggle and shield mode are reported as unsupported.
+"Flush" lifts the operator's bans and all dynamic blocks in one command on the node
+(`FLUSH_ALL`), `--block` addresses stay, and protected addresses are refused. The dashboard does
+not keep its own copy of the bans: it reads them from each node (`LIST_BANS`) every 5 s and after
+every action, so a restarted dashboard or another operator's change shows the node's real state.
+A node without a heartbeat for 15 s is shown as STALE. The operator needs access to that socket (`--control-group`, e.g.
+`sokol-ops`). The dashboard takes node heartbeats on `/run/sokol_telemetry.sock` (mode 0660, group
+`SOKOL_TELEMETRY_GROUP` if set) only from the uids in `SOKOL_NODE_UIDS` (default: root and its own
+uid). A node is bound to the uid that first announced it: heartbeats for it from another uid are
+ignored, and a control socket is used only if the process serving it runs as that uid, so a
+local process cannot re-point the operator's commands to a socket of its own. XDP toggle and shield mode are reported as unsupported.
 
 `sokol-client` (`127.0.0.1:3001`) attaches its own XDP program to `SOKOL_IFACE`, so do not run it
 on an interface the orchestrator already uses. It refuses to start without `SOKOL_CLIENT_TOKEN`
