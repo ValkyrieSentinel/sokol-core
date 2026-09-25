@@ -271,8 +271,11 @@ token on every API call. Set `SOKOL_OPERATOR_TOKEN` (16+ characters), or read th
 token it prints at startup; the dashboard asks for it and keeps it in an `HttpOnly`,
 `SameSite=Strict` cookie. Ban/unban/flush buttons go to the node's control socket
 (`--control-socket`, announced in its heartbeat): operator bans are permanent until lifted,
-"Flush" lifts the operator's bans and all dynamic blocks, `--block` addresses stay, and protected
-addresses are refused. The operator needs access to that socket (`--control-group`, e.g.
+"Flush" lifts the operator's bans and all dynamic blocks in one command on the node
+(`FLUSH_ALL`), `--block` addresses stay, and protected addresses are refused. The dashboard does
+not keep its own copy of the bans: it reads them from each node (`LIST_BANS`) every 5 s and after
+every action, so a restarted dashboard or another operator's change shows the node's real state.
+A node without a heartbeat for 15 s is shown as STALE. The operator needs access to that socket (`--control-group`, e.g.
 `sokol-ops`). The dashboard takes node heartbeats on `/run/sokol_telemetry.sock` (mode 0660, group
 `SOKOL_TELEMETRY_GROUP` if set) only from the uids in `SOKOL_NODE_UIDS` (default: root and its own
 uid). A node is bound to the uid that first announced it: heartbeats for it from another uid are

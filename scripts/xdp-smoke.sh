@@ -273,6 +273,21 @@ check "operator ban is enforced in XDP" bash -c "! ip netns exec $NS ping -c 1 -
 op /api/nodes/1/blacklist "{\"ip\":\"$ALLOWED_IP\",\"action\":\"remove\"}" >/dev/null
 sleep 0.3
 check "operator unban lifts the block" ping_from "$ALLOWED_IP"
+# F08: the node holds the bans. A ban made on the control socket directly (the dashboard never
+# saw it) shows up in a restarted dashboard, and the dashboard's flush lifts it.
+DIRECT_BAN=10.231.0.12
+printf 'BAN_IP:%s\n' "$DIRECT_BAN" | nc -U -q1 "$WORK/control.sock" >/dev/null
+kill "$OPERATOR_PID" 2>/dev/null || true; wait "$OPERATOR_PID" 2>/dev/null || true
+SOKOL_OPERATOR_TOKEN=$OP_TOKEN SOKOL_OPERATOR_BIND=127.0.0.1:3900 "$OPERATOR_BIN" >"$WORK/operator2.log" 2>&1 &
+OPERATOR_PID=$!
+for _ in $(seq 1 40); do
+    curl -s -H "Authorization: Bearer $OP_TOKEN" http://127.0.0.1:3900/api/data | grep -q "$DIRECT_BAN" && break
+    sleep 0.3
+done
+check "a restarted dashboard shows a ban it never made (read from the node)" \
+    bash -c "curl -s -H 'Authorization: Bearer $OP_TOKEN' http://127.0.0.1:3900/api/data | grep -q '$DIRECT_BAN'"
+check "dashboard flush lifts operator bans it did not make" \
+    bash -c "curl -s -X POST -H 'Authorization: Bearer $OP_TOKEN' http://127.0.0.1:3900/api/nodes/1/flush | grep -q '\"success\":true' && printf 'LIST_BANS\\n' | nc -U -q1 '$WORK/control.sock' | grep -q '^OK 0'"
 kill "$OPERATOR_PID" 2>/dev/null || true
 OPERATOR_PID=""
 
