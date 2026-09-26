@@ -423,6 +423,20 @@ STATE_FILE=$LAST_STATE start_orchestrator
 check "an operator ban survives a restart" \
     bash -c "! ip netns exec $NS ping -c 2 -W 1 -I $PERSIST_IP $HOST_IP >/dev/null 2>&1"
 check "the restart reports restored blocks" grep -q "Restored .* of this node's blocks" "$LOG"
+# R26-04: an operator decision is on disk before it is answered OK, so SIGKILL right after the
+# answer (no graceful shutdown, no tick in between) does not lose it.
+KILL_BAN=10.231.0.14
+ip netns exec "$NS" ip addr add "$KILL_BAN/24" dev "$PEER_IF"
+python3 - "$WORK/control.sock" "$KILL_BAN" <<'PY'
+import socket, sys
+s = socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]); f = s.makefile("rw")
+f.write("BAN_IP:%s\n" % sys.argv[2]); f.flush(); f.readline()
+PY
+kill -9 "$ORCH_PID"; wait "$ORCH_PID" 2>/dev/null || true; ORCH_PID=""
+STATE_FILE=$LAST_STATE start_orchestrator
+check "an operator ban answered OK survives SIGKILL right after the answer" \
+    bash -c "! ip netns exec $NS ping -c 2 -W 1 -I $KILL_BAN $HOST_IP >/dev/null 2>&1"
+printf 'UNBAN_IP:%s\n' "$KILL_BAN" | nc -U -q1 "$WORK/control.sock" >/dev/null
 printf 'UNBAN_IP:%s\n' "$PERSIST_IP" | nc -U -q1 "$WORK/control.sock" >/dev/null
 stop_orchestrator
 TRAP_PROTECTED=10.231.0.8; TRAP_OPEN=10.231.0.10

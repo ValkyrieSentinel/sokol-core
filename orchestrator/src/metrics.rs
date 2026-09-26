@@ -18,6 +18,7 @@ pub struct Snapshot {
     pub audit_queue_overflow: u64,
     pub defense_strict: bool,
     pub audit_healthy: bool,
+    pub state_healthy: bool,
     pub audit_write_errors: u64,
     pub audit_lost: u64,
     pub audit_sync_age_ms: u64,
@@ -135,6 +136,13 @@ pub fn render(s: &Snapshot) -> String {
         "1 while the audit log is written and fsynced; 0 while the node is DEGRADED (enforcement continues).",
     );
     let _ = writeln!(out, "sokol_audit_healthy {}", s.audit_healthy as u8);
+    family(
+        &mut out,
+        "sokol_state_healthy",
+        "gauge",
+        "1 while --state-file is written; 0 while this node's decisions are not being persisted.",
+    );
+    let _ = writeln!(out, "sokol_state_healthy {}", s.state_healthy as u8);
     family(
         &mut out,
         "sokol_audit_write_errors_total",
