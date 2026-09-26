@@ -230,6 +230,11 @@ impl TrustStore {
         &self.envelopes
     }
 
+    /// The pinned nodes' ids.
+    pub fn node_ids(&self) -> std::collections::HashSet<u64> {
+        self.keys.keys().copied().collect()
+    }
+
     /// Number of pinned nodes.
     pub fn len(&self) -> usize {
         self.keys.len()
@@ -945,6 +950,17 @@ async fn handle_reader_loop(
                         bail!("node {} sent a command claiming node {}", peer_id, claimed);
                     }
                 }
+                // R26-01: a snapshot carries only the sender's own claims; a relay could
+                // otherwise present claims (and quorum votes) in other nodes' names.
+                if let MeshCommand::BlockSync { claims, .. } = &command {
+                    if let Some(c) = claims.iter().find(|c| c.issuer != peer_id) {
+                        bail!(
+                            "node {} sent a snapshot carrying a claim of node {}",
+                            peer_id,
+                            c.issuer
+                        );
+                    }
+                }
                 // Only this node's own storm latch may switch its defense mode.
                 if matches!(
                     command,
@@ -1090,6 +1106,65 @@ mod tests {
                 (Ok(Some(MeshCommand::Alert { .. })), true) => {}
                 (Err(_), false) => {}
                 (other, _) => panic!("unexpected delivery: {:?}", other.is_ok()),
+            }
+        }
+    }
+
+    /// R26-01 at the ingress boundary: one pinned peer cannot present claims in other nodes'
+    /// names in a snapshot (it would forge quorum votes); its own snapshot is delivered.
+    #[tokio::test]
+    async fn a_snapshot_with_claims_of_other_nodes_is_refused() {
+        use crate::block_table::{Claim, ClaimKind};
+        let server = Arc::new(NodeCrypto::generate());
+        let friend = Arc::new(NodeCrypto::generate());
+        let mut trust = TrustStore::default();
+        trust.insert(2, friend.public_key);
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(8);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let net = P2PNetwork::new(
+            addr,
+            1,
+            server,
+            Arc::new(dag()),
+            cmd_tx,
+            8,
+            shutdown_rx,
+            PeerRegistry::new(trust),
+        );
+        tokio::spawn(async move { net.serve(listener).await });
+
+        let claim = |issuer: u64| Claim {
+            issuer,
+            kind: ClaimKind::Detector,
+            target: "198.51.96.0/20".into(),
+            issued_ms: 1,
+            expires_ms: Some(2),
+            reason: "t".into(),
+        };
+        let forged: Vec<Claim> = (3..103).map(claim).collect();
+        for (claims, delivered) in [(forged, false), (vec![claim(2)], true)] {
+            let msg = NetworkMessage::Command(MeshCommand::BlockSync {
+                issuer: 2,
+                claims,
+                retracted: vec![],
+            });
+            let mut stream = TcpStream::connect(addr).await.unwrap();
+            let d = dag();
+            for m in [NetworkMessage::Handshake { node_id: 2 }, msg] {
+                let env = seal(&friend, 2, &m, &d).await.unwrap();
+                let bytes = bincode::serialize(&env).unwrap();
+                let _ = stream.write_all(&(bytes.len() as u32).to_be_bytes()).await;
+                let _ = stream.write_all(&bytes).await;
+            }
+            let got = timeout(Duration::from_millis(500), cmd_rx.recv()).await;
+            match (got, delivered) {
+                (Ok(Some(MeshCommand::BlockSync { claims, .. })), true) => {
+                    assert!(claims.iter().all(|c| c.issuer == 2))
+                }
+                (Err(_), false) => {}
+                (other, _) => panic!("delivered={}: unexpected {:?}", delivered, other.is_ok()),
             }
         }
     }

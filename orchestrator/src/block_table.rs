@@ -275,6 +275,9 @@ pub struct BlockTable<B = KernelBlocklist> {
     quorum: Quorum,
     active_by_issuer: HashMap<u64, usize>,
     waiting: HashMap<u64, std::collections::VecDeque<ClaimId>>,
+    /// Nodes whose claims may count here (the pinned peers). `None` until configured: no
+    /// restriction (tests). A peer removed from the peers file loses its claims' effect.
+    pinned: Option<HashSet<u64>>,
 }
 
 fn ms(d: Duration) -> u64 {
@@ -310,7 +313,20 @@ impl<B: Blocklist> BlockTable<B> {
             quorum: Quorum::OFF,
             active_by_issuer: HashMap::new(),
             waiting: HashMap::new(),
+            pinned: None,
         }
+    }
+
+    /// Sets the nodes whose claims may count here (R26-01: an unknown or revoked origin's
+    /// claims are known but never enforced).
+    pub fn set_pinned(&mut self, pinned: HashSet<u64>, now_ms: u64) {
+        self.pinned = Some(pinned);
+        let nets: Vec<IpNet> = self.by_target.keys().copied().collect();
+        self.settle(nets, now_ms);
+    }
+
+    fn origin_trusted(&self, issuer: u64) -> bool {
+        issuer == self.node_id || self.pinned.as_ref().is_none_or(|p| p.contains(&issuer))
     }
 
     /// Sets what peers may impose (ADR-7): `default` for every peer, `per_peer` overrides, and
@@ -346,6 +362,7 @@ impl<B: Blocklist> BlockTable<B> {
     fn counts(&self, id: &ClaimId, held: &Held, now_ms: u64) -> bool {
         held.allowed
             && held.in_quota
+            && self.origin_trusted(held.claim.issuer)
             && held.until_ms.is_none_or(|u| u > now_ms)
             && !self.retracted(id, held)
             && (held.claim.issuer == self.node_id
@@ -376,6 +393,8 @@ impl<B: Blocklist> BlockTable<B> {
     fn hold_reason(&self, id: &ClaimId, held: &Held, now_ms: u64) -> Option<&'static str> {
         if !held.allowed {
             Some("protected")
+        } else if !self.origin_trusted(held.claim.issuer) {
+            Some("revoked")
         } else if self.retracted(id, held) {
             Some("retracted")
         } else if held.claim.issuer != self.node_id
@@ -808,14 +827,14 @@ impl<B: Blocklist> BlockTable<B> {
         self.applied.contains(&canonical(net))
     }
 
-    /// The mesh state this node shares: detector claims that are live and not retracted by their
-    /// issuer (whatever this node's own operator or policy did with them), and this node's own
-    /// retractions.
+    /// What this node sends a peer (R26-01): only its own live detector claims and its own
+    /// retractions. A node speaks only for itself; other nodes' claims come from those nodes, so
+    /// a relay cannot introduce claims (or quorum votes) in another node's name.
     pub fn snapshot(&self, now_ms: u64) -> (Vec<Claim>, Vec<ClaimId>) {
         let mut claims: Vec<(&ClaimId, &Claim)> = self
             .claims
             .iter()
-            .filter(|(id, h)| self.shared(id, h, now_ms))
+            .filter(|(id, h)| h.claim.issuer == self.node_id && self.shared(id, h, now_ms))
             .map(|(id, h)| (id, &h.claim))
             .collect();
         claims.sort_by(|a, b| a.0.cmp(b.0));
@@ -841,12 +860,14 @@ impl<B: Blocklist> BlockTable<B> {
                 .is_some_and(|r| r.by_nodes.contains(&h.claim.issuer))
     }
 
-    /// Digest of the shared claim set; equal digests mean two nodes need not exchange snapshots.
-    pub fn digest(&self, now_ms: u64) -> String {
+    /// Digest of `issuer`'s live, unretracted detector claims as this node knows them. A node
+    /// sends the digest of its own claims; a peer whose view of them differs asks it for a
+    /// snapshot.
+    pub fn digest_of(&self, issuer: u64, now_ms: u64) -> String {
         let mut ids: Vec<&ClaimId> = self
             .claims
             .iter()
-            .filter(|(id, h)| self.shared(id, h, now_ms))
+            .filter(|(id, h)| h.claim.issuer == issuer && self.shared(id, h, now_ms))
             .map(|(id, _)| id)
             .collect();
         ids.sort();
@@ -855,6 +876,11 @@ impl<B: Blocklist> BlockTable<B> {
             hasher.update(id.as_bytes());
         }
         hasher.finalize().to_hex().to_string()
+    }
+
+    /// Digest of this node's own shared claims.
+    pub fn digest(&self, now_ms: u64) -> String {
+        self.digest_of(self.node_id, now_ms)
     }
 
     /// Marks the durable part as changed (e.g. after a failed write, to retry it).
@@ -1351,7 +1377,7 @@ mod tests {
         assert_eq!(n1.adopt(c, false, T0), Adoption::Held("protected"));
         assert!(!n1.is_blocked(ip("203.0.113.14")));
         assert_eq!(
-            n1.digest(T0),
+            n1.digest_of(2, T0),
             n2.digest(T0),
             "the mesh state converges regardless of policy"
         );
@@ -1387,24 +1413,64 @@ mod tests {
         a.retract(b.node_id, &br, now);
     }
 
+    /// Every node's view of every issuer's claims equals that issuer's own digest.
+    fn converged(nodes: &[&BlockTable<FakeLists>], now: u64) -> bool {
+        nodes.iter().all(|issuer| {
+            let own = issuer.digest(now);
+            nodes
+                .iter()
+                .all(|n| n.digest_of(issuer.node_id, now) == own)
+        })
+    }
+
     #[test]
-    fn one_exchange_converges_including_retractions() {
+    fn one_exchange_with_each_issuer_converges_including_retractions() {
         let (mut n1, mut n2, mut n3) = (table(1, 64), table(2, 64), table(3, 64));
         detect(&mut n1, "203.0.113.30", T0);
         let c2 = detect(&mut n2, "203.0.113.31", T0);
         exchange(&mut n1, &mut n2, T0);
         exchange(&mut n1, &mut n3, T0);
-        // n2 retracts its claim while n3 is cut off; n3 hears of it only through a later exchange.
+        exchange(&mut n2, &mut n3, T0);
+        assert!(converged(&[&n1, &n2, &n3], T0));
+        // n2 retracts its claim while n3 is cut off; n3's view of n2 differs until they exchange.
         n2.retract(2, &[c2.id()], T0 + S);
         exchange(&mut n1, &mut n2, T0 + S);
-        assert_ne!(n3.digest(T0 + S), n2.digest(T0 + S));
+        assert_ne!(n3.digest_of(2, T0 + S), n2.digest(T0 + S));
         exchange(&mut n2, &mut n3, T0 + 2 * S);
-        exchange(&mut n1, &mut n3, T0 + 2 * S);
-        let d = n1.digest(T0 + 2 * S);
-        assert_eq!(n2.digest(T0 + 2 * S), d);
-        assert_eq!(n3.digest(T0 + 2 * S), d);
+        assert!(converged(&[&n1, &n2, &n3], T0 + 2 * S));
         assert!(!n3.is_blocked(ip("203.0.113.31")));
         assert!(n3.is_blocked(ip("203.0.113.30")));
+    }
+
+    #[test]
+    fn a_snapshot_carries_only_the_nodes_own_claims() {
+        // R26-01: n1 knows n2's claim but never passes it on in n2's name.
+        let mut n2 = table(2, 64);
+        let theirs = detect(&mut n2, "203.0.113.32", T0);
+        let mut n1 = table(1, 64);
+        n1.adopt(theirs, true, T0);
+        let mine = detect(&mut n1, "203.0.113.33", T0);
+        let (claims, _) = n1.snapshot(T0);
+        assert_eq!(claims, vec![mine]);
+    }
+
+    #[test]
+    fn a_revoked_origin_stops_counting() {
+        let mut n2 = table(2, 64);
+        let c = detect(&mut n2, "203.0.113.34", T0);
+        let mut n1 = table(1, 64);
+        n1.set_pinned([2].into_iter().collect(), T0);
+        assert_eq!(n1.adopt(c.clone(), true, T0), Adoption::Enforced);
+        n1.set_pinned(HashSet::new(), T0 + S); // node 2 removed from the peers file
+        assert!(!n1.is_blocked(ip("203.0.113.34")));
+        let mut n3 = table(3, 64);
+        n3.set_pinned([2].into_iter().collect(), T0);
+        let unknown = detect(&mut table(9, 8), "203.0.113.35", T0);
+        assert_eq!(
+            n3.adopt(unknown, true, T0),
+            Adoption::Held("revoked"),
+            "an unknown origin"
+        );
     }
 
     #[test]
@@ -1578,7 +1644,7 @@ mod tests {
         let wide = detect(&mut n2, "198.51.96.0/20", T0);
         let mut n1 = limited(1, Envelope::unlimited(POLICY.max), &[]);
         n1.adopt(wide, true, T0);
-        assert_eq!(n1.digest(T0), n2.digest(T0));
+        assert_eq!(n1.digest_of(2, T0), n2.digest(T0));
     }
 
     #[test]

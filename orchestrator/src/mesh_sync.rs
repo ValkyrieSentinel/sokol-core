@@ -33,19 +33,23 @@ pub enum MeshCommand {
         level: AlertLevel,
         message: String,
     },
-    /// The sender's shared mesh state: live detector claims it knows (any issuer) and its own
-    /// retractions. Sent when a peer (re)connects and when digests differ, so a node that missed
-    /// messages (cut off, or its queue overflowed) converges. `issuer` is the sender.
+    /// The sender's own live detector claims and own retractions (every claim's issuer must be
+    /// the sender). Sent when a peer (re)connects and when it asks (SyncRequest), so a node that
+    /// missed messages converges. `issuer` is the sender.
     BlockSync {
         issuer: u64,
         claims: Vec<Claim>,
         retracted: Vec<ClaimId>,
     },
-    /// Digest of the sender's shared claim set; a peer whose digest differs answers with its
-    /// BlockSync (anti-entropy).
+    /// Digest of the sender's own claims; a peer whose view of them differs sends SyncRequest
+    /// (anti-entropy).
     Digest {
         issuer: u64,
         digest: String,
+    },
+    /// The sender asks for the receiver's own claims (a BlockSync).
+    SyncRequest {
+        issuer: u64,
     },
     /// A detection made on this node by the orchestrator itself; never accepted from a peer.
     LocalDetection {
@@ -76,7 +80,8 @@ impl MeshCommand {
             MeshCommand::Claim { claim } => Some(claim.issuer),
             MeshCommand::Retract { issuer, .. }
             | MeshCommand::BlockSync { issuer, .. }
-            | MeshCommand::Digest { issuer, .. } => Some(*issuer),
+            | MeshCommand::Digest { issuer, .. }
+            | MeshCommand::SyncRequest { issuer } => Some(*issuer),
             MeshCommand::Telemetry { node_id, .. } => Some(*node_id),
             _ => None,
         }
