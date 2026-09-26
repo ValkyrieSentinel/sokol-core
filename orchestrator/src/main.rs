@@ -637,10 +637,14 @@ async fn execute_control(cmd: control::ControlCommand, ctx: &ControlCtx) -> Stri
                 return format!("ERR {} is protected ({})", shown, why);
             }
             let added =
-                blocks
+                match blocks
                     .lock()
                     .await
-                    .add_local(ip, ClaimKind::Operator, "operator", now_ms());
+                    .add_local(ip, ClaimKind::Operator, "operator", now_ms())
+                {
+                    Ok(added) => added,
+                    Err(why) => return format!("ERR {} not banned: {}", shown, why),
+                };
             sntl_db.append(format!("OPERATOR_BAN_{}|IP:{}", ip_tag(ip), shown));
             match added.applied {
                 Ok(()) => {
@@ -1079,10 +1083,21 @@ async fn enforce_block_local(
         ));
         return Enforcement::Refused;
     }
-    let added = blocks
+    let added = match blocks
         .lock()
         .await
-        .add_local(ip, ClaimKind::Detector, reason, now_ms());
+        .add_local(ip, ClaimKind::Detector, reason, now_ms())
+    {
+        Ok(added) => added,
+        Err(why) => {
+            log::error!("[Local Security] Not blocking {}: {}", shown, why);
+            sntl_db.append(format!(
+                "BLOCK_REFUSED|IP:{}|Why:{}|Reason:{}",
+                shown, why, reason
+            ));
+            return Enforcement::Refused;
+        }
+    };
     let ttl = added.ttl;
     // The claim is shared either way: peers can enforce it even if this node's map is full.
     let broadcast_cmd = MeshCommand::Claim { claim: added.claim };
@@ -1338,6 +1353,7 @@ async fn main() -> Result<(), anyhow::Error> {
                 .lock()
                 .await
                 .add_local(ip, ClaimKind::Static, "--block", now_ms())
+                .map_err(|why| anyhow::anyhow!("--block {}: {}", show(&ip), why))?
                 .applied?;
             sntl_db.append(format!(
                 "STATIC_BLOCK_{}|IP:{}|Action:XDP_DROP",
