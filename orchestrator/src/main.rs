@@ -766,26 +766,9 @@ async fn send_snapshot(
     crypto: &Arc<NodeCrypto>,
     dag: &Arc<tokio::sync::Mutex<DagTracker>>,
 ) {
-    let (claims, mut retracted) = blocks.lock().await.snapshot(now_ms());
+    let (claims, retracted) = blocks.lock().await.snapshot(now_ms());
     let total = claims.len();
-    // Always at least one message, so a peer learns about retractions even with no claims.
-    let mut chunks: Vec<Vec<block_table::Claim>> = claims
-        .chunks(mesh_sync::SYNC_CHUNK)
-        .map(|c| c.to_vec())
-        .collect();
-    if chunks.is_empty() {
-        chunks.push(Vec::new());
-    }
-    for (i, chunk) in chunks.into_iter().enumerate() {
-        let cmd = MeshCommand::BlockSync {
-            issuer: node_id,
-            claims: chunk,
-            retracted: if i == 0 {
-                std::mem::take(&mut retracted)
-            } else {
-                Vec::new()
-            },
-        };
+    for cmd in mesh_sync::pack_snapshot(node_id, claims, retracted) {
         if let Err(e) = registry.send_to(addr, &cmd, node_id, crypto, dag).await {
             log::warn!("[Mesh] Block sync to {} failed: {:#}", addr, e);
             return;

@@ -66,8 +66,53 @@ pub enum MeshCommand {
     },
 }
 
-/// Claims per BlockSync message (keeps each envelope well under the 128 KiB frame limit).
-pub const SYNC_CHUNK: usize = 250;
+/// JSON bytes one BlockSync may take: the transport's frame limit is 128 KiB, and the signature,
+/// envelope fields and framing need the rest (R26-02).
+pub const SNAPSHOT_PAYLOAD_BUDGET: usize = 112 * 1024;
+
+/// Splits a node's own claims and retractions into BlockSync messages whose JSON stays within
+/// SNAPSHOT_PAYLOAD_BUDGET, counting claims and retracted ids alike (a large tombstone list is
+/// split too). Always at least one message, so a peer learns about retractions with no claims.
+pub fn pack_snapshot(issuer: u64, claims: Vec<Claim>, retracted: Vec<ClaimId>) -> Vec<MeshCommand> {
+    let empty = MeshCommand::BlockSync {
+        issuer,
+        claims: Vec::new(),
+        retracted: Vec::new(),
+    };
+    // Envelope wrapper ({"Command":...}) and slack for separators.
+    let base = serde_json::to_vec(&empty).map_or(128, |v| v.len()) + 64;
+    let mut out = Vec::new();
+    let (mut cur_claims, mut cur_ids, mut size) = (Vec::new(), Vec::new(), base);
+    let flush = |out: &mut Vec<MeshCommand>, c: &mut Vec<Claim>, r: &mut Vec<ClaimId>| {
+        out.push(MeshCommand::BlockSync {
+            issuer,
+            claims: std::mem::take(c),
+            retracted: std::mem::take(r),
+        });
+    };
+    for claim in claims {
+        let n = serde_json::to_vec(&claim).map_or(1024, |v| v.len()) + 1;
+        if size + n > SNAPSHOT_PAYLOAD_BUDGET && !(cur_claims.is_empty() && cur_ids.is_empty()) {
+            flush(&mut out, &mut cur_claims, &mut cur_ids);
+            size = base;
+        }
+        size += n;
+        cur_claims.push(claim);
+    }
+    for id in retracted {
+        let n = id.len() + 3;
+        if size + n > SNAPSHOT_PAYLOAD_BUDGET && !(cur_claims.is_empty() && cur_ids.is_empty()) {
+            flush(&mut out, &mut cur_claims, &mut cur_ids);
+            size = base;
+        }
+        size += n;
+        cur_ids.push(id);
+    }
+    if !cur_claims.is_empty() || !cur_ids.is_empty() || out.is_empty() {
+        flush(&mut out, &mut cur_claims, &mut cur_ids);
+    }
+    out
+}
 
 /// How often each node sends its digest to its peers.
 pub const DIGEST_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);

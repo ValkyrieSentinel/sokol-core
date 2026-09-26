@@ -122,6 +122,20 @@ impl Claim {
     }
 }
 
+/// Longest reason a claim may carry (bounds the size of every claim, R26-02).
+pub const MAX_REASON_BYTES: usize = 512;
+
+fn bounded_reason(reason: &str) -> String {
+    if reason.len() <= MAX_REASON_BYTES {
+        return reason.to_string();
+    }
+    let mut end = MAX_REASON_BYTES;
+    while !reason.is_char_boundary(end) {
+        end -= 1;
+    }
+    reason[..end].to_string()
+}
+
 /// Pending kernel operations retried per tick (a full map must not cost a syscall per entry per s).
 pub const MAX_RETRIES_PER_TICK: usize = 256;
 
@@ -412,6 +426,10 @@ impl<B: Blocklist> BlockTable<B> {
         }
     }
 
+    fn retractions_full(&self) -> bool {
+        self.retractions.len() >= MAX_KNOWN_CLAIMS
+    }
+
     fn release_slot(&mut self, id: &ClaimId) {
         if let Some(h) = self.claims.get_mut(id) {
             if h.in_quota && h.claim.issuer != self.node_id {
@@ -490,7 +508,7 @@ impl<B: Blocklist> BlockTable<B> {
             target: show(&net),
             issued_ms: now_ms,
             expires_ms: ttl.map(|t| now_ms.saturating_add(ms(t))),
-            reason: reason.to_string(),
+            reason: bounded_reason(reason),
         };
         let id = claim.id();
         self.insert_held(
@@ -522,6 +540,9 @@ impl<B: Blocklist> BlockTable<B> {
         let Some(net) = claim.net() else {
             return Adoption::Refused("target is not canonical");
         };
+        if claim.reason.len() > MAX_REASON_BYTES {
+            return Adoption::Refused("reason too long");
+        }
         if claim.issuer == self.node_id {
             return Adoption::Refused("claims to be issued by this node");
         }
@@ -584,17 +605,31 @@ impl<B: Blocklist> BlockTable<B> {
                 }
                 None => Some(now_ms.saturating_add(ms(self.policy.max))),
             };
-            if !self.retractions.contains_key(id) && self.retractions.len() >= MAX_KNOWN_CLAIMS {
-                continue;
+            // R26-03: a new record takes the claim's end (or a bounded wait for an unseen claim);
+            // "forever" only where the claim itself never expires. Merging keeps the later end.
+            let full = self.retractions_full();
+            match self.retractions.entry(id.clone()) {
+                std::collections::hash_map::Entry::Vacant(v) => {
+                    if full {
+                        continue;
+                    }
+                    v.insert(Retraction {
+                        operator: false,
+                        by_nodes: vec![issuer],
+                        forget_ms,
+                    });
+                }
+                std::collections::hash_map::Entry::Occupied(mut o) => {
+                    let r = o.get_mut();
+                    if !r.by_nodes.contains(&issuer) && r.by_nodes.len() < MAX_RETRACTORS {
+                        r.by_nodes.push(issuer);
+                    }
+                    r.forget_ms = match (r.forget_ms, forget_ms) {
+                        (Some(a), Some(b)) => Some(a.max(b)),
+                        _ => None,
+                    };
+                }
             }
-            let r = self.retractions.entry(id.clone()).or_default();
-            if !r.by_nodes.contains(&issuer) && r.by_nodes.len() < MAX_RETRACTORS {
-                r.by_nodes.push(issuer);
-            }
-            r.forget_ms = match (r.forget_ms, forget_ms) {
-                (Some(a), Some(b)) => Some(a.max(b)),
-                _ => None,
-            };
             self.release_slot(id);
         }
         self.settle(touched, now_ms)
@@ -1663,6 +1698,56 @@ mod tests {
         assert!(t.operator_targets(T0).is_empty());
         assert!(t.is_blocked(ip("198.51.100.1")), "--block stays");
         assert_eq!(t.active(), 1);
+    }
+
+    #[test]
+    fn retractions_are_forgotten_after_their_horizon() {
+        // R26-03: a retraction record ends with its claim (or a bounded wait for an unseen one);
+        // only a claim that never expires keeps its tombstone.
+        let mut n2 = table(2, 64);
+        let finite = detect(&mut n2, "203.0.113.90", T0);
+        let mut n1 = table(1, 64);
+        n1.adopt(finite.clone(), true, T0);
+        n1.retract(2, &[finite.id()], T0);
+        n1.retract(2, &["f".repeat(64)], T0); // a claim n1 has never seen
+        let mut forever_src = BlockTable::with_lists(
+            FakeLists {
+                nets: HashSet::new(),
+                capacity: 8,
+                fail_delete: false,
+            },
+            TtlPolicy {
+                base: Duration::ZERO,
+                max: Duration::ZERO,
+            },
+            3,
+        );
+        let forever = detect(&mut forever_src, "203.0.113.91", T0);
+        n1.adopt(forever.clone(), true, T0);
+        n1.retract(3, &[forever.id()], T0);
+        assert_eq!(n1.retractions.len(), 3);
+        n1.tick(T0 + ms(POLICY.max) + S);
+        assert_eq!(
+            n1.retractions.keys().cloned().collect::<Vec<_>>(),
+            vec![forever.id()],
+            "finite and unseen tombstones end; the never-expiring claim keeps its own"
+        );
+    }
+
+    #[test]
+    fn a_claims_reason_is_bounded() {
+        let mut t = table(1, 8);
+        let long = "x".repeat(4 * MAX_REASON_BYTES);
+        let c = t
+            .add_local(ip("203.0.113.92"), ClaimKind::Detector, &long, T0)
+            .claim;
+        assert_eq!(c.reason.len(), MAX_REASON_BYTES);
+        let mut peer_claim = detect(&mut table(2, 8), "203.0.113.93", T0);
+        peer_claim.reason = long;
+        assert!(matches!(
+            t.adopt(peer_claim, true, T0),
+            Adoption::Refused(_)
+        ));
     }
 
     #[test]

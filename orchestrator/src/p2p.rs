@@ -37,7 +37,7 @@ use common::canonical::CanonicalParser;
 const ENVELOPE_DOMAIN: &[u8] = b"sokol-mesh-envelope-v1\0";
 pub const MAX_CLOCK_SKEW_MS: u64 = 30_000;
 const MAX_REPLAY_ENTRIES: usize = 100_000;
-const MAX_FRAME_BYTES: usize = 128 * 1024;
+pub const MAX_FRAME_BYTES: usize = 128 * 1024;
 
 pub fn now_ms() -> u64 {
     SystemTime::now()
@@ -1107,6 +1107,60 @@ mod tests {
                 (Err(_), false) => {}
                 (other, _) => panic!("unexpected delivery: {:?}", other.is_ok()),
             }
+        }
+    }
+
+    /// R26-02: every snapshot message, sealed and framed for real, fits the receiver's frame
+    /// limit, whatever the mix of claims (with maximal reasons) and tombstones; nothing is lost
+    /// or duplicated across messages.
+    #[tokio::test]
+    async fn every_snapshot_frame_fits_the_frame_limit() {
+        use crate::block_table::{Claim, ClaimKind, MAX_REASON_BYTES};
+        use crate::mesh_sync::pack_snapshot;
+        let crypto = NodeCrypto::generate();
+        let d = dag();
+        let claim = |i: u32| Claim {
+            issuer: 1,
+            kind: ClaimKind::Detector,
+            target: format!("10.{}.{}.{}", i / 65536, (i / 256) % 256, i % 256),
+            issued_ms: 1_700_000_000_000 + i as u64,
+            expires_ms: Some(1_800_000_000_000),
+            reason: "r".repeat(MAX_REASON_BYTES),
+        };
+        let cases: Vec<(Vec<Claim>, Vec<String>)> = vec![
+            (vec![], vec![]),
+            (vec![claim(1)], vec![]),
+            (vec![], (0..2500).map(|i| format!("{:064x}", i)).collect()),
+            (
+                (0..3000).map(claim).collect(),
+                (0..3000).map(|i| format!("{:064x}", i)).collect(),
+            ),
+        ];
+        for (claims, ids) in cases {
+            let msgs = pack_snapshot(1, claims.clone(), ids.clone());
+            assert!(!msgs.is_empty());
+            let (mut got_claims, mut got_ids) = (Vec::new(), Vec::new());
+            for m in msgs {
+                let env = seal(&crypto, 1, &NetworkMessage::Command(m.clone()), &d)
+                    .await
+                    .unwrap();
+                let frame = bincode::serialize(&env).unwrap();
+                assert!(
+                    frame.len() <= MAX_FRAME_BYTES,
+                    "frame of {} bytes over the {} limit",
+                    frame.len(),
+                    MAX_FRAME_BYTES
+                );
+                if let MeshCommand::BlockSync {
+                    claims, retracted, ..
+                } = m
+                {
+                    got_claims.extend(claims);
+                    got_ids.extend(retracted);
+                }
+            }
+            assert_eq!(got_claims, claims);
+            assert_eq!(got_ids, ids);
         }
     }
 
