@@ -266,6 +266,10 @@ pub struct Persisted {
     pub claims: Vec<Claim>,
     pub operator_lifts: Vec<(ClaimId, Option<u64>)>,
     pub retracted: Vec<(ClaimId, Option<u64>)>,
+    /// Local ends of peers' claims that were cut short here (R26-07): after a restart the same
+    /// claim does not get a new lease. (id, local end, the claim's own expiry)
+    #[serde(default)]
+    pub peer_ends: Vec<(ClaimId, u64, Option<u64>)>,
 }
 
 /// Block decisions (claims) with owners, and the kernel maps kept in line with them.
@@ -295,6 +299,8 @@ pub struct BlockTable<B = KernelBlocklist> {
     quorum: Quorum,
     active_by_issuer: HashMap<u64, usize>,
     waiting: HashMap<u64, std::collections::VecDeque<ClaimId>>,
+    /// Local ends of peers' claims cut short here, remembered across restarts (R26-07).
+    lease_ends: HashMap<ClaimId, (u64, Option<u64>)>,
     /// Nodes whose claims may count here (the pinned peers). `None` until configured: no
     /// restriction (tests). A peer removed from the peers file loses its claims' effect.
     pinned: Option<HashSet<u64>>,
@@ -336,6 +342,7 @@ impl<B: Blocklist> BlockTable<B> {
             active_by_issuer: HashMap::new(),
             waiting: HashMap::new(),
             pinned: None,
+            lease_ends: HashMap::new(),
         }
     }
 
@@ -646,7 +653,17 @@ impl<B: Blocklist> BlockTable<B> {
         }
         let envelope = *self.envelope(claim.issuer);
         let cap = now_ms.saturating_add(ms(self.policy.max.min(envelope.max_ttl)));
+        // A claim already given a lease here (before a restart) keeps that lease's end: the
+        // local cap bounds a claim's total effect, not each lifetime of this process (R26-07).
+        let cap = match self.lease_ends.get(&id) {
+            Some((end, _)) => cap.min(*end),
+            None => cap,
+        };
         let until_ms = Some(claim.expires_ms.map_or(cap, |e| e.min(cap)));
+        if claim.expires_ms.is_none_or(|e| e > cap) && !self.lease_ends.contains_key(&id) {
+            self.lease_ends.insert(id.clone(), (cap, claim.expires_ms));
+            self.dirty = true;
+        }
         let issuer = claim.issuer;
         let active = self.active_by_issuer.entry(issuer).or_insert(0);
         let in_quota = *active < envelope.max_active;
@@ -923,6 +940,12 @@ impl<B: Blocklist> BlockTable<B> {
         self.waiting.retain(|_, q| !q.is_empty());
         self.retractions
             .retain(|_, r| r.forget_ms.is_none_or(|f| f > now_ms));
+        let before = self.lease_ends.len();
+        self.lease_ends
+            .retain(|_, (_, expires)| expires.is_none_or(|e| e > now_ms));
+        if self.lease_ends.len() != before {
+            self.dirty = true;
+        }
         self.strikes
             .retain(|_, (_, last)| now_ms.saturating_sub(*last) <= ms(STRIKE_MEMORY));
         let mut lifted = self.settle(touched, now_ms);
@@ -1057,10 +1080,18 @@ impl<B: Blocklist> BlockTable<B> {
         }
         operator_lifts.sort();
         retracted.sort();
+        let mut peer_ends: Vec<(ClaimId, u64, Option<u64>)> = self
+            .lease_ends
+            .iter()
+            .filter(|(_, (_, expires))| expires.is_none_or(|e| e > now_ms))
+            .map(|(id, (end, expires))| (id.clone(), *end, *expires))
+            .collect();
+        peer_ends.sort();
         Persisted {
             claims,
             operator_lifts,
             retracted,
+            peer_ends,
         }
     }
 
@@ -1072,6 +1103,11 @@ impl<B: Blocklist> BlockTable<B> {
         allowed: impl Fn(IpNet) -> bool,
         now_ms: u64,
     ) -> (usize, usize) {
+        for (id, end, expires) in state.peer_ends {
+            if expires.is_none_or(|e| e > now_ms) && self.lease_ends.len() < MAX_KNOWN_CLAIMS {
+                self.lease_ends.insert(id, (end, expires));
+            }
+        }
         for (id, forget_ms) in state.operator_lifts {
             let r = self.retractions.entry(id).or_default();
             r.operator = true;
@@ -1975,6 +2011,41 @@ mod tests {
         n1.tick(T0 + ms(POLICY.max) + 5 * S);
         assert_eq!(n1.pending(), 0, "every target made progress");
         assert_eq!(n1.active(), 0);
+    }
+
+    #[test]
+    fn a_capped_peer_claim_gets_no_new_lease_after_a_restart() {
+        // R26-07: the review replayed the same never-expiring claim after a restart and it was
+        // enforced again for another max. The lease end is kept across restarts.
+        let mut peer = BlockTable::with_lists(
+            FakeLists {
+                nets: HashSet::new(),
+                capacity: 8,
+                fail_delete: false,
+                deletes: 0,
+            },
+            TtlPolicy {
+                base: Duration::ZERO,
+                max: Duration::ZERO,
+            },
+            2,
+        );
+        let forever = detect(&mut peer, "203.0.113.97", T0);
+        let mut n1 = table(1, 64);
+        assert_eq!(n1.adopt(forever.clone(), true, T0), Adoption::Enforced);
+        let after = T0 + ms(POLICY.max) + S;
+        n1.tick(after);
+        assert!(!n1.is_blocked(ip("203.0.113.97")));
+        let mut restarted = table(1, 64);
+        restarted.restore(n1.take_persisted(after), |_| true, after);
+        assert_eq!(
+            restarted.adopt(forever, true, after),
+            Adoption::Held("expired")
+        );
+        assert!(
+            !restarted.is_blocked(ip("203.0.113.97")),
+            "a new lease after the restart"
+        );
     }
 
     #[test]
