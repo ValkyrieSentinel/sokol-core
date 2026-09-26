@@ -718,12 +718,17 @@ async fn execute_control(cmd: control::ControlCommand, ctx: &ControlCtx) -> Stri
             Some(path) => match TrustStore::load(path) {
                 Ok(trust) => {
                     let per_peer = ctx.peer_limits.per_peer(&trust);
-                    ctx.blocks.lock().await.configure_peers(
-                        ctx.peer_limits.default,
-                        per_peer,
-                        ctx.peer_limits.quorum,
-                        now_ms(),
-                    );
+                    {
+                        let mut table = ctx.blocks.lock().await;
+                        table.configure_peers(
+                            ctx.peer_limits.default,
+                            per_peer,
+                            ctx.peer_limits.quorum,
+                            now_ms(),
+                        );
+                        // A revoked node's claims stop counting here at once.
+                        table.set_pinned(trust.node_ids(), now_ms());
+                    }
                     let pinned = ctx.registry.reload(trust);
                     log::warn!(
                         "[Control] Reloaded {}: {} pinned peers",
@@ -1187,12 +1192,16 @@ async fn main() -> Result<(), anyhow::Error> {
         args.node_id,
     )));
     let peer_limits = PeerLimits::from_args(&args);
-    blocks.lock().await.configure_peers(
-        peer_limits.default,
-        peer_limits.per_peer(&trust_store),
-        peer_limits.quorum,
-        now_ms(),
-    );
+    {
+        let mut table = blocks.lock().await;
+        table.configure_peers(
+            peer_limits.default,
+            peer_limits.per_peer(&trust_store),
+            peer_limits.quorum,
+            now_ms(),
+        );
+        table.set_pinned(trust_store.node_ids(), now_ms());
+    }
     let state_file = args
         .state_file
         .clone()
@@ -1547,20 +1556,34 @@ async fn main() -> Result<(), anyhow::Error> {
                     }
                 }
                 MeshCommand::Digest { issuer, digest } => {
-                    let own = blocks_mesh.lock().await.digest(now_ms());
-                    if own != digest {
+                    // Our view of the sender's own claims differs: ask the sender for them.
+                    let ours = blocks_mesh.lock().await.digest_of(issuer, now_ms());
+                    if ours != digest {
                         if let Some(addr) = registry_mesh.addr_of(issuer).await {
-                            log::info!("[Mesh] State differs from node {}; sending ours", issuer);
-                            send_snapshot(
-                                addr,
-                                &blocks_mesh,
-                                &registry_mesh,
-                                node_id_mesh,
-                                &crypto_mesh,
-                                &dag_mesh,
-                            )
-                            .await;
+                            log::info!(
+                                "[Mesh] Node {}'s claims differ from our view; asking it",
+                                issuer
+                            );
+                            let cmd = MeshCommand::SyncRequest {
+                                issuer: node_id_mesh,
+                            };
+                            let _ = registry_mesh
+                                .send_to(addr, &cmd, node_id_mesh, &crypto_mesh, &dag_mesh)
+                                .await;
                         }
+                    }
+                }
+                MeshCommand::SyncRequest { issuer } => {
+                    if let Some(addr) = registry_mesh.addr_of(issuer).await {
+                        send_snapshot(
+                            addr,
+                            &blocks_mesh,
+                            &registry_mesh,
+                            node_id_mesh,
+                            &crypto_mesh,
+                            &dag_mesh,
+                        )
+                        .await;
                     }
                 }
                 MeshCommand::LocalDetection { ip, reason } => {

@@ -251,9 +251,12 @@ claim keeps its own expiry but is enforced here for at most `--block-ttl-max`.
   "min_prefix_v4": 32, "min_prefix_v6": 128}` (unknown fields are refused; `RELOAD_PEERS` applies
   changes). Held claims are audited as `MESH_BLOCK_HELD` with the reason, and are still shared,
   so the mesh state converges whatever each node enforces.
-- Nodes exchange a digest of their shared claims every 15 s; a node whose digest differs sends its
-  state, so a node that missed messages (a partition, a full send queue) converges without waiting
-  for a reconnect. All nodes of a mesh must run this protocol version.
+- Every 15 s each node sends a digest of its own claims; a peer whose view of them differs asks
+  for them (SyncRequest), so a node that missed messages (a partition, a full send queue)
+  converges without waiting for a reconnect. A node speaks only for itself: a snapshot carrying
+  another node's claim closes the connection, so one peer cannot forge quorum votes. Connect the
+  nodes as a full mesh. A node removed from the peers file loses its claims' effect on
+  `RELOAD_PEERS`. All nodes of a mesh must run this protocol version.
 
 Blocks can be single addresses or CIDR prefixes (`--block 198.51.100.0/24`, `BAN_IP:198.51.100.0/24`
 on the control socket, `SIGNAL:<source>|<prefix>|-|<reason>`, CrowdSec range decisions, mesh and
