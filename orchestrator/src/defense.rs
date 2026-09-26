@@ -28,44 +28,74 @@ pub fn flags(base: u32, mode: StormMode, engaged: bool) -> u32 {
     }
 }
 
-pub struct Defense {
-    config: Mutex<Array<MapData, u32>>,
-    base: u32,
-    mode: StormMode,
-    strict: AtomicBool,
+/// Where the flags go (the XDP CONFIG map; a stand-in in tests).
+pub trait ConfigMap: Send {
+    fn write(&mut self, flags: u32) -> Result<(), aya::maps::MapError>;
 }
 
-impl Defense {
-    pub fn new(config: Array<MapData, u32>, base: u32, mode: StormMode) -> Self {
+impl ConfigMap for Array<MapData, u32> {
+    fn write(&mut self, flags: u32) -> Result<(), aya::maps::MapError> {
+        self.set(0, flags, 0)
+    }
+}
+
+/// Desired and applied mode kept apart (R26-08): a CONFIG write that fails is retried by
+/// `reconcile` on every tick until the kernel holds the desired flags, instead of leaving strict
+/// flags in force after a storm (or missing them during one) until the next transition.
+pub struct Defense<M = Array<MapData, u32>> {
+    config: Mutex<M>,
+    base: u32,
+    mode: StormMode,
+    desired: AtomicBool,
+    /// Flags last written successfully, or u32::MAX before the first success.
+    applied: std::sync::atomic::AtomicU32,
+}
+
+impl<M: ConfigMap> Defense<M> {
+    pub fn new(config: M, base: u32, mode: StormMode) -> Self {
         Self {
             config: Mutex::new(config),
             base,
             mode,
-            strict: AtomicBool::new(false),
+            desired: AtomicBool::new(false),
+            applied: std::sync::atomic::AtomicU32::new(u32::MAX),
         }
     }
 
-    /// Applies the state to the kernel; returns the flags written.
+    /// Records the latch's state and applies it; returns the flags written.
     pub fn set(&self, engaged: bool) -> Result<u32, aya::maps::MapError> {
-        let value = flags(self.base, self.mode, engaged);
+        self.desired.store(engaged, Ordering::Relaxed);
+        self.reconcile()
+    }
+
+    /// Writes the desired flags if the kernel does not hold them yet.
+    pub fn reconcile(&self) -> Result<u32, aya::maps::MapError> {
+        let value = flags(self.base, self.mode, self.desired.load(Ordering::Relaxed));
+        if self.applied.load(Ordering::Relaxed) == value {
+            return Ok(value);
+        }
         self.config
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .set(0, value, 0)?;
-        self.strict.store(
-            value & STORM_FLAGS != self.base & STORM_FLAGS,
-            Ordering::Relaxed,
-        );
+            .write(value)?;
+        self.applied.store(value, Ordering::Relaxed);
         Ok(value)
+    }
+
+    /// Whether the kernel does not hold the desired flags yet.
+    pub fn pending(&self) -> bool {
+        self.applied.load(Ordering::Relaxed)
+            != flags(self.base, self.mode, self.desired.load(Ordering::Relaxed))
     }
 
     pub fn mode(&self) -> StormMode {
         self.mode
     }
 
-    /// Whether storm flags beyond the operator's are in force.
+    /// Whether storm flags beyond the operator's are in force in the kernel.
     pub fn strict(&self) -> bool {
-        self.strict.load(Ordering::Relaxed)
+        let applied = self.applied.load(Ordering::Relaxed);
+        applied != u32::MAX && applied & STORM_FLAGS != self.base & STORM_FLAGS
     }
 }
 
@@ -86,6 +116,47 @@ mod tests {
             0,
             "observe changes nothing"
         );
+    }
+
+    struct Flaky {
+        fail: bool,
+        value: Option<u32>,
+    }
+
+    impl ConfigMap for Flaky {
+        fn write(&mut self, flags: u32) -> Result<(), aya::maps::MapError> {
+            if self.fail {
+                return Err(aya::maps::MapError::ElementNotFound);
+            }
+            self.value = Some(flags);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_failed_config_write_is_retried_until_the_kernel_holds_the_desired_mode() {
+        // R26-08: the latch transitions once; the kernel must still reach the desired flags.
+        let d = Defense::new(
+            Flaky {
+                fail: false,
+                value: None,
+            },
+            0,
+            StormMode::Strict,
+        );
+        d.set(true).unwrap();
+        d.config.lock().unwrap().fail = true;
+        assert!(d.set(false).is_err(), "Disengage fails");
+        assert!(d.pending());
+        assert!(
+            d.strict(),
+            "the kernel still holds strict flags, and says so"
+        );
+        d.config.lock().unwrap().fail = false;
+        d.reconcile().unwrap(); // the next tick
+        assert!(!d.pending());
+        assert!(!d.strict());
+        assert_eq!(d.config.lock().unwrap().value, Some(0));
     }
 
     #[test]

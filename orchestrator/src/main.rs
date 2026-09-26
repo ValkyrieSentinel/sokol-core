@@ -2164,6 +2164,12 @@ async fn main() -> Result<(), anyhow::Error> {
                 }
                 snapshot.p2p_peers = peer_registry.peer_count().await;
                 snapshot.audit_queue_overflow = sntl_db.overflow_total();
+                // R26-08: a CONFIG write that failed at a latch transition is retried here.
+                if defense.pending() {
+                    if let Err(e) = defense.reconcile() {
+                        log::error!("[Defense] XDP config still not updated: {:?}", e);
+                    }
+                }
                 snapshot.defense_strict = defense.strict();
                 let audit = sntl_db.status();
                 snapshot.audit_healthy = audit.healthy;
