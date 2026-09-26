@@ -600,6 +600,7 @@ impl PeerLimits {
 }
 
 struct ControlCtx {
+    state: Arc<StateStore>,
     peer_limits: PeerLimits,
     blocks: SharedBlockTable,
     policy: Arc<BlockPolicy>,
@@ -790,7 +791,77 @@ fn save_state(path: &std::path::Path, state: &Persisted) -> std::io::Result<()> 
         .open(&tmp)?;
     f.write_all(&serde_json::to_vec(state).map_err(std::io::Error::other)?)?;
     f.sync_all()?;
-    std::fs::rename(&tmp, path)
+    std::fs::rename(&tmp, path)?;
+    // The rename is durable only once the directory entry is (R26-04).
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::File::open(dir)?.sync_all()?;
+    }
+    Ok(())
+}
+
+/// Durable block state (R26-04). One writer at a time, so an older snapshot never overwrites a
+/// newer one; the write runs off the async runtime.
+///
+/// Contract: an operator decision (BAN/UNBAN/FLUSH) is written before the control socket answers
+/// OK. A detector decision answered `OK applied` is in the kernel and is written within one tick
+/// (<= 1 s): a crash in that second loses it locally (detectors re-signal and peers resend their
+/// claims). A graceful shutdown writes the last state.
+struct StateStore {
+    path: std::path::PathBuf,
+    writer: tokio::sync::Mutex<()>,
+    healthy: std::sync::atomic::AtomicBool,
+}
+
+impl StateStore {
+    fn new(path: std::path::PathBuf) -> Self {
+        Self {
+            path,
+            writer: tokio::sync::Mutex::new(()),
+            healthy: std::sync::atomic::AtomicBool::new(true),
+        }
+    }
+
+    fn healthy(&self) -> bool {
+        self.healthy.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Writes the table's durable part if it changed. On failure the table stays dirty (the next
+    /// call retries) and the store reports itself unhealthy.
+    async fn persist(&self, blocks: &SharedBlockTable) -> Result<(), String> {
+        use std::sync::atomic::Ordering;
+        let _one_writer = self.writer.lock().await;
+        let state = {
+            let mut table = blocks.lock().await;
+            table.dirty().then(|| table.take_persisted(now_ms()))
+        };
+        let Some(state) = state else {
+            return Ok(());
+        };
+        let path = self.path.clone();
+        let result = tokio::task::spawn_blocking(move || save_state(&path, &state))
+            .await
+            .map_err(|e| e.to_string())
+            .and_then(|r| r.map_err(|e| e.to_string()));
+        match result {
+            Ok(()) => {
+                if !self.healthy.swap(true, Ordering::Relaxed) {
+                    log::warn!("[State] {} writable again", self.path.display());
+                }
+                Ok(())
+            }
+            Err(e) => {
+                blocks.lock().await.mark_dirty();
+                if self.healthy.swap(false, Ordering::Relaxed) {
+                    log::error!(
+                        "[State] Cannot write {}: {}; node is DEGRADED, retrying",
+                        self.path.display(),
+                        e
+                    );
+                }
+                Err(e)
+            }
+        }
+    }
 }
 
 struct IpcCtx {
@@ -1189,6 +1260,7 @@ async fn main() -> Result<(), anyhow::Error> {
         .state_file
         .clone()
         .unwrap_or_else(|| std::path::PathBuf::from(format!("{}.blocks.json", args.db_path)));
+    let state_store = Arc::new(StateStore::new(state_file.clone()));
 
     let stats_map_data = bpf
         .take_map("STATS")
@@ -1721,6 +1793,7 @@ async fn main() -> Result<(), anyhow::Error> {
     let control_listener = bind_private_socket(&args.control_socket, control_gid)?;
     let control_slots = Arc::new(tokio::sync::Semaphore::new(CONTROL_MAX_CONNS));
     let ctl_ctx = Arc::new(ControlCtx {
+        state: state_store.clone(),
         peer_limits,
         blocks: blocks.clone(),
         policy: block_policy.clone(),
@@ -1762,7 +1835,21 @@ async fn main() -> Result<(), anyhow::Error> {
                         Ok(Ok(_)) => {}
                     }
                     let reply = match control::parse(&line) {
-                        Ok(cmd) => execute_control(cmd, &ctx).await,
+                        Ok(cmd) => {
+                            use control::ControlCommand as C;
+                            let mutating = matches!(
+                                cmd,
+                                C::Ban(_) | C::Unban(_) | C::FlushDynamic | C::FlushAll
+                            );
+                            let mut reply = execute_control(cmd, &ctx).await;
+                            // R26-04: an operator decision is on disk before it is answered OK.
+                            if mutating && reply.starts_with("OK") {
+                                if let Err(e) = ctx.state.persist(&ctx.blocks).await {
+                                    reply = format!("{}; WARNING: not persisted ({})", reply, e);
+                                }
+                            }
+                            reply
+                        }
                         Err(e) => format!("ERR {}", e),
                     };
                     if write_half
@@ -1949,7 +2036,6 @@ async fn main() -> Result<(), anyhow::Error> {
     );
     let node_id_tick = args.node_id;
     let mut last_digest = std::time::Instant::now();
-    let mut state_error = false;
     let mut telemetry_window_start = std::time::Instant::now();
     let mut window_rx = 0u64;
     let mut window_dropped = 0u64;
@@ -2011,23 +2097,9 @@ async fn main() -> Result<(), anyhow::Error> {
                     sntl_db.append(format!("BLOCK_EXPIRED_{}|IP:{}", ip_tag(ip), show(&ip)));
                 }
 
-                // ADR-4: this node's decisions and lifts survive a restart.
-                let state = {
-                    let mut table = blocks.lock().await;
-                    table.dirty().then(|| table.take_persisted(now_ms()))
-                };
-                if let Some(state) = state {
-                    match save_state(&state_file, &state) {
-                        Ok(()) => state_error = false,
-                        Err(e) => {
-                            if !state_error {
-                                log::error!("[State] Cannot write {}: {}; retrying", state_file.display(), e);
-                            }
-                            state_error = true;
-                            blocks.lock().await.mark_dirty();
-                        }
-                    }
-                }
+                // ADR-4: this node's decisions and lifts survive a restart (<= 1 tick for detector
+                // decisions; operator decisions are written before they are answered).
+                let _ = state_store.persist(&blocks).await;
 
                 // ADR-3 anti-entropy: a peer whose digest differs answers with its state.
                 if last_digest.elapsed() >= mesh_sync::DIGEST_INTERVAL {
@@ -2037,7 +2109,7 @@ async fn main() -> Result<(), anyhow::Error> {
                     let _ = registry_tick.broadcast(&cmd, node_id_tick, &crypto_tick, &dag_tick).await;
                 }
 
-                let mode = if sntl_db.status().healthy { "NORMAL" } else { "DEGRADED" };
+                let mode = if sntl_db.status().healthy && state_store.healthy() { "NORMAL" } else { "DEGRADED" };
                 let hb_msg = format!("HEARTBEAT:ID={}|NAME=Sokol-Node-{}|EP={}|MODE={}|CTL={}\n", node_id_hb, node_id_hb, p2p_bind_hb, mode, control_socket_hb);
                 push_telemetry(&hb_msg).await;
 
@@ -2079,6 +2151,7 @@ async fn main() -> Result<(), anyhow::Error> {
                 snapshot.defense_strict = defense.strict();
                 let audit = sntl_db.status();
                 snapshot.audit_healthy = audit.healthy;
+                snapshot.state_healthy = state_store.healthy();
                 snapshot.audit_write_errors = audit.write_errors + audit.sync_errors;
                 snapshot.audit_lost = audit.lost;
                 snapshot.audit_sync_age_ms = audit.last_sync_age_ms;
@@ -2174,6 +2247,10 @@ async fn main() -> Result<(), anyhow::Error> {
         {
             log::error!("[Flowspec] Worker did not finish withdrawing in time");
         }
+    }
+    // The last decisions since the previous tick (R26-04).
+    if let Err(e) = state_store.persist(&blocks).await {
+        log::error!("[State] Shutdown without a final state write: {}", e);
     }
     sntl_db.append("NODE_SHUTDOWN".to_string());
     if !sntl_db.flush(Duration::from_secs(2)) {
