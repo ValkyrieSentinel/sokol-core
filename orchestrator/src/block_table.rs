@@ -210,6 +210,8 @@ struct Held {
     allowed: bool,
     /// Holds one of its issuer's enforcement slots (always true for this node's claims).
     in_quota: bool,
+    /// Its local end has been handled (so an ended claim is not re-examined every tick).
+    ended: bool,
 }
 
 #[derive(Default)]
@@ -282,6 +284,10 @@ pub struct BlockTable<B = KernelBlocklist> {
     by_target: HashMap<IpNet, HashSet<ClaimId>>,
     applied: HashSet<IpNet>,
     pending: HashSet<IpNet>,
+    /// Targets to retry, oldest first (R26-06): each is retried at most once per tick, and a
+    /// target that keeps failing goes to the back, so it cannot starve the others.
+    retry: std::collections::VecDeque<IpNet>,
+    queued: HashSet<IpNet>,
     strikes: HashMap<IpNet, (u32, u64)>,
     dirty: bool,
     default_envelope: Envelope,
@@ -320,6 +326,8 @@ impl<B: Blocklist> BlockTable<B> {
             by_target: HashMap::new(),
             applied: HashSet::new(),
             pending: HashSet::new(),
+            retry: std::collections::VecDeque::new(),
+            queued: HashSet::new(),
             strikes: HashMap::new(),
             dirty: false,
             default_envelope: Envelope::unlimited(policy.max),
@@ -472,6 +480,9 @@ impl<B: Blocklist> BlockTable<B> {
             self.pending.remove(&net);
         } else {
             self.pending.insert(net);
+            if self.queued.insert(net) {
+                self.retry.push_back(net);
+            }
         }
         result
     }
@@ -485,7 +496,19 @@ impl<B: Blocklist> BlockTable<B> {
     }
 
     /// A decision made on this node. The caller has checked the never-block policy.
-    pub fn add_local(&mut self, net: IpNet, kind: ClaimKind, reason: &str, now_ms: u64) -> Added {
+    ///
+    /// Repeats are coalesced (R26-05): a repeat adds a claim only if it would extend this node's
+    /// longest own claim on the target by at least a quarter of its lifetime (so escalation still
+    /// doubles the block, and a target at the cap gets a new claim at most every max/4). When a new detector claim does outlast the older ones, they are retracted
+    /// mesh-wide, so a target carries a handful of own claims however often it is signalled.
+    /// A new claim beyond MAX_KNOWN_CLAIMS is refused.
+    pub fn add_local(
+        &mut self,
+        net: IpNet,
+        kind: ClaimKind,
+        reason: &str,
+        now_ms: u64,
+    ) -> Result<Added, &'static str> {
         let net = canonical(net);
         let ttl = match kind {
             ClaimKind::Static | ClaimKind::Operator => None,
@@ -501,13 +524,62 @@ impl<B: Blocklist> BlockTable<B> {
                 Some(self.policy.base.saturating_mul(factor).min(self.policy.max))
             }
         };
-        // Each repeat is its own claim, so a shorter repeat cannot cut a longer running block.
+        let new_end = ttl.map(|t| now_ms.saturating_add(ms(t)));
+        // This node's own effective claims of the same kind on the target.
+        let own: Vec<(ClaimId, Option<u64>)> = self
+            .by_target
+            .get(&net)
+            .into_iter()
+            .flatten()
+            .filter_map(|id| {
+                let h = self.claims.get(id)?;
+                (h.claim.issuer == self.node_id
+                    && h.claim.kind == kind
+                    && self.effective(id, h, now_ms))
+                .then(|| (id.clone(), h.claim.expires_ms))
+            })
+            .collect();
+        let longest = own.iter().map(|(_, e)| *e).max_by(|a, b| match (a, b) {
+            (None, None) => std::cmp::Ordering::Equal,
+            (None, _) => std::cmp::Ordering::Greater,
+            (_, None) => std::cmp::Ordering::Less,
+            (Some(x), Some(y)) => x.cmp(y),
+        });
+        if let Some(longest) = longest {
+            let enough = match (longest, new_end, ttl) {
+                (None, _, _) => true,
+                (Some(_), None, _) => false,
+                // A new claim only if it extends the block by at least a quarter of its lifetime.
+                (Some(have), Some(want), Some(t)) => want < have.saturating_add(ms(t) / 4),
+                (Some(have), Some(want), None) => have >= want,
+            };
+            if enough {
+                let id = own
+                    .iter()
+                    .find(|(_, e)| *e == longest)
+                    .map(|(id, _)| id.clone())
+                    .expect("longest is one of them");
+                let claim = self.claims[&id].claim.clone();
+                let applied = self.reconcile(net, now_ms);
+                let left = claim
+                    .expires_ms
+                    .map(|e| Duration::from_millis(e.saturating_sub(now_ms)));
+                return Ok(Added {
+                    claim,
+                    ttl: left,
+                    applied,
+                });
+            }
+        }
+        if self.claims.len() >= MAX_KNOWN_CLAIMS {
+            return Err("too many known claims");
+        }
         let claim = Claim {
             issuer: self.node_id,
             kind,
             target: show(&net),
             issued_ms: now_ms,
-            expires_ms: ttl.map(|t| now_ms.saturating_add(ms(t))),
+            expires_ms: new_end,
             reason: bounded_reason(reason),
         };
         let id = claim.id();
@@ -519,17 +591,33 @@ impl<B: Blocklist> BlockTable<B> {
                 net,
                 allowed: true,
                 in_quota: true,
+                ended: false,
             },
         );
+        // Older own detector claims the new one outlasts are redundant: take them back.
+        if kind == ClaimKind::Detector {
+            let outlasted: Vec<ClaimId> = own
+                .iter()
+                .filter(|(_, e)| match (e, new_end) {
+                    (Some(e), Some(n)) => *e <= n,
+                    (_, None) => true,
+                    (None, Some(_)) => false,
+                })
+                .map(|(id, _)| id.clone())
+                .collect();
+            if !outlasted.is_empty() {
+                self.retract(self.node_id, &outlasted, now_ms);
+            }
+        }
         if kind != ClaimKind::Static {
             self.dirty = true;
         }
         let applied = self.reconcile(net, now_ms);
-        Added {
+        Ok(Added {
             claim,
             ttl,
             applied,
-        }
+        })
     }
 
     /// A claim from a peer (live or in a snapshot). `allowed` is the local never-block verdict.
@@ -578,6 +666,7 @@ impl<B: Blocklist> BlockTable<B> {
                 until_ms,
                 allowed,
                 in_quota,
+                ended: false,
             },
         );
         let was = self.applied.contains(&net);
@@ -767,13 +856,14 @@ impl<B: Blocklist> BlockTable<B> {
     /// Ends what ran out, forgets what can no longer matter (claims past their global expiry and
     /// their retractions) and retries pending map operations. Returns targets no longer blocked.
     pub fn tick(&mut self, now_ms: u64) -> Vec<IpNet> {
-        let mut touched: Vec<IpNet> = self
-            .claims
-            .values()
-            .filter(|h| h.until_ms.is_some_and(|u| u <= now_ms))
-            .map(|h| h.net)
-            .collect();
-        touched.extend(self.pending.iter().copied().take(MAX_RETRIES_PER_TICK));
+        // Claims whose local end came are handled once, not on every later tick (R26-06).
+        let mut touched: Vec<IpNet> = Vec::new();
+        for h in self.claims.values_mut() {
+            if !h.ended && h.until_ms.is_some_and(|u| u <= now_ms) {
+                h.ended = true;
+                touched.push(h.net);
+            }
+        }
 
         let dead: Vec<ClaimId> = self
             .claims
@@ -823,6 +913,7 @@ impl<B: Blocklist> BlockTable<B> {
                     if !h.in_quota && h.claim.live_at(now_ms) {
                         h.in_quota = true;
                         h.until_ms = Some(h.claim.expires_ms.map_or(cap, |e| e.min(cap)));
+                        h.ended = false;
                         *self.active_by_issuer.entry(issuer).or_insert(0) += 1;
                         touched.push(h.net);
                     }
@@ -834,7 +925,19 @@ impl<B: Blocklist> BlockTable<B> {
             .retain(|_, r| r.forget_ms.is_none_or(|f| f > now_ms));
         self.strikes
             .retain(|_, (_, last)| now_ms.saturating_sub(*last) <= ms(STRIKE_MEMORY));
-        self.settle(touched, now_ms)
+        let mut lifted = self.settle(touched, now_ms);
+        // Retries: at most MAX_RETRIES_PER_TICK targets, each once, in queue order.
+        let n = self.retry.len().min(MAX_RETRIES_PER_TICK);
+        for _ in 0..n {
+            let Some(net) = self.retry.pop_front() else {
+                break;
+            };
+            self.queued.remove(&net);
+            if self.pending.contains(&net) {
+                lifted.extend(self.settle(vec![net], now_ms));
+            }
+        }
+        lifted
     }
 
     /// Blocks the kernel enforces (for metrics and Flowspec).
@@ -1008,6 +1111,7 @@ impl<B: Blocklist> BlockTable<B> {
                     net,
                     allowed: ok,
                     in_quota: true,
+                    ended: false,
                 },
             );
             nets.push(net);
@@ -1115,6 +1219,7 @@ mod tests {
         nets: HashSet<IpNet>,
         capacity: usize,
         fail_delete: bool,
+        deletes: usize,
     }
 
     impl Blocklist for FakeLists {
@@ -1130,6 +1235,7 @@ mod tests {
         }
 
         fn delete(&mut self, net: IpNet) -> Result<(), MapError> {
+            self.deletes += 1;
             if self.fail_delete {
                 return Err(MapError::ElementNotFound);
             }
@@ -1147,6 +1253,7 @@ mod tests {
                 nets: HashSet::new(),
                 capacity,
                 fail_delete: false,
+                deletes: 0,
             },
             POLICY,
             node,
@@ -1155,6 +1262,7 @@ mod tests {
 
     fn detect(t: &mut BlockTable<FakeLists>, target: &str, now: u64) -> Claim {
         t.add_local(ip(target), ClaimKind::Detector, "test", now)
+            .unwrap()
             .claim
     }
 
@@ -1162,16 +1270,24 @@ mod tests {
     fn detector_blocks_escalate_and_are_capped() {
         let mut t = table(1, 64);
         let a = ip("203.0.113.1");
-        let ttl =
-            |t: &mut BlockTable<FakeLists>, now| t.add_local(a, ClaimKind::Detector, "x", now).ttl;
+        let ttl = |t: &mut BlockTable<FakeLists>, now| {
+            t.add_local(a, ClaimKind::Detector, "x", now).unwrap().ttl
+        };
         assert_eq!(ttl(&mut t, T0), Some(Duration::from_secs(60)));
         assert_eq!(ttl(&mut t, T0), Some(Duration::from_secs(120)));
         assert_eq!(ttl(&mut t, T0), Some(Duration::from_secs(240)));
         assert_eq!(ttl(&mut t, T0), Some(Duration::from_secs(480)));
+        // At the cap a repeat that would not extend the block by a quarter is coalesced: it
+        // reports the running block instead of adding a claim.
         for _ in 0..40 {
-            assert_eq!(ttl(&mut t, T0), Some(Duration::from_secs(600)), "capped");
+            assert_eq!(ttl(&mut t, T0), Some(Duration::from_secs(480)));
         }
-        let later = T0 + ms(STRIKE_MEMORY) + S;
+        assert_eq!(
+            ttl(&mut t, T0 + 150 * S),
+            Some(Duration::from_secs(600)),
+            "capped"
+        );
+        let later = T0 + 150 * S + ms(STRIKE_MEMORY) + S;
         assert_eq!(
             ttl(&mut t, later),
             Some(Duration::from_secs(60)),
@@ -1202,6 +1318,7 @@ mod tests {
                 nets: HashSet::new(),
                 capacity: 8,
                 fail_delete: false,
+                deletes: 0,
             },
             TtlPolicy {
                 base: Duration::ZERO,
@@ -1211,6 +1328,7 @@ mod tests {
         );
         let c = t
             .add_local(ip("203.0.113.5"), ClaimKind::Detector, "x", T0)
+            .unwrap()
             .claim;
         assert_eq!(c.expires_ms, None);
         assert!(t.tick(T0 + 10_000_000 * S).is_empty());
@@ -1221,7 +1339,7 @@ mod tests {
     fn only_the_configuration_lifts_a_static_block() {
         let mut t = table(1, 64);
         let a = ip("198.51.100.1");
-        t.add_local(a, ClaimKind::Static, "--block", T0);
+        t.add_local(a, ClaimKind::Static, "--block", T0).unwrap();
         assert_eq!(t.lift(a, T0), Err(LiftError::Static));
         detect(&mut t, "198.51.100.1", T0);
         assert_eq!(
@@ -1238,6 +1356,7 @@ mod tests {
         let mut t = table(1, 64);
         let a = ip("198.51.100.3");
         t.add_local(a, ClaimKind::Operator, "operator", T0)
+            .unwrap()
             .applied
             .unwrap();
         assert!(
@@ -1310,6 +1429,7 @@ mod tests {
                 nets: HashSet::new(),
                 capacity: 64,
                 fail_delete: false,
+                deletes: 0,
             },
             TtlPolicy {
                 base: Duration::from_secs(7 * 86_400),
@@ -1341,8 +1461,15 @@ mod tests {
                 day
             );
         }
-        let fresh = detect(&mut peer, "203.0.113.12", T0 + 3 * S);
-        assert_eq!(n1.adopt(fresh, true, T0 + 3 * S), Adoption::Enforced);
+        // A repeat on the peer within a quarter of the block's lifetime is the same decision
+        // (coalesced, R26-05), so the lift still holds against it...
+        let repeat = detect(&mut peer, "203.0.113.12", T0 + 3 * S);
+        assert_eq!(repeat.id(), long.id());
+        // ...while a detection that extends the block by a quarter or more is a new claim.
+        let later = T0 + 2 * 86_400 * S;
+        let fresh = detect(&mut peer, "203.0.113.12", later);
+        assert_ne!(fresh.id(), long.id());
+        assert_eq!(n1.adopt(fresh, true, later), Adoption::Enforced);
     }
 
     #[test]
@@ -1352,6 +1479,7 @@ mod tests {
                 nets: HashSet::new(),
                 capacity: 8,
                 fail_delete: false,
+                deletes: 0,
             },
             TtlPolicy {
                 base: Duration::ZERO,
@@ -1376,7 +1504,9 @@ mod tests {
         // F01: desired and applied are kept apart.
         let mut t = table(1, 1);
         detect(&mut t, "198.51.100.20", T0);
-        let added = t.add_local(ip("198.51.100.21"), ClaimKind::Detector, "x", T0 + 30 * S);
+        let added = t
+            .add_local(ip("198.51.100.21"), ClaimKind::Detector, "x", T0 + 30 * S)
+            .unwrap();
         assert!(added.applied.is_err());
         assert_eq!(
             (t.active(), t.pending()),
@@ -1427,6 +1557,7 @@ mod tests {
         let mut n2 = table(2, 8);
         let op = n2
             .add_local(ip("203.0.113.16"), ClaimKind::Operator, "x", T0)
+            .unwrap()
             .claim;
         assert!(matches!(n1.adopt(op, true, T0), Adoption::Refused(_)));
         let mut odd = detect(&mut n2, "203.0.113.17", T0);
@@ -1515,7 +1646,8 @@ mod tests {
         let mut n1 = table(1, 64);
         n1.adopt(theirs, true, T0);
         let mine = detect(&mut n1, "203.0.113.41", T0);
-        n1.add_local(ip("203.0.113.42"), ClaimKind::Operator, "x", T0);
+        n1.add_local(ip("203.0.113.42"), ClaimKind::Operator, "x", T0)
+            .unwrap();
         let (lifted_nets, lifted) = n1.flush_detector(T0);
         assert_eq!(lifted_nets.len(), 2);
         assert_eq!(lifted.retracted, vec![mine.id()]);
@@ -1528,7 +1660,8 @@ mod tests {
         let mut n2 = table(2, 64);
         let theirs = detect(&mut n2, "203.0.113.50", T0);
         let mut n1 = table(1, 64);
-        n1.add_local(ip("203.0.113.51"), ClaimKind::Operator, "op", T0);
+        n1.add_local(ip("203.0.113.51"), ClaimKind::Operator, "op", T0)
+            .unwrap();
         detect(&mut n1, "203.0.113.52", T0);
         n1.adopt(theirs.clone(), true, T0);
         n1.lift(ip("203.0.113.50"), T0).unwrap();
@@ -1685,9 +1818,12 @@ mod tests {
     #[test]
     fn operator_bans_can_be_listed_and_flushed_with_everything_but_static() {
         let mut t = table(1, 64);
-        t.add_local(ip("198.51.100.1"), ClaimKind::Static, "--block", T0);
-        t.add_local(ip("198.51.100.2"), ClaimKind::Operator, "op", T0);
-        t.add_local(ip("198.51.100.0/24"), ClaimKind::Operator, "op", T0);
+        t.add_local(ip("198.51.100.1"), ClaimKind::Static, "--block", T0)
+            .unwrap();
+        t.add_local(ip("198.51.100.2"), ClaimKind::Operator, "op", T0)
+            .unwrap();
+        t.add_local(ip("198.51.100.0/24"), ClaimKind::Operator, "op", T0)
+            .unwrap();
         detect(&mut t, "198.51.100.3", T0);
         assert_eq!(
             t.operator_targets(T0),
@@ -1715,6 +1851,7 @@ mod tests {
                 nets: HashSet::new(),
                 capacity: 8,
                 fail_delete: false,
+                deletes: 0,
             },
             TtlPolicy {
                 base: Duration::ZERO,
@@ -1740,6 +1877,7 @@ mod tests {
         let long = "x".repeat(4 * MAX_REASON_BYTES);
         let c = t
             .add_local(ip("203.0.113.92"), ClaimKind::Detector, &long, T0)
+            .unwrap()
             .claim;
         assert_eq!(c.reason.len(), MAX_REASON_BYTES);
         let mut peer_claim = detect(&mut table(2, 8), "203.0.113.93", T0);
@@ -1748,6 +1886,95 @@ mod tests {
             t.adopt(peer_claim, true, T0),
             Adoption::Refused(_)
         ));
+    }
+
+    #[test]
+    fn repeated_detections_of_one_target_keep_a_handful_of_claims() {
+        // R26-05: the review stored 262 145 claims for one address; repeats are coalesced now.
+        let mut t = table(1, 64);
+        for i in 0..20_000u64 {
+            t.add_local(ip("203.0.113.95"), ClaimKind::Detector, "x", T0 + i * 10)
+                .unwrap();
+        }
+        assert!(
+            t.claims.len() <= 8,
+            "{} claims for one target",
+            t.claims.len()
+        );
+        assert!(t.is_blocked(ip("203.0.113.95")));
+        // The claims it replaced are taken back, so peers drop them too.
+        let (shared, own_retracted) = t.snapshot(T0 + 200_000 * S / 1000);
+        assert_eq!(shared.len(), 1);
+        assert!(own_retracted.len() + 1 >= t.claims.len());
+    }
+
+    #[test]
+    fn local_claims_respect_the_known_claims_cap() {
+        let mut t = table(1, 64);
+        for i in 0..MAX_KNOWN_CLAIMS as u32 {
+            let target = format!("10.{}.{}.{}", i >> 16, (i >> 8) & 255, i & 255);
+            t.claims.insert(
+                format!("{:064x}", i),
+                Held {
+                    claim: Claim {
+                        issuer: 1,
+                        kind: ClaimKind::Detector,
+                        target: target.clone(),
+                        issued_ms: T0,
+                        expires_ms: Some(T0 + 60 * S),
+                        reason: String::new(),
+                    },
+                    net: ip(&target),
+                    until_ms: Some(T0 + 60 * S),
+                    allowed: true,
+                    in_quota: true,
+                    ended: false,
+                },
+            );
+        }
+        assert_eq!(
+            t.add_local(ip("203.0.113.96"), ClaimKind::Detector, "x", T0)
+                .err(),
+            Some("too many known claims")
+        );
+    }
+
+    #[test]
+    fn a_failing_target_does_not_starve_the_others_and_retries_are_bounded() {
+        // R26-06: 300 peer claims end locally while deletes fail; later ticks do bounded work.
+        let mut peer = BlockTable::with_lists(
+            FakeLists {
+                nets: HashSet::new(),
+                capacity: 1024,
+                fail_delete: false,
+                deletes: 0,
+            },
+            TtlPolicy {
+                base: Duration::ZERO,
+                max: Duration::ZERO,
+            },
+            2,
+        );
+        let mut n1 = table(1, 1024);
+        for i in 0..300u32 {
+            let c = detect(&mut peer, &format!("10.9.{}.{}", i / 256, i % 256), T0);
+            n1.adopt(c, true, T0);
+        }
+        n1.lists.fail_delete = true;
+        n1.tick(T0 + ms(POLICY.max) + S); // local ends: 300 first attempts, all fail
+        assert_eq!(n1.pending(), 300);
+        n1.lists.deletes = 0;
+        n1.tick(T0 + ms(POLICY.max) + 2 * S);
+        assert_eq!(
+            n1.lists.deletes, MAX_RETRIES_PER_TICK,
+            "retries bounded per tick"
+        );
+        n1.tick(T0 + ms(POLICY.max) + 3 * S);
+        n1.lists.fail_delete = false;
+        n1.tick(T0 + ms(POLICY.max) + 4 * S);
+        n1.tick(T0 + ms(POLICY.max) + 5 * S);
+        assert_eq!(n1.pending(), 0, "every target made progress");
+        assert_eq!(n1.active(), 0);
     }
 
     #[test]
@@ -1764,7 +1991,8 @@ mod tests {
     fn counts_by_family_and_reports_watermark_crossings_once() {
         let mut t = table(1, 64);
         detect(&mut t, "203.0.113.1", T0);
-        t.add_local(ip("203.0.113.2"), ClaimKind::Operator, "x", T0);
+        t.add_local(ip("203.0.113.2"), ClaimKind::Operator, "x", T0)
+            .unwrap();
         detect(&mut t, "2001:db8::1", T0);
         assert_eq!(t.active_by_family(), (2, 1));
 
@@ -1806,7 +2034,8 @@ mod tests {
     fn prefixes_and_hosts_are_separate_targets() {
         let mut t = table(1, 64);
         detect(&mut t, "198.51.100.0/24", T0);
-        t.add_local(ip("198.51.100.9"), ClaimKind::Operator, "x", T0);
+        t.add_local(ip("198.51.100.9"), ClaimKind::Operator, "x", T0)
+            .unwrap();
         assert_eq!(t.active_by_family(), (2, 0));
         assert_eq!(t.tick(T0 + 60 * S), vec![ip("198.51.100.0/24")]);
         assert!(t.is_blocked(ip("198.51.100.9")));
