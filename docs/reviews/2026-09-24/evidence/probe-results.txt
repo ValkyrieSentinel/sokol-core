@@ -1,0 +1,235 @@
+   Compiling proc-macro2 v1.0.107
+   Compiling quote v1.0.47
+   Compiling unicode-ident v1.0.24
+   Compiling libc v0.2.189
+   Compiling cfg-if v1.0.4
+   Compiling stable_deref_trait v1.2.1
+   Compiling smallvec v1.15.2
+   Compiling shlex v2.0.1
+   Compiling find-msvc-tools v0.1.12
+   Compiling itoa v1.0.18
+   Compiling bytes v1.12.1
+   Compiling pin-project-lite v0.2.17
+   Compiling writeable v0.6.4
+   Compiling litemap v0.8.3
+   Compiling parking_lot_core v0.9.12
+   Compiling serde_core v1.0.229
+   Compiling futures-core v0.3.34
+   Compiling icu_properties_data v2.3.0
+   Compiling utf8_iter v1.0.4
+   Compiling objc2 v0.6.4
+   Compiling scopeguard v1.2.0
+   Compiling icu_normalizer_data v2.3.0
+   Compiling memchr v2.8.3
+   Compiling lock_api v0.4.14
+   Compiling log v0.4.34
+   Compiling objc2-encode v4.1.0
+   Compiling once_cell v1.21.4
+   Compiling http v1.5.0
+   Compiling httparse v1.10.1
+   Compiling dunce v1.0.5
+   Compiling serde v1.0.229
+   Compiling percent-encoding v2.3.2
+   Compiling bitflags v2.13.1
+   Compiling zerocopy v0.8.56
+   Compiling tracing-core v0.1.36
+   Compiling form_urlencoded v1.2.2
+   Compiling autocfg v1.5.1
+   Compiling rustversion v1.0.23
+   Compiling getrandom v0.3.4
+   Compiling slab v0.4.12
+   Compiling futures-task v0.3.34
+   Compiling utf8parse v0.2.2
+   Compiling tower-service v0.3.3
+   Compiling zmij v1.0.23
+   Compiling num-traits v0.2.19
+   Compiling anstyle-parse v1.0.0
+   Compiling jobserver v0.1.35
+   Compiling errno v0.3.14
+   Compiling http-body v1.1.0
+   Compiling signal-hook-registry v1.4.8
+   Compiling mio v1.2.2
+   Compiling socket2 v0.6.5
+   Compiling syn v3.0.4
+   Compiling cc v1.4.5
+   Compiling getrandom v0.2.17
+   Compiling parking_lot v0.12.5
+   Compiling tracing v0.1.44
+   Compiling aho-corasick v1.1.5
+   Compiling futures-channel v0.3.34
+   Compiling anstyle v1.0.14
+   Compiling tower-layer v0.3.3
+   Compiling objc2-core-foundation v0.3.2
+   Compiling serde_json v1.0.151
+   Compiling glob v0.3.4
+   Compiling is_terminal_polyfill v1.70.2
+   Compiling anstyle-query v1.1.5
+   Compiling httpdate v1.0.3
+   Compiling atomic-waker v1.1.2
+   Compiling sync_wrapper v1.0.2
+   Compiling regex-syntax v0.8.11
+   Compiling colorchoice v1.0.5
+   Compiling anstream v1.0.0
+   Compiling objc2-foundation v0.3.2
+   Compiling rand_core v0.6.4
+   Compiling http-body-util v0.1.5
+   Compiling mime v0.3.17
+   Compiling ryu v1.0.23
+   Compiling heck v0.5.0
+   Compiling clap_lex v1.1.0
+   Compiling anyhow v1.0.104
+   Compiling core-foundation-sys v0.8.7
+   Compiling constant_time_eq v0.4.2
+   Compiling arrayvec v0.7.8
+   Compiling strsim v0.11.1
+   Compiling iana-time-zone v0.1.65
+   Compiling objc2-open-directory v0.3.2
+   Compiling objc2-io-kit v0.3.2
+   Compiling serde_path_to_error v0.1.20
+   Compiling clap_builder v4.6.6
+   Compiling regex-automata v0.4.18
+   Compiling is-terminal v0.4.17
+   Compiling pqcrypto-internals v0.2.11
+   Compiling blake3 v1.8.7
+   Compiling pqcrypto-dilithium v0.5.0
+   Compiling pqcrypto-traits v0.3.5
+   Compiling termcolor v1.4.1
+   Compiling matchit v0.7.3
+   Compiling humantime v2.4.0
+   Compiling base64 v0.22.1
+   Compiling chrono v0.4.45
+   Compiling sysinfo v0.39.6
+   Compiling ipnet v2.12.2
+   Compiling synstructure v0.14.0
+   Compiling regex v1.13.1
+   Compiling ppv-lite86 v0.2.21
+   Compiling zerovec-derive v0.11.6
+   Compiling displaydoc v0.2.7
+   Compiling tokio-macros v2.7.2
+   Compiling serde_derive v1.0.229
+   Compiling zerofrom-derive v0.1.8
+   Compiling yoke-derive v0.8.3
+   Compiling futures-macro v0.3.34
+   Compiling async-trait v0.1.92
+   Compiling rand_chacha v0.3.1
+   Compiling clap_derive v4.6.4
+   Compiling tokio v1.53.1
+   Compiling common v0.1.0 (/Users/s0fractal/Projects/external/sokol-core/common)
+   Compiling rand v0.8.8
+   Compiling env_logger v0.10.2
+   Compiling futures-util v0.3.34
+   Compiling zerofrom v0.1.8
+   Compiling yoke v0.8.3
+   Compiling clap v4.6.6
+   Compiling zerovec v0.11.8
+   Compiling zerotrie v0.2.5
+   Compiling axum-core v0.4.5
+   Compiling serde_urlencoded v0.7.1
+   Compiling bincode v1.3.3
+   Compiling tinystr v0.8.4
+   Compiling potential_utf v0.1.6
+   Compiling icu_collections v2.3.0
+   Compiling icu_locale_core v2.3.0
+   Compiling icu_provider v2.3.1
+   Compiling icu_normalizer v2.3.0
+   Compiling icu_properties v2.3.0
+   Compiling hyper v1.11.1
+   Compiling tower v0.5.3
+   Compiling idna_adapter v1.2.2
+   Compiling idna v1.1.0
+   Compiling url v2.5.8
+   Compiling hyper-util v0.1.20
+   Compiling axum v0.7.9
+   Compiling ureq v2.12.1
+   Compiling sokol-review-probes v0.0.0 (/var/folders/3j/t95dsnsj7wlc35dpwlwpdy8r0000gn/T/sokol-review-1tzpxzik)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 9.24s
+     Running unittests src/lib.rs (/var/folders/3j/t95dsnsj7wlc35dpwlwpdy8r0000gn/T/sokol-review-1tzpxzik/target/debug/build/sokol-review-probes/d6746bf7e47d56d3/out/sokol_review_probes-d6746bf7e47d56d3)
+
+running 39 tests
+test block_table::tests::dynamic_blocks_expire_and_escalate ... ok
+test block_table::tests::forget_drops_history ... ok
+test block_table::review_probes::failed_sync_poison_prevents_retry ... ok
+test block_table::tests::permanent_blocks_never_expire_and_stay_permanent ... ok
+test block_table::tests::zero_base_disables_expiry ... ok
+test block_table::tests::snapshot_and_adoption_of_peer_blocks ... ok
+test block_table::tests::only_dynamic_blocks_can_be_released ... ok
+test block_table::tests::flush_releases_only_dynamic_blocks ... ok
+test block_table::tests::prefixes_and_hosts_are_tracked_separately ... ok
+test block_table::review_probes::failed_expiry_is_reported_as_removed_and_not_retried ... ok
+test block_table::tests::a_shorter_new_block_does_not_cut_a_longer_one ... ok
+test block_table::tests::counts_by_family_and_reports_watermark_crossings_once ... ok
+test block_table::tests::strikes_are_forgotten_after_the_memory_window ... ok
+test block_table::tests::targets_parse_canonically_and_print_like_before ... ok
+test flowspec::tests::plans_the_difference_and_retries_failures ... ok
+test flowspec::tests::builds_gobgp_flowspec_commands ... ok
+test flowspec::tests::prefixes_are_announced_as_prefixes ... ok
+test p2p::tests::backoff_grows_to_a_cap_and_resets_after_a_stable_connection ... ok
+test flowspec::tests::caps_work_per_tick_and_withdraws_first ... ok
+test p2p::tests::a_stale_connection_cannot_unregister_its_replacement ... ok
+test p2p::tests::pinned_peer_envelope_opens ... ok
+test p2p::tests::broadcast_does_not_wait_for_a_stuck_peer ... ok
+test p2p::tests::replay_and_stale_envelopes_are_rejected ... ok
+test p2p::tests::header_fields_are_covered_by_the_signature ... ok
+test probes::flowspec_does_not_notice_daemon_losing_rib ... ok
+test probes::flowspec_forgets_surviving_rules_on_restart ... ok
+test p2p::tests::key_file_round_trips_and_rejects_loose_permissions ... ok
+test p2p::tests::heartbeat_messages_seal_and_open ... ok
+test p2p::tests::trust_store_parses_hex_keys_and_rejects_duplicates ... ok
+test p2p::tests::stranger_key_is_rejected_even_with_valid_signature ... ok
+test p2p::tests::ping_is_answered_with_pong ... ok
+test p2p::tests::rotation_accepts_old_and_new_keys_then_revokes_the_old_one ... ok
+test probes::two_audit_writers_corrupt_chain ... ok
+test p2p::tests::connection_is_bound_to_its_handshake_identity ... ok
+test p2p::tests::telemetry_must_describe_the_sender ... ok
+test p2p::tests::outbound_connection_carries_broadcasts_both_ways ... ok
+test p2p::tests::only_pinned_peers_can_deliver_commands_over_the_network ... ok
+test p2p::tests::seed_connection_is_retried_until_the_peer_comes_up ... ok
+test probes::timed_out_gobgp_process_continues ... ok
+
+test result: ok. 39 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.02s
+
+     Running unittests /Users/s0fractal/Projects/external/sokol-core/orchestrator/src/bin/sokol-crowdsec.rs (/var/folders/3j/t95dsnsj7wlc35dpwlwpdy8r0000gn/T/sokol-review-1tzpxzik/target/debug/build/sokol-review-probes/72bc63075d11d0be/out/sokol_crowdsec-72bc63075d11d0be)
+
+running 4 tests
+test tests::stream_url_marks_startup ... ok
+test tests::a_scenario_cannot_inject_a_second_line ... ok
+test tests::real_lapi_response_becomes_a_signal ... ok
+test tests::filters_origin_type_and_scope ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests /Users/s0fractal/Projects/external/sokol-core/orchestrator/src/bin/sokol-fastnetmon-notify.rs (/var/folders/3j/t95dsnsj7wlc35dpwlwpdy8r0000gn/T/sokol-review-1tzpxzik/target/debug/build/sokol-review-probes/fb7c78edbdc57320/out/sokol_fastnetmon_notify-fb7c78edbdc57320)
+
+running 2 tests
+test tests::builds_the_attack_line_from_fastnetmon_arguments ... ok
+test tests::arguments_cannot_add_fields_or_lines ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests /Users/s0fractal/Projects/external/sokol-core/orchestrator/src/bin/sokol-operator.rs (/var/folders/3j/t95dsnsj7wlc35dpwlwpdy8r0000gn/T/sokol-review-1tzpxzik/target/debug/build/sokol-review-probes/6c0a1139ad50f555/out/sokol_operator-6c0a1139ad50f555)
+
+running 5 tests
+test tests::block_targets_are_addresses_only ... ok
+test tests::login_sets_a_strict_cookie_that_authorizes ... ok
+test tests::api_requires_the_token ... ok
+test tests::control_actions_validate_input_and_report_real_outcome ... ok
+test tests::commands_reach_the_node_socket_and_its_reply_decides_the_outcome ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests /Users/s0fractal/Projects/external/sokol-core/orchestrator/src/bin/sokol-suricata.rs (/var/folders/3j/t95dsnsj7wlc35dpwlwpdy8r0000gn/T/sokol-review-1tzpxzik/target/debug/build/sokol-review-probes/72180176aa7925e1/out/sokol_suricata-72180176aa7925e1)
+
+running 4 tests
+test tests::gate_suppresses_repeats_and_caps_rate ... ok
+test tests::real_suricata_alert_becomes_a_signal ... ok
+test tests::filters_by_type_severity_and_sid ... ok
+test tests::follower_handles_appends_partial_lines_truncation_and_rotation ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests sokol_review_probes
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

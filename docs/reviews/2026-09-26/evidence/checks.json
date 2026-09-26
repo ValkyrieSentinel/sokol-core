@@ -1,0 +1,33 @@
+{
+  "fmt": {
+    "command": [
+      "cargo",
+      "fmt",
+      "--all",
+      "--check"
+    ],
+    "exit_code": 0
+  },
+  "ebpf-fmt": {
+    "command": [
+      "cargo",
+      "fmt",
+      "--manifest-path",
+      "ebpf/Cargo.toml",
+      "--check"
+    ],
+    "exit_code": 0
+  },
+  "common-ai": {
+    "command": [
+      "cargo",
+      "test",
+      "-p",
+      "common",
+      "-p",
+      "sokol_ai",
+      "--locked"
+    ],
+    "exit_code": 0
+  }
+}

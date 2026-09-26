@@ -1,0 +1,129 @@
+   Compiling libc v0.2.189
+   Compiling cfg-if v1.0.4
+   Compiling find-msvc-tools v0.1.12
+   Compiling shlex v2.0.1
+   Compiling proc-macro2 v1.0.107
+   Compiling quote v1.0.47
+   Compiling unicode-ident v1.0.24
+   Compiling zerocopy v0.8.56
+   Compiling serde_core v1.0.229
+   Compiling dunce v1.0.5
+   Compiling getrandom v0.3.4
+   Compiling parking_lot_core v0.9.12
+   Compiling scopeguard v1.2.0
+   Compiling zmij v1.0.23
+   Compiling serde v1.0.229
+   Compiling glob v0.3.4
+   Compiling smallvec v1.15.2
+   Compiling lock_api v0.4.14
+   Compiling serde_json v1.0.151
+   Compiling anyhow v1.0.104
+   Compiling constant_time_eq v0.4.2
+   Compiling arrayvec v0.7.8
+   Compiling bytes v1.12.1
+   Compiling pqcrypto-traits v0.3.5
+   Compiling pin-project-lite v0.2.17
+   Compiling memchr v2.8.3
+   Compiling itoa v1.0.18
+   Compiling log v0.4.34
+   Compiling ipnet v2.12.2
+   Compiling jobserver v0.1.35
+   Compiling getrandom v0.2.17
+   Compiling errno v0.3.14
+   Compiling mio v1.2.2
+   Compiling socket2 v0.6.5
+   Compiling signal-hook-registry v1.4.8
+   Compiling syn v3.0.4
+   Compiling rand_core v0.6.4
+   Compiling cc v1.4.5
+   Compiling parking_lot v0.12.5
+   Compiling pqcrypto-internals v0.2.11
+   Compiling blake3 v1.8.7
+   Compiling pqcrypto-dilithium v0.5.0
+   Compiling serde_derive v1.0.229
+   Compiling tokio-macros v2.7.2
+   Compiling tokio v1.53.1
+   Compiling common v0.1.0 (/var/folders/3j/t95dsnsj7wlc35dpwlwpdy8r0000gn/T/sokol-review-0926-n8wf4lsp/common)
+   Compiling ppv-lite86 v0.2.21
+   Compiling rand_chacha v0.3.1
+   Compiling rand v0.8.8
+   Compiling bincode v1.3.3
+   Compiling sokol-review-0926 v0.0.0 (/var/folders/3j/t95dsnsj7wlc35dpwlwpdy8r0000gn/T/sokol-review-0926-n8wf4lsp/review-harness)
+warning: unused import: `crate::AlertLevel`
+  --> src/lib.rs:15:24
+   |
+15 | mod mesh_sync {pub use crate::AlertLevel;}
+   |                        ^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: `sokol-review-0926` (lib) generated 1 warning (run `cargo fix --lib -p sokol-review-0926` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 6.01s
+     Running unittests src/lib.rs (/var/folders/3j/t95dsnsj7wlc35dpwlwpdy8r0000gn/T/sokol-review-0926-n8wf4lsp/review-harness/target/debug/build/sokol-review-0926/52a1187bbd7a3215/out/sokol_review_0926-52a1187bbd7a3215)
+
+running 55 tests
+test block_table::tests::a_local_wide_block_needs_no_quorum ... ok
+test block_table::tests::a_peer_claim_is_capped_at_the_local_maximum ... ok
+test block_table::tests::a_failed_removal_is_not_reported_and_is_retried ... ok
+test block_table::tests::a_block_the_map_cannot_take_is_pending_not_counted_and_retried ... ok
+test block_table::tests::a_peer_cannot_retract_another_nodes_claim ... ok
+test block_table::tests::claim_identity_is_its_bytes ... ok
+test block_table::tests::a_retraction_that_arrives_first_still_applies ... ok
+test block_table::tests::counts_by_family_and_reports_watermark_crossings_once ... ok
+test block_table::tests::a_flush_lifts_all_detector_claims_and_retracts_own_ones ... ok
+test block_table::tests::a_retraction_frees_the_issuers_slot ... ok
+test block_table::tests::another_nodes_retraction_cannot_displace_the_issuers ... ok
+test block_table::tests::a_peers_envelope_bounds_what_it_can_block_here ... ok
+test block_table::tests::envelopes_do_not_change_the_shared_mesh_state ... ok
+test block_table::tests::a_wide_prefix_from_one_peer_waits_for_a_second_node ... ok
+test block_table::tests::expiry_unblocks_once_and_a_shorter_repeat_does_not_cut_a_longer_block ... ok
+test block_table::tests::operator_ban_and_unban ... ok
+test block_table::tests::only_the_configuration_lifts_a_static_block ... ok
+test block_table::tests::an_operator_lift_holds_against_every_copy_of_the_lifted_claims ... ok
+test block_table::tests::peers_cannot_forge_this_nodes_or_non_detector_claims ... ok
+test block_table::tests::prefixes_and_hosts_are_separate_targets ... ok
+test block_table::tests::operator_bans_can_be_listed_and_flushed_with_everything_but_static ... ok
+test block_table::tests::protected_targets_are_known_and_shared_but_not_enforced ... ok
+test block_table::tests::decisions_and_lifts_survive_a_restart ... ok
+test block_table::tests::review_duplicate_delivery_escalates_one_event ... ok
+test block_table::tests::review_retractions_never_expire ... ok
+test block_table::tests::one_exchange_converges_including_retractions ... ok
+test block_table::tests::targets_parse_canonically_and_print_like_before ... ok
+test block_table::tests::review_replayed_capped_claim_gets_new_lease_after_restart ... ok
+test block_table::tests::zero_base_makes_detector_blocks_permanent ... ok
+test p2p::tests::backoff_grows_to_a_cap_and_resets_after_a_stable_connection ... ok
+test block_table::tests::detector_blocks_escalate_and_are_capped ... ok
+test p2p::tests::a_stale_connection_cannot_unregister_its_replacement ... ok
+test p2p::tests::peers_file_envelopes_are_parsed_and_checked ... ok
+test p2p::tests::pinned_peer_envelope_opens ... ok
+test p2p::tests::header_fields_are_covered_by_the_signature ... ok
+test block_table::tests::review_expired_targets_bypass_retry_budget ... ok
+test p2p::tests::broadcast_does_not_wait_for_a_stuck_peer ... ok
+test p2p::tests::key_file_round_trips_and_rejects_loose_permissions ... ok
+test p2p::tests::heartbeat_messages_seal_and_open ... ok
+test review::review_hash_does_not_authenticate_issuer ... ok
+test p2p::tests::replay_and_stale_envelopes_are_rejected ... ok
+test p2p::tests::trust_store_parses_hex_keys_and_rejects_duplicates ... ok
+test p2p::tests::ping_is_answered_with_pong ... ok
+test p2p::tests::stranger_key_is_rejected_even_with_valid_signature ... ok
+test p2p::tests::rotation_accepts_old_and_new_keys_then_revokes_the_old_one ... ok
+test review::review_one_signed_snapshot_forges_quorum ... ok
+review snapshot envelope bytes=137453, max=131072
+test review::review_snapshot_tombstones_exceed_frame_limit ... ok
+test p2p::tests::connection_is_bound_to_its_handshake_identity ... ok
+test p2p::tests::telemetry_must_describe_the_sender ... ok
+test p2p::tests::outbound_connection_carries_broadcasts_both_ways ... ok
+test p2p::tests::a_peer_cannot_send_claims_in_another_nodes_name ... ok
+test p2p::tests::only_pinned_peers_can_deliver_commands_over_the_network ... ok
+test p2p::tests::a_peer_cannot_switch_this_nodes_defense_mode ... ok
+test block_table::tests::review_local_claims_ignore_known_claim_limit ... ok
+test p2p::tests::seed_connection_is_retried_until_the_peer_comes_up ... ok
+
+test result: ok. 55 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.05s
+
+   Doc-tests sokol_review_0926
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

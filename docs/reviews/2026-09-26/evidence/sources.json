@@ -1,0 +1,26 @@
+{
+  "commit": "5fbacdc7c7af94be0ac1e58262af381f8e9fdb0c",
+  "sha256": {
+    "orchestrator/src/block_policy.rs": "3f7148e8114a6ea84f6245d0751ccc29d8afaa2d970fba033e43327be4843011",
+    "orchestrator/src/mesh_sync.rs": "8f0832b134e13b6ef48a796bc31a07b7464214158181e65d5b5246314acbee5f",
+    "orchestrator/src/control.rs": "b2bcead314d517b57b62f97f296114a6a7c0256c82d8b78c32d9512798652075",
+    "orchestrator/src/signal.rs": "728625da2ee28396775ed364e5592760a142052420dd9f0e780e01c6696b4036",
+    "orchestrator/src/block_table.rs": "6dc6d6857047ab2f41c315892b7789841c251feaa9f7f7fa597f760f0328ac8f",
+    "orchestrator/src/p2p.rs": "2baa2a7ba4c1bab0550f0d4443f9e9177ebfc4f232e1b3dce06f8e593d2ed1a4",
+    "orchestrator/src/delivery.rs": "e827ec1c96a0f33225bcef57ff1fb4d9a28604d7bdc5f9c4fed1f8be43b483e6",
+    "orchestrator/src/attack_reports.rs": "fa428b810ceb9526a06c51b9fc05982c90df9fc8826fa741462b24edeb71f49d",
+    "orchestrator/src/defense.rs": "cfd686443d7fe38694e099731e46e39dbe27ba8fe69bbb83dddf343314a810ab",
+    "orchestrator/src/metrics.rs": "8df49586f123941f25fba1c90f0bce9686686070adc7a5bf3f8cbe2079cec652",
+    "orchestrator/src/sokol.rs": "7bf392f19d7ecc0ea14ba7856fd1df79d6e23e9a20f66269c8d87c01c670018c",
+    "orchestrator/src/cluster_state.rs": "5ff12b8be818fcdb322fd877883dd3b81fd22ce8b5108437adc321b065b0bf86",
+    "orchestrator/src/main.rs": "3468d04ddcf8d4f8d20c4bdd5bdf55d26f6de834c6974bcb378f9facffbc6bb3",
+    "orchestrator/src/flowspec.rs": "3d9761fbec26859dc54fb1f3b5ea82f8e32a40f19992880e30ce8bf3b8616bdc",
+    "orchestrator/src/bin/sokol-crowdsec.rs": "b7b80596d8ce43141fe1b0747ecc781d3cad1fef4a10eb8865c5eb3eb695fb61",
+    "orchestrator/src/bin/sokol-suricata.rs": "65b026fc98ee7aaf9c3854900357dfc0644f26c60dc99fc0b2a876068526ba10",
+    "orchestrator/src/bin/sokol-operator.rs": "e9d80b980a749e8fe8c5901b5afaa60d43cb1db6c88ea6a613629cc0764e1628",
+    "orchestrator/src/bin/monitor.rs": "c26bd16a961d1093345c2bf569a7a396c3d9570dbc7bc8f7740d896faf0f236d",
+    "orchestrator/src/bin/trident_trap.rs": "b1231004039093b656c5494975f606fd3397a975e0ea19956a70bb45af3d8c4d",
+    "orchestrator/src/bin/sokol-client.rs": "77f87525695c4c5f6ac24c04c2a4f7841886c8c682bf9e671b30afec94a18ffd",
+    "orchestrator/src/bin/sokol-fastnetmon-notify.rs": "8219517eb3577ea885d90012c38bd6fc844cfd94c20ed1fe878f9a45f895abe9"
+  }
+}
