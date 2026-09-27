@@ -7,16 +7,7 @@ all-features = true
 version = 2
 yanked = "deny"
 unmaintained = "workspace"
-# Known and tracked: each is unmaintained, none has a known vulnerability. New advisories fail.
-ignore = [
-    # bincode 1.x frames the mesh envelope. Replacing it changes the wire format, so it goes
-    # together with protocol versioning (roadmap, milestone 2).
-    { id = "RUSTSEC-2025-0141", reason = "mesh envelope framing; replaced with the wire-format versioning" },
-    # pqcrypto-dilithium is superseded by pqcrypto-mldsa (ML-DSA, FIPS 204), and PQClean, which
-    # both wrap, is being archived. Moving to ML-DSA changes keys and signatures: its own change.
-    { id = "RUSTSEC-2024-0380", reason = "move to ML-DSA (FIPS 204) is a key/signature format change" },
-    { id = "RUSTSEC-2026-0162", reason = "pqcrypto-traits goes with the ML-DSA migration" },
-]
+ignore = []
 
 [licenses]
 version = 2

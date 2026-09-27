@@ -739,6 +739,7 @@ async fn execute_control(cmd: control::ControlCommand, ctx: &ControlCtx) -> Stri
             Some(path) => match TrustStore::load(path) {
                 Ok(trust) => {
                     let per_peer = ctx.peer_limits.per_peer(&trust);
+                    let legacy = trust.legacy_peers().to_vec();
                     {
                         let mut table = ctx.blocks.lock().await;
                         table.configure_peers(
@@ -756,8 +757,19 @@ async fn execute_control(cmd: control::ControlCommand, ctx: &ControlCtx) -> Stri
                         path.display(),
                         pinned
                     );
-                    sntl_db.append(format!("PEERS_RELOADED|Pinned:{}", pinned));
-                    format!("OK {} pinned peers", pinned)
+                    sntl_db.append(format!(
+                        "PEERS_RELOADED|Pinned:{}|Legacy:{:?}",
+                        pinned, legacy
+                    ));
+                    if legacy.is_empty() {
+                        format!("OK {} pinned peers", pinned)
+                    } else {
+                        format!(
+                            "OK {} pinned peers; not trusted until their ML-DSA key is listed \
+                             (legacy key only): {:?}",
+                            pinned, legacy
+                        )
+                    }
                 }
                 // A broken file must not wipe the current trust: keep it and report.
                 Err(e) => format!("ERR {:#}; previous trust store kept", e),
