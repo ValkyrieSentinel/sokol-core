@@ -89,7 +89,7 @@ journalctl -u sokol-orchestrator -n 50 --no-pager
 | `sokol_mesh_broadcasts_dropped_total{class="urgent"}` | росте | лінк до піра не встигає за заявками |
 | `sokol_mesh_handshake_timeouts_total` | швидко росте | хтось відкриває з'єднання й мовчить |
 | `sokol_tick_seconds_max` | > 0,5 | обслуговування таблиці сповільнюється |
-| `sokol_block_outcomes_total{effect="none"}` | частка велика | блоки нічого не відкидають: переглянути детектори й TTL (ADR-0014) |
+| `sokol_block_outcomes_total{effect="none"}` | частка велика | блоки нічого не відкидають: `sudo sokol-monitor --outcomes /var/lib/sokol/audit.log` покаже, які детектори й правила (ADR-0014) |
 
 Будь-яка з перших п'яти причин переводить вузол у `MODE=DEGRADED`. Захист при цьому працює.
 

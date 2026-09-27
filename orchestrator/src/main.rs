@@ -2267,11 +2267,13 @@ async fn main() -> Result<(), anyhow::Error> {
                         hits,
                         seconds
                     );
+                    // Cause last: it is free text (with any '|' replaced, the field separator).
                     sntl_db.append(format!(
-                        "BLOCK_OUTCOME|IP:{}|Dropped:{}|Seconds:{}",
+                        "BLOCK_OUTCOME|IP:{}|Dropped:{}|Seconds:{}|Cause:{}",
                         show(&o.net),
                         hits,
-                        seconds
+                        seconds,
+                        o.cause.replace('|', "/")
                     ));
                     match o.hits {
                         Some(0) => outcome_stats.idle += 1,
