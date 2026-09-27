@@ -267,6 +267,20 @@ print(sum(1 for _ in range(n) if f.readline().startswith("ERR")))
 PY
 check "a flooding IPC client gets an answer to every line" test "$(cat "$WORK/ipc-flood.txt")" = 6000
 check "and it was paced past its burst" bash -c "sleep 1.2; test \"\$(curl -s http://127.0.0.1:9469/metrics | awk '\$1 == \"sokol_ipc_lines_delayed_total\" { print \$2 }')\" -gt 0"
+check "the binary names its build" bash -c "'$BIN' --version | grep -q '(build '"
+check "the running build is in the metrics" \
+    bash -c "curl -s http://127.0.0.1:9469/metrics | grep -q '^sokol_build_info{version=.*,build=.*} 1'"
+# A support bundle has what a remote diagnosis needs and never the node key.
+BUNDLE=$(CONTROL="$WORK/control.sock" METRICS=http://127.0.0.1:9469/metrics AUDIT="$WORK/events.sntl" \
+    PEERS="$WORK/peers.json" BIN="$BIN" MONITOR="$(dirname "$BIN")/monitor" OUT="$WORK" \
+    "$(dirname "$0")/support-bundle.sh" 2>/dev/null | tail -1)
+mkdir -p "$WORK/bundle" && tar -xzf "$BUNDLE" -C "$WORK/bundle"
+check "a support bundle holds version, metrics, bans and the audit verification" bash -c \
+    "d=\$(ls -d '$WORK'/bundle/sokol-support-*); grep -q '(build ' \$d/version.txt && grep -q '^sokol_blocks_active' \$d/metrics.txt && grep -q '^OK' \$d/bans.txt && grep -q '^OK' \$d/audit-verify.txt"
+check "the support bundle does not contain the node key" python3 -c "
+import pathlib, sys
+key = pathlib.Path('$WORK/node.key').read_bytes()[4:]
+sys.exit(any(key in p.read_bytes() for p in pathlib.Path('$WORK/bundle').rglob('*') if p.is_file()))"
 check "mesh admission counters are exported" \
     bash -c "curl -s http://127.0.0.1:9469/metrics | grep -q '^sokol_mesh_handshake_timeouts_total '"
 printf 'UNBAN_IP:%s\n' "$MOVED_IP" | nc -U -q1 "$WORK/control.sock" >/dev/null
@@ -566,6 +580,8 @@ s = socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]); f = s.makefile("rw")
 f.write("BAN_IP:%s\n" % sys.argv[2]); f.flush(); f.readline()
 PY
 kill -9 "$ORCH_PID"; wait "$ORCH_PID" 2>/dev/null || true; ORCH_PID=""
+check "a killed node leaves no XDP program on the interface" \
+    bash -c "! ip -d link show $HOST_IF | grep -q 'prog/xdp'"
 STATE_FILE=$LAST_STATE start_orchestrator
 check "an operator ban answered OK survives SIGKILL right after the answer" \
     bash -c "! ip netns exec $NS ping -c 2 -W 1 -I $KILL_BAN $HOST_IP >/dev/null 2>&1"
@@ -602,6 +618,8 @@ check "the corrupt state bytes are kept aside" test "$(cat "$LAST_STATE.corrupt"
 check "ACCEPT_STATE_LOSS is answered" bash -c "printf 'ACCEPT_STATE_LOSS\\n' | nc -U -q1 '$WORK/control.sock' | grep -q '^OK state loss accepted'"
 check "after ACCEPT_STATE_LOSS the node is healthy again" wait_metric sokol_state_healthy 1
 stop_orchestrator
+check "a stopped node leaves no XDP program on the interface (traffic passes unfiltered)" \
+    bash -c "! ip -d link show $HOST_IF | grep -q 'prog/xdp'"
 TRAP_PROTECTED=10.231.0.8; TRAP_OPEN=10.231.0.10
 ip netns exec "$NS" ip addr add "$TRAP_PROTECTED/24" dev "$PEER_IF"
 ip netns exec "$NS" ip addr add "$TRAP_OPEN/24" dev "$PEER_IF"

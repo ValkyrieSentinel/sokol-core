@@ -9,6 +9,8 @@ The program intercepts and drops garbage (attacks, malicious traffic) right at t
 Design and its reasons: [ARCHITECTURE.md](ARCHITECTURE.md) (Ukrainian). Normative decisions
 (authority, leases, persistence, degraded modes, protocol versioning, ...):
 [docs/adr/](docs/adr/README.md).
+Operating a node: [docs/RUNBOOK.md](docs/RUNBOOK.md) (install, health, incidents, keys, rollback,
+support bundle). What it is tested on: [docs/SUPPORT.md](docs/SUPPORT.md).
 
 ---
 
