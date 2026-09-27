@@ -240,6 +240,18 @@ check "once the address leaves the node it is no longer protected" \
 check "host addresses are being re-read" test "$(metric sokol_protected_refresh_ok)" = 1
 check "the maintenance tick is measured and takes well under its period" \
     awk -v t="$(metric sokol_tick_seconds_max)" 'BEGIN { exit !(t != "" && t < 0.5) }'
+# A detector connection past its line budget is slowed, not cut: every line is answered.
+python3 - <<'PY' >"$WORK/ipc-flood.txt"
+import socket
+s = socket.socket(socket.AF_UNIX); s.settimeout(30); s.connect("/run/sokol.sock")
+f = s.makefile("rw")
+f.write("ACK\n"); f.flush(); f.readline()
+n = 6000
+f.write("NOT_A_COMMAND\n" * n); f.flush()
+print(sum(1 for _ in range(n) if f.readline().startswith("ERR")))
+PY
+check "a flooding IPC client gets an answer to every line" test "$(cat "$WORK/ipc-flood.txt")" = 6000
+check "and it was paced past its burst" bash -c "sleep 1.2; test \"\$(curl -s http://127.0.0.1:9469/metrics | awk '\$1 == \"sokol_ipc_lines_delayed_total\" { print \$2 }')\" -gt 0"
 check "mesh admission counters are exported" \
     bash -c "curl -s http://127.0.0.1:9469/metrics | grep -q '^sokol_mesh_handshake_timeouts_total '"
 printf 'UNBAN_IP:%s\n' "$MOVED_IP" | nc -U -q1 "$WORK/control.sock" >/dev/null

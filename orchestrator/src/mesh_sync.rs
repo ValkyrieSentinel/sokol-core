@@ -148,6 +148,18 @@ impl Cooldown {
 impl MeshCommand {
     /// The node a command claims to come from, if it names one; the transport requires it to be
     /// the authenticated sender.
+    /// Block decisions (and what repairs them) go before reports: when a peer's queue is full,
+    /// telemetry, digests and alerts are dropped first (ADR-0013).
+    pub fn urgent(&self) -> bool {
+        matches!(
+            self,
+            MeshCommand::Claim { .. }
+                | MeshCommand::Retract { .. }
+                | MeshCommand::BlockSync { .. }
+                | MeshCommand::SyncRequest { .. }
+        )
+    }
+
     pub fn claimed_sender(&self) -> Option<u64> {
         match self {
             MeshCommand::Claim { claim } => Some(claim.issuer),

@@ -29,6 +29,9 @@ pub struct Snapshot {
     pub mesh_handshake_timeouts: u64,
     pub mesh_frames_delayed: u64,
     pub mesh_sync_requests_throttled: u64,
+    pub mesh_dropped_urgent: u64,
+    pub mesh_dropped_bulk: u64,
+    pub ipc_lines_delayed: u64,
     pub tick_secs: f64,
     pub tick_max_secs: f64,
     pub audit_write_errors: u64,
@@ -245,6 +248,29 @@ pub fn render(s: &Snapshot) -> String {
         family(&mut out, name, "counter", help);
         let _ = writeln!(out, "{} {}", name, value);
     }
+    family(
+        &mut out,
+        "sokol_mesh_broadcasts_dropped_total",
+        "counter",
+        "Broadcasts not queued because a peer's queue was full: urgent (block decisions) or bulk (reports).",
+    );
+    let _ = writeln!(
+        out,
+        "sokol_mesh_broadcasts_dropped_total{{class=\"urgent\"}} {}",
+        s.mesh_dropped_urgent
+    );
+    let _ = writeln!(
+        out,
+        "sokol_mesh_broadcasts_dropped_total{{class=\"bulk\"}} {}",
+        s.mesh_dropped_bulk
+    );
+    family(
+        &mut out,
+        "sokol_ipc_lines_delayed_total",
+        "counter",
+        "Detector lines handled late because a connection or the IPC socket exceeded its rate.",
+    );
+    let _ = writeln!(out, "sokol_ipc_lines_delayed_total {}", s.ipc_lines_delayed);
     family(
         &mut out,
         "sokol_audit_write_errors_total",

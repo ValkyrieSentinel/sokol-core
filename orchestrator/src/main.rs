@@ -1007,6 +1007,16 @@ type SharedBlockTable = Arc<tokio::sync::Mutex<BlockTable>>;
 /// without bound, and idle connections are closed.
 const IPC_MAX_CONNS: usize = 64;
 const IPC_IDLE: Duration = Duration::from_secs(300);
+/// Lines a detector connection may send per second (and as a burst), and all of them together.
+/// A new block costs a signature and a broadcast (~0.2 ms); past the budget the reader waits,
+/// so a flooding adapter is slowed by its socket, and every line is still handled (ADR-0013).
+const IPC_LINES_PER_SEC: f64 = 1_000.0;
+const IPC_LINE_BURST: f64 = 5_000.0;
+const IPC_TOTAL_PER_SEC: f64 = 2_000.0;
+const IPC_TOTAL_BURST: f64 = 20_000.0;
+/// Operator commands per second (and burst) per control connection.
+const CONTROL_LINES_PER_SEC: f64 = 50.0;
+const CONTROL_LINE_BURST: f64 = 500.0;
 const CONTROL_MAX_CONNS: usize = 16;
 /// Targets listed per LIST_BANS reply.
 const LIST_BANS_MAX: usize = 4096;
@@ -1103,11 +1113,14 @@ async fn enforce_block_local(
         }
     };
     let ttl = added.ttl;
-    // The claim is shared either way: peers can enforce it even if this node's map is full.
-    let broadcast_cmd = MeshCommand::Claim { claim: added.claim };
-    let _ = registry
-        .broadcast(&broadcast_cmd, node_id, node_crypto)
-        .await;
+    // A new claim is shared either way: peers can enforce it even if this node's map is full.
+    // A repeat merged into the running claim is not signed and sent again (peers have it).
+    if added.new {
+        let broadcast_cmd = MeshCommand::Claim { claim: added.claim };
+        let _ = registry
+            .broadcast(&broadcast_cmd, node_id, node_crypto)
+            .await;
+    }
     match added.applied {
         Ok(()) => {
             log::warn!(
@@ -1877,12 +1890,17 @@ async fn main() -> Result<(), anyhow::Error> {
                 let (read_half, mut write_half) = stream.into_split();
                 let mut reader = BufReader::new(read_half);
                 let mut line = String::new();
+                let mut budget = p2p::Bucket::new(CONTROL_LINES_PER_SEC, CONTROL_LINE_BURST);
                 loop {
                     line.clear();
                     let mut limited = (&mut reader).take(control::MAX_LINE);
                     match tokio::time::timeout(CONTROL_IDLE, limited.read_line(&mut line)).await {
                         Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
                         Ok(Ok(_)) => {}
+                    }
+                    let wait = budget.take(1.0, std::time::Instant::now());
+                    if !wait.is_zero() {
+                        tokio::time::sleep(wait).await;
                     }
                     let reply = match control::parse(&line) {
                         Ok(cmd) => {
@@ -1924,6 +1942,12 @@ async fn main() -> Result<(), anyhow::Error> {
     let crypto_unix = node_crypto.clone();
     let node_id_unix = args.node_id;
     let policy_unix = block_policy.clone();
+    let ipc_total = Arc::new(std::sync::Mutex::new(p2p::Bucket::new(
+        IPC_TOTAL_PER_SEC,
+        IPC_TOTAL_BURST,
+    )));
+    let ipc_delayed = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let ipc_delayed_metrics = ipc_delayed.clone();
     let reports_unix = attack_reports.clone();
 
     let socket_path_log = socket_path.to_string();
@@ -1962,12 +1986,14 @@ async fn main() -> Result<(), anyhow::Error> {
                         policy: policy_stream,
                         reports: reports_stream,
                     };
+                    let (total, delayed) = (ipc_total.clone(), ipc_delayed.clone());
                     tokio::spawn(async move {
                         let _permit = permit;
                         let (read_half, mut writer) = stream.into_split();
                         let mut reader = BufReader::new(read_half);
                         let mut line = String::new();
                         let mut ack = false;
+                        let mut own = p2p::Bucket::new(IPC_LINES_PER_SEC, IPC_LINE_BURST);
 
                         loop {
                             line.clear();
@@ -2007,6 +2033,17 @@ async fn main() -> Result<(), anyhow::Error> {
                                             break;
                                         }
                                         continue;
+                                    }
+                                    let now = std::time::Instant::now();
+                                    let wait = own.take(1.0, now).max(
+                                        total
+                                            .lock()
+                                            .unwrap_or_else(|p| p.into_inner())
+                                            .take(1.0, now),
+                                    );
+                                    if !wait.is_zero() {
+                                        delayed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        tokio::time::sleep(wait).await;
                                     }
                                     let reply = handle_ipc_line(content, &ipc).await;
                                     if ack
@@ -2295,6 +2332,9 @@ async fn main() -> Result<(), anyhow::Error> {
                     snapshot.mesh_frames_delayed = stats.frames_delayed.load(Ordering::Relaxed);
                     snapshot.mesh_sync_requests_throttled =
                         sync_throttled.load(Ordering::Relaxed);
+                    snapshot.mesh_dropped_urgent = stats.dropped_urgent.load(Ordering::Relaxed);
+                    snapshot.mesh_dropped_bulk = stats.dropped_bulk.load(Ordering::Relaxed);
+                    snapshot.ipc_lines_delayed = ipc_delayed_metrics.load(Ordering::Relaxed);
                 }
                 // Time the tick took up to here (expiry, state hand-off, digest, heartbeat, stats).
                 let tick_secs = tick_started.elapsed().as_secs_f64();
