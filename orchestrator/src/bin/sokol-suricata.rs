@@ -60,6 +60,8 @@ struct Filter {
 
 #[derive(Debug, PartialEq, Eq)]
 struct Alert {
+    /// Hash of the EVE line: a resend after a lost ACK is recognised by the node.
+    event: String,
     src: IpAddr,
     dst: Option<IpAddr>,
     sid: u64,
@@ -73,8 +75,8 @@ impl Alert {
             .map(|d| d.to_string())
             .unwrap_or_else(|| "-".into());
         format!(
-            "SIGNAL:suricata|{}|{}|sid:{} {}\n",
-            self.src, dst, self.sid, self.signature
+            "SIGNAL#{}:suricata|{}|{}|sid:{} {}\n",
+            self.event, self.src, dst, self.sid, self.signature
         )
     }
 }
@@ -108,6 +110,7 @@ fn decide(line: &str, filter: &Filter) -> Option<Alert> {
         .take(160)
         .collect();
     Some(Alert {
+        event: blake3::hash(line.as_bytes()).to_hex()[..32].to_string(),
         src,
         dst,
         sid,
@@ -241,7 +244,8 @@ fn deliver(outbox: &mut delivery::Outbox, socket: &Path) {
         match outcome {
             delivery::Outcome::Applied
             | delivery::Outcome::Pending
-            | delivery::Outcome::Recorded => {
+            | delivery::Outcome::Recorded
+            | delivery::Outcome::Duplicate => {
                 log::info!("[sokol-suricata] {} ({:?})", line, outcome)
             }
             delivery::Outcome::Refused(why) => {
@@ -334,9 +338,24 @@ mod tests {
     #[test]
     fn real_suricata_alert_becomes_a_signal() {
         let alert = decide(ALERT, &filter()).unwrap();
+        let (event, rest) = alert
+            .signal_line()
+            .split_once(':')
+            .map(|(v, r)| (v.to_string(), r.to_string()))
+            .unwrap();
         assert_eq!(
-            alert.signal_line(),
-            "SIGNAL:suricata|10.7.0.2|10.7.0.1|sid:1000001 SOKOL TEST telnet probe\n"
+            rest,
+            "suricata|10.7.0.2|10.7.0.1|sid:1000001 SOKOL TEST telnet probe\n"
+        );
+        assert_eq!(
+            event,
+            format!("SIGNAL#{}", &blake3::hash(ALERT.as_bytes()).to_hex()[..32])
+        );
+        let other = ALERT.replace("\"flow_id\":", "\"flow_id\":1");
+        assert_ne!(
+            decide(&other, &filter()).unwrap().event,
+            alert.event,
+            "another alert is another event"
         );
     }
 

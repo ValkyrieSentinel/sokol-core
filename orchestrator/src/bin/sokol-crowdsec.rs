@@ -116,9 +116,15 @@ fn batch_from(body: &str, origins: &[String]) -> Result<Batch, String> {
         .filter(|c| !c.is_control())
         .take(160)
         .collect();
+        // The decision id names the event: a decision replayed by `startup=true` after an
+        // adapter restart, or resent after a lost ACK, adds no strike on the node.
+        let verb = match decision.get("id").and_then(|v| v.as_u64()) {
+            Some(id) => format!("SIGNAL#{}", id),
+            None => "SIGNAL".to_string(),
+        };
         batch
             .signals
-            .push(format!("SIGNAL:crowdsec|{}|-|{}\n", ip, reason));
+            .push(format!("{}:crowdsec|{}|-|{}\n", verb, ip, reason));
     }
     Ok(batch)
 }
@@ -246,7 +252,7 @@ mod tests {
         let batch = batch_from(STARTUP, &local()).unwrap();
         assert_eq!(
             batch.signals,
-            vec!["SIGNAL:crowdsec|203.0.113.9|-|test ban (origin cscli, crowdsec duration 3h59m59.382698294s)\n"]
+            vec!["SIGNAL#1:crowdsec|203.0.113.9|-|test ban (origin cscli, crowdsec duration 3h59m59.382698294s)\n"]
         );
         assert_eq!(
             batch_from(r#"{"deleted":null,"new":null}"#, &local()).unwrap(),

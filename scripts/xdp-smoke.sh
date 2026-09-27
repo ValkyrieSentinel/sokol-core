@@ -215,6 +215,26 @@ sleep 0.5
 check "loopback is never blocked" grep -q "Refusing to block 127.0.0.1 (loopback)" "$LOG"
 check "the node's own address is never blocked" grep -q "Refusing to block $HOST_IP (address of this node)" "$LOG"
 
+# Event ids: a detector event is acted on once; a resend (lost ACK) gets OK duplicate.
+ipc_ack() {   # ipc_ack <line>...: one ACK-mode connection, prints one reply per line
+    python3 - "$@" <<'PY'
+import socket, sys
+s = socket.socket(socket.AF_UNIX); s.settimeout(3); s.connect("/run/sokol.sock")
+f = s.makefile("rw")
+for line in ["ACK"] + sys.argv[1:]:
+    f.write(line + "\n"); f.flush(); print(f.readline().strip())
+PY
+}
+EV_IP=198.51.100.77
+ipc_ack "SIGNAL#smoke-1:smoke|$EV_IP|-|first" "SIGNAL#smoke-1:smoke|$EV_IP|-|resend" \
+    "SIGNAL#smoke-1:other|$EV_IP|-|same id, other source" "SIGNAL#bad id:smoke|$EV_IP|-|x" >"$WORK/event-ids.txt"
+check "an event id is acted on once, a resend is a duplicate" \
+    test "$(sed -n 1,3p "$WORK/event-ids.txt" | tr '\n' ,)" = "OK ack,OK applied,OK duplicate,"
+check "the same id from another source is another event" test "$(sed -n 4p "$WORK/event-ids.txt")" = "OK applied"
+check "a malformed event id is an error" grep -q "^ERR invalid event id 'bad id'" "$WORK/event-ids.txt"
+check "the resend added no claim" test "$(grep -c "Dynamic block enforced in XDP: $EV_IP" "$LOG")" = 2
+printf 'UNBAN_IP:%s\n' "$EV_IP" | nc -U -q1 "$WORK/control.sock" >/dev/null
+
 # FastNetMon hook: an attack report marks the node under attack without blocking the victim.
 FNM="$(dirname "$BIN")/sokol-fastnetmon-notify"
 wait_metric() {   # wait_metric <name> <value>: up to 8 s for the next metrics refresh
@@ -318,7 +338,7 @@ if command -v suricata >/dev/null; then
     sleep 3
     kill "$PING_PID" 2>/dev/null || true
     LAST_REPLY=$(grep -o '^\[[0-9.]*\]' "$WORK/probe-ping.log" | tail -1 | tr -d '[]')
-    check "Suricata alert is forwarded as a signal" grep -q "SIGNAL:suricata|$PROBE_IP|$HOST_IP|sid:1000001" "$WORK/adapter.log"
+    check "Suricata alert is forwarded as a signal with an event id" grep -Eq "SIGNAL#[0-9a-f]{32}:suricata\|$PROBE_IP\|$HOST_IP\|sid:1000001" "$WORK/adapter.log"
     check "Suricata alert blocks the probing address in XDP" \
         bash -c "! ip netns exec $NS ping -c 2 -W 1 -I $PROBE_IP $HOST_IP >/dev/null 2>&1"
     check "the block reason names Suricata and the rule" grep -q "Dynamic block enforced in XDP: $PROBE_IP.*suricata: sid:1000001 SOKOL TEST telnet probe" "$LOG"
@@ -351,10 +371,23 @@ if command -v cscli >/dev/null && command -v crowdsec >/dev/null; then
         grep -q "Dynamic block enforced in XDP: $CS_IP" "$LOG" && break
         sleep 0.2
     done
-    check "CrowdSec ban decision is forwarded as a signal" grep -q "SIGNAL:crowdsec|$CS_IP|-|sokol smoke ban (origin cscli" "$WORK/crowdsec-adapter.log"
+    check "CrowdSec ban decision is forwarded as a signal with its decision id" grep -Eq "SIGNAL#[0-9]+:crowdsec\|$CS_IP\|-\|sokol smoke ban \(origin cscli" "$WORK/crowdsec-adapter.log"
     check "CrowdSec ban blocks the address in XDP" \
         bash -c "! ip netns exec $NS ping -c 2 -W 1 -I $CS_IP $HOST_IP >/dev/null 2>&1"
     check "the block reason names CrowdSec and the scenario" grep -q "Dynamic block enforced in XDP: $CS_IP.*crowdsec: sokol smoke ban" "$LOG"
+    # A restarted adapter replays every active decision (startup=true); the node recognises the
+    # decision id and adds no strike.
+    kill "$CS_ADAPTER_PID" 2>/dev/null || true
+    wait "$CS_ADAPTER_PID" 2>/dev/null || true
+    SOKOL_CROWDSEC_KEY="$CS_KEY" "$(dirname "$BIN")/sokol-crowdsec" --poll-secs 1 >>"$WORK/crowdsec-adapter.log" 2>&1 </dev/null &
+    CS_ADAPTER_PID=$!
+    for _ in $(seq 1 50); do
+        grep -q "crowdsec event [0-9]* for $CS_IP already handled" "$LOG" && break
+        sleep 0.2
+    done
+    check "a decision replayed by a restarted adapter is a duplicate on the node" \
+        grep -q "crowdsec event [0-9]* for $CS_IP already handled" "$LOG"
+    check "the adapter logs the duplicate answer" grep -q "$CS_IP.*(Duplicate)" "$WORK/crowdsec-adapter.log"
     # F09: a decision made while the node is down is delivered once it is back (the adapter keeps
     # it until the node answers), instead of being lost.
     CS_IP2=10.231.0.13

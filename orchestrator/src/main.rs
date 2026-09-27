@@ -887,6 +887,7 @@ async fn handle_ipc_line(content: &str, c: &IpcCtx) -> String {
         Enforcement::Enforced => "OK applied".to_string(),
         Enforcement::Refused => "OK refused protected".to_string(),
         Enforcement::Pending => "OK pending".to_string(),
+        Enforcement::Duplicate => "OK duplicate".to_string(),
     };
     if content.starts_with('{') {
         if let Err(e) = CanonicalParser::validate_strict_json_object(content) {
@@ -909,6 +910,7 @@ async fn handle_ipc_line(content: &str, c: &IpcCtx) -> String {
                         &c.crypto,
                         &c.dag,
                         &c.policy,
+                        None,
                     )
                     .await,
                 )
@@ -952,7 +954,11 @@ async fn handle_ipc_line(content: &str, c: &IpcCtx) -> String {
                 format!("ERR {}", e)
             }
         }
-    } else if let Some(payload) = content.strip_prefix("SIGNAL:") {
+    } else if let Some((event_id, payload)) = signal::split_verb(content) {
+        let event_id = match event_id.map(signal::event_id).transpose() {
+            Ok(id) => id,
+            Err(e) => return format!("ERR {}", e),
+        };
         match signal::parse(payload) {
             Ok(sig) => match signal::target(&sig, &c.policy) {
                 Ok(ip) => {
@@ -965,6 +971,7 @@ async fn handle_ipc_line(content: &str, c: &IpcCtx) -> String {
                         sig.reason
                     ));
                     let reason = format!("{}: {}", sig.source, sig.reason);
+                    let event = event_id.map(|id| (sig.source.as_str(), id));
                     outcome(
                         enforce_block_local(
                             ip,
@@ -976,6 +983,7 @@ async fn handle_ipc_line(content: &str, c: &IpcCtx) -> String {
                             &c.crypto,
                             &c.dag,
                             &c.policy,
+                            event,
                         )
                         .await,
                     )
@@ -1043,6 +1051,8 @@ enum Enforcement {
     Refused,
     /// Recorded, but the kernel map refused it for now; retried every second.
     Pending,
+    /// The same detector event was already acted on (a replay): nothing changed.
+    Duplicate,
 }
 
 impl Enforcement {
@@ -1052,6 +1062,7 @@ impl Enforcement {
             Enforcement::Enforced => "EnforcedDrop",
             Enforcement::Refused => "Refused",
             Enforcement::Pending => "Pending",
+            Enforcement::Duplicate => "Duplicate",
         }
     }
 }
@@ -1067,6 +1078,7 @@ async fn enforce_block_local(
     node_crypto: &Arc<NodeCrypto>,
     dag_tracker: &Arc<tokio::sync::Mutex<DagTracker>>,
     policy: &BlockPolicy,
+    event: Option<(&str, &str)>,
 ) -> Enforcement {
     let ip = block_table::canonical(target);
     let shown = show(&ip);
@@ -1083,11 +1095,25 @@ async fn enforce_block_local(
         ));
         return Enforcement::Refused;
     }
-    let added = match blocks
-        .lock()
-        .await
-        .add_local(ip, ClaimKind::Detector, reason, now_ms())
-    {
+    let added = {
+        let mut table = blocks.lock().await;
+        let now = now_ms();
+        // Checked and recorded under the same lock as the strike, so no state save sees one
+        // without the other.
+        if let Some((source, id)) = event {
+            if !table.first_sighting(source, id, now) {
+                log::info!(
+                    "[Local Security] {} event {} for {} already handled",
+                    source,
+                    id,
+                    shown
+                );
+                return Enforcement::Duplicate;
+            }
+        }
+        table.add_local(ip, ClaimKind::Detector, reason, now)
+    };
+    let added = match added {
         Ok(added) => added,
         Err(why) => {
             log::error!("[Local Security] Not blocking {}: {}", shown, why);
@@ -1671,6 +1697,7 @@ async fn main() -> Result<(), anyhow::Error> {
                             &crypto_mesh,
                             &dag_mesh,
                             &policy_mesh,
+                            None,
                         )
                         .await;
                     }
@@ -1768,6 +1795,7 @@ async fn main() -> Result<(), anyhow::Error> {
                                     &crypto_trap,
                                     &dag_trap,
                                     &policy_trap,
+                                    None,
                                 )
                                 .await;
                                 db_trap.append(format!(
@@ -2157,7 +2185,12 @@ async fn main() -> Result<(), anyhow::Error> {
                 snapshot.blocks_active_v4 = v4_active;
                 snapshot.blocks_active_v6 = v6_active;
                 snapshot.blocks_capacity = common::BLOCKLIST_CAPACITY as usize;
-                snapshot.blocks_pending = blocks.lock().await.pending();
+                {
+                    let table = blocks.lock().await;
+                    snapshot.blocks_pending = table.pending();
+                    (snapshot.event_ids_remembered, snapshot.event_ids_evicted) =
+                        table.event_memory();
+                }
                 for message in watermark.update((v4_active, v6_active), common::BLOCKLIST_CAPACITY as usize) {
                     log::warn!("[BlockTable] {}", message);
                     sntl_db.append(format!("BLOCKLIST_WATERMARK|{}", message));

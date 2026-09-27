@@ -26,6 +26,12 @@ use aya::maps::{LpmTrie, MapData, MapError};
 /// How long an address's past blocks count towards escalation.
 pub const STRIKE_MEMORY: Duration = Duration::from_secs(24 * 3600);
 
+/// How long a detector event id is remembered: a replay within it adds no strike. As long as
+/// the strike memory, so a replay can never escalate a block.
+pub const EVENT_MEMORY: Duration = STRIKE_MEMORY;
+/// At most this many remembered event ids; the oldest is forgotten first (and counted).
+pub const MAX_EVENTS: usize = common::BLOCKLIST_CAPACITY as usize;
+
 /// A single address as a host network (/32 or /128); `::ffff:a.b.c.d` becomes `a.b.c.d/32`.
 pub fn host(ip: IpAddr) -> IpNet {
     IpNet::from(ip.to_canonical())
@@ -293,6 +299,10 @@ pub struct BlockTable<B = KernelBlocklist> {
     retry: std::collections::VecDeque<IpNet>,
     queued: HashSet<IpNet>,
     strikes: HashMap<IpNet, (u32, u64)>,
+    /// Detector events already acted on, keyed by hash of (source, event id), oldest first.
+    events: HashMap<[u8; 16], u64>,
+    event_order: std::collections::VecDeque<([u8; 16], u64)>,
+    events_evicted: u64,
     dirty: bool,
     default_envelope: Envelope,
     envelopes: HashMap<u64, Envelope>,
@@ -335,6 +345,9 @@ impl<B: Blocklist> BlockTable<B> {
             retry: std::collections::VecDeque::new(),
             queued: HashSet::new(),
             strikes: HashMap::new(),
+            events: HashMap::new(),
+            event_order: std::collections::VecDeque::new(),
+            events_evicted: 0,
             dirty: false,
             default_envelope: Envelope::unlimited(policy.max),
             envelopes: HashMap::new(),
@@ -492,6 +505,47 @@ impl<B: Blocklist> BlockTable<B> {
             }
         }
         result
+    }
+
+    /// Remembers a detector event; false if the same (source, event id) was seen within
+    /// EVENT_MEMORY. The caller checks this and adds the claim under one lock, so a replay
+    /// after a lost ACK or an adapter restart adds no strike.
+    pub fn first_sighting(&mut self, source: &str, event: &str, now_ms: u64) -> bool {
+        while let Some(&(key, seen)) = self.event_order.front() {
+            if now_ms.saturating_sub(seen) <= ms(EVENT_MEMORY) {
+                break;
+            }
+            self.event_order.pop_front();
+            if self.events.get(&key) == Some(&seen) {
+                self.events.remove(&key);
+            }
+        }
+        let mut h = blake3::Hasher::new();
+        h.update(source.as_bytes());
+        h.update(&[0]);
+        h.update(event.as_bytes());
+        let mut key = [0u8; 16];
+        key.copy_from_slice(&h.finalize().as_bytes()[..16]);
+        if self.events.contains_key(&key) {
+            return false;
+        }
+        while self.events.len() >= MAX_EVENTS {
+            let Some((old, seen)) = self.event_order.pop_front() else {
+                break;
+            };
+            if self.events.get(&old) == Some(&seen) {
+                self.events.remove(&old);
+                self.events_evicted += 1;
+            }
+        }
+        self.events.insert(key, now_ms);
+        self.event_order.push_back((key, now_ms));
+        true
+    }
+
+    /// (remembered event ids, ids forgotten early because the memory was full)
+    pub fn event_memory(&self) -> (usize, u64) {
+        (self.events.len(), self.events_evicted)
     }
 
     fn insert_held(&mut self, id: ClaimId, held: Held) {
@@ -1300,6 +1354,41 @@ mod tests {
         t.add_local(ip(target), ClaimKind::Detector, "test", now)
             .unwrap()
             .claim
+    }
+
+    #[test]
+    fn a_replayed_event_is_seen_once() {
+        let mut t = table(1, 64);
+        assert!(t.first_sighting("crowdsec", "17", T0));
+        assert!(
+            !t.first_sighting("crowdsec", "17", T0 + S),
+            "a replay of the same event"
+        );
+        assert!(
+            t.first_sighting("suricata", "17", T0 + S),
+            "the same id from another source is another event"
+        );
+        assert!(t.first_sighting("crowdsec", "18", T0 + S));
+        let later = T0 + ms(EVENT_MEMORY) + 2 * S;
+        assert!(
+            t.first_sighting("crowdsec", "17", later),
+            "forgotten after EVENT_MEMORY"
+        );
+        assert_eq!(t.event_memory(), (1, 0), "expired ids are dropped");
+    }
+
+    #[test]
+    fn event_memory_is_bounded() {
+        let mut t = table(1, 64);
+        for i in 0..=MAX_EVENTS {
+            assert!(t.first_sighting("x", &i.to_string(), T0));
+        }
+        assert_eq!(t.event_memory(), (MAX_EVENTS, 1));
+        assert!(
+            t.first_sighting("x", "0", T0),
+            "the oldest id was forgotten to make room"
+        );
+        assert!(!t.first_sighting("x", &MAX_EVENTS.to_string(), T0));
     }
 
     #[test]

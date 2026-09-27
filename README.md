@@ -201,13 +201,18 @@ notify_script_path = /usr/local/bin/sokol-fastnetmon-notify   # SOKOL_IPC_SOCKET
 ```
 
 Other detectors can use the same line protocol on the IPC socket:
-`SIGNAL:<source>|<src ip>|<dst ip or ->|<reason>`.
+`SIGNAL:<source>|<src ip>|<dst ip or ->|<reason>`. A detector that can name its events sends
+`SIGNAL#<event id>:<source>|...` (id: 1-64 of `A-Z a-z 0-9 . _ -`, unique per source); the node
+acts on each (source, id) once within 24 h and answers a resend with `OK duplicate`, so a retry
+after a lost reply or an adapter restart adds no strike. `sokol-crowdsec` sends the LAPI decision
+id, `sokol-suricata` a hash of the EVE line.
 
 ## Local control socket and protected addresses
 
 `/run/sokol.sock` accepts `DROP_IMMEDIATE:<ip>` from local tools such as `trident_trap`.
 A client that first sends the line `ACK` gets one reply per command: `OK applied`, `OK pending`
-(recorded; the node retries the kernel write), `OK recorded` (reports, logs), `OK refused <why>`
+(recorded; the node retries the kernel write), `OK recorded` (reports, logs), `OK duplicate`
+(an event id already acted on), `OK refused <why>`
 or `ERR <why>`. `OK applied` means the block is in the kernel; it is written to `--state-file`
 within one second (a crash in that second loses it on this node; operator decisions, in contrast,
 are written before the control socket answers OK, and a graceful shutdown writes the last state).

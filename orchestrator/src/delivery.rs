@@ -2,7 +2,7 @@
 //!
 //! A signal leaves the outbox only when the node has answered it: the connection is switched to
 //! ACK mode, and the node replies to each line with `OK applied`, `OK pending`, `OK recorded`,
-//! `OK refused <why>` or `ERR <why>`. Refusals and errors are final (retrying a protected address
+//! `OK duplicate` (an event id it already acted on), `OK refused <why>` or `ERR <why>`. Refusals and errors are final (retrying a protected address
 //! or a malformed line would not change the answer). A node that is down, restarting or not
 //! answering leaves the signal queued; delivery is retried with a growing pause. The queue is
 //! bounded: when it is full the oldest signal is dropped and counted.
@@ -22,6 +22,8 @@ pub enum Outcome {
     /// Recorded by the node; its kernel map refused the entry for now and the node retries it.
     Pending,
     Recorded,
+    /// The node already acted on this event id (a resend); nothing changed.
+    Duplicate,
     /// Final: the node will not act on it (e.g. a protected address).
     Refused(String),
     /// Final: the node could not parse it.
@@ -35,6 +37,7 @@ impl Outcome {
             "OK applied" => Outcome::Applied,
             "OK pending" => Outcome::Pending,
             "OK recorded" => Outcome::Recorded,
+            "OK duplicate" => Outcome::Duplicate,
             _ => {
                 if let Some(why) = reply.strip_prefix("OK refused") {
                     Outcome::Refused(why.trim().to_string())
@@ -287,6 +290,7 @@ mod tests {
         assert_eq!(Outcome::parse("OK applied\n"), Outcome::Applied);
         assert_eq!(Outcome::parse("OK pending"), Outcome::Pending);
         assert_eq!(Outcome::parse("OK recorded"), Outcome::Recorded);
+        assert_eq!(Outcome::parse("OK duplicate"), Outcome::Duplicate);
         assert_eq!(
             Outcome::parse("OK something else"),
             Outcome::Rejected("unexpected reply 'OK something else'".into())
