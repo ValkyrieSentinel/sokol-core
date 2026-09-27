@@ -28,7 +28,8 @@ Sokol-Core перевірено**, а не гарантію. «Перевіре�
 
 | Властивість | Перевірено |
 |---|---|
-| Режими XDP | `native` і `generic` на veth; `auto` (типово) |
+| Режими XDP | `native` і `generic` на veth; `auto` (типово) бере native, а якщо драйвер відмовляє — generic (`sokol_xdp_mode`) |
+| Apple Virtualization (VM lima/colima з `vz`) | native XDP **неможливий**: `virtio_net: Can't set XDP while host is implementing GRO_HW/CSUM`; `auto` працює в generic (перевірено на Ubuntu 24.04, ядро 6.8) |
 | Розмір мешу | 2 вузли (smoke, зокрема через WireGuard), 3 вузли (демо), до кількох вузлів у `bench/mesh.sh` |
 | Повний меш | так; ретрансляції немає (ADR-0002) |
 | Ємність блокліста | 65 536 записів на сімейство, заповнення й переповнення (smoke) |
