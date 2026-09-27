@@ -1,0 +1,1508 @@
+{
+  "nodes": {
+    "block_policy": {
+      "path": "orchestrator/src/block_policy.rs",
+      "sha256": "3f7148e8114a6ea84f6245d0751ccc29d8afaa2d970fba033e43327be4843011",
+      "signals": [
+        {
+          "kind": "host_read",
+          "line": 115,
+          "token": "libc::getifaddrs"
+        },
+        {
+          "kind": "host_read",
+          "line": 148,
+          "token": "std::fs::read_to_string"
+        },
+        {
+          "kind": "host_read",
+          "line": 151,
+          "token": "std::fs::read_to_string"
+        },
+        {
+          "kind": "disk",
+          "line": 148,
+          "token": "std::fs::"
+        },
+        {
+          "kind": "disk",
+          "line": 151,
+          "token": "std::fs::"
+        },
+        {
+          "kind": "log",
+          "line": 116,
+          "token": "log::warn!"
+        },
+        {
+          "kind": "unsafe",
+          "line": 114,
+          "token": "unsafe {"
+        }
+      ],
+      "dependencies": [],
+      "unresolved": [],
+      "direct": [
+        "disk",
+        "host_read",
+        "log",
+        "unsafe"
+      ],
+      "reachable": [
+        "disk",
+        "host_read",
+        "log",
+        "unsafe"
+      ],
+      "rgb": "#F0F",
+      "alpha": "F"
+    },
+    "block_table": {
+      "path": "orchestrator/src/block_table.rs",
+      "sha256": "8c9ffa2dc239692e49aa14d80b825d3d59d314107483dbe94957faf7d0822790",
+      "signals": [
+        {
+          "kind": "kernel",
+          "line": 23,
+          "token": "aya::"
+        },
+        {
+          "kind": "kernel",
+          "line": 24,
+          "token": "aya::"
+        }
+      ],
+      "dependencies": [],
+      "unresolved": [],
+      "direct": [
+        "kernel"
+      ],
+      "reachable": [
+        "kernel"
+      ],
+      "rgb": "#F00",
+      "alpha": "F"
+    },
+    "control": {
+      "path": "orchestrator/src/control.rs",
+      "sha256": "b2bcead314d517b57b62f97f296114a6a7c0256c82d8b78c32d9512798652075",
+      "signals": [],
+      "dependencies": [
+        "block_table"
+      ],
+      "unresolved": [],
+      "direct": [],
+      "reachable": [
+        "kernel"
+      ],
+      "rgb": "#F00",
+      "alpha": "?"
+    },
+    "delivery": {
+      "path": "orchestrator/src/delivery.rs",
+      "sha256": "601035c2ad62d0b550b1bcb443fb98717b477c04e434e25a8174f0b7660230fb",
+      "signals": [
+        {
+          "kind": "ipc",
+          "line": 11,
+          "token": "UnixStream"
+        },
+        {
+          "kind": "ipc",
+          "line": 55,
+          "token": "UnixStream"
+        },
+        {
+          "kind": "ipc",
+          "line": 56,
+          "token": "UnixStream"
+        },
+        {
+          "kind": "ipc",
+          "line": 61,
+          "token": "UnixStream"
+        },
+        {
+          "kind": "clock",
+          "line": 137,
+          "token": "Instant::now"
+        },
+        {
+          "kind": "clock",
+          "line": 164,
+          "token": "Instant::now"
+        }
+      ],
+      "dependencies": [],
+      "unresolved": [],
+      "direct": [
+        "clock",
+        "ipc"
+      ],
+      "reachable": [
+        "clock",
+        "ipc"
+      ],
+      "rgb": "#0FF",
+      "alpha": "F"
+    },
+    "mesh_sync": {
+      "path": "orchestrator/src/mesh_sync.rs",
+      "sha256": "331acadbc2d62abeb1ce5393431248cb6505475d02b64b868673ab68eeea6146",
+      "signals": [
+        {
+          "kind": "clock",
+          "line": 285,
+          "token": "Instant::now"
+        },
+        {
+          "kind": "log",
+          "line": 200,
+          "token": "warn!"
+        },
+        {
+          "kind": "log",
+          "line": 249,
+          "token": "info!"
+        },
+        {
+          "kind": "log",
+          "line": 257,
+          "token": "info!"
+        },
+        {
+          "kind": "log",
+          "line": 269,
+          "token": "warn!"
+        },
+        {
+          "kind": "log",
+          "line": 295,
+          "token": "warn!"
+        },
+        {
+          "kind": "log",
+          "line": 303,
+          "token": "error!"
+        },
+        {
+          "kind": "log",
+          "line": 308,
+          "token": "info!"
+        }
+      ],
+      "dependencies": [
+        "block_table",
+        "cluster_state",
+        "main"
+      ],
+      "unresolved": [],
+      "direct": [
+        "clock",
+        "log"
+      ],
+      "reachable": [
+        "clock",
+        "disk",
+        "host_read",
+        "ipc",
+        "kernel",
+        "log",
+        "network",
+        "process",
+        "sign",
+        "unsafe"
+      ],
+      "rgb": "#FFF",
+      "alpha": "F"
+    },
+    "cluster_state": {
+      "path": "orchestrator/src/cluster_state.rs",
+      "sha256": "5ff12b8be818fcdb322fd877883dd3b81fd22ce8b5108437adc321b065b0bf86",
+      "signals": [
+        {
+          "kind": "clock",
+          "line": 163,
+          "token": "Instant::now"
+        },
+        {
+          "kind": "clock",
+          "line": 203,
+          "token": "Instant::now"
+        }
+      ],
+      "dependencies": [],
+      "unresolved": [],
+      "direct": [
+        "clock"
+      ],
+      "reachable": [
+        "clock"
+      ],
+      "rgb": "#00F",
+      "alpha": "F"
+    },
+    "attack_reports": {
+      "path": "orchestrator/src/attack_reports.rs",
+      "sha256": "fa428b810ceb9526a06c51b9fc05982c90df9fc8826fa741462b24edeb71f49d",
+      "signals": [],
+      "dependencies": [],
+      "unresolved": [],
+      "direct": [],
+      "reachable": [],
+      "rgb": "#000",
+      "alpha": "?"
+    },
+    "defense": {
+      "path": "orchestrator/src/defense.rs",
+      "sha256": "11a916fcb9886df4fc8d08b1dc12a14706577af330ff5e0a709fbfd83fb73041",
+      "signals": [
+        {
+          "kind": "kernel",
+          "line": 6,
+          "token": "aya::"
+        },
+        {
+          "kind": "kernel",
+          "line": 33,
+          "token": "aya::"
+        },
+        {
+          "kind": "kernel",
+          "line": 37,
+          "token": "aya::"
+        },
+        {
+          "kind": "kernel",
+          "line": 66,
+          "token": "aya::"
+        },
+        {
+          "kind": "kernel",
+          "line": 72,
+          "token": "aya::"
+        }
+      ],
+      "dependencies": [],
+      "unresolved": [],
+      "direct": [
+        "kernel"
+      ],
+      "reachable": [
+        "kernel"
+      ],
+      "rgb": "#F00",
+      "alpha": "F"
+    },
+    "metrics": {
+      "path": "orchestrator/src/metrics.rs",
+      "sha256": "005e8c78d258429ad34eb5875dddaafff3a1c964c79210d869f13d9cd6404fe4",
+      "signals": [],
+      "dependencies": [],
+      "unresolved": [],
+      "direct": [],
+      "reachable": [],
+      "rgb": "#000",
+      "alpha": "?"
+    },
+    "signal": {
+      "path": "orchestrator/src/signal.rs",
+      "sha256": "f3a184c419e1ed894354dbc7a0810429e4a19d9da0bf0b0ff85b089f59ac8e83",
+      "signals": [],
+      "dependencies": [
+        "block_policy",
+        "block_table"
+      ],
+      "unresolved": [],
+      "direct": [],
+      "reachable": [
+        "disk",
+        "host_read",
+        "kernel",
+        "log",
+        "unsafe"
+      ],
+      "rgb": "#F0F",
+      "alpha": "?"
+    },
+    "flowspec": {
+      "path": "orchestrator/src/flowspec.rs",
+      "sha256": "3d9761fbec26859dc54fb1f3b5ea82f8e32a40f19992880e30ce8bf3b8616bdc",
+      "signals": [
+        {
+          "kind": "process",
+          "line": 78,
+          "token": "tokio::process::"
+        },
+        {
+          "kind": "log",
+          "line": 193,
+          "token": "log::error!"
+        },
+        {
+          "kind": "log",
+          "line": 207,
+          "token": "log::error!"
+        },
+        {
+          "kind": "log",
+          "line": 215,
+          "token": "log::error!"
+        },
+        {
+          "kind": "log",
+          "line": 235,
+          "token": "log::info!"
+        }
+      ],
+      "dependencies": [
+        "block_table",
+        "main"
+      ],
+      "unresolved": [],
+      "direct": [
+        "log",
+        "process"
+      ],
+      "reachable": [
+        "clock",
+        "disk",
+        "host_read",
+        "ipc",
+        "kernel",
+        "log",
+        "network",
+        "process",
+        "sign",
+        "unsafe"
+      ],
+      "rgb": "#FFF",
+      "alpha": "F"
+    },
+    "p2p": {
+      "path": "orchestrator/src/p2p.rs",
+      "sha256": "eeab71bef9340b5782245e8e119d2f5d511add13bf569ea6da253c8e0b4a3cae",
+      "signals": [
+        {
+          "kind": "host_read",
+          "line": 181,
+          "token": "std::fs::read_to_string"
+        },
+        {
+          "kind": "disk",
+          "line": 81,
+          "token": "std::fs::"
+        },
+        {
+          "kind": "disk",
+          "line": 83,
+          "token": "std::fs::"
+        },
+        {
+          "kind": "disk",
+          "line": 97,
+          "token": "std::fs::"
+        },
+        {
+          "kind": "disk",
+          "line": 99,
+          "token": "std::fs::"
+        },
+        {
+          "kind": "disk",
+          "line": 99,
+          "token": "OpenOptions::"
+        },
+        {
+          "kind": "disk",
+          "line": 181,
+          "token": "std::fs::"
+        },
+        {
+          "kind": "network",
+          "line": 23,
+          "token": "TcpListener"
+        },
+        {
+          "kind": "network",
+          "line": 23,
+          "token": "TcpStream"
+        },
+        {
+          "kind": "network",
+          "line": 620,
+          "token": "TcpListener"
+        },
+        {
+          "kind": "network",
+          "line": 626,
+          "token": "TcpListener"
+        },
+        {
+          "kind": "network",
+          "line": 692,
+          "token": "TcpStream"
+        },
+        {
+          "kind": "network",
+          "line": 746,
+          "token": "TcpStream"
+        },
+        {
+          "kind": "clock",
+          "line": 43,
+          "token": "SystemTime::now"
+        },
+        {
+          "kind": "clock",
+          "line": 724,
+          "token": "Instant::now"
+        },
+        {
+          "kind": "log",
+          "line": 110,
+          "token": "info!"
+        },
+        {
+          "kind": "log",
+          "line": 464,
+          "token": "info!"
+        },
+        {
+          "kind": "log",
+          "line": 544,
+          "token": "info!"
+        },
+        {
+          "kind": "log",
+          "line": 578,
+          "token": "warn!"
+        },
+        {
+          "kind": "log",
+          "line": 627,
+          "token": "info!"
+        },
+        {
+          "kind": "log",
+          "line": 640,
+          "token": "info!"
+        },
+        {
+          "kind": "log",
+          "line": 649,
+          "token": "error!"
+        },
+        {
+          "kind": "log",
+          "line": 657,
+          "token": "warn!"
+        },
+        {
+          "kind": "log",
+          "line": 662,
+          "token": "debug!"
+        },
+        {
+          "kind": "log",
+          "line": 671,
+          "token": "warn!"
+        },
+        {
+          "kind": "log",
+          "line": 679,
+          "token": "info!"
+        },
+        {
+          "kind": "log",
+          "line": 695,
+          "token": "info!"
+        },
+        {
+          "kind": "log",
+          "line": 735,
+          "token": "info!"
+        },
+        {
+          "kind": "log",
+          "line": 736,
+          "token": "debug!"
+        },
+        {
+          "kind": "log",
+          "line": 799,
+          "token": "error!"
+        },
+        {
+          "kind": "log",
+          "line": 813,
+          "token": "warn!"
+        },
+        {
+          "kind": "log",
+          "line": 838,
+          "token": "error!"
+        },
+        {
+          "kind": "log",
+          "line": 867,
+          "token": "debug!"
+        },
+        {
+          "kind": "log",
+          "line": 902,
+          "token": "warn!"
+        },
+        {
+          "kind": "log",
+          "line": 909,
+          "token": "error!"
+        },
+        {
+          "kind": "log",
+          "line": 942,
+          "token": "debug!"
+        },
+        {
+          "kind": "log",
+          "line": 981,
+          "token": "debug!"
+        },
+        {
+          "kind": "log",
+          "line": 982,
+          "token": "debug!"
+        },
+        {
+          "kind": "sign",
+          "line": 143,
+          "token": "detached_sign("
+        }
+      ],
+      "dependencies": [
+        "mesh_sync"
+      ],
+      "unresolved": [],
+      "direct": [
+        "clock",
+        "disk",
+        "host_read",
+        "log",
+        "network",
+        "sign"
+      ],
+      "reachable": [
+        "clock",
+        "disk",
+        "host_read",
+        "ipc",
+        "kernel",
+        "log",
+        "network",
+        "process",
+        "sign",
+        "unsafe"
+      ],
+      "rgb": "#FFF",
+      "alpha": "F"
+    },
+    "main": {
+      "path": "orchestrator/src/main.rs",
+      "sha256": "029148829db762f69a3b1ab4802bc52955eee9147ebe70fcede3f5f8f3a3945d",
+      "signals": [
+        {
+          "kind": "disk",
+          "line": 544,
+          "token": "std::fs::"
+        },
+        {
+          "kind": "disk",
+          "line": 550,
+          "token": "std::fs::"
+        },
+        {
+          "kind": "disk",
+          "line": 550,
+          "token": "std::fs::"
+        },
+        {
+          "kind": "disk",
+          "line": 552,
+          "token": "std::fs::"
+        },
+        {
+          "kind": "disk",
+          "line": 552,
+          "token": "std::fs::"
+        },
+        {
+          "kind": "disk",
+          "line": 790,
+          "token": "std::fs::"
+        },
+        {
+          "kind": "disk",
+          "line": 790,
+          "token": "OpenOptions::"
+        },
+        {
+          "kind": "disk",
+          "line": 798,
+          "token": "std::fs::"
+        },
+        {
+          "kind": "disk",
+          "line": 801,
+          "token": "std::fs::"
+        },
+        {
+          "kind": "disk",
+          "line": 801,
+          "token": "File::"
+        },
+        {
+          "kind": "disk",
+          "line": 1401,
+          "token": "std::fs::"
+        },
+        {
+          "kind": "disk",
+          "line": 2314,
+          "token": "std::fs::"
+        },
+        {
+          "kind": "disk",
+          "line": 2315,
+          "token": "std::fs::"
+        },
+        {
+          "kind": "network",
+          "line": 1774,
+          "token": "TcpListener"
+        },
+        {
+          "kind": "network",
+          "line": 2040,
+          "token": "TcpListener"
+        },
+        {
+          "kind": "ipc",
+          "line": 1019,
+          "token": "UnixStream"
+        },
+        {
+          "kind": "kernel",
+          "line": 16,
+          "token": "aya::"
+        },
+        {
+          "kind": "kernel",
+          "line": 17,
+          "token": "aya::"
+        },
+        {
+          "kind": "kernel",
+          "line": 18,
+          "token": "aya::"
+        },
+        {
+          "kind": "clock",
+          "line": 161,
+          "token": "Instant::now"
+        },
+        {
+          "kind": "clock",
+          "line": 209,
+          "token": "Instant::now"
+        },
+        {
+          "kind": "clock",
+          "line": 274,
+          "token": "Instant::now"
+        },
+        {
+          "kind": "clock",
+          "line": 281,
+          "token": "Instant::now"
+        },
+        {
+          "kind": "clock",
+          "line": 291,
+          "token": "Instant::now"
+        },
+        {
+          "kind": "clock",
+          "line": 932,
+          "token": "Instant::now"
+        },
+        {
+          "kind": "clock",
+          "line": 2082,
+          "token": "Instant::now"
+        },
+        {
+          "kind": "clock",
+          "line": 2083,
+          "token": "Instant::now"
+        },
+        {
+          "kind": "clock",
+          "line": 2124,
+          "token": "Instant::now"
+        },
+        {
+          "kind": "clock",
+          "line": 2150,
+          "token": "Instant::now"
+        },
+        {
+          "kind": "clock",
+          "line": 2217,
+          "token": "Instant::now"
+        },
+        {
+          "kind": "clock",
+          "line": 2235,
+          "token": "Instant::now"
+        },
+        {
+          "kind": "clock",
+          "line": 2259,
+          "token": "Instant::now"
+        },
+        {
+          "kind": "log",
+          "line": 100,
+          "token": "log::error!"
+        },
+        {
+          "kind": "log",
+          "line": 139,
+          "token": "log::error!"
+        },
+        {
+          "kind": "log",
+          "line": 172,
+          "token": "log::warn!"
+        },
+        {
+          "kind": "log",
+          "line": 195,
+          "token": "log::info!"
+        },
+        {
+          "kind": "log",
+          "line": 243,
+          "token": "log::info!"
+        },
+        {
+          "kind": "log",
+          "line": 282,
+          "token": "log::error!"
+        },
+        {
+          "kind": "log",
+          "line": 295,
+          "token": "log::error!"
+        },
+        {
+          "kind": "log",
+          "line": 299,
+          "token": "log::error!"
+        },
+        {
+          "kind": "log",
+          "line": 315,
+          "token": "log::error!"
+        },
+        {
+          "kind": "log",
+          "line": 651,
+          "token": "log::warn!"
+        },
+        {
+          "kind": "log",
+          "line": 669,
+          "token": "log::warn!"
+        },
+        {
+          "kind": "log",
+          "line": 696,
+          "token": "log::warn!"
+        },
+        {
+          "kind": "log",
+          "line": 706,
+          "token": "log::warn!"
+        },
+        {
+          "kind": "log",
+          "line": 738,
+          "token": "log::warn!"
+        },
+        {
+          "kind": "log",
+          "line": 778,
+          "token": "log::warn!"
+        },
+        {
+          "kind": "log",
+          "line": 782,
+          "token": "log::info!"
+        },
+        {
+          "kind": "log",
+          "line": 852,
+          "token": "log::warn!"
+        },
+        {
+          "kind": "log",
+          "line": 859,
+          "token": "log::error!"
+        },
+        {
+          "kind": "log",
+          "line": 894,
+          "token": "log::error!"
+        },
+        {
+          "kind": "log",
+          "line": 901,
+          "token": "log::warn!"
+        },
+        {
+          "kind": "log",
+          "line": 919,
+          "token": "log::error!"
+        },
+        {
+          "kind": "log",
+          "line": 938,
+          "token": "log::warn!"
+        },
+        {
+          "kind": "log",
+          "line": 953,
+          "token": "log::error!"
+        },
+        {
+          "kind": "log",
+          "line": 992,
+          "token": "log::warn!"
+        },
+        {
+          "kind": "log",
+          "line": 1003,
+          "token": "log::error!"
+        },
+        {
+          "kind": "log",
+          "line": 1086,
+          "token": "log::error!"
+        },
+        {
+          "kind": "log",
+          "line": 1105,
+          "token": "log::info!"
+        },
+        {
+          "kind": "log",
+          "line": 1119,
+          "token": "log::error!"
+        },
+        {
+          "kind": "log",
+          "line": 1135,
+          "token": "log::warn!"
+        },
+        {
+          "kind": "log",
+          "line": 1158,
+          "token": "log::error!"
+        },
+        {
+          "kind": "log",
+          "line": 1179,
+          "token": "println!"
+        },
+        {
+          "kind": "log",
+          "line": 1186,
+          "token": "log::warn!"
+        },
+        {
+          "kind": "log",
+          "line": 1204,
+          "token": "log::info!"
+        },
+        {
+          "kind": "log",
+          "line": 1264,
+          "token": "log::info!"
+        },
+        {
+          "kind": "log",
+          "line": 1319,
+          "token": "log::info!"
+        },
+        {
+          "kind": "log",
+          "line": 1345,
+          "token": "log::error!"
+        },
+        {
+          "kind": "log",
+          "line": 1356,
+          "token": "log::error!"
+        },
+        {
+          "kind": "log",
+          "line": 1364,
+          "token": "log::error!"
+        },
+        {
+          "kind": "log",
+          "line": 1389,
+          "token": "log::info!"
+        },
+        {
+          "kind": "log",
+          "line": 1394,
+          "token": "log::error!"
+        },
+        {
+          "kind": "log",
+          "line": 1409,
+          "token": "log::warn!"
+        },
+        {
+          "kind": "log",
+          "line": 1420,
+          "token": "log::error!"
+        },
+        {
+          "kind": "log",
+          "line": 1427,
+          "token": "log::error!"
+        },
+        {
+          "kind": "log",
+          "line": 1434,
+          "token": "log::warn!"
+        },
+        {
+          "kind": "log",
+          "line": 1459,
+          "token": "log::error!"
+        },
+        {
+          "kind": "log",
+          "line": 1471,
+          "token": "log::info!"
+        },
+        {
+          "kind": "log",
+          "line": 1536,
+          "token": "log::warn!"
+        },
+        {
+          "kind": "log",
+          "line": 1558,
+          "token": "log::warn!"
+        },
+        {
+          "kind": "log",
+          "line": 1571,
+          "token": "log::error!"
+        },
+        {
+          "kind": "log",
+          "line": 1583,
+          "token": "log::warn!"
+        },
+        {
+          "kind": "log",
+          "line": 1596,
+          "token": "log::info!"
+        },
+        {
+          "kind": "log",
+          "line": 1647,
+          "token": "log::warn!"
+        },
+        {
+          "kind": "log",
+          "line": 1660,
+          "token": "log::info!"
+        },
+        {
+          "kind": "log",
+          "line": 1710,
+          "token": "log::warn!"
+        },
+        {
+          "kind": "log",
+          "line": 1719,
+          "token": "log::warn!"
+        },
+        {
+          "kind": "log",
+          "line": 1723,
+          "token": "log::error!"
+        },
+        {
+          "kind": "log",
+          "line": 1727,
+          "token": "log::info!"
+        },
+        {
+          "kind": "log",
+          "line": 1757,
+          "token": "log::error!"
+        },
+        {
+          "kind": "log",
+          "line": 1776,
+          "token": "log::info!"
+        },
+        {
+          "kind": "log",
+          "line": 1781,
+          "token": "log::warn!"
+        },
+        {
+          "kind": "log",
+          "line": 1815,
+          "token": "log::error!"
+        },
+        {
+          "kind": "log",
+          "line": 1826,
+          "token": "log::error!"
+        },
+        {
+          "kind": "log",
+          "line": 1856,
+          "token": "log::error!"
+        },
+        {
+          "kind": "log",
+          "line": 1862,
+          "token": "log::warn!"
+        },
+        {
+          "kind": "log",
+          "line": 1923,
+          "token": "log::info!"
+        },
+        {
+          "kind": "log",
+          "line": 1932,
+          "token": "log::warn!"
+        },
+        {
+          "kind": "log",
+          "line": 1972,
+          "token": "log::info!"
+        },
+        {
+          "kind": "log",
+          "line": 1984,
+          "token": "log::error!"
+        },
+        {
+          "kind": "log",
+          "line": 1988,
+          "token": "log::debug!"
+        },
+        {
+          "kind": "log",
+          "line": 2016,
+          "token": "log::error!"
+        },
+        {
+          "kind": "log",
+          "line": 2024,
+          "token": "log::error!"
+        },
+        {
+          "kind": "log",
+          "line": 2060,
+          "token": "log::info!"
+        },
+        {
+          "kind": "log",
+          "line": 2063,
+          "token": "log::error!"
+        },
+        {
+          "kind": "log",
+          "line": 2068,
+          "token": "log::info!"
+        },
+        {
+          "kind": "log",
+          "line": 2109,
+          "token": "log::info!"
+        },
+        {
+          "kind": "log",
+          "line": 2130,
+          "token": "log::info!"
+        },
+        {
+          "kind": "log",
+          "line": 2140,
+          "token": "log::info!"
+        },
+        {
+          "kind": "log",
+          "line": 2161,
+          "token": "log::warn!"
+        },
+        {
+          "kind": "log",
+          "line": 2195,
+          "token": "log::warn!"
+        },
+        {
+          "kind": "log",
+          "line": 2203,
+          "token": "log::error!"
+        },
+        {
+          "kind": "log",
+          "line": 2233,
+          "token": "log::warn!"
+        },
+        {
+          "kind": "log",
+          "line": 2275,
+          "token": "log::warn!"
+        },
+        {
+          "kind": "log",
+          "line": 2296,
+          "token": "log::info!"
+        },
+        {
+          "kind": "log",
+          "line": 2303,
+          "token": "log::error!"
+        },
+        {
+          "kind": "log",
+          "line": 2308,
+          "token": "log::error!"
+        },
+        {
+          "kind": "log",
+          "line": 2312,
+          "token": "log::error!"
+        },
+        {
+          "kind": "unsafe",
+          "line": 758,
+          "token": "unsafe {"
+        },
+        {
+          "kind": "unsafe",
+          "line": 762,
+          "token": "unsafe {"
+        },
+        {
+          "kind": "unsafe",
+          "line": 1327,
+          "token": "unsafe {"
+        }
+      ],
+      "dependencies": [
+        "attack_reports",
+        "audit_log",
+        "block_policy",
+        "block_table",
+        "cluster_state",
+        "control",
+        "defense",
+        "flowspec",
+        "mesh_sync",
+        "metrics",
+        "p2p",
+        "signal"
+      ],
+      "unresolved": [
+        "sokol"
+      ],
+      "direct": [
+        "clock",
+        "disk",
+        "ipc",
+        "kernel",
+        "log",
+        "network",
+        "unsafe"
+      ],
+      "reachable": [
+        "clock",
+        "disk",
+        "host_read",
+        "ipc",
+        "kernel",
+        "log",
+        "network",
+        "process",
+        "sign",
+        "unsafe"
+      ],
+      "rgb": "#FFF",
+      "alpha": "F"
+    },
+    "audit_log": {
+      "path": "common/src/audit_log.rs",
+      "sha256": "d34e818d5759ab6f7d73922997329874793f5201d73cc83cb3aff3bcfc1d09ce",
+      "signals": [
+        {
+          "kind": "disk",
+          "line": 23,
+          "token": "std::fs::"
+        },
+        {
+          "kind": "disk",
+          "line": 123,
+          "token": "File::"
+        },
+        {
+          "kind": "disk",
+          "line": 283,
+          "token": "std::fs::"
+        },
+        {
+          "kind": "disk",
+          "line": 306,
+          "token": "File::"
+        },
+        {
+          "kind": "disk",
+          "line": 322,
+          "token": "std::fs::"
+        },
+        {
+          "kind": "disk",
+          "line": 330,
+          "token": "OpenOptions::"
+        },
+        {
+          "kind": "disk",
+          "line": 337,
+          "token": "std::fs::"
+        },
+        {
+          "kind": "disk",
+          "line": 338,
+          "token": "std::fs::"
+        },
+        {
+          "kind": "disk",
+          "line": 340,
+          "token": "OpenOptions::"
+        },
+        {
+          "kind": "disk",
+          "line": 394,
+          "token": "std::fs::"
+        },
+        {
+          "kind": "disk",
+          "line": 395,
+          "token": "OpenOptions::"
+        },
+        {
+          "kind": "disk",
+          "line": 407,
+          "token": "std::fs::"
+        },
+        {
+          "kind": "disk",
+          "line": 518,
+          "token": "std::fs::"
+        },
+        {
+          "kind": "clock",
+          "line": 87,
+          "token": "SystemTime::now"
+        }
+      ],
+      "dependencies": [],
+      "unresolved": [],
+      "direct": [
+        "clock",
+        "disk"
+      ],
+      "reachable": [
+        "clock",
+        "disk"
+      ],
+      "rgb": "#F0F",
+      "alpha": "F"
+    }
+  },
+  "module_cycles": [
+    [
+      "flowspec",
+      "main",
+      "mesh_sync",
+      "p2p"
+    ]
+  ],
+  "hypotheses": [
+    {
+      "module": "block_policy",
+      "status": "not_supported",
+      "witnesses": [
+        {
+          "path": [
+            "block_policy"
+          ],
+          "signals": [
+            {
+              "kind": "host_read",
+              "line": 115,
+              "token": "libc::getifaddrs"
+            },
+            {
+              "kind": "host_read",
+              "line": 148,
+              "token": "std::fs::read_to_string"
+            },
+            {
+              "kind": "host_read",
+              "line": 151,
+              "token": "std::fs::read_to_string"
+            },
+            {
+              "kind": "disk",
+              "line": 148,
+              "token": "std::fs::"
+            },
+            {
+              "kind": "disk",
+              "line": 151,
+              "token": "std::fs::"
+            },
+            {
+              "kind": "log",
+              "line": 116,
+              "token": "log::warn!"
+            },
+            {
+              "kind": "unsafe",
+              "line": 114,
+              "token": "unsafe {"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "module": "control",
+      "status": "not_supported",
+      "witnesses": [
+        {
+          "path": [
+            "control",
+            "block_table"
+          ],
+          "signals": [
+            {
+              "kind": "kernel",
+              "line": 23,
+              "token": "aya::"
+            },
+            {
+              "kind": "kernel",
+              "line": 24,
+              "token": "aya::"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "module": "signal",
+      "status": "not_supported",
+      "witnesses": [
+        {
+          "path": [
+            "signal",
+            "block_policy"
+          ],
+          "signals": [
+            {
+              "kind": "host_read",
+              "line": 115,
+              "token": "libc::getifaddrs"
+            },
+            {
+              "kind": "host_read",
+              "line": 148,
+              "token": "std::fs::read_to_string"
+            },
+            {
+              "kind": "host_read",
+              "line": 151,
+              "token": "std::fs::read_to_string"
+            },
+            {
+              "kind": "disk",
+              "line": 148,
+              "token": "std::fs::"
+            },
+            {
+              "kind": "disk",
+              "line": 151,
+              "token": "std::fs::"
+            },
+            {
+              "kind": "log",
+              "line": 116,
+              "token": "log::warn!"
+            },
+            {
+              "kind": "unsafe",
+              "line": 114,
+              "token": "unsafe {"
+            }
+          ]
+        },
+        {
+          "path": [
+            "signal",
+            "block_table"
+          ],
+          "signals": [
+            {
+              "kind": "kernel",
+              "line": 23,
+              "token": "aya::"
+            },
+            {
+              "kind": "kernel",
+              "line": 24,
+              "token": "aya::"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "module": "metrics",
+      "status": "unknown",
+      "witnesses": []
+    }
+  ],
+  "port_errors": [],
+  "source_commit": "88d96c2ee25a9cc390089e8630a590d14fbbf8e4",
+  "manifest_sha256": "ebe91680a0280ba23215d0d80545382f8631541dfa41ccd9e6ca8c973dd9c620",
+  "checker_sha256": "1e1271c6ab4c75053c5a8e317fa949074804389f683b7fa10cf3d417e11f69d8",
+  "scope": "lexical inventory; proposed ports; no runtime/purity/capability proof"
+}

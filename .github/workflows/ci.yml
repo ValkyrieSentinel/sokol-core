@@ -7,31 +7,37 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # Every downloaded tool is pinned by version and checksum; actions are pinned by commit.
   BPF_LINKER_VERSION: v0.11.1
+  BPF_LINKER_SHA256: e058a6aecc9e65fa4c977b298a8e4b738424d7629769fd352eed409fb57e16e8
+  GOBGP_VERSION: 4.9.0
+  GOBGP_SHA256: 653f52cd11614cff847c9a70dd800b1d2746e61d5796744f591388db7084a038
 
 jobs:
   build-test-smoke:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - name: Install Rust nightly
+      - name: Install the pinned Rust toolchain (rust-toolchain.toml)
         run: |
-          rustup toolchain install nightly --profile minimal --component rust-src,clippy,rustfmt
-          rustup default nightly
+          rustup show active-toolchain || rustup toolchain install
+          (cd ebpf && (rustup show active-toolchain || rustup toolchain install))
 
       - name: Install bpf-linker
         run: |
-          curl -sSfL "https://github.com/aya-rs/bpf-linker/releases/download/${BPF_LINKER_VERSION}/bpf-linker-x86_64-unknown-linux-musl.tar.zst" \
-            | tar --zstd -x -C /usr/local/bin
+          curl -sSfL -o /tmp/bpf-linker.tar.zst "https://github.com/aya-rs/bpf-linker/releases/download/${BPF_LINKER_VERSION}/bpf-linker-x86_64-unknown-linux-musl.tar.zst"
+          echo "${BPF_LINKER_SHA256}  /tmp/bpf-linker.tar.zst" | sha256sum -c -
+          tar --zstd -x -C /usr/local/bin -f /tmp/bpf-linker.tar.zst
           bpf-linker --version
 
       - name: Install GoBGP (BGP Flowspec smoke checks)
         run: |
-          curl -sSfL "https://github.com/osrg/gobgp/releases/download/v4.9.0/gobgp_4.9.0_linux_amd64.tar.gz" \
-            | sudo tar -xz -C /usr/local/bin gobgp gobgpd
+          curl -sSfL -o /tmp/gobgp.tar.gz "https://github.com/osrg/gobgp/releases/download/v${GOBGP_VERSION}/gobgp_${GOBGP_VERSION}_linux_amd64.tar.gz"
+          echo "${GOBGP_SHA256}  /tmp/gobgp.tar.gz" | sha256sum -c -
+          sudo tar -xz -C /usr/local/bin -f /tmp/gobgp.tar.gz gobgp gobgpd
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: |
             . -> target
@@ -49,10 +55,10 @@ jobs:
         run: cargo build --release --locked
 
       - name: Test
-        run: cargo test --release
+        run: cargo test --release --locked
 
       - name: Clippy
-        run: cargo clippy --release --all-targets -- -D warnings
+        run: cargo clippy --release --locked --all-targets -- -D warnings
 
       - name: XDP smoke test (veth + netns)
         run: |
@@ -62,3 +68,33 @@ jobs:
 
       - name: Demo scenario (3 nodes, attacker, rogue node, Suricata)
         run: sudo DEMO_AUTO=1 demo/demo.sh target/release
+
+      - name: Build manifest and checksums
+        if: always()
+        run: |
+          mkdir -p dist
+          for b in orchestrator sokol-operator sokol-suricata sokol-crowdsec sokol-fastnetmon-notify trident_trap; do
+            if [ -x "target/release/$b" ]; then cp "target/release/$b" dist/; fi
+          done
+          cp target/bpfel-unknown-none/release/ebpf-probe dist/ebpf-probe.o 2>/dev/null || true
+          {
+            echo "commit: ${GITHUB_SHA}"
+            echo "runner: ${ImageOS:-?} ${ImageVersion:-?}, kernel $(uname -r)"
+            rustc -Vv
+            cargo -V
+            (cd ebpf && rustc -V)
+            bpf-linker --version
+            gobgp --version 2>&1 | head -1
+            dpkg-query -W suricata crowdsec 2>/dev/null || true
+            echo "Cargo.lock sha256: $(sha256sum Cargo.lock | cut -d' ' -f1)"
+            echo "ebpf/Cargo.lock sha256: $(sha256sum ebpf/Cargo.lock | cut -d' ' -f1)"
+          } > dist/MANIFEST.txt
+          (cd dist && sha256sum -- * > SHA256SUMS)
+          cat dist/MANIFEST.txt dist/SHA256SUMS
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: sokol-${{ github.sha }}
+          path: dist/
+          if-no-files-found: warn

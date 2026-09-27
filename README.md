@@ -27,23 +27,28 @@ git clone https://github.com/ValkyrieSentinel/sokol-core.git
 cd sokol-core
 ```
 
+The Rust toolchain is pinned in `rust-toolchain.toml` (a dated nightly; the eBPF build needs
+`build-std`), so plain `cargo` picks it up. `cargo +nightly` would bypass the pin. CI verifies the
+checksums of bpf-linker and GoBGP, pins its actions by commit, and uploads the binaries with a
+`MANIFEST.txt` (toolchain, tool versions, lockfile hashes) and `SHA256SUMS` for every run.
+
 Build the eBPF program first. The orchestrator embeds the compiled object
 (`target/bpfel-unknown-none/<profile>/ebpf-probe`), so this step must come before the Rust build:
 
 ```shell
-cd ebpf && cargo +nightly build --release && cd ..
+cd ebpf && cargo build --release --locked && cd ..
 ```
 
 Build the orchestrator and tools:
 
 ```shell
-cargo +nightly build --release
+cargo build --release --locked
 ```
 
 Run the tests and the XDP smoke test (Linux, root: creates a veth pair in a network namespace):
 
 ```shell
-cargo +nightly test --release
+cargo test --release --locked
 sudo scripts/xdp-smoke.sh target/release/orchestrator
 ```
 

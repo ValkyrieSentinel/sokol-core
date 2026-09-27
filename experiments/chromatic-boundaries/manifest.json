@@ -1,0 +1,167 @@
+{
+  "version": 1,
+  "scale": {
+    "rgb_bits_per_axis": 1,
+    "display": "#RGB",
+    "q": 0,
+    "aggregation": "set union; never channel averaging"
+  },
+  "modules": {
+    "block_policy": {
+      "path": "orchestrator/src/block_policy.rs"
+    },
+    "block_table": {
+      "path": "orchestrator/src/block_table.rs"
+    },
+    "control": {
+      "path": "orchestrator/src/control.rs"
+    },
+    "delivery": {
+      "path": "orchestrator/src/delivery.rs"
+    },
+    "mesh_sync": {
+      "path": "orchestrator/src/mesh_sync.rs"
+    },
+    "cluster_state": {
+      "path": "orchestrator/src/cluster_state.rs"
+    },
+    "attack_reports": {
+      "path": "orchestrator/src/attack_reports.rs"
+    },
+    "defense": {
+      "path": "orchestrator/src/defense.rs"
+    },
+    "metrics": {
+      "path": "orchestrator/src/metrics.rs"
+    },
+    "signal": {
+      "path": "orchestrator/src/signal.rs"
+    },
+    "flowspec": {
+      "path": "orchestrator/src/flowspec.rs"
+    },
+    "p2p": {
+      "path": "orchestrator/src/p2p.rs"
+    },
+    "main": {
+      "path": "orchestrator/src/main.rs"
+    },
+    "audit_log": {
+      "path": "common/src/audit_log.rs"
+    }
+  },
+  "aliases": {
+    "SentinelDb": "main",
+    "MeshCommand": "mesh_sync"
+  },
+  "pure_module_hypotheses": [
+    "block_policy",
+    "control",
+    "signal",
+    "metrics"
+  ],
+  "ports": {
+    "endpoints": {
+      "detector.observation": {
+        "direction": "out",
+        "schema": "observation/v1",
+        "grants": [],
+        "allows_effects": []
+      },
+      "policy.observation": {
+        "direction": "in",
+        "schema": "observation/v1",
+        "requires": [],
+        "effects": []
+      },
+      "operator.apply": {
+        "direction": "out",
+        "schema": "decision/v1",
+        "grants": [
+          "apply_block"
+        ],
+        "allows_effects": [
+          "kernel"
+        ]
+      },
+      "enforcement.apply": {
+        "direction": "in",
+        "schema": "decision/v1",
+        "requires": [
+          "apply_block"
+        ],
+        "effects": [
+          "kernel"
+        ]
+      },
+      "enforcement.evidence": {
+        "direction": "out",
+        "schema": "outcome/v1",
+        "grants": [],
+        "allows_effects": [
+          "disk"
+        ]
+      },
+      "exporter.evidence": {
+        "direction": "in",
+        "schema": "outcome/v1",
+        "requires": [],
+        "effects": [
+          "disk"
+        ]
+      },
+      "operator.trust": {
+        "direction": "out",
+        "schema": "trust-update/v1",
+        "grants": [
+          "change_trust"
+        ],
+        "allows_effects": [
+          "disk"
+        ]
+      },
+      "trust.update": {
+        "direction": "in",
+        "schema": "trust-update/v1",
+        "requires": [
+          "change_trust"
+        ],
+        "effects": [
+          "disk"
+        ]
+      },
+      "peer.proposal": {
+        "direction": "out",
+        "schema": "decision/v1",
+        "grants": [],
+        "allows_effects": []
+      },
+      "peer.trust-shaped": {
+        "direction": "out",
+        "schema": "trust-update/v1",
+        "grants": [],
+        "allows_effects": [
+          "disk"
+        ]
+      }
+    },
+    "connections": [
+      [
+        "detector.observation",
+        "policy.observation"
+      ],
+      [
+        "operator.apply",
+        "enforcement.apply"
+      ],
+      [
+        "enforcement.evidence",
+        "exporter.evidence"
+      ],
+      [
+        "operator.trust",
+        "trust.update"
+      ]
+    ]
+  }
+}
