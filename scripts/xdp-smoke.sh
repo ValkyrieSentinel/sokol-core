@@ -755,7 +755,7 @@ if command -v wg >/dev/null && ip link add sokol-wgprobe type wireguard 2>/dev/n
     ip addr add "$ATTACK_SRC/24" dev "$HOST_IF"
 
     P2P_BIND=10.99.0.1:7946 start_orchestrator --node-id 1 --peers-file "$WORK/peers-n1.json" \
-        --storm-threshold 0.4 --never-block 10.99.0.2 --never-block "$ALLOWED_IP"
+        --storm-threshold 0.4 --never-block 10.99.0.2
     ip netns exec "$NS" "$BIN" --interface "$PEER_IF" --node-id 2 --block "$ATTACK_SRC" \
         --db-path "$WORK/n2/events.log" --key-file "$WORK/n2/node.key" \
         --ipc-socket "$WORK/n2/ipc.sock" --control-socket "$WORK/n2/control.sock" \
@@ -772,8 +772,14 @@ if command -v wg >/dev/null && ip link add sokol-wgprobe type wireguard 2>/dev/n
     check "mesh over WireGuard: both nodes authenticated each other" \
         bash -c "test \"\$(curl -s http://127.0.0.1:9469/metrics | awk '\$1==\"sokol_p2p_active_peers\"{print \$2}')\" = 1"
     check "telemetry: node 1 sees both nodes in the cluster" test "$(metric sokol_cluster_nodes)" = 2
-    check "node 2's WireGuard endpoint $ALLOWED_IP is protected on node 1" \
-        bash -c "printf 'BAN_IP:$ALLOWED_IP\\n' | nc -U -q1 '$WORK/control.sock' | grep -q '^ERR $ALLOWED_IP is protected'"
+    check "node 2's WireGuard endpoint $ALLOWED_IP is protected on node 1 without --never-block" \
+        bash -c "printf 'BAN_IP:$ALLOWED_IP\\n' | nc -U -q1 '$WORK/control.sock' | grep -q '^ERR $ALLOWED_IP is protected (WireGuard peer endpoint)'"
+    # A WireGuard peer added while the node runs is protected within the refresh period.
+    WG_NEW=10.231.0.21
+    wg set sokol-wg0 peer "$(wg genkey | wg pubkey)" allowed-ips 10.99.0.9/32 endpoint "$WG_NEW:51900"
+    for _ in $(seq 1 30); do grep -q "Protected host addresses changed: +\[$WG_NEW\]" "$LOG" && break; sleep 0.2; done
+    check "a WireGuard peer added at run time gets its endpoint protected" \
+        bash -c "printf 'BAN_IP:$WG_NEW\\n' | nc -U -q1 '$WORK/control.sock' | grep -q '^ERR $WG_NEW is protected (WireGuard peer endpoint)'"
     check "telemetry: cluster is stable before the attack" test "$(metric sokol_cluster_status)" = 1
 
     ipc "DROP_IMMEDIATE:203.0.113.77"
