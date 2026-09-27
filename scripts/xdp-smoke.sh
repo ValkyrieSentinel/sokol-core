@@ -392,7 +392,8 @@ if command -v suricata >/dev/null; then
         sleep 0.5
     done
     touch "$WORK/suricata/eve.json"
-    "$(dirname "$BIN")/sokol-suricata" --eve "$WORK/suricata/eve.json" >"$WORK/adapter.log" 2>&1 &
+    "$(dirname "$BIN")/sokol-suricata" --eve "$WORK/suricata/eve.json" --cursor-file "$WORK/suricata.cursor" \
+        >"$WORK/adapter.log" 2>&1 &
     ADAPTER_PID=$!
     sleep 1
     check "the probe address reaches the node before the alert" \
@@ -412,6 +413,23 @@ if command -v suricata >/dev/null; then
     if [ -n "$LAST_REPLY" ]; then
         echo "      probe -> last reply before block: $(awk -v a="$T_PROBE" -v b="$LAST_REPLY" 'BEGIN { printf "%.0f ms", (b - a) * 1000 }')"
     fi
+    # An alert written while the adapter is down is forwarded after it restarts (cursor file).
+    sleep 1.5   # the cursor is saved about once a second
+    kill "$ADAPTER_PID" 2>/dev/null || true
+    wait "$ADAPTER_PID" 2>/dev/null || true
+    PROBE2_IP=10.231.0.19
+    ip netns exec "$NS" ip addr add "$PROBE2_IP/24" dev "$PEER_IF"
+    check "the second probe address reaches the node while the adapter is down" \
+        ip netns exec "$NS" ping -c 1 -W 1 -I "$PROBE2_IP" "$HOST_IP"
+    ip netns exec "$NS" nc -z -w 1 -s "$PROBE2_IP" "$HOST_IP" 23 2>/dev/null || true
+    for _ in $(seq 1 30); do grep -q "\"src_ip\":\"$PROBE2_IP\"" "$WORK/suricata/eve.json" && break; sleep 0.2; done
+    "$(dirname "$BIN")/sokol-suricata" --eve "$WORK/suricata/eve.json" --cursor-file "$WORK/suricata.cursor" \
+        >>"$WORK/adapter.log" 2>&1 &
+    ADAPTER_PID=$!
+    for _ in $(seq 1 30); do grep -q "Dynamic block enforced in XDP: $PROBE2_IP" "$LOG" && break; sleep 0.2; done
+    check "an alert written while the adapter was down is forwarded after its restart" \
+        grep -q "Dynamic block enforced in XDP: $PROBE2_IP.*suricata" "$LOG"
+    check "the adapter resumed at its saved cursor" grep -q "resumed at the saved position" "$WORK/adapter.log"
     kill "$ADAPTER_PID" "$SURICATA_PID" 2>/dev/null || true
     ADAPTER_PID=""; SURICATA_PID=""
 else
