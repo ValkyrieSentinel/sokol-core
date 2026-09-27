@@ -345,7 +345,7 @@ unsafe impl Pod for BpfPacketStats {}
 #[derive(Parser, Debug)]
 #[command(
     author,
-    version,
+    version = env!("SOKOL_VERSION"),
     about = "Sokol-Core Sovereign Orchestrator - Production Node"
 )]
 struct Args {
@@ -1164,6 +1164,7 @@ async fn enforce_block_local(
 async fn main() -> Result<(), anyhow::Error> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let args = Args::parse();
+    log::info!("Sokol-Core {}", env!("SOKOL_VERSION"));
 
     let node_crypto = Arc::new(NodeCrypto::load_or_create(&args.key_file)?);
     if args.print_public_key {

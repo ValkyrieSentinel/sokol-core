@@ -290,9 +290,34 @@ pub enum Adoption {
     Refused(&'static str),
 }
 
+/// Layout of the state file this build writes and reads. Bumped on any incompatible change;
+/// there are no migrations (no release yet): another layout is refused by name at restore.
+pub const STATE_SCHEMA: u32 = 1;
+
+fn first_schema() -> u32 {
+    1
+}
+
+impl Default for Persisted {
+    fn default() -> Self {
+        Self {
+            schema: STATE_SCHEMA,
+            claims: Vec::new(),
+            operator_lifts: Vec::new(),
+            retracted: Vec::new(),
+            peer_ends: Vec::new(),
+            events: Vec::new(),
+        }
+    }
+}
+
 /// Durable part of the table (ADR-4): this node's own decisions and lifts.
-#[derive(Serialize, Deserialize, Default, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
 pub struct Persisted {
+    /// Layout of this file ([`STATE_SCHEMA`]). A file without it predates the field and has
+    /// layout 1.
+    #[serde(default = "first_schema")]
+    pub schema: u32,
     pub claims: Vec<Claim>,
     pub operator_lifts: Vec<(ClaimId, Option<u64>)>,
     pub retracted: Vec<(ClaimId, Option<u64>)>,
@@ -1342,6 +1367,7 @@ impl<B: Blocklist> BlockTable<B> {
             .map(|(key, seen)| (crate::p2p::to_hex(key), *seen))
             .collect();
         Persisted {
+            schema: STATE_SCHEMA,
             claims,
             operator_lifts,
             retracted,

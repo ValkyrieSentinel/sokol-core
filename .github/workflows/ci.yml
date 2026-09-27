@@ -9,15 +9,35 @@ env:
   CARGO_TERM_COLOR: always
   # Every downloaded tool is pinned by version and checksum; actions are pinned by commit.
   BPF_LINKER_VERSION: v0.11.1
-  BPF_LINKER_SHA256: e058a6aecc9e65fa4c977b298a8e4b738424d7629769fd352eed409fb57e16e8
   GOBGP_VERSION: 4.9.0
-  GOBGP_SHA256: 653f52cd11614cff847c9a70dd800b1d2746e61d5796744f591388db7084a038
   CARGO_DENY_VERSION: 0.20.2
   CARGO_DENY_SHA256: 9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f
 
 jobs:
+  # Both architectures run the whole suite, XDP smoke and demo included: an arm64 kernel faults
+  # on things x86 tolerates (a misaligned 64-bit atomic in a map value hung one, ADR-0014).
   build-test-smoke:
-    runs-on: ubuntu-24.04
+    name: ${{ matrix.arch == 'x86_64' && 'build-test-smoke' || 'build-test-smoke (arm64)' }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+            gobgp_arch: amd64
+            bpf_linker_sha256: e058a6aecc9e65fa4c977b298a8e4b738424d7629769fd352eed409fb57e16e8
+            gobgp_sha256: 653f52cd11614cff847c9a70dd800b1d2746e61d5796744f591388db7084a038
+            policy_checks: true
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+            gobgp_arch: arm64
+            bpf_linker_sha256: 341ec1c595496877cae2b073544c2226d78a922739632b5732dbaa48507f1380
+            gobgp_sha256: 359f157e476627ab706c58b738ec65aac9b3e115e0ff1f939de4ccab951b1247
+            policy_checks: false
+    env:
+      BPF_LINKER_SHA256: ${{ matrix.bpf_linker_sha256 }}
+      GOBGP_SHA256: ${{ matrix.gobgp_sha256 }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
@@ -28,14 +48,14 @@ jobs:
 
       - name: Install bpf-linker
         run: |
-          curl -sSfL -o /tmp/bpf-linker.tar.zst "https://github.com/aya-rs/bpf-linker/releases/download/${BPF_LINKER_VERSION}/bpf-linker-x86_64-unknown-linux-musl.tar.zst"
+          curl -sSfL -o /tmp/bpf-linker.tar.zst "https://github.com/aya-rs/bpf-linker/releases/download/${BPF_LINKER_VERSION}/bpf-linker-${{ matrix.arch }}-unknown-linux-musl.tar.zst"
           echo "${BPF_LINKER_SHA256}  /tmp/bpf-linker.tar.zst" | sha256sum -c -
           tar --zstd -x -C /usr/local/bin -f /tmp/bpf-linker.tar.zst
           bpf-linker --version
 
       - name: Install GoBGP (BGP Flowspec smoke checks)
         run: |
-          curl -sSfL -o /tmp/gobgp.tar.gz "https://github.com/osrg/gobgp/releases/download/v${GOBGP_VERSION}/gobgp_${GOBGP_VERSION}_linux_amd64.tar.gz"
+          curl -sSfL -o /tmp/gobgp.tar.gz "https://github.com/osrg/gobgp/releases/download/v${GOBGP_VERSION}/gobgp_${GOBGP_VERSION}_linux_${{ matrix.gobgp_arch }}.tar.gz"
           echo "${GOBGP_SHA256}  /tmp/gobgp.tar.gz" | sha256sum -c -
           sudo tar -xz -C /usr/local/bin -f /tmp/gobgp.tar.gz gobgp gobgpd
 
@@ -45,11 +65,13 @@ jobs:
             . -> target
 
       - name: Format
+        if: matrix.policy_checks
         run: |
           cargo fmt --all --check
           (cd ebpf && cargo fmt --check)
 
       - name: Dependency policy (cargo-deny, deny.toml)
+        if: matrix.policy_checks
         run: |
           curl -sSfL -o /tmp/cargo-deny.tar.gz "https://github.com/EmbarkStudios/cargo-deny/releases/download/${CARGO_DENY_VERSION}/cargo-deny-${CARGO_DENY_VERSION}-x86_64-unknown-linux-musl.tar.gz"
           echo "${CARGO_DENY_SHA256}  /tmp/cargo-deny.tar.gz" | sha256sum -c -
@@ -105,6 +127,6 @@ jobs:
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:
-          name: sokol-${{ github.sha }}
+          name: sokol-${{ github.sha }}-${{ matrix.arch }}
           path: dist/
           if-no-files-found: warn

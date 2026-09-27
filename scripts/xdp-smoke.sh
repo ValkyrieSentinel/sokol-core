@@ -267,6 +267,20 @@ print(sum(1 for _ in range(n) if f.readline().startswith("ERR")))
 PY
 check "a flooding IPC client gets an answer to every line" test "$(cat "$WORK/ipc-flood.txt")" = 6000
 check "and it was paced past its burst" bash -c "sleep 1.2; test \"\$(curl -s http://127.0.0.1:9469/metrics | awk '\$1 == \"sokol_ipc_lines_delayed_total\" { print \$2 }')\" -gt 0"
+check "the binary names its build" bash -c "'$BIN' --version | grep -q '(build '"
+check "the running build is in the metrics" \
+    bash -c "curl -s http://127.0.0.1:9469/metrics | grep -q '^sokol_build_info{version=.*,build=.*} 1'"
+# A support bundle has what a remote diagnosis needs and never the node key.
+BUNDLE=$(CONTROL="$WORK/control.sock" METRICS=http://127.0.0.1:9469/metrics AUDIT="$WORK/events.sntl" \
+    PEERS="$WORK/peers.json" BIN="$BIN" MONITOR="$(dirname "$BIN")/monitor" OUT="$WORK" \
+    "$(dirname "$0")/support-bundle.sh" 2>/dev/null | tail -1)
+mkdir -p "$WORK/bundle" && tar -xzf "$BUNDLE" -C "$WORK/bundle"
+check "a support bundle holds version, metrics, bans and the audit verification" bash -c \
+    "d=\$(ls -d '$WORK'/bundle/sokol-support-*); grep -q '(build ' \$d/version.txt && grep -q '^sokol_blocks_active' \$d/metrics.txt && grep -q '^OK' \$d/bans.txt && grep -q '^OK' \$d/audit-verify.txt"
+check "the support bundle does not contain the node key" python3 -c "
+import pathlib, sys
+key = pathlib.Path('$WORK/node.key').read_bytes()[4:]
+sys.exit(any(key in p.read_bytes() for p in pathlib.Path('$WORK/bundle').rglob('*') if p.is_file()))"
 check "mesh admission counters are exported" \
     bash -c "curl -s http://127.0.0.1:9469/metrics | grep -q '^sokol_mesh_handshake_timeouts_total '"
 printf 'UNBAN_IP:%s\n' "$MOVED_IP" | nc -U -q1 "$WORK/control.sock" >/dev/null
@@ -392,7 +406,8 @@ if command -v suricata >/dev/null; then
         sleep 0.5
     done
     touch "$WORK/suricata/eve.json"
-    "$(dirname "$BIN")/sokol-suricata" --eve "$WORK/suricata/eve.json" >"$WORK/adapter.log" 2>&1 &
+    "$(dirname "$BIN")/sokol-suricata" --eve "$WORK/suricata/eve.json" --cursor-file "$WORK/suricata.cursor" \
+        >"$WORK/adapter.log" 2>&1 &
     ADAPTER_PID=$!
     sleep 1
     check "the probe address reaches the node before the alert" \
@@ -412,6 +427,23 @@ if command -v suricata >/dev/null; then
     if [ -n "$LAST_REPLY" ]; then
         echo "      probe -> last reply before block: $(awk -v a="$T_PROBE" -v b="$LAST_REPLY" 'BEGIN { printf "%.0f ms", (b - a) * 1000 }')"
     fi
+    # An alert written while the adapter is down is forwarded after it restarts (cursor file).
+    sleep 1.5   # the cursor is saved about once a second
+    kill "$ADAPTER_PID" 2>/dev/null || true
+    wait "$ADAPTER_PID" 2>/dev/null || true
+    PROBE2_IP=10.231.0.19
+    ip netns exec "$NS" ip addr add "$PROBE2_IP/24" dev "$PEER_IF"
+    check "the second probe address reaches the node while the adapter is down" \
+        ip netns exec "$NS" ping -c 1 -W 1 -I "$PROBE2_IP" "$HOST_IP"
+    ip netns exec "$NS" nc -z -w 1 -s "$PROBE2_IP" "$HOST_IP" 23 2>/dev/null || true
+    for _ in $(seq 1 30); do grep -q "\"src_ip\":\"$PROBE2_IP\"" "$WORK/suricata/eve.json" && break; sleep 0.2; done
+    "$(dirname "$BIN")/sokol-suricata" --eve "$WORK/suricata/eve.json" --cursor-file "$WORK/suricata.cursor" \
+        >>"$WORK/adapter.log" 2>&1 &
+    ADAPTER_PID=$!
+    for _ in $(seq 1 30); do grep -q "Dynamic block enforced in XDP: $PROBE2_IP" "$LOG" && break; sleep 0.2; done
+    check "an alert written while the adapter was down is forwarded after its restart" \
+        grep -q "Dynamic block enforced in XDP: $PROBE2_IP.*suricata" "$LOG"
+    check "the adapter resumed at its saved cursor" grep -q "resumed at the saved position" "$WORK/adapter.log"
     kill "$ADAPTER_PID" "$SURICATA_PID" 2>/dev/null || true
     ADAPTER_PID=""; SURICATA_PID=""
 else
@@ -548,6 +580,8 @@ s = socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]); f = s.makefile("rw")
 f.write("BAN_IP:%s\n" % sys.argv[2]); f.flush(); f.readline()
 PY
 kill -9 "$ORCH_PID"; wait "$ORCH_PID" 2>/dev/null || true; ORCH_PID=""
+check "a killed node leaves no XDP program on the interface" \
+    bash -c "! ip -d link show $HOST_IF | grep -q 'prog/xdp'"
 STATE_FILE=$LAST_STATE start_orchestrator
 check "an operator ban answered OK survives SIGKILL right after the answer" \
     bash -c "! ip netns exec $NS ping -c 2 -W 1 -I $KILL_BAN $HOST_IP >/dev/null 2>&1"
@@ -584,6 +618,8 @@ check "the corrupt state bytes are kept aside" test "$(cat "$LAST_STATE.corrupt"
 check "ACCEPT_STATE_LOSS is answered" bash -c "printf 'ACCEPT_STATE_LOSS\\n' | nc -U -q1 '$WORK/control.sock' | grep -q '^OK state loss accepted'"
 check "after ACCEPT_STATE_LOSS the node is healthy again" wait_metric sokol_state_healthy 1
 stop_orchestrator
+check "a stopped node leaves no XDP program on the interface (traffic passes unfiltered)" \
+    bash -c "! ip -d link show $HOST_IF | grep -q 'prog/xdp'"
 TRAP_PROTECTED=10.231.0.8; TRAP_OPEN=10.231.0.10
 ip netns exec "$NS" ip addr add "$TRAP_PROTECTED/24" dev "$PEER_IF"
 ip netns exec "$NS" ip addr add "$TRAP_OPEN/24" dev "$PEER_IF"

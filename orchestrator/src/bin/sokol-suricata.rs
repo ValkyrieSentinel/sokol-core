@@ -69,6 +69,17 @@ struct Args {
     /// Process the existing file content instead of starting at its end.
     #[arg(long)]
     from_start: bool,
+
+    /// Remember where reading got to (the oldest alert the node has not answered yet) in this
+    /// file, and resume there after a restart, so alerts written while the adapter was down are
+    /// not lost. Replays are safe: the node recognises an alert it already acted on.
+    #[arg(long, value_name = "PATH")]
+    cursor_file: Option<PathBuf>,
+
+    /// Alerts older than this (by their EVE timestamp) are not forwarded: catching up after a
+    /// long outage must not turn an old event into a new block.
+    #[arg(long, default_value = "600")]
+    max_alert_age_secs: u64,
 }
 
 struct Filter {
@@ -80,6 +91,8 @@ struct Filter {
 struct Alert {
     /// Hash of the EVE line: a resend after a lost ACK is recognised by the node.
     event: String,
+    /// When Suricata saw it (ms since the epoch), if the line says.
+    at_ms: Option<i64>,
     src: IpAddr,
     dst: Option<IpAddr>,
     sid: u64,
@@ -127,7 +140,13 @@ fn decide(line: &str, filter: &Filter) -> Option<Alert> {
         .filter(|c| !c.is_control())
         .take(160)
         .collect();
+    let at_ms = event
+        .get("timestamp")
+        .and_then(|v| v.as_str())
+        .and_then(|t| chrono::DateTime::parse_from_str(t, "%Y-%m-%dT%H:%M:%S%.f%z").ok())
+        .map(|t| t.timestamp_millis());
     Some(Alert {
+        at_ms,
         event: blake3::hash(line.as_bytes())
             .to_hex()
             .chars()
@@ -192,6 +211,28 @@ struct Follower {
     inode: u64,
     position: u64,
     partial: String,
+    /// Where the line being assembled in `partial` starts.
+    line_start: u64,
+}
+
+/// Where reading got to, saved across restarts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct Cursor {
+    inode: u64,
+    position: u64,
+}
+
+impl Cursor {
+    fn load(path: &Path) -> Option<Cursor> {
+        serde_json::from_slice(&std::fs::read(path).ok()?).ok()
+    }
+
+    /// Atomic replace (temporary file, rename).
+    fn save(&self, path: &Path) -> io::Result<()> {
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, serde_json::to_vec(self).map_err(io::Error::other)?)?;
+        std::fs::rename(&tmp, path)
+    }
 }
 
 impl Follower {
@@ -202,9 +243,52 @@ impl Follower {
             inode: 0,
             position: 0,
             partial: String::new(),
+            line_start: 0,
         };
         let _ = f.open(!from_start);
         f
+    }
+
+    /// Resumes at a saved cursor: at its position if the file is the same one and not shorter,
+    /// from the start if it was rotated meanwhile (all of the new file is unread), otherwise as
+    /// `new`. Says what it did.
+    fn resume(path: &Path, cursor: Cursor, from_start: bool) -> (Self, &'static str) {
+        let mut f = Self::new(path, from_start);
+        let Ok(meta) = std::fs::metadata(path) else {
+            return (f, "no file yet");
+        };
+        if meta.ino() == cursor.inode && meta.len() >= cursor.position {
+            if f.open_at(cursor.position).is_ok() {
+                return (f, "resumed at the saved position");
+            }
+        } else if meta.ino() != cursor.inode && f.open(false).is_ok() {
+            return (
+                f,
+                "file rotated while down; reading the new one from its start",
+            );
+        }
+        (f, "saved position no longer valid; starting as usual")
+    }
+
+    fn open_at(&mut self, position: u64) -> io::Result<()> {
+        let file = File::open(&self.path)?;
+        let meta = file.metadata()?;
+        let mut reader = BufReader::new(file);
+        reader.seek(SeekFrom::Start(position))?;
+        self.position = position;
+        self.line_start = position;
+        self.inode = meta.ino();
+        self.reader = Some(reader);
+        self.partial.clear();
+        Ok(())
+    }
+
+    /// The cursor just past the last complete line read.
+    fn cursor(&self) -> Cursor {
+        Cursor {
+            inode: self.inode,
+            position: self.line_start,
+        }
     }
 
     fn open(&mut self, at_end: bool) -> io::Result<()> {
@@ -212,6 +296,7 @@ impl Follower {
         let meta = file.metadata()?;
         let mut reader = BufReader::new(file);
         self.position = if at_end { meta.len() } else { 0 };
+        self.line_start = self.position;
         reader.seek(SeekFrom::Start(self.position))?;
         self.inode = meta.ino();
         self.reader = Some(reader);
@@ -219,8 +304,8 @@ impl Follower {
         Ok(())
     }
 
-    /// Complete lines appended since the last call.
-    fn poll(&mut self) -> io::Result<Vec<String>> {
+    /// Complete lines appended since the last call, each with the position where it starts.
+    fn poll(&mut self) -> io::Result<Vec<(u64, String)>> {
         match std::fs::metadata(&self.path) {
             Ok(meta)
                 if self.reader.is_none()
@@ -247,7 +332,8 @@ impl Follower {
             self.position += n as u64;
             if chunk.ends_with('\n') {
                 self.partial.push_str(&chunk);
-                lines.push(std::mem::take(&mut self.partial));
+                lines.push((self.line_start, std::mem::take(&mut self.partial)));
+                self.line_start = self.position;
             } else {
                 // Suricata is mid-write; keep the fragment until the newline arrives.
                 self.partial.push_str(&chunk);
@@ -308,7 +394,20 @@ fn main() {
         Duration::from_secs(args.cooldown_secs),
         args.max_signals_per_sec,
     );
-    let mut follower = Follower::new(&args.eve, args.from_start);
+    let mut follower = match args.cursor_file.as_deref().and_then(Cursor::load) {
+        Some(cursor) => {
+            let (f, how) = Follower::resume(&args.eve, cursor, args.from_start);
+            log::info!("[sokol-suricata] {} ({:?})", how, cursor);
+            f
+        }
+        None => Follower::new(&args.eve, args.from_start),
+    };
+    let max_age_ms = (args.max_alert_age_secs as i64).saturating_mul(1000);
+    // Where each queued alert's line starts, oldest first (the outbox is FIFO too): the saved
+    // cursor never passes an alert the node has not answered.
+    let mut queued_at: std::collections::VecDeque<u64> = std::collections::VecDeque::new();
+    let mut saved: Option<Cursor> = None;
+    let mut last_save = Instant::now();
     let mut outbox = delivery::Outbox::new(&args.ipc_socket, OUTBOX_CAP);
     log::info!(
         "[sokol-suricata] following {} (severity <= {}), signalling {}",
@@ -320,16 +419,26 @@ fn main() {
     loop {
         match follower.poll() {
             Ok(lines) => {
-                for line in lines {
+                let now_ms = chrono::Utc::now().timestamp_millis();
+                for (start, line) in lines {
                     let Some(alert) = decide(&line, &filter) else {
                         continue;
                     };
+                    if alert
+                        .at_ms
+                        .is_some_and(|at| now_ms.saturating_sub(at) > max_age_ms)
+                    {
+                        log::debug!("[sokol-suricata] stale alert from {} skipped", alert.src);
+                        continue;
+                    }
                     if !gate.admit(alert.src, Instant::now()) {
                         continue;
                     }
                     let lost = outbox.lost;
                     outbox.push(&alert.signal_line());
+                    queued_at.push_back(start);
                     if outbox.lost > lost {
+                        queued_at.pop_front();
                         log::error!(
                             "[sokol-suricata] outbox full ({} queued): oldest alert dropped",
                             OUTBOX_CAP
@@ -340,6 +449,28 @@ fn main() {
             Err(e) => log::error!("[sokol-suricata] reading {}: {}", args.eve.display(), e),
         }
         deliver(&mut outbox, &args.ipc_socket);
+        while queued_at.len() > outbox.pending() {
+            queued_at.pop_front();
+        }
+        if let Some(path) = args.cursor_file.as_deref() {
+            if last_save.elapsed() >= Duration::from_secs(1) {
+                last_save = Instant::now();
+                let mut cursor = follower.cursor();
+                if let Some(oldest) = queued_at.front() {
+                    cursor.position = *oldest;
+                }
+                if saved != Some(cursor) {
+                    match cursor.save(path) {
+                        Ok(()) => saved = Some(cursor),
+                        Err(e) => log::warn!(
+                            "[sokol-suricata] cannot save the cursor to {}: {}",
+                            path.display(),
+                            e
+                        ),
+                    }
+                }
+            }
+        }
         std::thread::sleep(Duration::from_millis(50));
     }
 }
@@ -429,6 +560,10 @@ mod tests {
         ));
     }
 
+    fn lines(f: &mut Follower) -> Vec<String> {
+        f.poll().unwrap().into_iter().map(|(_, l)| l).collect()
+    }
+
     #[test]
     fn follower_handles_appends_partial_lines_truncation_and_rotation() {
         let dir = std::env::temp_dir().join(format!("sokol-suricata-{}", std::process::id()));
@@ -437,27 +572,94 @@ mod tests {
         std::fs::write(&path, "old line\n").unwrap();
 
         let mut f = Follower::new(&path, false);
-        assert!(f.poll().unwrap().is_empty(), "starts at the end by default");
+        assert!(lines(&mut f).is_empty(), "starts at the end by default");
 
         let mut w = std::fs::OpenOptions::new()
             .append(true)
             .open(&path)
             .unwrap();
         w.write_all(b"one\ntw").unwrap();
-        assert_eq!(f.poll().unwrap(), vec!["one\n"]);
+        assert_eq!(lines(&mut f), vec!["one\n"]);
         w.write_all(b"o\n").unwrap();
-        assert_eq!(f.poll().unwrap(), vec!["two\n"], "partial line joined");
+        assert_eq!(lines(&mut f), vec!["two\n"], "partial line joined");
 
         // Rotation: rename away, new file appears.
         std::fs::rename(&path, dir.join("eve.json.1")).unwrap();
         std::fs::write(&path, "three\n").unwrap();
-        assert_eq!(f.poll().unwrap(), vec!["three\n"]);
+        assert_eq!(lines(&mut f), vec!["three\n"]);
 
         // Truncation in place.
         std::fs::write(&path, "").unwrap();
-        assert!(f.poll().unwrap().is_empty());
+        assert!(lines(&mut f).is_empty());
         std::fs::write(&path, "four\n").unwrap();
-        assert_eq!(f.poll().unwrap(), vec!["four\n"]);
+        assert_eq!(lines(&mut f), vec!["four\n"]);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn lines_carry_their_start_and_the_cursor_follows_complete_lines() {
+        let dir = std::env::temp_dir().join(format!("sokol-suricata-pos-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("eve.json");
+        std::fs::write(&path, "aa\nbbb\ncc").unwrap();
+        let mut f = Follower::new(&path, true);
+        assert_eq!(
+            f.poll().unwrap(),
+            vec![(0, "aa\n".to_string()), (3, "bbb\n".to_string())]
+        );
+        assert_eq!(
+            f.cursor().position,
+            7,
+            "the partial line is not past the cursor"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_restart_resumes_at_the_cursor_or_reads_a_rotated_file_from_its_start() {
+        let dir = std::env::temp_dir().join(format!("sokol-suricata-cur-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (path, saved) = (dir.join("eve.json"), dir.join("cursor"));
+        std::fs::write(&path, "one\ntwo\n").unwrap();
+        let mut f = Follower::new(&path, true);
+        let _ = f.poll().unwrap();
+        let cursor = Cursor {
+            position: 4, // "two" was queued but not yet answered when the adapter stopped
+            ..f.cursor()
+        };
+        cursor.save(&saved).unwrap();
+        assert_eq!(Cursor::load(&saved), Some(cursor));
+
+        // Written while the adapter was down.
+        let mut w = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        w.write_all(b"three\n").unwrap();
+        let (mut f, how) = Follower::resume(&path, cursor, false);
+        assert_eq!(how, "resumed at the saved position");
+        assert_eq!(
+            lines(&mut f),
+            vec!["two\n", "three\n"],
+            "nothing unanswered is lost"
+        );
+
+        // Rotated while down: the new file is read from its start.
+        std::fs::rename(&path, dir.join("eve.json.1")).unwrap();
+        std::fs::write(&path, "four\n").unwrap();
+        let (mut f, how) = Follower::resume(&path, cursor, false);
+        assert!(how.starts_with("file rotated"), "{}", how);
+        assert_eq!(lines(&mut f), vec!["four\n"]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn an_alert_carries_its_time() {
+        let alert = decide(ALERT, &filter()).unwrap();
+        assert_eq!(
+            alert.at_ms,
+            Some(1_790_250_503_712),
+            "2026-09-24T11:48:23.712804Z"
+        );
     }
 }
