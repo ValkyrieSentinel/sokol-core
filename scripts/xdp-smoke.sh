@@ -487,6 +487,36 @@ check "an operator ban answered OK survives SIGKILL right after the answer" \
     bash -c "! ip netns exec $NS ping -c 2 -W 1 -I $KILL_BAN $HOST_IP >/dev/null 2>&1"
 printf 'UNBAN_IP:%s\n' "$KILL_BAN" | nc -U -q1 "$WORK/control.sock" >/dev/null
 printf 'UNBAN_IP:%s\n' "$PERSIST_IP" | nc -U -q1 "$WORK/control.sock" >/dev/null
+# R27-03: a hung state write (its temp file is a FIFO nobody reads) must not stall the node:
+# the operator gets an answer within the durable wait, the tick keeps running, health turns bad.
+STATE_TMP="${LAST_STATE%.json}.tmp"
+sleep 1.5   # let the unbans reach the disk first
+rm -f "$STATE_TMP"; mkfifo "$STATE_TMP"
+HUNG_IP=10.231.0.15
+ip netns exec "$NS" ip addr add "$HUNG_IP/24" dev "$PEER_IF"
+T_BAN=$(date +%s.%N)
+HUNG_REPLY=$(printf 'BAN_IP:%s\n' "$HUNG_IP" | timeout 10 nc -U -q1 "$WORK/control.sock")
+T_REPLY=$(date +%s.%N)
+check "a ban is answered within the durable wait while the disk hangs, and says so" \
+    bash -c "echo '$HUNG_REPLY' | grep -q '^OK .*WARNING: not yet durable' && awk -v a=$T_BAN -v b=$T_REPLY 'BEGIN { exit !(b - a < 4) }'"
+check "the ban is enforced although not yet durable" \
+    bash -c "! ip netns exec $NS ping -c 2 -W 1 -I $HUNG_IP $HOST_IP >/dev/null 2>&1"
+check "a hung state write makes the node DEGRADED" wait_metric sokol_state_healthy 0
+PENDING1=$(metric sokol_state_pending_seconds); sleep 2.5; PENDING2=$(metric sokol_state_pending_seconds)
+check "the maintenance tick keeps running while the write hangs" \
+    awk -v a="$PENDING1" -v b="$PENDING2" 'BEGIN { exit !(b > a + 1) }'
+(timeout 5 cat "$STATE_TMP" >/dev/null &) ; sleep 0.5; rm -f "$STATE_TMP"
+check "health returns once the disk answers" wait_metric sokol_state_healthy 1
+printf 'UNBAN_IP:%s\n' "$HUNG_IP" | nc -U -q1 "$WORK/control.sock" >/dev/null
+stop_orchestrator
+# R27-04: a state file that does not parse is not a first start: its bytes are kept and the node
+# stays DEGRADED until the operator accepts the loss.
+printf '{ not a state file' >"$LAST_STATE"
+STATE_FILE=$LAST_STATE start_orchestrator
+check "a corrupt state file keeps the node DEGRADED" wait_metric sokol_state_restore_ok 0
+check "the corrupt state bytes are kept aside" test "$(cat "$LAST_STATE.corrupt")" = "{ not a state file"
+check "ACCEPT_STATE_LOSS is answered" bash -c "printf 'ACCEPT_STATE_LOSS\\n' | nc -U -q1 '$WORK/control.sock' | grep -q '^OK state loss accepted'"
+check "after ACCEPT_STATE_LOSS the node is healthy again" wait_metric sokol_state_healthy 1
 stop_orchestrator
 TRAP_PROTECTED=10.231.0.8; TRAP_OPEN=10.231.0.10
 ip netns exec "$NS" ip addr add "$TRAP_PROTECTED/24" dev "$PEER_IF"

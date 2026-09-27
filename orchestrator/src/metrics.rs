@@ -21,6 +21,8 @@ pub struct Snapshot {
     pub defense_strict: bool,
     pub audit_healthy: bool,
     pub state_healthy: bool,
+    pub state_pending_secs: f64,
+    pub state_restore_ok: bool,
     pub audit_write_errors: u64,
     pub audit_lost: u64,
     pub audit_sync_age_ms: u64,
@@ -159,6 +161,24 @@ pub fn render(s: &Snapshot) -> String {
         "1 while --state-file is written; 0 while this node's decisions are not being persisted.",
     );
     let _ = writeln!(out, "sokol_state_healthy {}", s.state_healthy as u8);
+    family(
+        &mut out,
+        "sokol_state_pending_seconds",
+        "gauge",
+        "How long the oldest change to this node's decisions has waited to reach --state-file.",
+    );
+    let _ = writeln!(
+        out,
+        "sokol_state_pending_seconds {:.3}",
+        s.state_pending_secs
+    );
+    family(
+        &mut out,
+        "sokol_state_restore_ok",
+        "gauge",
+        "0 after a state file failed to restore, until ACCEPT_STATE_LOSS on the control socket.",
+    );
+    let _ = writeln!(out, "sokol_state_restore_ok {}", s.state_restore_ok as u8);
     family(
         &mut out,
         "sokol_audit_write_errors_total",
