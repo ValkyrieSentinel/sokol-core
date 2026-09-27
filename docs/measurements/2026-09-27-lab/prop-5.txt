@@ -1,0 +1,5 @@
+# nodes=5 netem='none' host=aarch64 cpus=10 kernel=6.8.0-142-generic
+# full mesh after 3s: 5/5 nodes see 4 peers
+per node (issue on node 1 -> recorded on node k): n=80 min=0 median=0 p95=1 max=1 (ms)
+until the last node has it:                       n=20 min=0 median=0 p95=1 max=1 (ms)
+missing deliveries: 0 of 80
