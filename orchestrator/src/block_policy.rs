@@ -7,6 +7,10 @@ use ipnet::IpNet;
 /// Reason given for this host's own interface addresses.
 pub const LOCAL_ADDRESS: &str = "address of this node";
 
+/// Reason given for a WireGuard peer's outer (endpoint) address: XDP sees the tunnel's UDP
+/// packets from it, so blocking it would cut the peer, and the mesh running over the tunnel, off.
+pub const WIREGUARD_ENDPOINT: &str = "WireGuard peer endpoint";
+
 pub const PREFIX_TOO_WIDE: &str = "prefix wider than --min-block-prefix-v4/-v6 allows";
 
 #[derive(Clone)]
@@ -96,6 +100,9 @@ impl BlockPolicy {
         for ip in &host.gateways {
             policy.protect_ip(*ip, "default gateway");
         }
+        for ip in &host.wireguard {
+            policy.protect_ip(*ip, WIREGUARD_ENDPOINT);
+        }
         policy
     }
 }
@@ -105,6 +112,8 @@ impl BlockPolicy {
 pub struct HostView {
     pub addresses: std::collections::BTreeSet<IpAddr>,
     pub gateways: std::collections::BTreeSet<IpAddr>,
+    /// Endpoints of this host's WireGuard peers (`wg show all endpoints`).
+    pub wireguard: std::collections::BTreeSet<IpAddr>,
 }
 
 impl HostView {
@@ -117,15 +126,24 @@ impl HostView {
                 .map(canonical)
                 .collect(),
             gateways: default_gateways()?.into_iter().map(canonical).collect(),
+            wireguard: wireguard_endpoints()?.into_iter().map(canonical).collect(),
         })
     }
 
     /// What `self` protects that `before` did not, and the reverse.
     pub fn diff(&self, before: &HostView) -> (Vec<IpAddr>, Vec<IpAddr>) {
-        let now: std::collections::BTreeSet<&IpAddr> =
-            self.addresses.iter().chain(&self.gateways).collect();
-        let was: std::collections::BTreeSet<&IpAddr> =
-            before.addresses.iter().chain(&before.gateways).collect();
+        let now: std::collections::BTreeSet<&IpAddr> = self
+            .addresses
+            .iter()
+            .chain(&self.gateways)
+            .chain(&self.wireguard)
+            .collect();
+        let was: std::collections::BTreeSet<&IpAddr> = before
+            .addresses
+            .iter()
+            .chain(&before.gateways)
+            .chain(&before.wireguard)
+            .collect();
         (
             now.difference(&was).map(|ip| **ip).collect(),
             was.difference(&now).map(|ip| **ip).collect(),
@@ -214,6 +232,39 @@ fn default_gateways() -> Result<Vec<IpAddr>, String> {
     Ok(out)
 }
 
+/// Endpoints of all WireGuard peers on this host. No `wg` tool means no WireGuard to protect (not
+/// an error); a `wg` that fails is an error, so a failed read never looks like "no peers".
+fn wireguard_endpoints() -> Result<Vec<IpAddr>, String> {
+    let out = match std::process::Command::new("wg")
+        .args(["show", "all", "endpoints"])
+        .output()
+    {
+        Ok(out) => out,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("cannot run wg: {}", e)),
+    };
+    if !out.status.success() {
+        return Err(format!(
+            "wg show all endpoints failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(parse_wireguard_endpoints(&String::from_utf8_lossy(
+        &out.stdout,
+    )))
+}
+
+/// `wg show all endpoints`: the endpoint (`ip:port`, `[ipv6]:port` or `(none)`) is the last field.
+/// The interface name starts only an interface's first line; its other peers' lines hold just
+/// `<public key>\t<endpoint>` (seen with wireguard-tools on Ubuntu 24.04).
+fn parse_wireguard_endpoints(text: &str) -> Vec<IpAddr> {
+    text.lines()
+        .filter_map(|line| line.split_whitespace().last())
+        .filter_map(|endpoint| endpoint.parse::<std::net::SocketAddr>().ok())
+        .map(|endpoint| endpoint.ip())
+        .collect()
+}
+
 /// `/proc/net/route`: Iface Destination Gateway ... in little-endian hex.
 fn parse_ipv4_default_gateways(table: &str) -> Vec<IpAddr> {
     table
@@ -255,6 +306,26 @@ mod tests {
 
     fn ip(s: &str) -> IpAddr {
         s.parse().unwrap()
+    }
+
+    #[test]
+    fn wireguard_endpoints_are_read_and_protected() {
+        // As wireguard-tools prints it: the interface name only on its first peer's line.
+        let out = "wg0\tAAAA=\t203.0.113.5:51820\nBBBB=\t(none)\nDDDD=\t198.51.100.9:51820\n\
+                   wg1\tCCCC=\t[2001:db8::7]:51821\n";
+        assert_eq!(
+            parse_wireguard_endpoints(out),
+            vec![ip("203.0.113.5"), ip("198.51.100.9"), ip("2001:db8::7")]
+        );
+        let mut view = HostView::default();
+        view.wireguard.extend(parse_wireguard_endpoints(out));
+        let policy = BlockPolicy::builtin().with_host(&view);
+        assert_eq!(policy.check(ip("203.0.113.5")), Err(WIREGUARD_ENDPOINT));
+        assert_eq!(
+            view.diff(&HostView::default()).0.len(),
+            3,
+            "a new peer is a change"
+        );
     }
 
     #[test]
