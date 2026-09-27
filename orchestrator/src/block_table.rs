@@ -145,6 +145,11 @@ fn bounded_reason(reason: &str) -> String {
 /// Pending kernel operations retried per tick (a full map must not cost a syscall per entry per s).
 pub const MAX_RETRIES_PER_TICK: usize = 256;
 
+/// A retraction or lift record is kept this long past the moment its claim can no longer
+/// count, so a clock stepped back by less than this (NTP, a VM resumed) cannot bring a lifted
+/// claim back to life for the length of the step. Twenty times the mesh's clock-skew bound.
+pub const FORGET_GRACE: Duration = Duration::from_secs(600);
+
 /// Distinct nodes remembered per retracted id (the issuer plus a few others).
 const MAX_RETRACTORS: usize = 4;
 
@@ -443,10 +448,10 @@ impl<B: Blocklist> BlockTable<B> {
             && !self.envelope(held.claim.issuer).admits(&held.net)
         {
             Some("envelope")
-        } else if !held.in_quota {
-            Some("quota")
         } else if held.until_ms.is_some_and(|u| u <= now_ms) {
             Some("expired")
+        } else if !held.in_quota {
+            Some("quota")
         } else if !self.effective(id, held, now_ms) {
             Some("quorum")
         } else {
@@ -546,6 +551,26 @@ impl<B: Blocklist> BlockTable<B> {
     /// (remembered event ids, ids forgotten early because the memory was full)
     pub fn event_memory(&self) -> (usize, u64) {
         (self.events.len(), self.events_evicted)
+    }
+
+    /// Remembers where a peer claim's lease ends if the local cap cuts it short. The end only
+    /// ever moves earlier: a lease shortened once (e.g. after a clock step) is not lengthened by
+    /// a later restart, so records timed by it (an operator lift) outlive it.
+    fn record_lease(&mut self, id: &ClaimId, cap: u64, expires: Option<u64>) {
+        if expires.is_some_and(|e| e <= cap) {
+            return;
+        }
+        match self.lease_ends.get_mut(id) {
+            Some((end, _)) if *end <= cap => {}
+            Some((end, _)) => {
+                *end = cap;
+                self.dirty = true;
+            }
+            None => {
+                self.lease_ends.insert(id.clone(), (cap, expires));
+                self.dirty = true;
+            }
+        }
     }
 
     fn insert_held(&mut self, id: ClaimId, held: Held) {
@@ -714,16 +739,23 @@ impl<B: Blocklist> BlockTable<B> {
             None => cap,
         };
         let until_ms = Some(claim.expires_ms.map_or(cap, |e| e.min(cap)));
-        if claim.expires_ms.is_none_or(|e| e > cap) && !self.lease_ends.contains_key(&id) {
-            self.lease_ends.insert(id.clone(), (cap, claim.expires_ms));
-            self.dirty = true;
-        }
+        // Only a claim that could count takes a slot or waits for one: not one whose lease ran
+        // out (before a restart), one the local policy refuses, or one already retracted (a
+        // lifted claim resent by its issuer must not use up the issuer's quota).
+        let lease_over = cap <= now_ms;
+        let retracted = self
+            .retractions
+            .get(&id)
+            .is_some_and(|r| r.operator || r.by_nodes.contains(&claim.issuer));
+        let could_count = !lease_over && allowed && !retracted;
         let issuer = claim.issuer;
         let active = self.active_by_issuer.entry(issuer).or_insert(0);
-        let in_quota = *active < envelope.max_active;
+        let in_quota = could_count && *active < envelope.max_active;
         if in_quota {
             *active += 1;
-        } else {
+            // The lease starts with enforcement; a waiting claim records it when it gets a slot.
+            self.record_lease(&id, cap, claim.expires_ms);
+        } else if could_count {
             self.waiting
                 .entry(issuer)
                 .or_default()
@@ -737,7 +769,7 @@ impl<B: Blocklist> BlockTable<B> {
                 until_ms,
                 allowed,
                 in_quota,
-                ended: false,
+                ended: lease_over,
             },
         );
         let was = self.applied.contains(&net);
@@ -821,13 +853,19 @@ impl<B: Blocklist> BlockTable<B> {
                 self.claims.remove(&id);
                 if let Some(set) = self.by_target.get_mut(&net) {
                     set.remove(&id);
+                    if set.is_empty() {
+                        self.by_target.remove(&net);
+                    }
                 }
                 out.claims += 1;
                 continue;
             }
             let own_detector =
                 h.claim.issuer == self.node_id && h.claim.kind == ClaimKind::Detector;
-            let forget_ms = h.claim.expires_ms.or(h.until_ms);
+            // Kept as long as the claim can live anywhere (not just its local lease: a claim
+            // that never had one, e.g. one waiting for a slot, would get a fresh lease when it
+            // is resent after the record is gone). A claim that never expires keeps it for good.
+            let forget_ms = h.claim.expires_ms;
             let r = self.retractions.entry(id.clone()).or_default();
             if !r.operator {
                 out.claims += 1;
@@ -859,20 +897,21 @@ impl<B: Blocklist> BlockTable<B> {
             .flatten()
             .cloned()
             .collect();
+        // Lifts every decision about the target known now, enforced or not: a claim waiting
+        // for a slot or a quorum must not re-block the target later.
         let mut liftable = Vec::new();
-        let mut has_static = false;
+        let (mut has_static, mut blocked) = (false, false);
         for id in ids {
             let h = &self.claims[&id];
-            if !self.effective(&id, h, now_ms) {
-                continue;
-            }
+            let effective = self.effective(&id, h, now_ms);
             if h.claim.kind == ClaimKind::Static {
-                has_static = true;
+                has_static |= effective;
             } else {
+                blocked |= effective;
                 liftable.push(id);
             }
         }
-        if liftable.is_empty() {
+        if !blocked {
             return Err(if has_static {
                 LiftError::Static
             } else {
@@ -903,7 +942,7 @@ impl<B: Blocklist> BlockTable<B> {
         let ids: Vec<ClaimId> = self
             .claims
             .iter()
-            .filter(|(id, h)| h.claim.kind != ClaimKind::Static && self.effective(id, h, now_ms))
+            .filter(|(_, h)| h.claim.kind != ClaimKind::Static)
             .map(|(id, _)| id.clone())
             .collect();
         let nets: Vec<IpNet> = ids.iter().map(|id| self.claims[id].net).collect();
@@ -916,7 +955,7 @@ impl<B: Blocklist> BlockTable<B> {
         let ids: Vec<ClaimId> = self
             .claims
             .iter()
-            .filter(|(id, h)| h.claim.kind == ClaimKind::Detector && self.effective(id, h, now_ms))
+            .filter(|(_, h)| h.claim.kind == ClaimKind::Detector)
             .map(|(id, _)| id.clone())
             .collect();
         let nets: Vec<IpNet> = ids.iter().map(|id| self.claims[id].net).collect();
@@ -977,9 +1016,19 @@ impl<B: Blocklist> BlockTable<B> {
                 let Some(id) = self.waiting.get_mut(&issuer).and_then(|q| q.pop_front()) else {
                     break;
                 };
-                // Enforcement starts now, so the local end is counted from now.
+                // Enforcement starts now, so the local end is counted from now, but never past
+                // a lease this claim already had (before a restart, R26-07).
                 let cap =
                     now_ms.saturating_add(ms(self.policy.max.min(self.envelope(issuer).max_ttl)));
+                let earlier = self.lease_ends.get(&id).map(|(end, _)| *end);
+                let cap = earlier.map_or(cap, |end| cap.min(end));
+                if cap <= now_ms {
+                    continue;
+                }
+                let retracted = self.claims.get(&id).is_some_and(|h| self.retracted(&id, h));
+                if retracted {
+                    continue;
+                }
                 if let Some(h) = self.claims.get_mut(&id) {
                     if !h.in_quota && h.claim.live_at(now_ms) {
                         h.in_quota = true;
@@ -987,13 +1036,26 @@ impl<B: Blocklist> BlockTable<B> {
                         h.ended = false;
                         *self.active_by_issuer.entry(issuer).or_insert(0) += 1;
                         touched.push(h.net);
+                        let expires = h.claim.expires_ms;
+                        self.record_lease(&id, cap, expires);
                     }
                 }
             }
         }
         self.waiting.retain(|_, q| !q.is_empty());
-        self.retractions
-            .retain(|_, r| r.forget_ms.is_none_or(|f| f > now_ms));
+        // A forgotten record must not leave its target's kernel entry stale.
+        let claims = &self.claims;
+        self.retractions.retain(|id, r| {
+            let keep = r
+                .forget_ms
+                .is_none_or(|f| f.saturating_add(ms(FORGET_GRACE)) > now_ms);
+            if !keep {
+                if let Some(h) = claims.get(id) {
+                    touched.push(h.net);
+                }
+            }
+            keep
+        });
         let before = self.lease_ends.len();
         self.lease_ends
             .retain(|_, (_, expires)| expires.is_none_or(|e| e > now_ms));
@@ -1990,6 +2052,12 @@ mod tests {
         assert_eq!(n1.retractions.len(), 3);
         n1.tick(T0 + ms(POLICY.max) + S);
         assert_eq!(
+            n1.retractions.len(),
+            3,
+            "kept for FORGET_GRACE past the horizon"
+        );
+        n1.tick(T0 + ms(POLICY.max) + ms(FORGET_GRACE) + S);
+        assert_eq!(
             n1.retractions.keys().cloned().collect::<Vec<_>>(),
             vec![forever.id()],
             "finite and unseen tombstones end; the never-expiring claim keeps its own"
@@ -2137,6 +2205,101 @@ mod tests {
         );
     }
 
+    fn peer_claim(issuer: u64, target: &str, issued: u64) -> Claim {
+        Claim {
+            issuer,
+            kind: ClaimKind::Detector,
+            target: target.into(),
+            issued_ms: issued,
+            expires_ms: None,
+            reason: "peer".into(),
+        }
+    }
+
+    fn one_slot(t: &mut BlockTable<FakeLists>, issuer: u64, now: u64) {
+        let mut per_peer = HashMap::new();
+        per_peer.insert(
+            issuer,
+            Envelope {
+                max_active: 1,
+                ..Envelope::unlimited(POLICY.max)
+            },
+        );
+        t.configure_peers(Envelope::unlimited(POLICY.max), per_peer, Quorum::OFF, now);
+    }
+
+    #[test]
+    fn a_claim_that_waits_for_a_slot_keeps_its_earlier_lease_end() {
+        // R26-07 through the quota queue: a claim leased before a restart that has to wait for
+        // a slot afterwards is enforced only until its original lease end.
+        let (a, b) = (
+            peer_claim(2, "203.0.113.70", T0),
+            peer_claim(2, "203.0.113.71", T0),
+        );
+        let mut n1 = table(1, 64);
+        one_slot(&mut n1, 2, T0);
+        assert_eq!(n1.adopt(b.clone(), true, T0), Adoption::Enforced);
+        let restart = T0 + 400 * S; // b's lease (max 600 s) ends at T0 + 600 s
+        let mut restarted = table(1, 64);
+        one_slot(&mut restarted, 2, restart);
+        restarted.restore(n1.take_persisted(restart), |_| true, restart);
+        let a_id = a.id();
+        assert_eq!(restarted.adopt(a, true, restart), Adoption::Enforced);
+        assert_eq!(restarted.adopt(b, true, restart), Adoption::Held("quota"));
+        // a's slot frees at restart + 600 s... too late for b; free it sooner with a retraction.
+        restarted.retract(2, &[a_id], restart + 100 * S);
+        restarted.tick(restart + 100 * S);
+        assert!(
+            restarted.is_blocked(ip("203.0.113.71")),
+            "b takes the freed slot"
+        );
+        restarted.tick(T0 + 600 * S);
+        assert!(
+            !restarted.is_blocked(ip("203.0.113.71")),
+            "b is enforced past its original lease end"
+        );
+    }
+
+    #[test]
+    fn lifted_claims_resent_by_their_issuer_take_no_slots() {
+        // Found by the machine: after a restart, a peer resending claims the operator had lifted
+        // used up its quota with them, so its new claims waited.
+        let mut n1 = table(1, 64);
+        one_slot(&mut n1, 2, T0);
+        let old = peer_claim(2, "203.0.113.73", T0);
+        assert_eq!(n1.adopt(old.clone(), true, T0), Adoption::Enforced);
+        n1.lift(ip("203.0.113.73"), T0).unwrap();
+        let mut restarted = table(1, 64);
+        one_slot(&mut restarted, 2, T0 + S);
+        restarted.restore(n1.take_persisted(T0 + S), |_| true, T0 + S);
+        assert_eq!(
+            restarted.adopt(old, true, T0 + S),
+            Adoption::Held("retracted")
+        );
+        assert_eq!(
+            restarted.adopt(peer_claim(2, "203.0.113.74", T0 + S), true, T0 + S),
+            Adoption::Enforced,
+            "the lifted claim holds the peer's only slot"
+        );
+    }
+
+    #[test]
+    fn an_ended_lease_stays_ended_when_the_clock_steps_back() {
+        let mut t = table(1, 64);
+        let c = peer_claim(2, "203.0.113.72", T0);
+        assert_eq!(t.adopt(c, true, T0), Adoption::Enforced);
+        let end = T0 + ms(POLICY.max);
+        t.tick(end);
+        assert!(!t.is_blocked(ip("203.0.113.72")));
+        // The clock steps back a minute and something re-examines every target: the ended lease
+        // gave up its slot, so it does not count again.
+        t.set_pinned([2].into_iter().collect(), end - 60 * S);
+        assert!(
+            !t.is_blocked(ip("203.0.113.72")),
+            "an ended lease came back after a clock step"
+        );
+    }
+
     #[test]
     fn claim_identity_is_its_bytes() {
         let mut t = table(1, 8);
@@ -2199,5 +2362,561 @@ mod tests {
         assert_eq!(t.active_by_family(), (2, 0));
         assert_eq!(t.tick(T0 + 60 * S), vec![ip("198.51.100.0/24")]);
         assert!(t.is_blocked(ip("198.51.100.9")));
+    }
+
+    /// Model-based fuzzing: random sequences of everything that can happen to the table —
+    /// local decisions, peers' claims (with odd times, wide prefixes, quota and quorum),
+    /// retractions, lifts, flushes, failing map deletes, re-pinning, clock steps in both
+    /// directions — checked against invariants after every step.
+    mod machine {
+        use super::*;
+        use proptest::prelude::*;
+
+        const TARGETS: &[&str] = &[
+            "203.0.113.1",
+            "203.0.113.2",
+            "203.0.113.0/24",
+            "198.51.0.0/16",
+            "2001:db8::1",
+            "2001:db8::/48",
+            "::ffff:203.0.113.1",
+        ];
+        const PEERS: &[u64] = &[2, 3, 4];
+
+        #[derive(Clone, Debug)]
+        enum Op {
+            Local {
+                t: usize,
+                kind: u8,
+            },
+            Peer {
+                issuer: usize,
+                t: usize,
+                ttl: Option<u64>,
+                back: u64,
+                allowed: bool,
+                reason: u16,
+            },
+            Retract {
+                issuer: usize,
+                pick: usize,
+            },
+            Lift {
+                t: usize,
+            },
+            FlushAll,
+            FlushDetector,
+            Tick {
+                dt: i64,
+            },
+            FailDelete(bool),
+            Pin {
+                mask: u8,
+            },
+            Restart,
+        }
+
+        fn op() -> impl Strategy<Value = Op> {
+            let t = 0..TARGETS.len();
+            prop_oneof![
+                3 => (t.clone(), 0u8..3).prop_map(|(t, kind)| Op::Local { t, kind }),
+                4 => (
+                    0..PEERS.len(),
+                    t.clone(),
+                    prop_oneof![Just(None), (0u64..2_000_000).prop_map(Some), Just(Some(u64::MAX))],
+                    prop_oneof![Just(0u64), 0u64..5_000_000, Just(u64::MAX)],
+                    prop::bool::weighted(0.9),
+                    prop_oneof![Just(0u16), Just(600u16)],
+                )
+                    .prop_map(|(issuer, t, ttl, back, allowed, reason)| Op::Peer {
+                        issuer, t, ttl, back, allowed, reason
+                    }),
+                2 => (0..PEERS.len() + 1, any::<usize>()).prop_map(|(issuer, pick)| Op::Retract { issuer, pick }),
+                2 => t.prop_map(|t| Op::Lift { t }),
+                1 => Just(Op::FlushAll),
+                1 => Just(Op::FlushDetector),
+                4 => prop_oneof![
+                    4 => 0i64..700_000,
+                    1 => -120_000i64..0,
+                    1 => Just(24 * 3600 * 1000i64),
+                ]
+                .prop_map(|dt| Op::Tick { dt }),
+                1 => any::<bool>().prop_map(Op::FailDelete),
+                1 => any::<u8>().prop_map(|mask| Op::Pin { mask }),
+                1 => Just(Op::Restart),
+            ]
+        }
+
+        fn configure(t: &mut BlockTable<FakeLists>, now: u64) {
+            let mut per_peer = HashMap::new();
+            per_peer.insert(
+                3,
+                Envelope {
+                    max_active: 2,
+                    max_ttl: Duration::from_secs(300),
+                    min_prefix_v4: 24,
+                    min_prefix_v6: 48,
+                },
+            );
+            t.configure_peers(
+                Envelope::unlimited(POLICY.max),
+                per_peer,
+                Quorum {
+                    k: 2,
+                    wide_v4: 24,
+                    wide_v6: 64,
+                },
+                now,
+            );
+        }
+
+        /// Invariants that hold after every step.
+        fn check(t: &BlockTable<FakeLists>, now: u64, settled: bool) -> Result<(), TestCaseError> {
+            prop_assert_eq!(
+                &t.lists.nets,
+                &t.applied,
+                "applied is exactly what the kernel map holds"
+            );
+            prop_assert!(
+                t.pending.iter().all(|n| t.queued.contains(n)),
+                "every pending target is queued for retry"
+            );
+            for (issuer, n) in &t.active_by_issuer {
+                let held = t
+                    .claims
+                    .values()
+                    .filter(|h| h.claim.issuer == *issuer && h.in_quota)
+                    .count();
+                prop_assert_eq!(*n, held, "slot count of node {}", issuer);
+                prop_assert!(
+                    *n <= t.envelope(*issuer).max_active,
+                    "node {} over its envelope",
+                    issuer
+                );
+            }
+            for (id, h) in &t.claims {
+                if h.in_quota && h.claim.issuer != 1 {
+                    prop_assert!(
+                        h.allowed && !t.retracted(id, h),
+                        "a claim that cannot count holds one of {}'s slots",
+                        h.claim.issuer
+                    );
+                }
+            }
+            for (net, ids) in &t.by_target {
+                prop_assert!(!ids.is_empty(), "empty target set kept for {}", net);
+                for id in ids {
+                    let h = t.claims.get(id);
+                    prop_assert!(
+                        h.is_some_and(|h| h.net == *net),
+                        "by_target points to a missing or other claim"
+                    );
+                }
+            }
+            prop_assert_eq!(
+                t.claims.len(),
+                t.by_target.values().map(|s| s.len()).sum::<usize>(),
+                "every claim is indexed by its target"
+            );
+            // ADR-7: a prefix wider than /24 (/64) that only peers claim is enforced only with
+            // claims from two distinct nodes that count here.
+            for net in t.applied.iter().filter(|n| !t.pending.contains(n)) {
+                let wide = match net {
+                    IpNet::V4(n) => n.prefix_len() < 24,
+                    IpNet::V6(n) => n.prefix_len() < 64,
+                };
+                let ids = t.by_target.get(net).into_iter().flatten();
+                let counting: Vec<&Held> = ids
+                    .filter_map(|id| t.claims.get(id).filter(|h| t.counts(id, h, now)))
+                    .collect();
+                if wide && !counting.iter().any(|h| h.claim.issuer == 1) {
+                    let issuers: HashSet<u64> = counting.iter().map(|h| h.claim.issuer).collect();
+                    prop_assert!(
+                        issuers.len() >= 2,
+                        "{} enforced for peers {:?} without quorum",
+                        net,
+                        issuers
+                    );
+                }
+            }
+            if settled {
+                let mut nets: HashSet<IpNet> = t.by_target.keys().copied().collect();
+                nets.extend(t.applied.iter().copied());
+                for net in nets {
+                    prop_assert_eq!(
+                        t.applied.contains(&net),
+                        t.wanted(&net, now),
+                        "{} not converged at {}",
+                        net,
+                        now
+                    );
+                }
+            }
+            Ok(())
+        }
+
+        fn dump(label: &str, t: &BlockTable<FakeLists>, now: u64) {
+            let rel = |x: u64| x as i128 - now as i128;
+            eprintln!("--- {} applied {:?}", label, t.applied);
+            for (id, h) in &t.claims {
+                eprintln!(
+                    "  {} {} exp={:?} until={:?} allowed={} quota={} ended={} retr={:?} lease={:?}",
+                    h.claim.issuer,
+                    h.net,
+                    h.claim.expires_ms.map(rel),
+                    h.until_ms.map(rel),
+                    h.allowed,
+                    h.in_quota,
+                    h.ended,
+                    t.retractions.get(id).map(|r| (
+                        r.operator,
+                        r.by_nodes.clone(),
+                        r.forget_ms.map(rel)
+                    )),
+                    t.lease_ends.get(id).map(|(e, _)| rel(*e)),
+                );
+            }
+        }
+
+        fn run(ops: Vec<Op>) -> Result<(), TestCaseError> {
+            let mut now = T0;
+            let mut t = table(1, 1024);
+            configure(&mut t, now);
+            let mut known: Vec<Claim> = Vec::new();
+            // Ghost state: claims the operator lifted, kept outside the table.
+            let mut lifted: HashSet<ClaimId> = HashSet::new();
+            let lift_where = |t: &BlockTable<FakeLists>,
+                              lifted: &mut HashSet<ClaimId>,
+                              f: &dyn Fn(&Held) -> bool| {
+                for (id, h) in &t.claims {
+                    if h.claim.kind != ClaimKind::Static && f(h) {
+                        lifted.insert(id.clone());
+                    }
+                }
+            };
+            for op in ops {
+                match op {
+                    Op::Local { t: i, kind } => {
+                        let kind = [ClaimKind::Detector, ClaimKind::Operator, ClaimKind::Static]
+                            [kind as usize];
+                        if let Ok(a) = t.add_local(ip(TARGETS[i]), kind, "fuzz", now) {
+                            // A lifted operator ban is deleted, so the same bytes again (same
+                            // millisecond) are a new ban.
+                            if kind == ClaimKind::Operator {
+                                lifted.remove(&a.claim.id());
+                            }
+                            known.push(a.claim);
+                        }
+                    }
+                    Op::Peer {
+                        issuer,
+                        t: i,
+                        ttl,
+                        back,
+                        allowed,
+                        reason,
+                    } => {
+                        let issued = now.saturating_sub(back);
+                        let claim = Claim {
+                            issuer: PEERS[issuer],
+                            kind: ClaimKind::Detector,
+                            target: show(&canonical(ip(TARGETS[i]))),
+                            issued_ms: issued,
+                            expires_ms: ttl.map(|d| issued.saturating_add(d)),
+                            reason: "r".repeat(reason as usize),
+                        };
+                        known.push(claim.clone());
+                        t.adopt(claim, allowed, now);
+                    }
+                    Op::Retract { issuer, pick } => {
+                        if !known.is_empty() {
+                            let c = &known[pick % known.len()];
+                            let by = if issuer == PEERS.len() {
+                                1
+                            } else {
+                                PEERS[issuer]
+                            };
+                            t.retract(by, &[c.id()], now);
+                        }
+                    }
+                    Op::Lift { t: i } => {
+                        // Every decision about the target known at the time, enforced or not
+                        // (a claim waiting for a slot is lifted too); later ones are new.
+                        let net = canonical(ip(TARGETS[i]));
+                        let before = t.claims.keys().cloned().collect::<HashSet<_>>();
+                        if t.lift(net, now).is_ok() {
+                            lift_where(&t, &mut lifted, &|h| {
+                                h.net == net && before.contains(&h.claim.id())
+                            });
+                        }
+                    }
+                    Op::FlushAll => {
+                        lift_where(&t, &mut lifted, &|_| true);
+                        t.flush_all(now);
+                    }
+                    Op::FlushDetector => {
+                        lift_where(&t, &mut lifted, &|h| h.claim.kind == ClaimKind::Detector);
+                        t.flush_detector(now);
+                    }
+                    Op::Tick { dt } => {
+                        now = now.saturating_add_signed(dt);
+                        t.tick(now);
+                    }
+                    Op::FailDelete(on) => t.lists.fail_delete = on,
+                    Op::Pin { mask } => {
+                        let pinned = PEERS
+                            .iter()
+                            .enumerate()
+                            .filter(|(i, _)| mask & (1 << i) != 0)
+                            .map(|(_, p)| *p)
+                            .collect();
+                        t.set_pinned(pinned, now);
+                    }
+                    Op::Restart => {
+                        // What a restart keeps: this node's own decisions and lifts.
+                        let state = t.take_persisted(now);
+                        let bytes = serde_json::to_vec(&state).unwrap();
+                        let own_before: HashSet<IpNet> = t
+                            .by_target
+                            .iter()
+                            .filter(|(_, ids)| {
+                                ids.iter().any(|id| {
+                                    let h = &t.claims[id];
+                                    h.claim.issuer == 1
+                                        && h.claim.kind != ClaimKind::Static
+                                        && t.effective(id, h, now)
+                                })
+                            })
+                            .map(|(net, _)| *net)
+                            .collect();
+                        let mut fresh = table(1, 1024);
+                        fresh.lists.fail_delete = t.lists.fail_delete;
+                        configure(&mut fresh, now);
+                        fresh.restore(serde_json::from_slice(&bytes).unwrap(), |_| true, now);
+                        fresh.tick(now);
+                        let own_after: HashSet<IpNet> = fresh.applied.clone();
+                        prop_assert_eq!(
+                            &own_before,
+                            &own_after,
+                            "a restart keeps exactly this node's effective decisions"
+                        );
+                        // Then the peers resync: each sends its live claims and its retractions,
+                        // in the order they were first sent. The operator's lifts must hold.
+                        fresh.set_pinned(
+                            t.pinned
+                                .clone()
+                                .unwrap_or_else(|| PEERS.iter().copied().collect()),
+                            now,
+                        );
+                        let mut sent = HashSet::new();
+                        for c in &known {
+                            let id = c.id();
+                            if c.issuer == 1 || !sent.insert(id.clone()) {
+                                continue;
+                            }
+                            let Some(h) = t.claims.get(&id) else { continue };
+                            let by_issuer = t
+                                .retractions
+                                .get(&id)
+                                .is_some_and(|r| r.by_nodes.contains(&c.issuer));
+                            if by_issuer {
+                                fresh.retract(c.issuer, std::slice::from_ref(&id), now);
+                            } else if h.claim.live_at(now) {
+                                fresh.adopt(c.clone(), h.allowed, now);
+                            }
+                        }
+                        fresh.tick(now);
+                        t.tick(now);
+                        if std::env::var("SOKOL_FUZZ_DEBUG").is_ok() {
+                            dump("before", &t, now);
+                            dump("after", &fresh, now);
+                        }
+                        // Every claim the operator lifted stays without effect.
+                        for (id, r) in &t.retractions {
+                            if r.operator {
+                                if let Some(h) = fresh.claims.get(id) {
+                                    prop_assert!(
+                                        !fresh.effective(id, h, now),
+                                        "operator lift of {}'s claim on {} undone by a resync after restart",
+                                        h.claim.issuer, h.net
+                                    );
+                                }
+                            }
+                        }
+                        t = fresh;
+                    }
+                }
+                check(&t, now, false)?;
+                for id in &lifted {
+                    if let Some(h) = t.claims.get(id) {
+                        prop_assert!(
+                            !t.effective(id, h, now),
+                            "{}'s claim on {} counts again after the operator lifted it",
+                            h.claim.issuer,
+                            h.net
+                        );
+                    }
+                }
+            }
+            // With deletes working and time moving on, everything converges.
+            t.lists.fail_delete = false;
+            t.tick(now);
+            check(&t, now, true)?;
+            Ok(())
+        }
+
+        /// Found by the machine: after a restart a peer's claim whose lease had run out waited
+        /// for a quota slot and was then given a fresh lease (R26-07 bypass).
+        #[test]
+        fn a_claim_whose_lease_ran_out_gets_no_new_one_through_the_queue() {
+            use Op::*;
+            let ops = vec![
+                Peer {
+                    issuer: 0,
+                    t: 1,
+                    ttl: Some(u64::MAX),
+                    back: 0,
+                    allowed: true,
+                    reason: 0,
+                },
+                Peer {
+                    issuer: 1,
+                    t: 0,
+                    ttl: None,
+                    back: 0,
+                    allowed: false,
+                    reason: 0,
+                },
+                Peer {
+                    issuer: 1,
+                    t: 0,
+                    ttl: Some(1085013),
+                    back: 0,
+                    allowed: false,
+                    reason: 0,
+                },
+                Tick { dt: 300000 },
+                Lift { t: 1 },
+                Peer {
+                    issuer: 1,
+                    t: 1,
+                    ttl: None,
+                    back: 0,
+                    allowed: true,
+                    reason: 0,
+                },
+                Tick { dt: 300000 },
+                Restart,
+            ];
+            if let Err(e) = run(ops) {
+                panic!("{}", e);
+            }
+        }
+
+        /// Found by the machine: after a clock step back and two restarts, an operator lift was
+        /// forgotten before the lifted peer claim's (re-lengthened) lease ended.
+        #[test]
+        fn a_lift_outlives_the_lease_across_clock_steps_and_restarts() {
+            use Op::*;
+            let ops = vec![
+                Peer {
+                    issuer: 2,
+                    t: 0,
+                    ttl: None,
+                    back: 0,
+                    allowed: true,
+                    reason: 0,
+                },
+                Tick { dt: -27143 },
+                Restart,
+                Lift { t: 0 },
+                Tick { dt: 498025 },
+                Restart,
+                Tick { dt: 101975 },
+            ];
+            if let Err(e) = run(ops) {
+                panic!("{}", e);
+            }
+        }
+
+        /// Found by the machine: FLUSH_ALL left a peer's wide-prefix claim that was waiting
+        /// for quorum; a second node's claim then enforced it.
+        #[test]
+        fn a_flush_lifts_claims_that_wait_for_a_quorum() {
+            use Op::*;
+            let ops = vec![
+                Peer {
+                    issuer: 0,
+                    t: 5,
+                    ttl: None,
+                    back: 0,
+                    allowed: true,
+                    reason: 0,
+                },
+                FlushAll,
+                Peer {
+                    issuer: 1,
+                    t: 5,
+                    ttl: None,
+                    back: 0,
+                    allowed: true,
+                    reason: 0,
+                },
+            ];
+            if let Err(e) = run(ops) {
+                panic!("{}", e);
+            }
+        }
+
+        /// Found by the machine: a lifted claim that never had a lease (it waited for a slot)
+        /// was forgotten at its would-be lease end and got a fresh lease when resent.
+        #[test]
+        fn a_lift_of_a_waiting_claim_outlives_restarts() {
+            use Op::*;
+            let ops = vec![
+                Peer {
+                    issuer: 1,
+                    t: 0,
+                    ttl: None,
+                    back: 0,
+                    allowed: true,
+                    reason: 0,
+                },
+                Peer {
+                    issuer: 1,
+                    t: 0,
+                    ttl: None,
+                    back: 1,
+                    allowed: true,
+                    reason: 0,
+                },
+                Peer {
+                    issuer: 1,
+                    t: 6,
+                    ttl: None,
+                    back: 2,
+                    allowed: true,
+                    reason: 0,
+                },
+                FlushAll,
+                Tick { dt: 86_400_000 },
+                Restart,
+            ];
+            if let Err(e) = run(ops) {
+                panic!("{}", e);
+            }
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig {
+                cases: std::env::var("SOKOL_FUZZ_CASES").ok().and_then(|v| v.parse().ok()).unwrap_or(4096),
+                max_shrink_iters: 4096,
+                ..ProptestConfig::default()
+            })]
+            #[test]
+            fn the_table_keeps_its_invariants(ops in prop::collection::vec(op(), 1..60)) {
+                run(ops)?;
+            }
+        }
     }
 }
