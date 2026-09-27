@@ -14,7 +14,7 @@ The program intercepts and drops garbage (attacks, malicious traffic) right at t
 - **Toolchain:** 
   - Rust Nightly (needed for building eBPF target `bpfel-unknown-none`)
   - [`bpf-linker`](https://github.com/aya-rs/bpf-linker) (links the eBPF object)
-  - A C compiler (`gcc` or `clang`; `pqcrypto-dilithium` builds C sources)
+  - A C compiler (`gcc` or `clang`; `blake3` builds its SIMD code with it)
 
 ---
 
@@ -88,7 +88,8 @@ usage; crossing 80% is logged and recorded in the audit log.
 ## Mesh peers
 
 Nodes accept mesh commands (e.g. `BlockIp`) only from peers whose public key is pinned in a
-peers file. Without `--peers-file` the mesh rejects every peer.
+peers file. Without `--peers-file` the mesh rejects every peer. Identities are ML-DSA-65
+(FIPS 204) keys; every mesh message is signed with one (mesh protocol v2).
 
 Each node keeps its identity key in `--key-file` (default `/var/lib/sokol/node.key`, created
 with mode `0600` on first start). Print a node's public key:
@@ -101,8 +102,8 @@ Collect the keys into a peers file on every node:
 
 ```json
 [
-  { "node_id": 2, "public_key": "<hex from node 2>" },
-  { "node_id": 3, "public_key": "<hex from node 3>" }
+  { "node_id": 2, "public_key": "mldsa65:<hex from node 2>" },
+  { "node_id": 3, "public_key": "mldsa65:<hex from node 3>" }
 ]
 ```
 
@@ -120,6 +121,28 @@ To rotate a node's key without downtime:
    still sign with the removed key are closed on their next message.
 
 A peers file that fails to parse is rejected and the previous trust stays in force.
+
+### Upgrading a mesh from protocol v1 (Dilithium3) to v2 (ML-DSA)
+
+v1 and v2 nodes cannot verify each other, so a mesh is upgraded in one window; every node keeps
+enforcing its own decisions (and its operator bans) the whole time, only mesh sharing pauses.
+
+1. Upgrade the binary on every node and restart it. At startup a v1 key file (raw Dilithium3,
+   5952 bytes) is moved to `node.key.dilithium3.retired` and a new ML-DSA identity is created;
+   the log prints its public key. `--print-public-key` prints it too.
+2. Put the new `mldsa65:` keys into every peers file and send `RELOAD_PEERS`. Until then a peer
+   listed with only an old (unprefixed) key is not trusted; startup and `RELOAD_PEERS` name it
+   instead of failing.
+3. Peers reconnect and resynchronise by themselves (digests every 15 s).
+
+A v1 peer that connects to a v2 node is refused with "peer speaks the pre-versioned mesh
+protocol (v1 ...): upgrade the peer" in the log. Rolling back means restoring the retired key
+file and the old peers file together with the old binary.
+
+Each frame starts with `SKM` and the wire version, and the handshake carries the range of
+versions each side speaks: a peer with no common version is refused with both ranges in the log.
+Only v2 exists so far, so every frame is written as v2; when a v3 is added, the writer has to
+use the version negotiated per connection so that such an upgrade can go node by node.
 
 ### Encrypt the mesh with WireGuard
 

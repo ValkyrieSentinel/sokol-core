@@ -47,7 +47,7 @@
 - **Не DDoS-скрубер.** XDP відкидає пакети на мережевій карті, але об'ємну атаку, що забиває
   канал, вузол не зупинить. Для цього є BGP Flowspec (§12): Sokol передає правило відкидання
   апстріму.
-- **Не шифрує меш сам.** Меш автентифікує повідомлення (Dilithium), але не приховує їх;
+- **Не шифрує меш сам.** Меш автентифікує повідомлення (ML-DSA-65), але не приховує їх;
   конфіденційність дає WireGuard (§7.6).
 
 ## 2. Карта компонентів
@@ -73,7 +73,7 @@ flowchart LR
         POL[BlockPolicy<br/>ніколи не блокувати]
         BT[BlockTable<br/>заявки → карта ядра]
         AUD[(аудит<br/>ланцюг BLAKE3)]
-        MESH[меш p2p<br/>Dilithium, :7946]
+        MESH[меш p2p<br/>ML-DSA-65, :7946]
         FS[Flowspec-воркер]
         LATCH[латч шторму]
         MET["метрики Prometheus"]
@@ -383,11 +383,24 @@ issuer (вузол) · kind · target (канонічний) · issued_ms · exp
 
 ### 7.1 Довіра
 
-- **Закріплені ключі.** Вузол чує лише пірів, чий ML-DSA/Dilithium3-ключ є в `--peers-file`.
-  Ротація: `public_keys: [старий, новий]`, `RELOAD_PEERS`. Зіпсований файл відхиляється, і
-  попередня довіра лишається.
-- **Конверт.** Підпис покриває домен, відправника, час, nonce і корисне навантаження.
-  Конверти поза вікном ±30 с (`MAX_CLOCK_SKEW_MS`) і повтори (`ReplayGuard`) відкидаються.
+- **Закріплені ключі.** Вузол чує лише пірів, чий ключ ML-DSA-65 (FIPS 204, RustCrypto
+  `ml-dsa`) є в `--peers-file` у вигляді `mldsa65:<hex>`. Ротація: `public_keys: [старий, новий]`,
+  `RELOAD_PEERS`. Зіпсований файл відхиляється, і попередня довіра лишається.
+- **Конверт (протокол v2).** Кадр: `SKM`, версія, відправник, час, nonce, довжина,
+  корисне навантаження, підпис. Підпис покриває **всі** байти до нього, зокрема версію (тож
+  понизити її не можна), з контекстом FIPS 204 `sokol-mesh-envelope`. Підпис того самого
+  ключа для чогось іншого конвертом не стане. Непідписаних полів немає: у v1 поле
+  `dag_parents` передавалось без підпису й ніде не читалось. Конверти поза вікном ±30 с
+  (`MAX_CLOCK_SKEW_MS`) і повтори (`ReplayGuard`) відкидаються.
+- **Версії.** Рукостискання несе діапазон версій кожної сторони (`wire_min..wire_max`), і
+  з'єднання отримує найбільшу спільну. Якщо спільної немає, вузол закриває з'єднання й пише
+  в лог обидва діапазони. Кадр v1 (`bincode` без magic) розпізнається й відхиляється з
+  проханням оновити пір, а не з помилкою розбору.
+- **Перехід з v1.** Файл ключа v1 (сирий Dilithium3, 5952 байти) при старті відкладається в
+  `*.dilithium3.retired`, і створюється нова ідентичність ML-DSA. Вузол не зупиняється, бо
+  локальний захист важливіший за меш. Пір, указаний у peers-файлі лише старим ключем, не
+  довіряється, але й не валить ні старт, ні `RELOAD_PEERS`: відповідь його називає. Порядок
+  оновлення описано в README.
 - **Прив'язка з'єднання.** Перше повідомлення має бути рукостисканням. Після нього з'єднання
   говорить лише від імені того, хто в ньому назвався.
 - **Хто за кого говорить.** Телеметрія, заявки, відкликання і дайджести мусять описувати
@@ -397,7 +410,14 @@ issuer (вузол) · kind · target (канонічний) · issued_ms · exp
 Перевірка (`p2p.rs`): `stranger_key_is_rejected_even_with_valid_signature`,
 `header_fields_are_covered_by_the_signature`, `replay_and_stale_envelopes_are_rejected`,
 `connection_is_bound_to_its_handshake_identity`, `a_peer_cannot_switch_this_nodes_defense_mode`,
-`rotation_accepts_old_and_new_keys_then_revokes_the_old_one`.
+`rotation_accepts_old_and_new_keys_then_revokes_the_old_one`,
+`every_byte_of_a_v2_envelope_is_covered` (кожен з ~3,4 тис. байтів кадру),
+`a_signature_made_for_another_context_does_not_verify`, `frames_of_other_protocol_versions_are_named`,
+`a_peer_without_a_common_version_is_disconnected`,
+`a_legacy_key_file_is_retired_and_a_new_identity_created`,
+`legacy_peer_keys_are_not_trusted_but_do_not_stop_the_node`. Smoke: «a legacy key file is
+retired and replaced by an ML-DSA identity», «RELOAD_PEERS names a peer listed with only a
+legacy key».
 
 ### 7.2 Протокол (`mesh_sync.rs`)
 
@@ -811,12 +831,9 @@ unimplemented}`. Порушення валить крок Clippy у CI.
 - джерела (лише crates.io);
 - wildcard-версії.
 
-Три прямі залежності мають статус unmaintained, вразливостей у них немає. Вони записані в
-`deny.toml` як відомий борг, кожна з причиною:
-- `bincode` 1.x, що обгортає конверт мешу. Замінюється разом із версіонуванням протоколу;
-- `pqcrypto-dilithium` і `pqcrypto-traits`: PQClean архівується, стандартний наступник —
-  ML-DSA (FIPS 204, `pqcrypto-mldsa`). Перехід змінює формат ключів і підписів, тож це окрема
-  зміна.
+Винятків у `deny.toml` немає. Три unmaintained залежності, знайдені першим прогоном
+(`bincode`, `pqcrypto-dilithium`, `pqcrypto-traits`), прибрано переходом на протокол v2 з ML-DSA
+(§7.1).
 
 ### 15.5 Практика перевірки
 

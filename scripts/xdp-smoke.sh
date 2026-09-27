@@ -104,6 +104,11 @@ ping_fragmented_from() {
 
 PEER_KEY_HEX=$("$BIN" --key-file "$WORK/peer2.key" --print-public-key)
 PEER3_KEY_HEX=$("$BIN" --key-file "$WORK/peer3.key" --print-public-key)
+# A pre-v2 key file (raw Dilithium3, 5952 bytes) is moved aside and a new identity created.
+head -c 5952 /dev/urandom >"$WORK/legacy.key" && chmod 600 "$WORK/legacy.key"
+LEGACY_NEW=$("$BIN" --key-file "$WORK/legacy.key" --print-public-key 2>"$WORK/legacy-key.log")
+check "a legacy key file is retired and replaced by an ML-DSA identity" \
+    bash -c "echo '$LEGACY_NEW' | grep -q '^mldsa65:' && test \$(stat -c %s '$WORK/legacy.key.dilithium3.retired') = 5952 && test \$(stat -c %s '$WORK/legacy.key') = 36"
 printf '[{"node_id": 2, "public_key": "%s"}]' "$PEER_KEY_HEX" >"$WORK/peers.json"
 
 start_orchestrator --peers-file "$WORK/peers.json"
@@ -273,6 +278,13 @@ check "startup loads the pinned peers file" grep -q "(1 pinned peers)" "$LOG"
 printf '[{"node_id": 2, "public_keys": ["%s", "%s"]}, {"node_id": 3, "public_key": "%s"}]' \
     "$PEER_KEY_HEX" "$PEER3_KEY_HEX" "$PEER3_KEY_HEX" >"$WORK/peers.json"
 check "RELOAD_PEERS picks up a rotated key and a new peer" bash -c "printf 'RELOAD_PEERS\\n' | nc -U -q1 '$WORK/control.sock' | grep -q '^OK 2 pinned peers'"
+check "public keys are ML-DSA-65 (mesh protocol v2)" bash -c "echo '$PEER_KEY_HEX' | grep -Eq '^mldsa65:[0-9a-f]{3904}$'"
+# A pre-v2 (Dilithium3, unprefixed) key must not break the reload: that peer is named, not trusted.
+LEGACY_HEX=$(printf 'ab%.0s' $(seq 1 1952))
+printf '[{"node_id": 2, "public_key": "%s"}, {"node_id": 9, "public_key": "%s"}]' \
+    "$PEER_KEY_HEX" "$LEGACY_HEX" >"$WORK/peers.json"
+check "RELOAD_PEERS names a peer listed with only a legacy key and keeps the others" \
+    bash -c "printf 'RELOAD_PEERS\\n' | nc -U -q1 '$WORK/control.sock' | grep -q '^OK 1 pinned peers; not trusted until their ML-DSA key is listed (legacy key only): \\[9\\]'"
 printf 'not json' >"$WORK/peers.json"
 check "RELOAD_PEERS keeps the current trust when the file is broken" bash -c "printf 'RELOAD_PEERS\\n' | nc -U -q1 '$WORK/control.sock' | grep -q 'previous trust store kept'"
 OPERATOR_BIN="$(dirname "$BIN")/sokol-operator"
