@@ -109,6 +109,9 @@ pub struct MeshStats {
     pub handshakes_refused: std::sync::atomic::AtomicU64,
     pub handshake_timeouts: std::sync::atomic::AtomicU64,
     pub frames_delayed: std::sync::atomic::AtomicU64,
+    /// Broadcasts not queued because a peer's queue was full, by class.
+    pub dropped_urgent: std::sync::atomic::AtomicU64,
+    pub dropped_bulk: std::sync::atomic::AtomicU64,
 }
 
 /// Admission of connections that have not authenticated yet.
@@ -832,7 +835,30 @@ fn check_canonical(payload: &str) -> Result<(), common::canonical::CanonicalErro
 /// addr -> (writer, node id, connection id). The connection id lets a connection that ends
 /// remove only its own entry: a stale connection timing out after the peer already reconnected
 /// from the same address must not unregister the new one.
-pub type PeerMap = Arc<RwLock<HashMap<SocketAddr, (mpsc::Sender<SecureEnvelope>, u64, u64)>>>;
+/// A connected peer's two outgoing queues. The writer empties `urgent` first: block decisions,
+/// their repairs and keepalives; `bulk` carries telemetry, digests and alerts and is what a full
+/// link drops first.
+#[derive(Clone)]
+pub struct PeerLink {
+    pub urgent: mpsc::Sender<SecureEnvelope>,
+    pub bulk: mpsc::Sender<SecureEnvelope>,
+}
+
+pub const URGENT_QUEUE: usize = 256;
+pub const BULK_QUEUE: usize = 64;
+
+impl PeerLink {
+    fn for_command(&self, command: &MeshCommand) -> &mpsc::Sender<SecureEnvelope> {
+        if command.urgent() {
+            &self.urgent
+        } else {
+            &self.bulk
+        }
+    }
+}
+
+/// addr -> (queues, node id, connection id).
+pub type PeerMap = Arc<RwLock<HashMap<SocketAddr, (PeerLink, u64, u64)>>>;
 
 static NEXT_CONNECTION_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
@@ -858,15 +884,9 @@ impl PeerRegistry {
         }
     }
 
-    pub async fn add_peer(
-        &self,
-        addr: SocketAddr,
-        tx: mpsc::Sender<SecureEnvelope>,
-        node_id: u64,
-        conn_id: u64,
-    ) {
+    pub async fn add_peer(&self, addr: SocketAddr, link: PeerLink, node_id: u64, conn_id: u64) {
         let mut peers = self.peers.write().await;
-        peers.insert(addr, (tx, node_id, conn_id));
+        peers.insert(addr, (link, node_id, conn_id));
         info!(
             "[P2P] Registered authenticated peer: {} [Node ID: {}]",
             addr, node_id
@@ -909,7 +929,7 @@ impl PeerRegistry {
             .read()
             .await
             .get(&addr)
-            .map(|(tx, _, _)| tx.clone())
+            .map(|(link, _, _)| link.for_command(command).clone())
             .ok_or_else(|| anyhow::anyhow!("peer {} is not connected", addr))?;
         match timeout(Duration::from_secs(2), tx.send(envelope)).await {
             Ok(Ok(())) => Ok(()),
@@ -986,9 +1006,18 @@ impl PeerRegistry {
         // tick, IPC handling) behind one bad link. A peer that misses a block catches up through
         // BlockSync when it reconnects.
         let peers = self.peers.read().await;
-        for (addr, (tx, _, _)) in peers.iter() {
-            if let Err(e) = tx.try_send(envelope.clone()) {
-                warn!("[P2P] Dropping broadcast for peer {}: {}", addr, e);
+        let urgent = command.urgent();
+        for (addr, (link, _, _)) in peers.iter() {
+            if let Err(e) = link.for_command(command).try_send(envelope.clone()) {
+                let counter = if urgent {
+                    &self.stats.dropped_urgent
+                } else {
+                    &self.stats.dropped_bulk
+                };
+                // The first drop of a class is logged; the counters show the rest.
+                if counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+                    warn!("[P2P] Dropping broadcast for peer {}: {}", addr, e);
+                }
             }
         }
         Ok(())
@@ -1166,13 +1195,18 @@ async fn run_connection(
     // Mesh messages are small and latency-sensitive.
     let _ = stream.set_nodelay(true);
     let (mut reader, writer) = stream.into_split();
-    let (tx, rx) = mpsc::channel::<SecureEnvelope>(100);
+    let (tx, rx) = mpsc::channel::<SecureEnvelope>(URGENT_QUEUE);
+    let (bulk_tx, bulk_rx) = mpsc::channel::<SecureEnvelope>(BULK_QUEUE);
+    let link = PeerLink {
+        urgent: tx.clone(),
+        bulk: bulk_tx,
+    };
 
     let handshake = seal(&crypto, node_id, &NetworkMessage::handshake(node_id))?;
     tx.send(handshake).await?;
 
     let conn_id = NEXT_CONNECTION_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    spawn_peer_writer(rx, writer, peer_addr, registry.clone(), conn_id);
+    spawn_peer_writer(rx, bulk_rx, writer, peer_addr, registry.clone(), conn_id);
 
     let result = handle_reader_loop(
         &mut reader,
@@ -1181,7 +1215,7 @@ async fn run_connection(
         crypto.clone(),
         cmd_tx,
         registry.clone(),
-        tx,
+        link,
         conn_id,
         ticket,
     )
@@ -1192,13 +1226,21 @@ async fn run_connection(
 
 fn spawn_peer_writer(
     mut rx: mpsc::Receiver<SecureEnvelope>,
+    mut bulk_rx: mpsc::Receiver<SecureEnvelope>,
     mut writer: tokio::net::tcp::OwnedWriteHalf,
     peer_addr: SocketAddr,
     registry: PeerRegistry,
     conn_id: u64,
 ) {
     tokio::spawn(async move {
-        while let Some(envelope) = rx.recv().await {
+        loop {
+            // Urgent first; bulk only when nothing urgent is waiting.
+            let envelope = tokio::select! {
+                biased;
+                Some(e) = rx.recv() => e,
+                Some(e) = bulk_rx.recv() => e,
+                else => break,
+            };
             let payload = envelope.encode();
 
             // One write per frame: a separate write of the 4-byte length made the payload wait
@@ -1245,10 +1287,11 @@ async fn handle_reader_loop(
     crypto: Arc<NodeCrypto>,
     cmd_tx: mpsc::Sender<MeshCommand>,
     registry: PeerRegistry,
-    writer_tx: mpsc::Sender<SecureEnvelope>,
+    link: PeerLink,
     conn_id: u64,
     mut ticket: Option<HandshakeTicket>,
 ) -> Result<()> {
+    let writer_tx = link.urgent.clone();
     use std::sync::atomic::Ordering;
     let mut len_buf = [0u8; 4];
     let mut authenticated_peer: Option<u64> = None;
@@ -1389,7 +1432,7 @@ async fn handle_reader_loop(
                 }
                 authenticated_peer = Some(node_id);
                 registry
-                    .add_peer(peer_addr, writer_tx.clone(), node_id, conn_id)
+                    .add_peer(peer_addr, link.clone(), node_id, conn_id)
                     .await;
                 spawn_ping_loop(writer_tx.clone(), local_node_id, crypto.clone());
             }
@@ -1454,6 +1497,14 @@ mod tests {
 
     fn block_cmd(ip: &str) -> NetworkMessage {
         NetworkMessage::Command(alert(ip))
+    }
+
+    /// Both classes into one queue (tests that do not care about priority).
+    fn one_queue(tx: mpsc::Sender<SecureEnvelope>) -> PeerLink {
+        PeerLink {
+            urgent: tx.clone(),
+            bulk: tx,
+        }
     }
 
     fn trust_with(node_id: u64, crypto: &NodeCrypto) -> TrustStore {
@@ -1951,8 +2002,8 @@ mod tests {
         let addr: SocketAddr = "127.0.0.1:7946".parse().unwrap();
         let (old_tx, _old_rx) = mpsc::channel(1);
         let (new_tx, _new_rx) = mpsc::channel(1);
-        registry.add_peer(addr, old_tx, 2, 1).await;
-        registry.add_peer(addr, new_tx, 2, 2).await;
+        registry.add_peer(addr, one_queue(old_tx), 2, 1).await;
+        registry.add_peer(addr, one_queue(new_tx), 2, 2).await;
         registry.remove_peer(&addr, 1).await;
         assert_eq!(
             registry.peer_count().await,
@@ -1971,10 +2022,10 @@ mod tests {
         let (stuck_tx, _stuck_rx) = mpsc::channel(1);
         let (ok_tx, mut ok_rx) = mpsc::channel(8);
         registry
-            .add_peer("127.0.0.1:1".parse().unwrap(), stuck_tx, 2, 1)
+            .add_peer("127.0.0.1:1".parse().unwrap(), one_queue(stuck_tx), 2, 1)
             .await;
         registry
-            .add_peer("127.0.0.1:2".parse().unwrap(), ok_tx, 3, 2)
+            .add_peer("127.0.0.1:2".parse().unwrap(), one_queue(ok_tx), 3, 2)
             .await;
         let cmd = alert("203.0.113.1");
         for _ in 0..3 {
@@ -2788,6 +2839,85 @@ mod tests {
             "refusing a stranger's {} KiB frame: {:.1} us",
             frame.len() / 1024,
             t.elapsed().as_secs_f64() * 1e6 / n as f64
+        );
+    }
+
+    #[tokio::test]
+    async fn claims_go_first_and_reports_are_dropped_first() {
+        use crate::block_table::{Claim, ClaimKind};
+        use std::sync::atomic::Ordering;
+        let registry = PeerRegistry::new(TrustStore::default());
+        let crypto = NodeCrypto::generate();
+        let (urgent, mut urgent_rx) = mpsc::channel(4);
+        let (bulk, mut bulk_rx) = mpsc::channel(2);
+        registry
+            .add_peer(
+                "127.0.0.1:9".parse().unwrap(),
+                PeerLink { urgent, bulk },
+                2,
+                1,
+            )
+            .await;
+        // The link is saturated with reports: the bulk queue is full, further ones are dropped.
+        for i in 0..5 {
+            registry
+                .broadcast(&alert(&format!("report {}", i)), 1, &crypto)
+                .await
+                .unwrap();
+        }
+        assert_eq!(registry.stats.dropped_bulk.load(Ordering::Relaxed), 3);
+        // A block decision still gets through, in its own queue.
+        let claim = MeshCommand::Claim {
+            claim: Claim {
+                issuer: 1,
+                kind: ClaimKind::Detector,
+                target: "203.0.113.9".into(),
+                issued_ms: now_ms(),
+                expires_ms: Some(now_ms() + 60_000),
+                reason: "x".into(),
+            },
+        };
+        registry.broadcast(&claim, 1, &crypto).await.unwrap();
+        assert_eq!(registry.stats.dropped_urgent.load(Ordering::Relaxed), 0);
+        assert!(
+            urgent_rx.try_recv().is_ok(),
+            "the claim is queued as urgent"
+        );
+        assert_eq!(bulk_rx.try_recv().map(|_| ()), Ok(()));
+    }
+
+    #[tokio::test]
+    async fn the_writer_empties_the_urgent_queue_first() {
+        let crypto = NodeCrypto::generate();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = TcpStream::connect(addr).await.unwrap();
+        let (mut server, _) = listener.accept().await.unwrap();
+        let (_r, w) = client.into_split();
+        let (urgent, urgent_rx) = mpsc::channel(8);
+        let (bulk, bulk_rx) = mpsc::channel(8);
+        // Queue bulk first, then urgent, before the writer starts.
+        for text in ["bulk 1", "bulk 2"] {
+            bulk.send(seal(&crypto, 1, &block_cmd(text)).unwrap())
+                .await
+                .unwrap();
+        }
+        urgent
+            .send(seal(&crypto, 1, &NetworkMessage::Ping).unwrap())
+            .await
+            .unwrap();
+        let registry = PeerRegistry::new(TrustStore::default());
+        spawn_peer_writer(urgent_rx, bulk_rx, w, addr, registry, 1);
+        let mut len = [0u8; 4];
+        server.read_exact(&mut len).await.unwrap();
+        let mut buf = vec![0u8; u32::from_be_bytes(len) as usize];
+        server.read_exact(&mut buf).await.unwrap();
+        let first = SecureEnvelope::decode(&buf).unwrap();
+        let msg: NetworkMessage = serde_json::from_slice(&first.payload).unwrap();
+        assert!(
+            matches!(msg, NetworkMessage::Ping),
+            "bulk went before urgent: {:?}",
+            msg
         );
     }
 }
