@@ -243,8 +243,9 @@ A client that first sends the line `ACK` gets one reply per command: `OK applied
 (recorded; the node retries the kernel write), `OK recorded` (reports, logs), `OK duplicate`
 (an event id already acted on), `OK refused <why>`
 or `ERR <why>`. `OK applied` means the block is in the kernel; it is written to `--state-file`
-within one second (a crash in that second loses it on this node; operator decisions, in contrast,
-are written before the control socket answers OK, and a graceful shutdown writes the last state).
+within about a second (a crash before that loses it on this node; operator decisions, in contrast,
+wait up to 2 s for the write before the control socket answers, and say `WARNING: not yet durable`
+if it has not finished; a graceful shutdown writes the last state).
 `sokol-suricata` and `sokol-crowdsec` use it: a signal stays in their bounded
 queue until the node has answered it, so alerts and decisions that arrive while the node is down
 or restarting are delivered when it is back (refusals and errors are final, not retried).
@@ -275,7 +276,11 @@ claim keeps its own expiry but is enforced here for at most `--block-ttl-max`.
   detections also retracts them mesh-wide; other nodes' claims are lifted here only.
 - This node's own claims and lifts are kept in `--state-file` (default `<db-path>.blocks.json`) and
   restored on start, re-checked against the never-block policy. Peers' claims come back through
-  the mesh.
+  the mesh. A separate writer thread owns the file, so a slow or hung disk never holds up expiry
+  or the heartbeat; the node turns DEGRADED if a change waits more than 5 s
+  (`sokol_state_pending_seconds`). A state file that cannot be read or parsed is kept as
+  `<state-file>.corrupt` and the node stays DEGRADED (`sokol_state_restore_ok 0`) until the
+  operator sends `ACCEPT_STATE_LOSS` on the control socket.
 - The kernel map follows the claims. A map write or delete that fails (e.g. the map is full) stays
   pending, is retried every second and is shown as `sokol_blocks_pending`; `sokol_blocks_active`
   counts only entries the kernel holds.

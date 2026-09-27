@@ -19,6 +19,8 @@ pub enum ControlCommand {
     ListBans,
     /// Re-reads `--peers-file` (key rotation / revocation without a restart).
     ReloadPeers,
+    /// Accepts running without state that failed to restore at startup (R27-04).
+    AcceptStateLoss,
     /// A command the dashboard knows but this node cannot carry out.
     Unsupported(&'static str),
 }
@@ -42,6 +44,7 @@ pub fn parse(line: &str) -> Result<ControlCommand, String> {
         "RELOAD_PEERS" if arg.is_none() => Ok(ControlCommand::ReloadPeers),
         "FLUSH_ALL" if arg.is_none() => Ok(ControlCommand::FlushAll),
         "LIST_BANS" if arg.is_none() => Ok(ControlCommand::ListBans),
+        "ACCEPT_STATE_LOSS" if arg.is_none() => Ok(ControlCommand::AcceptStateLoss),
         "XDP_LOAD" | "XDP_UNLOAD" => Ok(ControlCommand::Unsupported(
             "toggling XDP from the dashboard is not supported; stop or start the service",
         )),

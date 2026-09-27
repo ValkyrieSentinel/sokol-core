@@ -29,6 +29,7 @@ mod metrics;
 mod p2p;
 mod signal;
 mod sokol;
+mod state_store;
 
 use aya::maps::{Array, LpmTrie, MapData, PerCpuArray, RingBuf};
 use aya::programs::{Xdp, XdpFlags};
@@ -51,7 +52,7 @@ use common::{DropEvent, NodeTelemetry};
 use crate::block_policy::BlockPolicy;
 use crate::block_table::{
     family_tag, host, parse_target, show, Adoption, BlockTable, ClaimKind, Envelope, LiftError,
-    Persisted, Quorum, TtlPolicy, Watermark,
+    Quorum, TtlPolicy, Watermark,
 };
 use crate::cluster_state::BirdEyeView;
 use crate::p2p::{
@@ -723,6 +724,15 @@ async fn execute_control(cmd: control::ControlCommand, ctx: &ControlCtx) -> Stri
             sntl_db.append(format!("OPERATOR_FLUSH_ALL|Released:{}", released.len()));
             format!("OK released {} blocks", released.len())
         }
+        ControlCommand::AcceptStateLoss => {
+            if ctx.state.accept_loss() {
+                log::warn!("[Control] Operator accepted running without the unrestored state");
+                sntl_db.append("STATE_LOSS_ACCEPTED".to_string());
+                "OK state loss accepted".to_string()
+            } else {
+                "ERR no failed state restore to accept".to_string()
+            }
+        }
         ControlCommand::ListBans => {
             let bans = blocks.lock().await.operator_targets(now_ms());
             let shown: Vec<String> = bans.iter().take(LIST_BANS_MAX).map(show).collect();
@@ -810,89 +820,31 @@ async fn send_snapshot(
 }
 
 /// Writes the durable part of the table atomically (temp file + rename, mode 0600).
-fn save_state(path: &std::path::Path, state: &Persisted) -> std::io::Result<()> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    let tmp = path.with_extension("tmp");
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&tmp)?;
-    f.write_all(&serde_json::to_vec(state).map_err(std::io::Error::other)?)?;
-    f.sync_all()?;
-    std::fs::rename(&tmp, path)?;
-    // The rename is durable only once the directory entry is (R26-04).
-    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
-        std::fs::File::open(dir)?.sync_all()?;
-    }
-    Ok(())
+use state_store::{Restore, StateStore};
+
+/// Hands the table's durable part to the state writer if it changed; never waits for the disk.
+async fn submit_state(store: &StateStore, blocks: &SharedBlockTable) -> Option<u64> {
+    let state = {
+        let mut table = blocks.lock().await;
+        table.dirty().then(|| table.take_persisted(now_ms()))
+    }?;
+    Some(store.submit(state, now_ms()))
 }
 
-/// Durable block state (R26-04). One writer at a time, so an older snapshot never overwrites a
-/// newer one; the write runs off the async runtime.
-///
-/// Contract: an operator decision (BAN/UNBAN/FLUSH) is written before the control socket answers
-/// OK. A detector decision answered `OK applied` is in the kernel and is written within one tick
-/// (<= 1 s): a crash in that second loses it locally (detectors re-signal and peers resend their
-/// claims). A graceful shutdown writes the last state.
-struct StateStore {
-    path: std::path::PathBuf,
-    writer: tokio::sync::Mutex<()>,
-    healthy: std::sync::atomic::AtomicBool,
-}
-
-impl StateStore {
-    fn new(path: std::path::PathBuf) -> Self {
-        Self {
-            path,
-            writer: tokio::sync::Mutex::new(()),
-            healthy: std::sync::atomic::AtomicBool::new(true),
-        }
+/// Submits the current state and waits (at most `wait`) until it, or anything newer, is on disk.
+async fn persist_now(
+    store: &StateStore,
+    blocks: &SharedBlockTable,
+    wait: Duration,
+) -> Result<(), String> {
+    let generation = match submit_state(store, blocks).await {
+        Some(g) => g,
+        None => store.submitted(),
+    };
+    if generation == 0 {
+        return Ok(());
     }
-
-    fn healthy(&self) -> bool {
-        self.healthy.load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    /// Writes the table's durable part if it changed. On failure the table stays dirty (the next
-    /// call retries) and the store reports itself unhealthy.
-    async fn persist(&self, blocks: &SharedBlockTable) -> Result<(), String> {
-        use std::sync::atomic::Ordering;
-        let _one_writer = self.writer.lock().await;
-        let state = {
-            let mut table = blocks.lock().await;
-            table.dirty().then(|| table.take_persisted(now_ms()))
-        };
-        let Some(state) = state else {
-            return Ok(());
-        };
-        let path = self.path.clone();
-        let result = tokio::task::spawn_blocking(move || save_state(&path, &state))
-            .await
-            .map_err(|e| e.to_string())
-            .and_then(|r| r.map_err(|e| e.to_string()));
-        match result {
-            Ok(()) => {
-                if !self.healthy.swap(true, Ordering::Relaxed) {
-                    log::warn!("[State] {} writable again", self.path.display());
-                }
-                Ok(())
-            }
-            Err(e) => {
-                blocks.lock().await.mark_dirty();
-                if self.healthy.swap(false, Ordering::Relaxed) {
-                    log::error!(
-                        "[State] Cannot write {}: {}; node is DEGRADED, retrying",
-                        self.path.display(),
-                        e
-                    );
-                }
-                Err(e)
-            }
-        }
-    }
+    store.wait_durable(generation, wait).await
 }
 
 struct IpcCtx {
@@ -1421,34 +1373,44 @@ async fn main() -> Result<(), anyhow::Error> {
         }
     }
 
-    match std::fs::read(&state_file) {
-        Ok(bytes) => match serde_json::from_slice::<Persisted>(&bytes) {
-            Ok(state) => {
-                let (restored, refused) = blocks.lock().await.restore(
-                    state,
-                    |net| block_policy.check_net(net).is_ok(),
-                    now_ms(),
-                );
-                log::warn!(
-                    "[State] Restored {} of this node's blocks from {} ({} refused)",
-                    restored,
-                    state_file.display(),
-                    refused
-                );
-                sntl_db.append(format!(
-                    "STATE_RESTORED|Blocks:{}|Refused:{}",
-                    restored, refused
-                ));
-            }
-            Err(e) => log::error!(
-                "[State] {} is not a valid state file ({}); starting without it",
+    // R27-04: a state file that cannot be restored is not a first start. Its bytes are kept, and
+    // the node stays DEGRADED until the operator accepts the loss (ACCEPT_STATE_LOSS).
+    let restore = match state_store.read() {
+        Ok(None) => Restore::Fresh,
+        Ok(Some(state)) => {
+            let (restored, refused) = blocks.lock().await.restore(
+                state,
+                |net| block_policy.check_net(net).is_ok(),
+                now_ms(),
+            );
+            log::warn!(
+                "[State] Restored {} of this node's blocks from {} ({} refused)",
+                restored,
                 state_file.display(),
-                e
-            ),
-        },
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => log::error!("[State] Cannot read {}: {}", state_file.display(), e),
-    }
+                refused
+            );
+            sntl_db.append(format!(
+                "STATE_RESTORED|Blocks:{}|Refused:{}",
+                restored, refused
+            ));
+            Restore::Restored { restored, refused }
+        }
+        Err(failed) => {
+            if let Restore::Failed { why, kept } = &failed {
+                log::error!(
+                    "[State] Restore failed: {}; bytes kept at {}. Running without this node's \
+                     earlier decisions and lifts; node is DEGRADED until ACCEPT_STATE_LOSS",
+                    why,
+                    kept.as_ref()
+                        .map(|k| k.display().to_string())
+                        .unwrap_or_else(|| "(not kept)".into())
+                );
+                sntl_db.append(format!("STATE_RESTORE_FAILED|Why:{}", why));
+            }
+            failed
+        }
+    };
+    state_store.set_restore(restore);
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let shutdown_tx_ctrlc = shutdown_tx.clone();
@@ -1898,8 +1860,11 @@ async fn main() -> Result<(), anyhow::Error> {
                             let mut reply = execute_control(cmd, &ctx).await;
                             // R26-04: an operator decision is on disk before it is answered OK.
                             if mutating && reply.starts_with("OK") {
-                                if let Err(e) = ctx.state.persist(&ctx.blocks).await {
-                                    reply = format!("{}; WARNING: not persisted ({})", reply, e);
+                                if let Err(e) =
+                                    persist_now(&ctx.state, &ctx.blocks, state_store::DURABLE_WAIT)
+                                        .await
+                                {
+                                    reply = format!("{}; WARNING: {}", reply, e);
                                 }
                             }
                             reply
@@ -2146,7 +2111,8 @@ async fn main() -> Result<(), anyhow::Error> {
 
                 // ADR-4: this node's decisions and lifts survive a restart (<= 1 tick for detector
                 // decisions; operator decisions are written before they are answered).
-                let _ = state_store.persist(&blocks).await;
+                // Never waits for the disk (R27-03): a slow write must not hold up expiry.
+                let _ = submit_state(&state_store, &blocks).await;
 
                 // ADR-3 anti-entropy: a peer whose digest differs answers with its state.
                 if last_digest.elapsed() >= mesh_sync::DIGEST_INTERVAL {
@@ -2156,7 +2122,7 @@ async fn main() -> Result<(), anyhow::Error> {
                     let _ = registry_tick.broadcast(&cmd, node_id_tick, &crypto_tick).await;
                 }
 
-                let mode = if sntl_db.status().healthy && state_store.healthy() { "NORMAL" } else { "DEGRADED" };
+                let mode = if sntl_db.status().healthy && state_store.healthy(now_ms()) { "NORMAL" } else { "DEGRADED" };
                 let hb_msg = format!("HEARTBEAT:ID={}|NAME=Sokol-Node-{}|EP={}|MODE={}|CTL={}\n", node_id_hb, node_id_hb, p2p_bind_hb, mode, control_socket_hb);
                 push_telemetry(&hb_msg).await;
 
@@ -2209,7 +2175,9 @@ async fn main() -> Result<(), anyhow::Error> {
                 snapshot.defense_strict = defense.strict();
                 let audit = sntl_db.status();
                 snapshot.audit_healthy = audit.healthy;
-                snapshot.state_healthy = state_store.healthy();
+                snapshot.state_healthy = state_store.healthy(now_ms());
+                snapshot.state_pending_secs = state_store.pending_for(now_ms()).as_secs_f64();
+                snapshot.state_restore_ok = state_store.restore_status().ok();
                 snapshot.audit_write_errors = audit.write_errors + audit.sync_errors;
                 snapshot.audit_lost = audit.lost;
                 snapshot.audit_sync_age_ms = audit.last_sync_age_ms;
@@ -2307,8 +2275,11 @@ async fn main() -> Result<(), anyhow::Error> {
         }
     }
     // The last decisions since the previous tick (R26-04).
-    if let Err(e) = state_store.persist(&blocks).await {
-        log::error!("[State] Shutdown without a final state write: {}", e);
+    if let Err(e) = persist_now(&state_store, &blocks, Duration::from_secs(5)).await {
+        log::error!(
+            "[State] Shutdown without a confirmed final state write: {}",
+            e
+        );
     }
     sntl_db.append("NODE_SHUTDOWN".to_string());
     if !sntl_db.flush(Duration::from_secs(2)) {
