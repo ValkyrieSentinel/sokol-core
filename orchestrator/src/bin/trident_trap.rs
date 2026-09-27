@@ -1,3 +1,19 @@
+// Release builds abort on panic (panic = "abort"), so a panic reachable from input (a peer's
+// frame, an IPC line, a trap connection, a file) stops the node. Outside tests, code must not
+// be able to panic: no unwrap/expect, no unchecked indexing or slicing, no panic!-family macros.
+// A provably safe exception is allowed locally, with its reason.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented
+    )
+)]
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
@@ -202,7 +218,7 @@ async fn handle_trident_connection(
         }
     };
 
-    let payload = &buf[..n];
+    let payload = buf.get(..n).unwrap_or_default();
     let fingerprint = analyze_and_fingerprint(&ip, port, payload);
     let tier = classify_traffic_tier(payload, &fingerprint);
 
@@ -301,7 +317,7 @@ fn analyze_and_fingerprint(ip: &str, port: u16, payload: &[u8]) -> ConnectionFin
     ip.hash(&mut hasher);
     let fingerprint_hash = hasher.finish();
 
-    let snippet = String::from_utf8_lossy(&payload[..payload_len.min(32)])
+    let snippet = String::from_utf8_lossy(payload.get(..payload_len.min(32)).unwrap_or_default())
         .chars()
         .filter(|c| c.is_ascii_graphic() || *c == ' ')
         .collect::<String>();
@@ -323,7 +339,9 @@ fn calculate_shannon_entropy(data: &[u8]) -> f64 {
     }
     let mut counts = [0u64; 256];
     for &b in data {
-        counts[b as usize] += 1;
+        if let Some(c) = counts.get_mut(usize::from(b)) {
+            *c += 1;
+        }
     }
     let len = data.len() as f64;
     let mut entropy = 0.0;
@@ -406,7 +424,7 @@ async fn run_tier2_payload_capture(
         match read_res {
             Ok(Ok(0)) | Err(_) => break,
             Ok(Ok(n)) => {
-                captured.extend_from_slice(&buf[..n]);
+                captured.extend_from_slice(buf.get(..n).unwrap_or_default());
 
                 let chunk_log = format!("CAPTURE_CHUNK|IP={}|BYTES={}", ip, n);
                 let _ = send_log_to_orchestrator(&chunk_log).await;
@@ -506,9 +524,9 @@ async fn run_embedded_mock_jail(
         match read_res {
             Ok(Ok(0)) | Err(_) => break,
             Ok(Ok(n)) => {
-                captured_data.extend_from_slice(&buf[..n]);
+                captured_data.extend_from_slice(buf.get(..n).unwrap_or_default());
 
-                let snippet = String::from_utf8_lossy(&buf[..n.min(32)])
+                let snippet = String::from_utf8_lossy(buf.get(..n.min(32)).unwrap_or_default())
                     .chars()
                     .filter(|c| c.is_ascii_graphic() || *c == ' ')
                     .collect::<String>();

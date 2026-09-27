@@ -1,3 +1,19 @@
+// Release builds abort on panic (panic = "abort"), so a panic reachable from input (a peer's
+// frame, an IPC line, a trap connection, a file) stops the node. Outside tests, code must not
+// be able to panic: no unwrap/expect, no unchecked indexing or slicing, no panic!-family macros.
+// A provably safe exception is allowed locally, with its reason.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented
+    )
+)]
 use axum::{
     extract::{Json, Path, Request, State},
     http::{header, HeaderMap, StatusCode},
@@ -251,7 +267,7 @@ struct MeshCommandReq {
 }
 
 #[tokio::main]
-async fn main() {
+async fn main() -> std::io::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     log::info!("[*] Запуск SOKOL-CORE Operations & Control Center...");
 
@@ -327,9 +343,9 @@ async fn main() {
 
     let bind_addr =
         std::env::var("SOKOL_OPERATOR_BIND").unwrap_or_else(|_| "127.0.0.1:3000".to_string());
-    let listener = TcpListener::bind(&bind_addr).await.unwrap();
+    let listener = TcpListener::bind(&bind_addr).await?;
     log::info!("[*] Command Center operational at http://{}", bind_addr);
-    axum::serve(listener, app).await.unwrap();
+    axum::serve(listener, app).await
 }
 
 fn build_router(state: AppState) -> Router {

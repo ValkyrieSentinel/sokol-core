@@ -194,7 +194,11 @@ impl UpstreamBgpIntegration {
         if bytes_needed > 16 {
             anyhow::bail!("Invalid IPv6 Flowspec prefix length: {}", prefix_len);
         }
-        nlri_buf.extend_from_slice(&octets[..bytes_needed]);
+        nlri_buf.extend_from_slice(
+            octets
+                .get(..bytes_needed)
+                .ok_or_else(|| anyhow::anyhow!("Invalid Flowspec prefix length: {}", prefix_len))?,
+        );
 
         // No BGP session exists yet: the NLRI is built but nothing is sent to the router.
         warn!(
