@@ -6,6 +6,10 @@ A high-performance network security and traffic filtering system running at the 
 
 The program intercepts and drops garbage (attacks, malicious traffic) right at the network interface card before it even reaches the OS. Blocks, trap hits and kernel drop events are recorded in an append-only, hash-chained audit log.
 
+Design and its reasons: [ARCHITECTURE.md](ARCHITECTURE.md) (Ukrainian). Normative decisions
+(authority, leases, persistence, degraded modes, protocol versioning, ...):
+[docs/adr/](docs/adr/README.md).
+
 ---
 
 ## Requirements
