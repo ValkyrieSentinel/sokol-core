@@ -68,6 +68,18 @@ fn family(out: &mut String, name: &str, kind: &str, help: &str) {
 
 pub fn render(s: &Snapshot) -> String {
     let mut out = String::new();
+    family(
+        &mut out,
+        "sokol_build_info",
+        "gauge",
+        "Always 1; the labels name the running build (version and source commit).",
+    );
+    let _ = writeln!(
+        out,
+        "sokol_build_info{{version=\"{}\",build=\"{}\"}} 1",
+        env!("CARGO_PKG_VERSION"),
+        env!("SOKOL_BUILD_ID")
+    );
 
     family(
         &mut out,
