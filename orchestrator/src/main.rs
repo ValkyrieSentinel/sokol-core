@@ -54,7 +54,7 @@ use crate::block_table::{
 };
 use crate::cluster_state::BirdEyeView;
 use crate::p2p::{
-    maintain_peer_connection, now_ms, DagTracker, NodeCrypto, P2PNetwork, PeerRegistry, TrustStore,
+    maintain_peer_connection, now_ms, NodeCrypto, P2PNetwork, PeerRegistry, TrustStore,
 };
 use ipnet::IpNet;
 
@@ -625,7 +625,6 @@ struct ControlCtx {
     peers_file: Option<std::path::PathBuf>,
     node_id: u64,
     crypto: Arc<NodeCrypto>,
-    dag: Arc<tokio::sync::Mutex<DagTracker>>,
 }
 
 /// Tells the mesh that this node takes back its own claims.
@@ -637,10 +636,7 @@ async fn broadcast_retraction(ctx: &ControlCtx, ids: Vec<block_table::ClaimId>) 
         issuer: ctx.node_id,
         claims: ids,
     };
-    let _ = ctx
-        .registry
-        .broadcast(&cmd, ctx.node_id, &ctx.crypto, &ctx.dag)
-        .await;
+    let _ = ctx.registry.broadcast(&cmd, ctx.node_id, &ctx.crypto).await;
 }
 
 async fn execute_control(cmd: control::ControlCommand, ctx: &ControlCtx) -> String {
@@ -797,12 +793,11 @@ async fn send_snapshot(
     registry: &PeerRegistry,
     node_id: u64,
     crypto: &Arc<NodeCrypto>,
-    dag: &Arc<tokio::sync::Mutex<DagTracker>>,
 ) {
     let (claims, retracted) = blocks.lock().await.snapshot(now_ms());
     let total = claims.len();
     for cmd in mesh_sync::pack_snapshot(node_id, claims, retracted) {
-        if let Err(e) = registry.send_to(addr, &cmd, node_id, crypto, dag).await {
+        if let Err(e) = registry.send_to(addr, &cmd, node_id, crypto).await {
             log::warn!("[Mesh] Block sync to {} failed: {:#}", addr, e);
             return;
         }
@@ -902,7 +897,6 @@ struct IpcCtx {
     registry: PeerRegistry,
     node_id: u64,
     crypto: Arc<NodeCrypto>,
-    dag: Arc<tokio::sync::Mutex<DagTracker>>,
     policy: Arc<BlockPolicy>,
     reports: Arc<std::sync::Mutex<attack_reports::AttackReports>>,
 }
@@ -936,7 +930,6 @@ async fn handle_ipc_line(content: &str, c: &IpcCtx) -> String {
                         &c.registry,
                         c.node_id,
                         &c.crypto,
-                        &c.dag,
                         &c.policy,
                         None,
                     )
@@ -1009,7 +1002,6 @@ async fn handle_ipc_line(content: &str, c: &IpcCtx) -> String {
                             &c.registry,
                             c.node_id,
                             &c.crypto,
-                            &c.dag,
                             &c.policy,
                             event,
                         )
@@ -1104,7 +1096,6 @@ async fn enforce_block_local(
     registry: &PeerRegistry,
     node_id: u64,
     node_crypto: &Arc<NodeCrypto>,
-    dag_tracker: &Arc<tokio::sync::Mutex<DagTracker>>,
     policy: &BlockPolicy,
     event: Option<(&str, &str)>,
 ) -> Enforcement {
@@ -1156,7 +1147,7 @@ async fn enforce_block_local(
     // The claim is shared either way: peers can enforce it even if this node's map is full.
     let broadcast_cmd = MeshCommand::Claim { claim: added.claim };
     let _ = registry
-        .broadcast(&broadcast_cmd, node_id, node_crypto, dag_tracker)
+        .broadcast(&broadcast_cmd, node_id, node_crypto)
         .await;
     match added.applied {
         Ok(()) => {
@@ -1466,8 +1457,6 @@ async fn main() -> Result<(), anyhow::Error> {
     let peer_registry = PeerRegistry::new(trust_store);
     let (mesh_cmd_tx, mut mesh_cmd_rx) = mpsc::channel::<MeshCommand>(1000);
 
-    let dag_tracker = Arc::new(tokio::sync::Mutex::new(DagTracker::new()));
-
     let p2p_bind_addr: std::net::SocketAddr = args
         .p2p_bind
         .parse()
@@ -1477,7 +1466,6 @@ async fn main() -> Result<(), anyhow::Error> {
         p2p_bind_addr,
         args.node_id,
         node_crypto.clone(),
-        dag_tracker.clone(),
         mesh_cmd_tx.clone(),
         100,
         shutdown_rx.clone(),
@@ -1495,7 +1483,6 @@ async fn main() -> Result<(), anyhow::Error> {
             let reg_clone = peer_registry.clone();
             let tx_clone = mesh_cmd_tx.clone();
             let crypto_clone = node_crypto.clone();
-            let dag_clone = dag_tracker.clone();
             let node_id = args.node_id;
 
             log::info!("[P2P] Maintaining connection to seed peer: {}", seed_addr);
@@ -1503,7 +1490,6 @@ async fn main() -> Result<(), anyhow::Error> {
                 seed_addr,
                 node_id,
                 crypto_clone,
-                dag_clone,
                 reg_clone,
                 tx_clone,
             ));
@@ -1522,16 +1508,12 @@ async fn main() -> Result<(), anyhow::Error> {
     let (peer_up_tx, mut peer_up_rx) = mpsc::unbounded_channel::<std::net::SocketAddr>();
     peer_registry.on_peer_up(peer_up_tx);
     {
-        let (blocks, registry, crypto, dag) = (
-            blocks.clone(),
-            peer_registry.clone(),
-            node_crypto.clone(),
-            dag_tracker.clone(),
-        );
+        let (blocks, registry, crypto) =
+            (blocks.clone(), peer_registry.clone(), node_crypto.clone());
         let node_id = args.node_id;
         tokio::spawn(async move {
             while let Some(addr) = peer_up_rx.recv().await {
-                send_snapshot(addr, &blocks, &registry, node_id, &crypto, &dag).await;
+                send_snapshot(addr, &blocks, &registry, node_id, &crypto).await;
             }
         });
     }
@@ -1539,11 +1521,7 @@ async fn main() -> Result<(), anyhow::Error> {
     let node_id_mesh = args.node_id;
     let policy_mesh = block_policy.clone();
     let defense_mesh = defense.clone();
-    let (registry_mesh, crypto_mesh, dag_mesh) = (
-        peer_registry.clone(),
-        node_crypto.clone(),
-        dag_tracker.clone(),
-    );
+    let (registry_mesh, crypto_mesh) = (peer_registry.clone(), node_crypto.clone());
 
     tokio::spawn(async move {
         while let Some(cmd) = mesh_cmd_rx.recv().await {
@@ -1695,7 +1673,7 @@ async fn main() -> Result<(), anyhow::Error> {
                                 issuer: node_id_mesh,
                             };
                             let _ = registry_mesh
-                                .send_to(addr, &cmd, node_id_mesh, &crypto_mesh, &dag_mesh)
+                                .send_to(addr, &cmd, node_id_mesh, &crypto_mesh)
                                 .await;
                         }
                     }
@@ -1708,7 +1686,6 @@ async fn main() -> Result<(), anyhow::Error> {
                             &registry_mesh,
                             node_id_mesh,
                             &crypto_mesh,
-                            &dag_mesh,
                         )
                         .await;
                     }
@@ -1725,7 +1702,6 @@ async fn main() -> Result<(), anyhow::Error> {
                             &registry_mesh,
                             node_id_mesh,
                             &crypto_mesh,
-                            &dag_mesh,
                             &policy_mesh,
                             None,
                         )
@@ -1797,7 +1773,6 @@ async fn main() -> Result<(), anyhow::Error> {
         let registry_trap = peer_registry.clone();
 
         let crypto_trap = node_crypto.clone();
-        let dag_trap = dag_tracker.clone();
         let node_id_trap = args.node_id;
         let policy_trap = block_policy.clone();
 
@@ -1826,7 +1801,6 @@ async fn main() -> Result<(), anyhow::Error> {
                                     &registry_trap,
                                     node_id_trap,
                                     &crypto_trap,
-                                    &dag_trap,
                                     &policy_trap,
                                     None,
                                 )
@@ -1879,7 +1853,6 @@ async fn main() -> Result<(), anyhow::Error> {
         peers_file: args.peers_file.clone(),
         node_id: args.node_id,
         crypto: node_crypto.clone(),
-        dag: dag_tracker.clone(),
     });
     tokio::spawn(async move {
         loop {
@@ -1946,7 +1919,6 @@ async fn main() -> Result<(), anyhow::Error> {
     let registry_unix = peer_registry.clone();
 
     let crypto_unix = node_crypto.clone();
-    let dag_unix = dag_tracker.clone();
     let node_id_unix = args.node_id;
     let policy_unix = block_policy.clone();
     let reports_unix = attack_reports.clone();
@@ -1974,7 +1946,6 @@ async fn main() -> Result<(), anyhow::Error> {
                     let registry = registry_unix.clone();
 
                     let crypto_stream = crypto_unix.clone();
-                    let dag_stream = dag_unix.clone();
                     let policy_stream = policy_unix.clone();
                     let reports_stream = reports_unix.clone();
                     let peer_uid = stream.peer_cred().map(|c| c.uid()).ok();
@@ -1985,7 +1956,6 @@ async fn main() -> Result<(), anyhow::Error> {
                         registry,
                         node_id: node_id_unix,
                         crypto: crypto_stream,
-                        dag: dag_stream,
                         policy: policy_stream,
                         reports: reports_stream,
                     };
@@ -2106,11 +2076,7 @@ async fn main() -> Result<(), anyhow::Error> {
     let p2p_bind_hb = args.p2p_bind.clone();
     let control_socket_hb = args.control_socket.clone();
     let mut watermark = Watermark::default();
-    let (registry_tick, crypto_tick, dag_tick) = (
-        peer_registry.clone(),
-        node_crypto.clone(),
-        dag_tracker.clone(),
-    );
+    let (registry_tick, crypto_tick) = (peer_registry.clone(), node_crypto.clone());
     let node_id_tick = args.node_id;
     let mut last_digest = std::time::Instant::now();
     let mut telemetry_window_start = std::time::Instant::now();
@@ -2183,7 +2149,7 @@ async fn main() -> Result<(), anyhow::Error> {
                     last_digest = std::time::Instant::now();
                     let digest = blocks.lock().await.digest(now_ms());
                     let cmd = MeshCommand::Digest { issuer: node_id_tick, digest };
-                    let _ = registry_tick.broadcast(&cmd, node_id_tick, &crypto_tick, &dag_tick).await;
+                    let _ = registry_tick.broadcast(&cmd, node_id_tick, &crypto_tick).await;
                 }
 
                 let mode = if sntl_db.status().healthy && state_store.healthy() { "NORMAL" } else { "DEGRADED" };
@@ -2262,7 +2228,7 @@ async fn main() -> Result<(), anyhow::Error> {
                     if let Some(record) = report.telemetry_record() {
                         let _ = telemetry_tx.try_send(record);
                     }
-                    if let Err(e) = peer_registry.broadcast(&report, node_id_hb, &node_crypto, &dag_tracker).await {
+                    if let Err(e) = peer_registry.broadcast(&report, node_id_hb, &node_crypto).await {
                         log::warn!("[Mesh] Telemetry broadcast failed: {:#}", e);
                     }
                     telemetry_window_start = std::time::Instant::now();
