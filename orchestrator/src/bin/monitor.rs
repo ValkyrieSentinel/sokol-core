@@ -8,6 +8,7 @@
         clippy::unwrap_used,
         clippy::expect_used,
         clippy::indexing_slicing,
+        clippy::string_slice,
         clippy::panic,
         clippy::unreachable,
         clippy::todo,
@@ -149,8 +150,7 @@ fn get_ebpf_active_blocks() -> Vec<String> {
         if out.status.success() {
             let stdout = String::from_utf8_lossy(&out.stdout);
             for line in stdout.lines() {
-                if let Some(idx) = line.find("key:") {
-                    let key_str = &line[idx + 4..];
+                if let Some((_, key_str)) = line.split_once("key:") {
                     let hex_bytes: Vec<u8> = key_str
                         .split_whitespace()
                         .filter_map(|s| u8::from_str_radix(s, 16).ok())

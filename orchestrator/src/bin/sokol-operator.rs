@@ -8,6 +8,7 @@
         clippy::unwrap_used,
         clippy::expect_used,
         clippy::indexing_slicing,
+        clippy::string_slice,
         clippy::panic,
         clippy::unreachable,
         clippy::todo,
@@ -455,8 +456,8 @@ async fn process_trident_telemetry(state: &AppState, uid: u32, raw_msg: &str) {
 
 fn extract_value(s: &str, key: &str) -> Option<String> {
     s.split('|')
-        .find(|p| p.starts_with(key))
-        .map(|p| p[key.len()..].to_string())
+        .find_map(|p| p.strip_prefix(key))
+        .map(str::to_string)
 }
 
 async fn dashboard_handler() -> Html<&'static str> {

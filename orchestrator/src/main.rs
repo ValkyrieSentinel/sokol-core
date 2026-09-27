@@ -9,6 +9,7 @@
         clippy::unwrap_used,
         clippy::expect_used,
         clippy::indexing_slicing,
+        clippy::string_slice,
         clippy::panic,
         clippy::unreachable,
         clippy::todo,
@@ -732,7 +733,10 @@ async fn execute_control(cmd: control::ControlCommand, ctx: &ControlCtx) -> Stri
         }
         ControlCommand::ReloadPeers => match &ctx.peers_file {
             None => "ERR no --peers-file configured".to_string(),
-            Some(path) => match TrustStore::load(path) {
+            Some(path) => match TrustStore::load(path).and_then(|trust| {
+                ctx.registry.check_candidate(&trust)?;
+                Ok(trust)
+            }) {
                 Ok(trust) => {
                     let per_peer = ctx.peer_limits.per_peer(&trust);
                     let legacy = trust.legacy_peers().to_vec();

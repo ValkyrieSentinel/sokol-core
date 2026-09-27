@@ -142,7 +142,7 @@ fn bounded_reason(reason: &str) -> String {
     while !reason.is_char_boundary(end) {
         end -= 1;
     }
-    reason[..end].to_string()
+    reason.get(..end).unwrap_or_default().to_string()
 }
 
 /// Pending kernel operations retried per tick (a full map must not cost a syscall per entry per s).

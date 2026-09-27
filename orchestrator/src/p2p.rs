@@ -68,13 +68,20 @@ pub fn to_hex(bytes: &[u8]) -> String {
 }
 
 pub fn from_hex(s: &str) -> Result<Vec<u8>> {
-    let s = s.trim();
+    // Byte-wise over ASCII digits only: a multi-byte character is an error, not a slice across
+    // its boundary (R27-01: that panicked, and panic aborts the node).
+    let digit = |b: u8| (b as char).to_digit(16).map(|d| d as u8);
+    let s = s.trim().as_bytes();
     if !s.len().is_multiple_of(2) {
         bail!("hex string has odd length");
     }
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).context("invalid hex digit"))
+    let (pairs, _) = s.as_chunks::<2>();
+    pairs
+        .iter()
+        .map(|[hi, lo]| match (digit(*hi), digit(*lo)) {
+            (Some(hi), Some(lo)) => Ok(hi << 4 | lo),
+            _ => bail!("invalid hex digit"),
+        })
         .collect()
 }
 
@@ -116,21 +123,13 @@ impl NodeCrypto {
                     );
                 }
                 if bytes.len() == LEGACY_KEY_FILE_LEN {
-                    let mut retired = path.as_os_str().to_owned();
-                    retired.push(".dilithium3.retired");
-                    std::fs::rename(path, &retired).with_context(|| {
-                        format!(
-                            "failed to move the legacy key file {} aside",
-                            path.display()
-                        )
-                    })?;
-                    let crypto = Self::create(path)?;
+                    let (crypto, retired) = Self::migrate_legacy(path)?;
                     error!(
                         "[P2P] {} held a legacy Dilithium3 key (mesh protocol v1), moved to {}. \
                          New ML-DSA-65 identity created: put its public key in every peer's \
                          peers file: {}",
                         path.display(),
-                        std::path::Path::new(&retired).display(),
+                        retired.display(),
                         crypto.public_key_hex()
                     );
                     return Ok(crypto);
@@ -158,6 +157,13 @@ impl NodeCrypto {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
+        Self::write_key(path, &seed)?;
+        sync_dir(path)?;
+        Ok(Self::from_seed(seed))
+    }
+
+    /// New key file, never replacing an existing one.
+    fn write_key(path: &Path, seed: &[u8; 32]) -> Result<()> {
         let mut file = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -165,9 +171,47 @@ impl NodeCrypto {
             .open(path)
             .with_context(|| format!("failed to create node key file {}", path.display()))?;
         file.write_all(KEY_FILE_MAGIC)?;
-        file.write_all(&seed)?;
+        file.write_all(seed)?;
         file.sync_all()?;
-        Ok(Self::from_seed(seed))
+        Ok(())
+    }
+
+    /// Replaces a v1 key file with a new ML-DSA identity without losing any key (R27-06):
+    /// 1. the old file is hard-linked to the first free `<path>.dilithium3.retired[.N]` (a link
+    ///    never replaces an existing backup), directory synced;
+    /// 2. the new key is written to `<path>.new` and renamed over `<path>`, directory synced.
+    ///
+    /// A crash before step 2 leaves the old key in place (the next start migrates again, to a
+    /// new backup name); after it, both keys exist.
+    fn migrate_legacy(path: &Path) -> Result<(Self, std::path::PathBuf)> {
+        let retired = (0..1000)
+            .map(|n| {
+                let mut name = path.as_os_str().to_owned();
+                name.push(".dilithium3.retired");
+                if n > 0 {
+                    name.push(format!(".{}", n));
+                }
+                std::path::PathBuf::from(name)
+            })
+            .find_map(|candidate| match std::fs::hard_link(path, &candidate) {
+                Ok(()) => Some(Ok(candidate)),
+                Err(e) if e.kind() == ErrorKind::AlreadyExists => None,
+                Err(e) => Some(Err(e)),
+            })
+            .unwrap_or_else(|| Err(std::io::Error::other("no free backup name")))
+            .with_context(|| format!("failed to keep the legacy key file {}", path.display()))?;
+        sync_dir(path)?;
+        let mut seed = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut seed);
+        let mut staged = path.as_os_str().to_owned();
+        staged.push(".new");
+        let staged = std::path::PathBuf::from(staged);
+        let _ = std::fs::remove_file(&staged); // left by an interrupted migration
+        Self::write_key(&staged, &seed)?;
+        std::fs::rename(&staged, path)
+            .with_context(|| format!("failed to install the new key at {}", path.display()))?;
+        sync_dir(path)?;
+        Ok((Self::from_seed(seed), retired))
     }
 
     fn from_key_bytes(bytes: &[u8]) -> Result<Self> {
@@ -198,6 +242,38 @@ impl NodeCrypto {
             .map_err(|e| anyhow::anyhow!("signing failed: {}", e))?;
         Ok(signature.encode().to_vec())
     }
+}
+
+/// Makes a rename or link in `path`'s directory durable.
+fn sync_dir(path: &Path) -> Result<()> {
+    let dir = match path.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d,
+        _ => Path::new("."),
+    };
+    std::fs::File::open(dir)
+        .and_then(|d| d.sync_all())
+        .with_context(|| format!("failed to sync directory {}", dir.display()))
+}
+
+/// A key as the peers file lists it.
+enum PeerKey {
+    MlDsa(VerifyingKey<MlDsa65>),
+    /// A v1 Dilithium3 key: exactly 1952 bytes as unprefixed hex.
+    Legacy,
+}
+
+fn classify_key(text: &str) -> Result<PeerKey> {
+    let text = text.trim();
+    if text.starts_with(KEY_PREFIX) {
+        return parse_public_key(text).map(PeerKey::MlDsa);
+    }
+    if text.len() == 2 * 1952 && text.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Ok(PeerKey::Legacy);
+    }
+    bail!(
+        "key is neither '{}<hex>' nor a legacy Dilithium3 key (3904 hex digits)",
+        KEY_PREFIX
+    )
 }
 
 /// Parses `mldsa65:<hex>`. An unprefixed key is a pre-v2 (Dilithium3) key: same length, but
@@ -261,10 +337,19 @@ impl TrustStore {
         let entries: Vec<PeerEntry> = serde_json::from_str(&raw)
             .with_context(|| format!("peers file {} is not a valid peer list", path.display()))?;
         let mut store = Self::default();
+        let mut seen = std::collections::HashSet::new();
         for entry in entries {
             let id = entry.node_id;
-            if store.keys.contains_key(&id) {
+            // Every entry counts, legacy or not (R27-02).
+            if !seen.insert(id) {
                 bail!("peers file lists node_id {} more than once", id);
+            }
+            if let Some(spec) = entry.envelope {
+                if spec.min_prefix_v4.is_some_and(|p| p > 32)
+                    || spec.min_prefix_v6.is_some_and(|p| p > 128)
+                {
+                    bail!("peer {}: envelope prefix length out of range", id);
+                }
             }
             let hexes: Vec<&String> = entry
                 .public_key
@@ -278,12 +363,13 @@ impl TrustStore {
             let mut legacy = false;
             for hex in hexes {
                 // A pre-v2 key must not keep the node from starting after an upgrade: the peer
-                // is not trusted until its ML-DSA key is listed, and the log says so.
-                if !hex.trim().starts_with(KEY_PREFIX) {
-                    legacy = true;
-                    continue;
+                // is not trusted until its ML-DSA key is listed, and the log says so. Only the
+                // exact v1 format counts as legacy; anything else is an error (a typo in the
+                // prefix must not quietly revoke a peer, R27-02).
+                match classify_key(hex).with_context(|| format!("peer {}", id))? {
+                    PeerKey::MlDsa(key) => keys.push(key),
+                    PeerKey::Legacy => legacy = true,
                 }
-                keys.push(parse_public_key(hex).with_context(|| format!("peer {}", id))?);
             }
             if keys.is_empty() {
                 error!(
@@ -304,11 +390,6 @@ impl TrustStore {
             }
             store.keys.insert(id, keys);
             if let Some(spec) = entry.envelope {
-                if spec.min_prefix_v4.is_some_and(|p| p > 32)
-                    || spec.min_prefix_v6.is_some_and(|p| p > 128)
-                {
-                    bail!("peer {}: envelope prefix length out of range", id);
-                }
                 store.envelopes.insert(id, spec);
             }
         }
@@ -725,6 +806,27 @@ impl PeerRegistry {
 
     /// Replaces the trust store. Connections of peers whose key was removed are closed on
     /// their next envelope, which no longer verifies.
+    /// Whether `node_id` is trusted now.
+    pub fn trusts(&self, node_id: u64) -> bool {
+        self.trust
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(node_id)
+            .is_some()
+    }
+
+    /// Refuses a candidate trust store that lists a peer trusted now with an ML-DSA key with
+    /// only a legacy key: a mistake, not an upgrade (R27-02). Checked before anything changes.
+    pub fn check_candidate(&self, candidate: &TrustStore) -> Result<()> {
+        if let Some(id) = candidate.legacy_peers().iter().find(|id| self.trusts(**id)) {
+            bail!(
+                "peer {} is trusted with an ML-DSA key but listed with only a legacy key",
+                id
+            );
+        }
+        Ok(())
+    }
+
     pub fn reload(&self, trust: TrustStore) -> usize {
         let pinned = trust.len();
         *self.trust.write().unwrap_or_else(|p| p.into_inner()) = Arc::new(trust);
@@ -2186,5 +2288,133 @@ mod tests {
             opened.as_micros() as f64 / n as f64,
             n
         );
+    }
+
+    // ---- R27-01/02/06 ----
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(4096))]
+        /// R27-01: any text in a key position is an error or a key, never a panic.
+        #[test]
+        fn no_key_text_panics(text in proptest::prelude::any::<String>(), prefixed in proptest::prelude::any::<bool>()) {
+            let text = if prefixed { format!("{}{}", KEY_PREFIX, text) } else { text };
+            let _ = parse_public_key(&text);
+            let _ = classify_key(&text);
+            let _ = from_hex(&text);
+        }
+    }
+
+    #[test]
+    fn multibyte_characters_in_a_key_are_an_error() {
+        for text in ["mldsa65:a€", "mldsa65:€€", "mldsa65:ab\u{e9}\u{e9}", "€€"] {
+            assert!(parse_public_key(text).is_err(), "{}", text);
+            assert!(classify_key(text).is_err(), "{}", text);
+        }
+        assert!(from_hex("a€").is_err());
+        assert_eq!(from_hex("0aFf").unwrap(), vec![0x0a, 0xff]);
+    }
+
+    fn peers_file(name: &str, body: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("sokol-r27-{}-{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("peers.json");
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
+    #[test]
+    fn a_mistyped_prefix_is_an_error_not_a_legacy_key() {
+        let a = NodeCrypto::generate();
+        let typo = a.public_key_hex().replacen("mldsa65:", "mldsa6S:", 1);
+        let path = peers_file(
+            "typo",
+            &format!(r#"[{{"node_id": 2, "public_key": "{}"}}]"#, typo),
+        );
+        assert!(
+            TrustStore::load(&path).is_err(),
+            "R27-02: a typo was taken for a legacy key"
+        );
+        let path = peers_file("garbage", r#"[{"node_id": 2, "public_key": "abcd"}]"#);
+        assert!(TrustStore::load(&path).is_err());
+    }
+
+    #[test]
+    fn duplicate_ids_are_refused_even_when_one_is_legacy() {
+        let a = NodeCrypto::generate();
+        let legacy = "ab".repeat(1952);
+        let path = peers_file(
+            "dup",
+            &format!(
+                r#"[{{"node_id": 2, "public_key": "{}"}}, {{"node_id": 2, "public_key": "{}"}}]"#,
+                legacy,
+                a.public_key_hex()
+            ),
+        );
+        assert!(TrustStore::load(&path).is_err());
+    }
+
+    #[test]
+    fn a_reload_cannot_demote_a_trusted_peer_to_a_legacy_key() {
+        let a = NodeCrypto::generate();
+        let registry = PeerRegistry::new(trust_with(2, &a));
+        let path = peers_file(
+            "demote",
+            &format!(
+                r#"[{{"node_id": 2, "public_key": "{}"}}]"#,
+                "ab".repeat(1952)
+            ),
+        );
+        let candidate = TrustStore::load(&path).unwrap();
+        assert!(registry.check_candidate(&candidate).is_err());
+        assert!(registry.trusts(2), "the refused candidate changed nothing");
+        let path = peers_file(
+            "new-legacy",
+            &format!(
+                r#"[{{"node_id": 9, "public_key": "{}"}}]"#,
+                "ab".repeat(1952)
+            ),
+        );
+        assert!(
+            registry
+                .check_candidate(&TrustStore::load(&path).unwrap())
+                .is_ok(),
+            "an untrusted peer may still be listed with its old key during an upgrade"
+        );
+    }
+
+    #[test]
+    fn migration_never_overwrites_an_existing_backup() {
+        let dir = std::env::temp_dir().join(format!("sokol-r27-06-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("node.key");
+        let backup = dir.join("node.key.dilithium3.retired");
+        std::fs::write(&backup, b"an earlier backup").unwrap();
+        std::fs::write(
+            dir.join("node.key.new"),
+            b"left by an interrupted migration",
+        )
+        .unwrap();
+        std::fs::write(&path, vec![5u8; LEGACY_KEY_FILE_LEN]).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let created = NodeCrypto::load_or_create(&path).unwrap();
+        assert_eq!(
+            std::fs::read(&backup).unwrap(),
+            b"an earlier backup",
+            "R27-06: backup clobbered"
+        );
+        assert_eq!(
+            std::fs::read(dir.join("node.key.dilithium3.retired.1")).unwrap(),
+            vec![5u8; LEGACY_KEY_FILE_LEN],
+            "the legacy key is kept under the next free name"
+        );
+        assert!(!dir.join("node.key.new").exists());
+        assert_eq!(
+            NodeCrypto::load_or_create(&path).unwrap().public_key_hex(),
+            created.public_key_hex()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
