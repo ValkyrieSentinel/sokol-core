@@ -1,0 +1,192 @@
+   Compiling libc v0.2.189
+   Compiling cfg-if v1.0.4
+   Compiling cmov v0.5.4
+   Compiling proc-macro2 v1.0.107
+   Compiling getrandom v0.3.4
+   Compiling zerocopy v0.8.56
+   Compiling typenum v1.20.1
+   Compiling quote v1.0.47
+   Compiling unicode-ident v1.0.24
+   Compiling getrandom v0.4.3
+   Compiling autocfg v1.5.1
+   Compiling rand_core v0.10.1
+   Compiling shlex v2.0.1
+   Compiling find-msvc-tools v0.1.12
+   Compiling parking_lot_core v0.9.12
+   Compiling zeroize v1.9.0
+   Compiling cc v1.4.5
+   Compiling const-oid v0.10.2
+   Compiling ctutils v0.4.2
+   Compiling serde_core v1.0.229
+   Compiling smallvec v1.15.2
+   Compiling num-traits v0.2.19
+   Compiling scopeguard v1.2.0
+   Compiling zmij v1.0.23
+   Compiling sponge-cursor v0.1.0
+   Compiling serde_json v1.0.151
+   Compiling lock_api v0.4.14
+   Compiling arrayvec v0.7.8
+   Compiling serde v1.0.229
+   Compiling anyhow v1.0.104
+   Compiling constant_time_eq v0.4.2
+   Compiling unarray v0.1.4
+   Compiling bitflags v2.13.1
+   Compiling regex-syntax v0.8.11
+   Compiling pin-project-lite v0.2.17
+   Compiling bytes v1.12.1
+   Compiling getrandom v0.2.17
+   Compiling rand_core v0.9.5
+   Compiling cpufeatures v0.3.1
+   Compiling rand_core v0.6.4
+   Compiling errno v0.3.14
+   Compiling keccak v0.2.2
+   Compiling syn v3.0.4
+   Compiling rand_xorshift v0.4.0
+   Compiling rand v0.9.5
+   Compiling hybrid-array v0.4.15
+   Compiling signal-hook-registry v1.4.8
+   Compiling socket2 v0.6.5
+   Compiling mio v1.2.2
+   Compiling memchr v2.8.3
+   Compiling blake3 v1.8.7
+   Compiling parking_lot v0.12.5
+   Compiling itoa v1.0.18
+   Compiling log v0.4.34
+   Compiling ipnet v2.12.2
+   Compiling der v0.8.2
+   Compiling crypto-common v0.2.2
+   Compiling module-lattice v0.2.3
+   Compiling digest v0.11.3
+   Compiling signature v3.0.0
+   Compiling shake v0.1.0
+   Compiling spki v0.8.0
+   Compiling pkcs8 v0.11.0
+   Compiling tokio-macros v2.7.2
+   Compiling serde_derive v1.0.229
+   Compiling ml-dsa v0.1.1
+   Compiling common v0.1.0 (/var/folders/3j/t95dsnsj7wlc35dpwlwpdy8r0000gn/T/sokol-review-harness-0927-yx_xy3wt/common)
+   Compiling tokio v1.53.1
+   Compiling ppv-lite86 v0.2.21
+   Compiling rand_chacha v0.9.0
+   Compiling rand_chacha v0.3.1
+   Compiling proptest v1.11.0
+   Compiling rand v0.8.8
+   Compiling sokol-review-0927 v0.0.0 (/var/folders/3j/t95dsnsj7wlc35dpwlwpdy8r0000gn/T/sokol-review-harness-0927-yx_xy3wt/review-harness)
+warning: unused imports: `AlertLevel` and `pack_snapshot`
+  --> src/lib.rs:15:32
+   |
+15 | mod mesh_sync {pub use crate::{AlertLevel,pack_snapshot};}
+   |                                ^^^^^^^^^^ ^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: `sokol-review-0927` (lib) generated 1 warning (run `cargo fix --lib -p sokol-review-0927` to apply 1 suggestion)
+warning: unused dependency `proptest`
+  --> Cargo.toml:17:1
+   |
+17 | proptest={version="1",default-features=false,features=["std"]}
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `cargo::unused_dependencies` is set to `warn` by default
+help: consider removing the dependency on `proptest`
+help: to still use for development builds, move to `dev-dependencies`
+warning: `sokol-review-0927` (manifest) generated 1 warning
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 6.43s
+     Running unittests src/lib.rs (/var/folders/3j/t95dsnsj7wlc35dpwlwpdy8r0000gn/T/sokol-review-harness-0927-yx_xy3wt/review-harness/target/debug/build/sokol-review-0927/8d73788c6b4e09ed/out/sokol_review_0927-8d73788c6b4e09ed)
+
+running 80 tests
+test block_table::tests::a_peer_cannot_retract_another_nodes_claim ... ok
+test block_table::tests::a_peer_claim_is_capped_at_the_local_maximum ... ok
+test block_table::tests::a_retraction_frees_the_issuers_slot ... ok
+test block_table::tests::a_claims_reason_is_bounded ... ok
+test block_table::tests::a_failed_removal_is_not_reported_and_is_retried ... ok
+test block_table::tests::a_capped_peer_claim_gets_no_new_lease_after_a_restart ... ok
+test block_table::tests::a_block_the_map_cannot_take_is_pending_not_counted_and_retried ... ok
+test block_table::tests::a_flush_lifts_all_detector_claims_and_retracts_own_ones ... ok
+test block_table::tests::a_local_wide_block_needs_no_quorum ... ok
+test block_table::tests::a_replayed_event_is_seen_once ... ok
+test block_table::tests::a_claim_that_waits_for_a_slot_keeps_its_earlier_lease_end ... ok
+test block_table::tests::a_retraction_that_arrives_first_still_applies ... ok
+test block_table::tests::a_peers_envelope_bounds_what_it_can_block_here ... ok
+test block_table::tests::a_snapshot_carries_only_the_nodes_own_claims ... ok
+test block_table::tests::a_revoked_origin_stops_counting ... ok
+test block_table::tests::an_ended_lease_stays_ended_when_the_clock_steps_back ... ok
+test block_table::tests::another_nodes_retraction_cannot_displace_the_issuers ... ok
+test block_table::tests::claim_identity_is_its_bytes ... ok
+test block_table::tests::counts_by_family_and_reports_watermark_crossings_once ... ok
+test block_table::tests::a_wide_prefix_from_one_peer_waits_for_a_second_node ... ok
+test block_table::tests::lifted_claims_resent_by_their_issuer_take_no_slots ... ok
+test block_table::tests::envelopes_do_not_change_the_shared_mesh_state ... ok
+test block_table::tests::machine::a_flush_lifts_claims_that_wait_for_a_quorum ... ok
+test block_table::tests::expiry_unblocks_once_and_a_shorter_repeat_does_not_cut_a_longer_block ... ok
+test block_table::tests::machine::a_lift_of_a_waiting_claim_outlives_restarts ... ok
+test block_table::tests::only_the_configuration_lifts_a_static_block ... ok
+test block_table::tests::operator_ban_and_unban ... ok
+test block_table::tests::decisions_and_lifts_survive_a_restart ... ok
+test block_table::tests::an_operator_lift_holds_against_every_copy_of_the_lifted_claims ... ok
+test block_table::tests::operator_bans_can_be_listed_and_flushed_with_everything_but_static ... ok
+test block_table::tests::machine::a_claim_whose_lease_ran_out_gets_no_new_one_through_the_queue ... ok
+test block_table::tests::protected_targets_are_known_and_shared_but_not_enforced ... ok
+test block_table::tests::peers_cannot_forge_this_nodes_or_non_detector_claims ... ok
+test block_table::tests::prefixes_and_hosts_are_separate_targets ... ok
+test block_table::tests::machine::a_lift_outlives_the_lease_across_clock_steps_and_restarts ... ok
+R27 replay: same event lease end moved from Some(1000060000) to Some(1000110000)
+test block_table::tests::targets_parse_canonically_and_print_like_before ... ok
+test block_table::tests::zero_base_makes_detector_blocks_permanent ... ok
+test block_table::tests::review_restart_replays_event_and_extends_lease ... ok
+test block_table::tests::one_exchange_with_each_issuer_converges_including_retractions ... ok
+
+thread 'p2p::review_probes::review_non_ascii_hex_panics' (19931226) panicked at src/p2p.rs:77:39:
+end byte index 2 is not a char boundary; it is inside '€' (bytes 1..4 of string)
+test block_table::tests::retractions_are_forgotten_after_their_horizon ... ok
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test block_table::tests::detector_blocks_escalate_and_are_capped ... ok
+test p2p::review_probes::review_non_ascii_hex_panics ... ok
+test p2p::tests::a_stale_connection_cannot_unregister_its_replacement ... ok
+test p2p::tests::backoff_grows_to_a_cap_and_resets_after_a_stable_connection ... ok
+test block_table::tests::a_failing_target_does_not_starve_the_others_and_retries_are_bounded ... ok
+test p2p::review_probes::review_typo_prefix_accepted_as_legacy_and_clears_trust ... ok
+test p2p::review_probes::review_migration_overwrites_existing_retired_key ... ok
+test p2p::tests::a_legacy_key_file_is_retired_and_a_new_identity_created ... ok
+test p2p::tests::frames_of_other_protocol_versions_are_named ... ok
+test p2p::tests::header_fields_are_covered_by_the_signature ... ok
+test p2p::tests::a_signature_made_for_another_context_does_not_verify ... ok
+test p2p::tests::a_peer_without_a_common_version_is_disconnected ... ok
+test p2p::tests::key_file_round_trips_and_rejects_loose_permissions ... ok
+test p2p::tests::measure_seal_and_open ... ignored
+test p2p::tests::legacy_peer_keys_are_not_trusted_but_do_not_stop_the_node ... ok
+test p2p::tests::broadcast_does_not_wait_for_a_stuck_peer ... ok
+test p2p::tests::peers_file_envelopes_are_parsed_and_checked ... ok
+test p2p::tests::heartbeat_messages_seal_and_open ... ok
+test p2p::tests::pinned_peer_envelope_opens ... ok
+test p2p::tests::replay_and_stale_envelopes_are_rejected ... ok
+test block_table::tests::event_memory_is_bounded ... ok
+test block_table::tests::repeated_detections_of_one_target_keep_a_handful_of_claims ... ok
+test p2p::tests::ping_is_answered_with_pong ... ok
+test p2p::tests::stranger_key_is_rejected_even_with_valid_signature ... ok
+test p2p::tests::the_highest_common_version_is_chosen_or_the_peer_refused ... ok
+test p2p::tests::trust_store_parses_hex_keys_and_rejects_duplicates ... ok
+test p2p::tests::rotation_accepts_old_and_new_keys_then_revokes_the_old_one ... ok
+test p2p::tests::connection_is_bound_to_its_handshake_identity ... ok
+test block_table::tests::local_claims_respect_the_known_claims_cap ... ok
+R27 FIFO released; platform-specific completion: Ok(())
+test state_probe::review_blocked_state_write_has_no_deadline_or_unhealthy_signal ... ok
+test p2p::tests::telemetry_must_describe_the_sender ... ok
+test p2p::tests::a_snapshot_with_claims_of_other_nodes_is_refused ... ok
+test p2p::tests::a_peer_cannot_send_claims_in_another_nodes_name ... ok
+test p2p::tests::outbound_connection_carries_broadcasts_both_ways ... ok
+test p2p::tests::every_snapshot_frame_fits_the_frame_limit ... ok
+test p2p::tests::only_pinned_peers_can_deliver_commands_over_the_network ... ok
+test p2p::tests::a_peer_cannot_switch_this_nodes_defense_mode ... ok
+test p2p::tests::seed_connection_is_retried_until_the_peer_comes_up ... ok
+test p2p::tests::every_byte_of_a_v2_envelope_is_covered ... ok
+test block_table::tests::machine::the_table_keeps_its_invariants ... ok
+
+test result: ok. 79 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 9.61s
+
+   Doc-tests sokol_review_0927
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
