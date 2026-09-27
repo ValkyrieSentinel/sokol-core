@@ -284,6 +284,11 @@ pub struct Persisted {
     /// claim does not get a new lease. (id, local end, the claim's own expiry)
     #[serde(default)]
     pub peer_ends: Vec<(ClaimId, u64, Option<u64>)>,
+    /// Detector events already acted on, oldest first: (hex of the hashed (source, id), seen
+    /// at). Saved with the claims they produced, so a replay after a restart is still a
+    /// duplicate (R27-05).
+    #[serde(default)]
+    pub events: Vec<(String, u64)>,
 }
 
 /// Block decisions (claims) with owners, and the kernel maps kept in line with them.
@@ -548,6 +553,7 @@ impl<B: Blocklist> BlockTable<B> {
         }
         self.events.insert(key, now_ms);
         self.event_order.push_back((key, now_ms));
+        self.dirty = true;
         true
     }
 
@@ -1216,11 +1222,19 @@ impl<B: Blocklist> BlockTable<B> {
             .map(|(id, (end, expires))| (id.clone(), *end, *expires))
             .collect();
         peer_ends.sort();
+        let events = self
+            .event_order
+            .iter()
+            .filter(|(key, seen)| self.events.get(key) == Some(seen))
+            .filter(|(_, seen)| now_ms.saturating_sub(*seen) <= ms(EVENT_MEMORY))
+            .map(|(key, seen)| (crate::p2p::to_hex(key), *seen))
+            .collect();
         Persisted {
             claims,
             operator_lifts,
             retracted,
             peer_ends,
+            events,
         }
     }
 
@@ -1232,6 +1246,21 @@ impl<B: Blocklist> BlockTable<B> {
         allowed: impl Fn(IpNet) -> bool,
         now_ms: u64,
     ) -> (usize, usize) {
+        let mut events: Vec<([u8; 16], u64)> = state
+            .events
+            .iter()
+            .filter(|(_, seen)| now_ms.saturating_sub(*seen) <= ms(EVENT_MEMORY))
+            .filter_map(|(hex, seen)| {
+                let bytes = crate::p2p::from_hex(hex).ok()?;
+                Some((<[u8; 16]>::try_from(bytes.as_slice()).ok()?, *seen))
+            })
+            .collect();
+        events.sort_by_key(|(_, seen)| *seen);
+        let skip = events.len().saturating_sub(MAX_EVENTS);
+        for (key, seen) in events.into_iter().skip(skip) {
+            self.events.insert(key, seen);
+            self.event_order.push_back((key, seen));
+        }
         for (id, end, expires) in state.peer_ends {
             if expires.is_none_or(|e| e > now_ms) && self.lease_ends.len() < MAX_KNOWN_CLAIMS {
                 self.lease_ends.insert(id, (end, expires));
@@ -1451,6 +1480,50 @@ mod tests {
             "forgotten after EVENT_MEMORY"
         );
         assert_eq!(t.event_memory(), (1, 0), "expired ids are dropped");
+    }
+
+    #[test]
+    fn a_replayed_event_is_a_duplicate_after_a_restart() {
+        // R27-05 (Codex's probe): event crowdsec/17 blocks until T0+60 s; after a restart at
+        // T0+50 s the same event was new again and moved the block's end to T0+110 s.
+        let mut a = table(1, 64);
+        assert!(a.first_sighting("crowdsec", "17", T0));
+        let first = detect(&mut a, "198.51.100.8", T0);
+        assert_eq!(first.expires_ms, Some(T0 + 60 * S));
+        let saved = serde_json::to_vec(&a.take_persisted(T0 + 50 * S)).unwrap();
+        let mut b = table(1, 64);
+        b.restore(
+            serde_json::from_slice(&saved).unwrap(),
+            |_| true,
+            T0 + 50 * S,
+        );
+        assert!(
+            !b.first_sighting("crowdsec", "17", T0 + 50 * S),
+            "the replayed event was taken as new after the restart"
+        );
+        assert!(
+            b.first_sighting("crowdsec", "18", T0 + 50 * S),
+            "a new event still counts"
+        );
+        // Remembered for EVENT_MEMORY from when it was first seen, restart or not.
+        let saved = serde_json::to_vec(&b.take_persisted(T0 + 60 * S)).unwrap();
+        let mut c = table(1, 64);
+        let late = T0 + ms(EVENT_MEMORY) + S;
+        c.restore(serde_json::from_slice(&saved).unwrap(), |_| true, late);
+        assert!(
+            c.first_sighting("crowdsec", "17", late),
+            "forgotten after EVENT_MEMORY"
+        );
+        assert_eq!(c.event_memory().0, 2, "18 (seen later) is still remembered");
+    }
+
+    #[test]
+    fn a_new_event_is_saved_even_when_it_adds_no_claim() {
+        let mut t = table(1, 64);
+        let _ = t.take_persisted(T0);
+        assert!(!t.dirty());
+        assert!(t.first_sighting("crowdsec", "5", T0));
+        assert!(t.dirty(), "a remembered event must reach the state file");
     }
 
     #[test]

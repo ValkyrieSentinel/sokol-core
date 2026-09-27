@@ -421,6 +421,21 @@ if command -v cscli >/dev/null && command -v crowdsec >/dev/null; then
     check "a decision made while the node was down is enforced once it is back" \
         bash -c "! ip netns exec $NS ping -c 2 -W 1 -I $CS_IP2 $HOST_IP >/dev/null 2>&1"
     check "the node's answer is logged by the adapter" grep -q "$CS_IP2.*(Applied)" "$WORK/crowdsec-adapter.log"
+    # R27-05: the node restarted above; the event memory came back with its state, so a replay
+    # by a restarted adapter is still a duplicate (not a new event that renews the block).
+    sleep 1.5   # the decision's event reaches the state file
+    STATE_FILE=$LAST_STATE stop_orchestrator
+    STATE_FILE=$LAST_STATE start_orchestrator
+    kill "$CS_ADAPTER_PID" 2>/dev/null || true
+    wait "$CS_ADAPTER_PID" 2>/dev/null || true
+    SOKOL_CROWDSEC_KEY="$CS_KEY" "$(dirname "$BIN")/sokol-crowdsec" --poll-secs 1 >>"$WORK/crowdsec-adapter.log" 2>&1 </dev/null &
+    CS_ADAPTER_PID=$!
+    for _ in $(seq 1 50); do
+        grep -q "crowdsec event [0-9]* for $CS_IP2 already handled" "$LOG" && break
+        sleep 0.2
+    done
+    check "after a node restart a replayed decision is still a duplicate" \
+        grep -q "crowdsec event [0-9]* for $CS_IP2 already handled" "$LOG"
     cscli decisions delete --ip "$CS_IP2" >/dev/null 2>&1 || true
     cscli decisions delete --ip "$CS_IP" >/dev/null 2>&1 || true
     kill "$CS_ADAPTER_PID" 2>/dev/null || true
