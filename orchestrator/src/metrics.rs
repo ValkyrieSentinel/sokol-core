@@ -23,6 +23,7 @@ pub struct Snapshot {
     pub state_healthy: bool,
     pub state_pending_secs: f64,
     pub state_restore_ok: bool,
+    pub protected_refresh_ok: bool,
     pub audit_write_errors: u64,
     pub audit_lost: u64,
     pub audit_sync_age_ms: u64,
@@ -179,6 +180,17 @@ pub fn render(s: &Snapshot) -> String {
         "0 after a state file failed to restore, until ACCEPT_STATE_LOSS on the control socket.",
     );
     let _ = writeln!(out, "sokol_state_restore_ok {}", s.state_restore_ok as u8);
+    family(
+        &mut out,
+        "sokol_protected_refresh_ok",
+        "gauge",
+        "0 while this host's addresses and gateways cannot be re-read (the last known ones stay protected).",
+    );
+    let _ = writeln!(
+        out,
+        "sokol_protected_refresh_ok {}",
+        s.protected_refresh_ok as u8
+    );
     family(
         &mut out,
         "sokol_audit_write_errors_total",

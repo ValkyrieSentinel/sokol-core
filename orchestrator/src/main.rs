@@ -49,7 +49,7 @@ use common::audit_log::{AuditLog, Rotation};
 use common::canonical::CanonicalParser;
 use common::{DropEvent, NodeTelemetry};
 
-use crate::block_policy::BlockPolicy;
+use crate::block_policy::{BlockPolicy, HostView, PolicyHandle};
 use crate::block_table::{
     family_tag, host, parse_target, show, Adoption, BlockTable, ClaimKind, Envelope, LiftError,
     Quorum, TtlPolicy, Watermark,
@@ -515,6 +515,8 @@ struct Args {
 
 /// How often each node reports its load to itself and its mesh peers.
 const TELEMETRY_INTERVAL: Duration = Duration::from_secs(5);
+/// How often the host's addresses and default gateways are re-read for the never-block policy.
+const PROTECTED_REFRESH: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
 enum XdpMode {
@@ -538,7 +540,6 @@ const MAX_IPC_LINE: u64 = 4096;
 fn build_block_policy(args: &Args) -> anyhow::Result<BlockPolicy> {
     let mut policy = BlockPolicy::builtin();
     policy.set_min_prefix(args.min_block_prefix_v4, args.min_block_prefix_v6);
-    policy.protect_host_addresses();
     for seed in &args.seed_peer {
         if let Ok(addr) = seed.trim().parse::<std::net::SocketAddr>() {
             policy.protect_ip(addr.ip(), "mesh seed peer");
@@ -621,7 +622,7 @@ struct ControlCtx {
     state: Arc<StateStore>,
     peer_limits: PeerLimits,
     blocks: SharedBlockTable,
-    policy: Arc<BlockPolicy>,
+    policy: PolicyHandle,
     sntl_db: Arc<SentinelDb>,
     registry: PeerRegistry,
     peers_file: Option<std::path::PathBuf>,
@@ -643,7 +644,7 @@ async fn broadcast_retraction(ctx: &ControlCtx, ids: Vec<block_table::ClaimId>) 
 
 async fn execute_control(cmd: control::ControlCommand, ctx: &ControlCtx) -> String {
     use control::ControlCommand;
-    let (blocks, policy, sntl_db) = (&ctx.blocks, &ctx.policy, &ctx.sntl_db);
+    let (blocks, policy, sntl_db) = (&ctx.blocks, &ctx.policy.current(), &ctx.sntl_db);
     match cmd {
         ControlCommand::Ban(ip) => {
             let shown = show(&ip);
@@ -853,7 +854,7 @@ struct IpcCtx {
     registry: PeerRegistry,
     node_id: u64,
     crypto: Arc<NodeCrypto>,
-    policy: Arc<BlockPolicy>,
+    policy: PolicyHandle,
     reports: Arc<std::sync::Mutex<attack_reports::AttackReports>>,
 }
 
@@ -886,7 +887,7 @@ async fn handle_ipc_line(content: &str, c: &IpcCtx) -> String {
                         &c.registry,
                         c.node_id,
                         &c.crypto,
-                        &c.policy,
+                        &c.policy.current(),
                         None,
                     )
                     .await,
@@ -937,7 +938,7 @@ async fn handle_ipc_line(content: &str, c: &IpcCtx) -> String {
             Err(e) => return format!("ERR {}", e),
         };
         match signal::parse(payload) {
-            Ok(sig) => match signal::target(&sig, &c.policy) {
+            Ok(sig) => match signal::target(&sig, &c.policy.current()) {
                 Ok(ip) => {
                     c.db.append(format!(
                         "SIGNAL|Source:{}|Src:{}|Dst:{}|Target:{}|Reason:{}",
@@ -958,7 +959,7 @@ async fn handle_ipc_line(content: &str, c: &IpcCtx) -> String {
                             &c.registry,
                             c.node_id,
                             &c.crypto,
-                            &c.policy,
+                            &c.policy.current(),
                             event,
                         )
                         .await,
@@ -1165,7 +1166,22 @@ async fn main() -> Result<(), anyhow::Error> {
         }
     };
 
-    let block_policy = Arc::new(build_block_policy(&args)?);
+    // The static part (built-in ranges, seeds, --never-block) plus the host's own addresses and
+    // gateways, which are re-read while the node runs (the protected set follows the host).
+    let base_policy = build_block_policy(&args)?;
+    let (host_view, host_read) = match HostView::discover() {
+        Ok(view) => (view, true),
+        Err(e) => {
+            log::error!(
+                "[BlockPolicy] Cannot read this host's addresses ({}); they are not protected \
+                 until a read succeeds; node is DEGRADED",
+                e
+            );
+            (HostView::default(), false)
+        }
+    };
+    let block_policy = PolicyHandle::new(base_policy.with_host(&host_view));
+    let host_read_ok = Arc::new(std::sync::atomic::AtomicBool::new(host_read));
     let attack_reports = Arc::new(std::sync::Mutex::new(attack_reports::AttackReports::new(
         Duration::from_secs(args.attack_report_ttl_secs),
     )));
@@ -1347,7 +1363,7 @@ async fn main() -> Result<(), anyhow::Error> {
     for ip_str in &args.block {
         let clean_str = ip_str.trim();
         if let Some(ip) = parse_target(clean_str) {
-            if let Err(why) = block_policy.check_net(ip) {
+            if let Err(why) = block_policy.current().check_net(ip) {
                 anyhow::bail!("--block {} refused ({})", show(&ip), why);
             }
             blocks
@@ -1380,7 +1396,7 @@ async fn main() -> Result<(), anyhow::Error> {
         Ok(Some(state)) => {
             let (restored, refused) = blocks.lock().await.restore(
                 state,
-                |net| block_policy.check_net(net).is_ok(),
+                |net| block_policy.current().check_net(net).is_ok(),
                 now_ms(),
             );
             log::warn!(
@@ -1497,7 +1513,9 @@ async fn main() -> Result<(), anyhow::Error> {
                     let reason = claim.reason.clone();
                     let issuer = claim.issuer;
                     let expires = claim.expires_ms;
-                    let refusal = claim.net().and_then(|n| policy_mesh.check_net(n).err());
+                    let refusal = claim
+                        .net()
+                        .and_then(|n| policy_mesh.current().check_net(n).err());
                     let now = now_ms();
                     let result = blocks_mesh
                         .lock()
@@ -1587,7 +1605,9 @@ async fn main() -> Result<(), anyhow::Error> {
                     let now = now_ms();
                     let mut adopted = 0;
                     for claim in claims {
-                        let refusal = claim.net().and_then(|n| policy_mesh.check_net(n).err());
+                        let refusal = claim
+                            .net()
+                            .and_then(|n| policy_mesh.current().check_net(n).err());
                         let (shown, secs) = (
                             claim.target.clone(),
                             claim.expires_ms.map(|e| e.saturating_sub(now) / 1000),
@@ -1668,7 +1688,7 @@ async fn main() -> Result<(), anyhow::Error> {
                             &registry_mesh,
                             node_id_mesh,
                             &crypto_mesh,
-                            &policy_mesh,
+                            &policy_mesh.current(),
                             None,
                         )
                         .await;
@@ -1767,7 +1787,7 @@ async fn main() -> Result<(), anyhow::Error> {
                                     &registry_trap,
                                     node_id_trap,
                                     &crypto_trap,
-                                    &policy_trap,
+                                    &policy_trap.current(),
                                     None,
                                 )
                                 .await;
@@ -2039,6 +2059,70 @@ async fn main() -> Result<(), anyhow::Error> {
 
     log::info!("Sokol-Core running with SokolEngine anomaly detection & sovereign mesh verification loops.");
 
+    // The protected set follows the host: addresses and default gateways are re-read every
+    // PROTECTED_REFRESH; a change replaces the policy and re-checks every claim, so a target that
+    // became protected is released now, not only refused in the future.
+    {
+        let (policy, blocks, db, read_ok) = (
+            block_policy.clone(),
+            blocks.clone(),
+            sntl_db.clone(),
+            host_read_ok.clone(),
+        );
+        let mut last = host_view.clone();
+        tokio::spawn(async move {
+            use std::sync::atomic::Ordering;
+            let mut interval = tokio::time::interval(PROTECTED_REFRESH);
+            loop {
+                interval.tick().await;
+                let view = match tokio::task::spawn_blocking(HostView::discover).await {
+                    Ok(Ok(view)) => view,
+                    Ok(Err(e)) => {
+                        if read_ok.swap(false, Ordering::Relaxed) {
+                            log::error!(
+                                "[BlockPolicy] Cannot re-read this host's addresses ({}); keeping \
+                                 the last known ones; node is DEGRADED",
+                                e
+                            );
+                        }
+                        continue;
+                    }
+                    Err(_) => continue,
+                };
+                if !read_ok.swap(true, Ordering::Relaxed) {
+                    log::warn!("[BlockPolicy] This host's addresses are readable again");
+                }
+                if view == last {
+                    continue;
+                }
+                let (added, removed) = view.diff(&last);
+                policy.replace(base_policy.with_host(&view));
+                log::warn!(
+                    "[BlockPolicy] Protected host addresses changed: +{:?} -{:?}",
+                    added,
+                    removed
+                );
+                db.append(format!(
+                    "PROTECTED_CHANGED|Added:{:?}|Removed:{:?}",
+                    added, removed
+                ));
+                let current = policy.current();
+                let released = blocks
+                    .lock()
+                    .await
+                    .recheck(|net| current.check_net(net).is_ok(), now_ms());
+                for net in released {
+                    log::warn!(
+                        "[BlockPolicy] Block of {} released: it is protected now",
+                        show(&net)
+                    );
+                    db.append(format!("BLOCK_RELEASED_PROTECTED|IP:{}", show(&net)));
+                }
+                last = view;
+            }
+        });
+    }
+
     let mut ticker = tokio::time::interval(Duration::from_secs(1));
     let mut shutdown_rx_loop = shutdown_rx.clone();
     let node_id_hb = args.node_id;
@@ -2122,7 +2206,14 @@ async fn main() -> Result<(), anyhow::Error> {
                     let _ = registry_tick.broadcast(&cmd, node_id_tick, &crypto_tick).await;
                 }
 
-                let mode = if sntl_db.status().healthy && state_store.healthy(now_ms()) { "NORMAL" } else { "DEGRADED" };
+                let mode = if sntl_db.status().healthy
+                    && state_store.healthy(now_ms())
+                    && host_read_ok.load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    "NORMAL"
+                } else {
+                    "DEGRADED"
+                };
                 let hb_msg = format!("HEARTBEAT:ID={}|NAME=Sokol-Node-{}|EP={}|MODE={}|CTL={}\n", node_id_hb, node_id_hb, p2p_bind_hb, mode, control_socket_hb);
                 push_telemetry(&hb_msg).await;
 
@@ -2178,6 +2269,8 @@ async fn main() -> Result<(), anyhow::Error> {
                 snapshot.state_healthy = state_store.healthy(now_ms());
                 snapshot.state_pending_secs = state_store.pending_for(now_ms()).as_secs_f64();
                 snapshot.state_restore_ok = state_store.restore_status().ok();
+                snapshot.protected_refresh_ok =
+                    host_read_ok.load(std::sync::atomic::Ordering::Relaxed);
                 snapshot.audit_write_errors = audit.write_errors + audit.sync_errors;
                 snapshot.audit_lost = audit.lost;
                 snapshot.audit_sync_age_ms = audit.last_sync_age_ms;

@@ -220,6 +220,26 @@ sleep 0.5
 check "loopback is never blocked" grep -q "Refusing to block 127.0.0.1 (loopback)" "$LOG"
 check "the node's own address is never blocked" grep -q "Refusing to block $HOST_IP (address of this node)" "$LOG"
 
+# The protected set follows the host: an address added to this node while it is banned is
+# released within the refresh period, and refused afterwards; once removed it may be banned again.
+MOVED_IP=10.231.0.16
+ip netns exec "$NS" ip addr add "$MOVED_IP/24" dev "$PEER_IF"
+printf 'BAN_IP:%s\n' "$MOVED_IP" | nc -U -q1 "$WORK/control.sock" >/dev/null
+check "a banned address is dropped before it moves to this node" \
+    bash -c "! ip netns exec $NS ping -c 2 -W 1 -I $MOVED_IP $HOST_IP >/dev/null 2>&1"
+ip addr add "$MOVED_IP/32" dev "$HOST_IF"
+for _ in $(seq 1 30); do grep -q "Block of $MOVED_IP released: it is protected now" "$LOG" && break; sleep 0.2; done
+check "an address that becomes this node's own is released within the refresh period" \
+    grep -q "Block of $MOVED_IP released: it is protected now" "$LOG"
+check "a ban of the node's new address is refused" \
+    bash -c "printf 'BAN_IP:$MOVED_IP\\n' | nc -U -q1 '$WORK/control.sock' | grep -q '^ERR $MOVED_IP is protected (address of this node)'"
+ip addr del "$MOVED_IP/32" dev "$HOST_IF"
+for _ in $(seq 1 30); do grep -q "Protected host addresses changed: +\[\] -\[$MOVED_IP\]" "$LOG" && break; sleep 0.2; done
+check "once the address leaves the node it is no longer protected" \
+    bash -c "printf 'BAN_IP:$MOVED_IP\\n' | nc -U -q1 '$WORK/control.sock' | grep -q '^OK'"
+check "host addresses are being re-read" test "$(metric sokol_protected_refresh_ok)" = 1
+printf 'UNBAN_IP:%s\n' "$MOVED_IP" | nc -U -q1 "$WORK/control.sock" >/dev/null
+
 # Event ids: a detector event is acted on once; a resend (lost ACK) gets OK duplicate.
 ipc_ack() {   # ipc_ack <line>...: one ACK-mode connection, prints one reply per line
     python3 - "$@" <<'PY'
