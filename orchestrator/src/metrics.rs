@@ -24,6 +24,13 @@ pub struct Snapshot {
     pub state_pending_secs: f64,
     pub state_restore_ok: bool,
     pub protected_refresh_ok: bool,
+    pub blocks_pending_oldest_secs: f64,
+    pub mesh_handshakes_refused: u64,
+    pub mesh_handshake_timeouts: u64,
+    pub mesh_frames_delayed: u64,
+    pub mesh_sync_requests_throttled: u64,
+    pub tick_secs: f64,
+    pub tick_max_secs: f64,
     pub audit_write_errors: u64,
     pub audit_lost: u64,
     pub audit_sync_age_ms: u64,
@@ -191,6 +198,53 @@ pub fn render(s: &Snapshot) -> String {
         "sokol_protected_refresh_ok {}",
         s.protected_refresh_ok as u8
     );
+    let gauges: [(&str, &str, f64); 3] = [
+        (
+            "sokol_blocks_pending_oldest_seconds",
+            "How long the oldest failing kernel map operation has been retried.",
+            s.blocks_pending_oldest_secs,
+        ),
+        (
+            "sokol_tick_seconds",
+            "Time the last maintenance tick took (expiry, state hand-off, digest, heartbeat, stats).",
+            s.tick_secs,
+        ),
+        (
+            "sokol_tick_seconds_max",
+            "Longest maintenance tick since start.",
+            s.tick_max_secs,
+        ),
+    ];
+    for (name, help, value) in gauges {
+        family(&mut out, name, "gauge", help);
+        let _ = writeln!(out, "{} {:.6}", name, value);
+    }
+    let counters: [(&str, &str, u64); 4] = [
+        (
+            "sokol_mesh_handshakes_refused_total",
+            "Connections refused: too many not yet authenticated (in total or from one address).",
+            s.mesh_handshakes_refused,
+        ),
+        (
+            "sokol_mesh_handshake_timeouts_total",
+            "Connections closed for not authenticating within the handshake timeout.",
+            s.mesh_handshake_timeouts,
+        ),
+        (
+            "sokol_mesh_frames_delayed_total",
+            "Frames from an authenticated peer read late because it exceeded its rate.",
+            s.mesh_frames_delayed,
+        ),
+        (
+            "sokol_mesh_sync_requests_throttled_total",
+            "Snapshot requests not answered because the peer got one less than 5 s ago.",
+            s.mesh_sync_requests_throttled,
+        ),
+    ];
+    for (name, help, value) in counters {
+        family(&mut out, name, "counter", help);
+        let _ = writeln!(out, "{} {}", name, value);
+    }
     family(
         &mut out,
         "sokol_audit_write_errors_total",

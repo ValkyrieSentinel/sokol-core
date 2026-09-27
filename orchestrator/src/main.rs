@@ -515,6 +515,8 @@ struct Args {
 
 /// How often each node reports its load to itself and its mesh peers.
 const TELEMETRY_INTERVAL: Duration = Duration::from_secs(5);
+/// A peer gets at most one snapshot (answer to SyncRequest) per this long.
+const SYNC_COOLDOWN: Duration = Duration::from_secs(5);
 /// How often the host's addresses and default gateways are re-read for the never-block policy.
 const PROTECTED_REFRESH: Duration = Duration::from_secs(2);
 
@@ -1504,8 +1506,13 @@ async fn main() -> Result<(), anyhow::Error> {
     let policy_mesh = block_policy.clone();
     let defense_mesh = defense.clone();
     let (registry_mesh, crypto_mesh) = (peer_registry.clone(), node_crypto.clone());
+    let sync_throttled = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let sync_throttled_mesh = sync_throttled.clone();
 
     tokio::spawn(async move {
+        // When each peer last got a snapshot (bounded by the pinned peers: a SyncRequest names
+        // its authenticated sender).
+        let mut snapshots = mesh_sync::Cooldown::new(SYNC_COOLDOWN);
         while let Some(cmd) = mesh_cmd_rx.recv().await {
             match cmd {
                 MeshCommand::Claim { claim } => {
@@ -1665,6 +1672,13 @@ async fn main() -> Result<(), anyhow::Error> {
                     }
                 }
                 MeshCommand::SyncRequest { issuer } => {
+                    // A snapshot is the most expensive answer (the whole table, signed frames):
+                    // at most one per peer per SYNC_COOLDOWN. A request dropped here is repeated
+                    // by the peer's next digest mismatch.
+                    if !snapshots.allow(issuer, std::time::Instant::now()) {
+                        sync_throttled_mesh.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        continue;
+                    }
                     if let Some(addr) = registry_mesh.addr_of(issuer).await {
                         send_snapshot(
                             addr,
@@ -2124,6 +2138,7 @@ async fn main() -> Result<(), anyhow::Error> {
     }
 
     let mut ticker = tokio::time::interval(Duration::from_secs(1));
+    let mut tick_max_secs = 0.0f64;
     let mut shutdown_rx_loop = shutdown_rx.clone();
     let node_id_hb = args.node_id;
     let p2p_bind_hb = args.p2p_bind.clone();
@@ -2185,6 +2200,7 @@ async fn main() -> Result<(), anyhow::Error> {
             }
 
             _ = ticker.tick() => {
+                let tick_started = std::time::Instant::now();
                 atp_controller.reset();
 
                 let released = blocks.lock().await.tick(now_ms());
@@ -2248,6 +2264,8 @@ async fn main() -> Result<(), anyhow::Error> {
                 {
                     let table = blocks.lock().await;
                     snapshot.blocks_pending = table.pending();
+                    snapshot.blocks_pending_oldest_secs =
+                        table.oldest_pending(now_ms()).as_secs_f64();
                     (snapshot.event_ids_remembered, snapshot.event_ids_evicted) =
                         table.event_memory();
                 }
@@ -2269,6 +2287,20 @@ async fn main() -> Result<(), anyhow::Error> {
                 snapshot.state_healthy = state_store.healthy(now_ms());
                 snapshot.state_pending_secs = state_store.pending_for(now_ms()).as_secs_f64();
                 snapshot.state_restore_ok = state_store.restore_status().ok();
+                {
+                    use std::sync::atomic::Ordering;
+                    let stats = &peer_registry.stats;
+                    snapshot.mesh_handshakes_refused = stats.handshakes_refused.load(Ordering::Relaxed);
+                    snapshot.mesh_handshake_timeouts = stats.handshake_timeouts.load(Ordering::Relaxed);
+                    snapshot.mesh_frames_delayed = stats.frames_delayed.load(Ordering::Relaxed);
+                    snapshot.mesh_sync_requests_throttled =
+                        sync_throttled.load(Ordering::Relaxed);
+                }
+                // Time the tick took up to here (expiry, state hand-off, digest, heartbeat, stats).
+                let tick_secs = tick_started.elapsed().as_secs_f64();
+                tick_max_secs = tick_max_secs.max(tick_secs);
+                snapshot.tick_secs = tick_secs;
+                snapshot.tick_max_secs = tick_max_secs;
                 snapshot.protected_refresh_ok =
                     host_read_ok.load(std::sync::atomic::Ordering::Relaxed);
                 snapshot.audit_write_errors = audit.write_errors + audit.sync_errors;

@@ -238,6 +238,10 @@ for _ in $(seq 1 30); do grep -q "Protected host addresses changed: +\[\] -\[$MO
 check "once the address leaves the node it is no longer protected" \
     bash -c "printf 'BAN_IP:$MOVED_IP\\n' | nc -U -q1 '$WORK/control.sock' | grep -q '^OK'"
 check "host addresses are being re-read" test "$(metric sokol_protected_refresh_ok)" = 1
+check "the maintenance tick is measured and takes well under its period" \
+    awk -v t="$(metric sokol_tick_seconds_max)" 'BEGIN { exit !(t != "" && t < 0.5) }'
+check "mesh admission counters are exported" \
+    bash -c "curl -s http://127.0.0.1:9469/metrics | grep -q '^sokol_mesh_handshake_timeouts_total '"
 printf 'UNBAN_IP:%s\n' "$MOVED_IP" | nc -U -q1 "$WORK/control.sock" >/dev/null
 
 # Event ids: a detector event is acted on once; a resend (lost ACK) gets OK duplicate.
@@ -584,16 +588,19 @@ check "native mode: blocked source is dropped" bash -c "! ip netns exec $NS ping
 
 # BGP Flowspec: this node's gobgpd (AS 65001) peers with an "upstream" gobgpd (AS 65002).
 gobgp_config() {
-    local as=$1 local_addr=$2 port=$3 peer_addr=$4 peer_port=$5 peer_as=$6
+    local as=$1 local_addr=$2 port=$3 peer_addr=$4 peer_port=$5 peer_as=$6 passive=${7:-false}
     printf '[global.config]\n  as = %s\n  router-id = "%s"\n  port = %s\n  local-address-list = ["%s"]\n' \
         "$as" "$local_addr" "$port" "$local_addr"
     printf '[[neighbors]]\n  [neighbors.config]\n    neighbor-address = "%s"\n    peer-as = %s\n' "$peer_addr" "$peer_as"
-    printf '  [neighbors.transport.config]\n    local-address = "%s"\n    remote-port = %s\n' "$local_addr" "$peer_port"
+    printf '  [neighbors.transport.config]\n    local-address = "%s"\n    remote-port = %s\n    passive-mode = %s\n' \
+        "$local_addr" "$peer_port" "$passive"
     printf '  [[neighbors.afi-safis]]\n    [neighbors.afi-safis.config]\n      afi-safi-name = "ipv4-flowspec"\n'
 }
 start_gobgp_pair() {
     gobgp_config 65001 127.0.0.1 1790 127.0.0.2 1791 65002 >"$WORK/gobgp-node.toml"
-    gobgp_config 65002 127.0.0.2 1791 127.0.0.1 1790 65001 >"$WORK/gobgp-upstream.toml"
+    # The upstream only listens: two active speakers dialling each other at once could leave the
+    # session in OpenConfirm (the Flowspec checks failed that way now and then).
+    gobgp_config 65002 127.0.0.2 1791 127.0.0.1 1790 65001 true >"$WORK/gobgp-upstream.toml"
     gobgpd -f "$WORK/gobgp-node.toml" --api-hosts 127.0.0.1:50051 >"$WORK/gobgpd-node.log" 2>&1 &
     gobgpd -f "$WORK/gobgp-upstream.toml" --api-hosts 127.0.0.1:50052 >"$WORK/gobgpd-upstream.log" 2>&1 &
     for _ in $(seq 1 40); do

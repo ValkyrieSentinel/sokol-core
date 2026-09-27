@@ -117,6 +117,34 @@ pub fn pack_snapshot(issuer: u64, claims: Vec<Claim>, retracted: Vec<ClaimId>) -
 /// How often each node sends its digest to its peers.
 pub const DIGEST_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
 
+/// At most one expensive answer (a snapshot) per peer per `every`; a refused request is
+/// repeated by the peer's next digest mismatch, so nothing is lost.
+pub struct Cooldown {
+    every: std::time::Duration,
+    last: std::collections::HashMap<u64, std::time::Instant>,
+}
+
+impl Cooldown {
+    pub fn new(every: std::time::Duration) -> Self {
+        Self {
+            every,
+            last: std::collections::HashMap::new(),
+        }
+    }
+
+    pub fn allow(&mut self, peer: u64, now: std::time::Instant) -> bool {
+        if self
+            .last
+            .get(&peer)
+            .is_some_and(|at| now.saturating_duration_since(*at) < self.every)
+        {
+            return false;
+        }
+        self.last.insert(peer, now);
+        true
+    }
+}
+
 impl MeshCommand {
     /// The node a command claims to come from, if it names one; the transport requires it to be
     /// the authenticated sender.
@@ -326,5 +354,20 @@ impl MeshOrchestrator {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_peer_gets_one_snapshot_per_cooldown() {
+        let t0 = std::time::Instant::now();
+        let mut c = Cooldown::new(std::time::Duration::from_secs(5));
+        assert!(c.allow(2, t0));
+        assert!(!c.allow(2, t0 + std::time::Duration::from_secs(4)));
+        assert!(c.allow(3, t0), "another peer is not affected");
+        assert!(c.allow(2, t0 + std::time::Duration::from_secs(5)));
     }
 }
