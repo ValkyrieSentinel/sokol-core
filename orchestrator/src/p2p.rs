@@ -27,7 +27,7 @@ use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, watch, Mutex, RwLock, Semaphore};
+use tokio::sync::{mpsc, watch, RwLock, Semaphore};
 use tokio::time::timeout;
 
 use ml_dsa::{EncodedVerifyingKey, Keypair, MlDsa65, Signature, SigningKey, VerifyingKey};
@@ -375,37 +375,6 @@ impl ReplayGuard {
     }
 }
 
-pub struct DagTracker {
-    tips: std::collections::VecDeque<[u8; 32]>,
-}
-
-impl DagTracker {
-    pub fn new() -> Self {
-        let mut tips = std::collections::VecDeque::new();
-        tips.push_back([0u8; 32]);
-        Self { tips }
-    }
-
-    pub fn get_latest_parents(&self) -> Vec<[u8; 32]> {
-        self.tips.iter().take(2).cloned().collect()
-    }
-
-    pub fn register_event(&mut self, payload: &[u8]) -> [u8; 32] {
-        let hash = *blake3::hash(payload).as_bytes();
-        self.tips.push_front(hash);
-        if self.tips.len() > 16 {
-            self.tips.pop_back();
-        }
-        hash
-    }
-
-    pub fn get_parents_and_register(&mut self, payload: &[u8]) -> (Vec<[u8; 32]>, [u8; 32]) {
-        let parents = self.get_latest_parents();
-        let hash = self.register_event(payload);
-        (parents, hash)
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SecureEnvelope {
     /// Wire version it was sealed for (signed).
@@ -579,18 +548,16 @@ pub enum EnvelopeError {
     MalformedPayload,
 }
 
-pub async fn seal(
+pub fn seal(
     crypto: &NodeCrypto,
     sender_id: u64,
     message: &NetworkMessage,
-    dag: &Mutex<DagTracker>,
 ) -> Result<SecureEnvelope> {
     let payload = serde_json::to_vec(message)?;
     let payload_str = std::str::from_utf8(&payload).context("Payload is not valid UTF-8")?;
     check_canonical(payload_str)
         .map_err(|e| anyhow::anyhow!("Canonical validation failed: {:?}", e))?;
 
-    dag.lock().await.register_event(&payload);
     let timestamp_ms = now_ms();
     let nonce: u64 = rand::random();
     let signature = crypto.sign(&unsigned_bytes(
@@ -740,15 +707,8 @@ impl PeerRegistry {
         command: &MeshCommand,
         node_id: u64,
         crypto: &NodeCrypto,
-        dag: &Arc<Mutex<DagTracker>>,
     ) -> Result<()> {
-        let envelope = seal(
-            crypto,
-            node_id,
-            &NetworkMessage::Command(command.clone()),
-            dag,
-        )
-        .await?;
+        let envelope = seal(crypto, node_id, &NetworkMessage::Command(command.clone()))?;
         let tx = self
             .peers
             .read()
@@ -803,15 +763,8 @@ impl PeerRegistry {
         command: &MeshCommand,
         node_id: u64,
         crypto: &NodeCrypto,
-        dag: &Arc<Mutex<DagTracker>>,
     ) -> Result<()> {
-        let envelope = seal(
-            crypto,
-            node_id,
-            &NetworkMessage::Command(command.clone()),
-            dag,
-        )
-        .await?;
+        let envelope = seal(crypto, node_id, &NetworkMessage::Command(command.clone()))?;
 
         // Never wait for a slow or dead peer: a full queue would stall the caller (the main
         // tick, IPC handling) behind one bad link. A peer that misses a block catches up through
@@ -830,7 +783,6 @@ pub struct P2PNetwork {
     bind_addr: SocketAddr,
     node_id: u64,
     crypto: Arc<NodeCrypto>,
-    dag: Arc<Mutex<DagTracker>>,
     cmd_tx: mpsc::Sender<MeshCommand>,
     max_connections: usize,
     shutdown_rx: watch::Receiver<bool>,
@@ -842,7 +794,6 @@ impl P2PNetwork {
         bind_addr: SocketAddr,
         node_id: u64,
         crypto: Arc<NodeCrypto>,
-        dag: Arc<Mutex<DagTracker>>,
         cmd_tx: mpsc::Sender<MeshCommand>,
         max_connections: usize,
         shutdown_rx: watch::Receiver<bool>,
@@ -852,7 +803,6 @@ impl P2PNetwork {
             bind_addr,
             node_id,
             crypto,
-            dag,
             cmd_tx,
             max_connections,
             shutdown_rx,
@@ -906,12 +856,11 @@ impl P2PNetwork {
                     debug!("[P2P] Accepted connection from {}", peer_addr);
                     let node_id = self.node_id;
                     let crypto = self.crypto.clone();
-                    let dag = self.dag.clone();
                     let cmd_tx = self.cmd_tx.clone();
                     let registry = self.registry.clone();
 
                     tokio::spawn(async move {
-                        if let Err(e) = run_connection(stream, peer_addr, node_id, crypto, dag, cmd_tx, registry).await {
+                        if let Err(e) = run_connection(stream, peer_addr, node_id, crypto, cmd_tx, registry).await {
                             warn!("[P2P] Connection with {} closed: {:#}", peer_addr, e);
                         }
                         drop(permit);
@@ -929,7 +878,6 @@ pub async fn connect_to_peer(
     peer_addr: SocketAddr,
     node_id: u64,
     crypto: Arc<NodeCrypto>,
-    dag: Arc<Mutex<DagTracker>>,
     registry: PeerRegistry,
     cmd_tx: mpsc::Sender<MeshCommand>,
 ) -> Result<()> {
@@ -937,7 +885,7 @@ pub async fn connect_to_peer(
         .await
         .context(format!("Failed to connect to outbound peer {}", peer_addr))?;
     info!("[P2P] Connected to outbound peer: {}", peer_addr);
-    run_connection(stream, peer_addr, node_id, crypto, dag, cmd_tx, registry).await
+    run_connection(stream, peer_addr, node_id, crypto, cmd_tx, registry).await
 }
 
 /// Delay before the next dial: doubles from 1 s up to 30 s, and starts over after a connection
@@ -959,7 +907,6 @@ pub async fn maintain_peer_connection(
     peer_addr: SocketAddr,
     node_id: u64,
     crypto: Arc<NodeCrypto>,
-    dag: Arc<Mutex<DagTracker>>,
     registry: PeerRegistry,
     cmd_tx: mpsc::Sender<MeshCommand>,
 ) {
@@ -970,7 +917,6 @@ pub async fn maintain_peer_connection(
             peer_addr,
             node_id,
             crypto.clone(),
-            dag.clone(),
             registry.clone(),
             cmd_tx.clone(),
         )
@@ -991,7 +937,6 @@ async fn run_connection(
     peer_addr: SocketAddr,
     node_id: u64,
     crypto: Arc<NodeCrypto>,
-    dag: Arc<Mutex<DagTracker>>,
     cmd_tx: mpsc::Sender<MeshCommand>,
     registry: PeerRegistry,
 ) -> Result<()> {
@@ -1000,7 +945,7 @@ async fn run_connection(
     let (mut reader, writer) = stream.into_split();
     let (tx, rx) = mpsc::channel::<SecureEnvelope>(100);
 
-    let handshake = seal(&crypto, node_id, &NetworkMessage::handshake(node_id), &dag).await?;
+    let handshake = seal(&crypto, node_id, &NetworkMessage::handshake(node_id))?;
     tx.send(handshake).await?;
 
     let conn_id = NEXT_CONNECTION_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1011,7 +956,6 @@ async fn run_connection(
         peer_addr,
         node_id,
         crypto.clone(),
-        dag.clone(),
         cmd_tx,
         registry.clone(),
         tx,
@@ -1050,17 +994,12 @@ fn spawn_peer_writer(
     });
 }
 
-fn spawn_ping_loop(
-    ping_tx: mpsc::Sender<SecureEnvelope>,
-    node_id: u64,
-    crypto: Arc<NodeCrypto>,
-    dag: Arc<Mutex<DagTracker>>,
-) {
+fn spawn_ping_loop(ping_tx: mpsc::Sender<SecureEnvelope>, node_id: u64, crypto: Arc<NodeCrypto>) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(10));
         loop {
             interval.tick().await;
-            match seal(&crypto, node_id, &NetworkMessage::Ping, &dag).await {
+            match seal(&crypto, node_id, &NetworkMessage::Ping) {
                 Ok(env) => {
                     if ping_tx.send(env).await.is_err() {
                         break;
@@ -1080,7 +1019,6 @@ async fn handle_reader_loop(
     peer_addr: SocketAddr,
     local_node_id: u64,
     crypto: Arc<NodeCrypto>,
-    dag: Arc<Mutex<DagTracker>>,
     cmd_tx: mpsc::Sender<MeshCommand>,
     registry: PeerRegistry,
     writer_tx: mpsc::Sender<SecureEnvelope>,
@@ -1188,12 +1126,7 @@ async fn handle_reader_loop(
                 registry
                     .add_peer(peer_addr, writer_tx.clone(), node_id, conn_id)
                     .await;
-                spawn_ping_loop(
-                    writer_tx.clone(),
-                    local_node_id,
-                    crypto.clone(),
-                    dag.clone(),
-                );
+                spawn_ping_loop(writer_tx.clone(), local_node_id, crypto.clone());
             }
             (None, _) => bail!("first message was not a handshake"),
             (Some(_), NetworkMessage::Handshake { .. }) => {
@@ -1233,7 +1166,7 @@ async fn handle_reader_loop(
                 }
             }
             (Some(_), NetworkMessage::Ping) => {
-                let pong = seal(&crypto, local_node_id, &NetworkMessage::Pong, &dag).await?;
+                let pong = seal(&crypto, local_node_id, &NetworkMessage::Pong)?;
                 let _ = writer_tx.send(pong).await;
             }
             (Some(_), NetworkMessage::Pong) => debug!("[P2P] Received Pong from {}", peer_addr),
@@ -1256,10 +1189,6 @@ mod tests {
 
     fn block_cmd(ip: &str) -> NetworkMessage {
         NetworkMessage::Command(alert(ip))
-    }
-
-    fn dag() -> Mutex<DagTracker> {
-        Mutex::new(DagTracker::new())
     }
 
     fn trust_with(node_id: u64, crypto: &NodeCrypto) -> TrustStore {
@@ -1310,9 +1239,7 @@ mod tests {
     async fn pinned_peer_envelope_opens() {
         let peer = NodeCrypto::generate();
         let trust = trust_with(7, &peer);
-        let env = seal(&peer, 7, &block_cmd("10.0.0.9"), &dag())
-            .await
-            .unwrap();
+        let env = seal(&peer, 7, &block_cmd("10.0.0.9")).unwrap();
         let msg = open(&trust, &mut ReplayGuard::default(), &env, now_ms()).unwrap();
         assert!(matches!(
             msg,
@@ -1336,7 +1263,6 @@ mod tests {
             addr,
             1,
             server,
-            Arc::new(dag()),
             cmd_tx,
             8,
             shutdown_rx,
@@ -1352,9 +1278,8 @@ mod tests {
             (block_cmd("still heard"), true),
         ] {
             let mut stream = TcpStream::connect(addr).await.unwrap();
-            let d = dag();
             for m in [NetworkMessage::handshake(2), msg] {
-                let env = seal(&friend, 2, &m, &d).await.unwrap();
+                let env = seal(&friend, 2, &m).unwrap();
                 let bytes = env.encode();
                 let _ = stream.write_all(&(bytes.len() as u32).to_be_bytes()).await;
                 let _ = stream.write_all(&bytes).await;
@@ -1376,7 +1301,6 @@ mod tests {
         use crate::block_table::{Claim, ClaimKind, MAX_REASON_BYTES};
         use crate::mesh_sync::pack_snapshot;
         let crypto = NodeCrypto::generate();
-        let d = dag();
         let claim = |i: u32| Claim {
             issuer: 1,
             kind: ClaimKind::Detector,
@@ -1399,9 +1323,7 @@ mod tests {
             assert!(!msgs.is_empty());
             let (mut got_claims, mut got_ids) = (Vec::new(), Vec::new());
             for m in msgs {
-                let env = seal(&crypto, 1, &NetworkMessage::Command(m.clone()), &d)
-                    .await
-                    .unwrap();
+                let env = seal(&crypto, 1, &NetworkMessage::Command(m.clone())).unwrap();
                 let frame = env.encode();
                 assert!(
                     frame.len() <= MAX_FRAME_BYTES,
@@ -1439,7 +1361,6 @@ mod tests {
             addr,
             1,
             server,
-            Arc::new(dag()),
             cmd_tx,
             8,
             shutdown_rx,
@@ -1463,9 +1384,8 @@ mod tests {
                 retracted: vec![],
             });
             let mut stream = TcpStream::connect(addr).await.unwrap();
-            let d = dag();
             for m in [NetworkMessage::handshake(2), msg] {
-                let env = seal(&friend, 2, &m, &d).await.unwrap();
+                let env = seal(&friend, 2, &m).unwrap();
                 let bytes = env.encode();
                 let _ = stream.write_all(&(bytes.len() as u32).to_be_bytes()).await;
                 let _ = stream.write_all(&bytes).await;
@@ -1498,7 +1418,6 @@ mod tests {
             addr,
             1,
             server,
-            Arc::new(dag()),
             cmd_tx,
             8,
             shutdown_rx,
@@ -1520,9 +1439,8 @@ mod tests {
         };
         for (issuer, delivered) in [(3, false), (2, true)] {
             let mut stream = TcpStream::connect(addr).await.unwrap();
-            let d = dag();
             for msg in [NetworkMessage::handshake(2), claim(issuer)] {
-                let env = seal(&friend, 2, &msg, &d).await.unwrap();
+                let env = seal(&friend, 2, &msg).unwrap();
                 let bytes = env.encode();
                 let _ = stream.write_all(&(bytes.len() as u32).to_be_bytes()).await;
                 let _ = stream.write_all(&bytes).await;
@@ -1541,16 +1459,12 @@ mod tests {
         let pinned = NodeCrypto::generate();
         let stranger = NodeCrypto::generate();
         let trust = trust_with(7, &pinned);
-        let env = seal(&stranger, 7, &block_cmd("10.0.0.9"), &dag())
-            .await
-            .unwrap();
+        let env = seal(&stranger, 7, &block_cmd("10.0.0.9")).unwrap();
         assert_eq!(
             open(&trust, &mut ReplayGuard::default(), &env, now_ms()).unwrap_err(),
             EnvelopeError::BadSignature
         );
-        let env = seal(&stranger, 666, &block_cmd("10.0.0.9"), &dag())
-            .await
-            .unwrap();
+        let env = seal(&stranger, 666, &block_cmd("10.0.0.9")).unwrap();
         assert_eq!(
             open(&trust, &mut ReplayGuard::default(), &env, now_ms()).unwrap_err(),
             EnvelopeError::UnknownSender
@@ -1561,9 +1475,7 @@ mod tests {
     async fn header_fields_are_covered_by_the_signature() {
         let peer = NodeCrypto::generate();
         let trust = trust_with(7, &peer);
-        let env = seal(&peer, 7, &block_cmd("10.0.0.9"), &dag())
-            .await
-            .unwrap();
+        let env = seal(&peer, 7, &block_cmd("10.0.0.9")).unwrap();
 
         let mut new_nonce = env.clone();
         new_nonce.nonce ^= 1;
@@ -1584,9 +1496,7 @@ mod tests {
     async fn replay_and_stale_envelopes_are_rejected() {
         let peer = NodeCrypto::generate();
         let trust = trust_with(7, &peer);
-        let env = seal(&peer, 7, &block_cmd("10.0.0.9"), &dag())
-            .await
-            .unwrap();
+        let env = seal(&peer, 7, &block_cmd("10.0.0.9")).unwrap();
         let mut guard = ReplayGuard::default();
         assert!(open(&trust, &mut guard, &env, now_ms()).is_ok());
         assert_eq!(
@@ -1657,9 +1567,7 @@ mod tests {
         .unwrap();
         let registry = PeerRegistry::new(TrustStore::load(&path).unwrap());
         for signer in [&old, &new] {
-            let env = seal(signer, 2, &block_cmd("10.0.0.2"), &dag())
-                .await
-                .unwrap();
+            let env = seal(signer, 2, &block_cmd("10.0.0.2")).unwrap();
             assert!(
                 registry.open(&env).is_ok(),
                 "both keys are valid during the rotation"
@@ -1675,13 +1583,13 @@ mod tests {
         )
         .unwrap();
         assert_eq!(registry.reload(TrustStore::load(&path).unwrap()), 1);
-        let env = seal(&old, 2, &block_cmd("10.0.0.2"), &dag()).await.unwrap();
+        let env = seal(&old, 2, &block_cmd("10.0.0.2")).unwrap();
         assert_eq!(
             registry.open(&env).unwrap_err(),
             EnvelopeError::BadSignature,
             "old key revoked"
         );
-        let env = seal(&new, 2, &block_cmd("10.0.0.2"), &dag()).await.unwrap();
+        let env = seal(&new, 2, &block_cmd("10.0.0.2")).unwrap();
         assert!(registry.open(&env).is_ok());
 
         std::fs::write(&path, r#"[{"node_id": 3}]"#).unwrap();
@@ -1707,23 +1615,13 @@ mod tests {
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let net = P2PNetwork::new(
-            addr,
-            1,
-            server,
-            Arc::new(dag()),
-            cmd_tx,
-            8,
-            shutdown_rx,
-            registry,
-        );
+        let net = P2PNetwork::new(addr, 1, server, cmd_tx, 8, shutdown_rx, registry);
         tokio::spawn(async move { net.serve(listener).await });
 
         async fn send_as(crypto: &NodeCrypto, id: u64, addr: SocketAddr, ip: &str) {
             let mut stream = TcpStream::connect(addr).await.unwrap();
-            let d = dag();
             for msg in [NetworkMessage::handshake(id), block_cmd(ip)] {
-                let bytes = seal(crypto, id, &msg, &d).await.unwrap().encode();
+                let bytes = seal(crypto, id, &msg).unwrap().encode();
                 let _ = stream.write_all(&(bytes.len() as u32).to_be_bytes()).await;
                 let _ = stream.write_all(&bytes).await;
             }
@@ -1760,33 +1658,19 @@ mod tests {
         let (reg1, reg2) = (registry_for(2, &n2), registry_for(1, &n1));
         let (tx1, mut rx1) = mpsc::channel(8);
         let (tx2, mut rx2) = mpsc::channel(8);
-        let (dag1, dag2) = (Arc::new(dag()), Arc::new(dag()));
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let net = P2PNetwork::new(
-            addr,
-            1,
-            n1.clone(),
-            dag1.clone(),
-            tx1,
-            8,
-            shutdown_rx,
-            reg1.clone(),
-        );
+        let net = P2PNetwork::new(addr, 1, n1.clone(), tx1, 8, shutdown_rx, reg1.clone());
         tokio::spawn(async move { net.serve(listener).await });
-        let (n2c, dag2c, reg2c) = (n2.clone(), dag2.clone(), reg2.clone());
-        tokio::spawn(async move { connect_to_peer(addr, 2, n2c, dag2c, reg2c, tx2).await });
+        let (n2c, reg2c) = (n2.clone(), reg2.clone());
+        tokio::spawn(async move { connect_to_peer(addr, 2, n2c, reg2c, tx2).await });
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         let cmd = alert;
-        reg1.broadcast(&cmd("10.0.0.21"), 1, &n1, &dag1)
-            .await
-            .unwrap();
-        reg2.broadcast(&cmd("10.0.0.12"), 2, &n2, &dag2)
-            .await
-            .unwrap();
+        reg1.broadcast(&cmd("10.0.0.21"), 1, &n1).await.unwrap();
+        reg2.broadcast(&cmd("10.0.0.12"), 2, &n2).await.unwrap();
 
         for (rx, want) in [(&mut rx2, "10.0.0.21"), (&mut rx1, "10.0.0.12")] {
             match timeout(Duration::from_secs(2), rx.recv()).await {
@@ -1819,7 +1703,6 @@ mod tests {
     async fn broadcast_does_not_wait_for_a_stuck_peer() {
         let registry = PeerRegistry::new(TrustStore::default());
         let crypto = NodeCrypto::generate();
-        let d = Arc::new(dag());
         let (stuck_tx, _stuck_rx) = mpsc::channel(1);
         let (ok_tx, mut ok_rx) = mpsc::channel(8);
         registry
@@ -1832,7 +1715,7 @@ mod tests {
         for _ in 0..3 {
             timeout(
                 Duration::from_millis(500),
-                registry.broadcast(&cmd, 1, &crypto, &d),
+                registry.broadcast(&cmd, 1, &crypto),
             )
             .await
             .expect("broadcast blocked on a stuck peer")
@@ -1855,9 +1738,7 @@ mod tests {
             NetworkMessage::Pong,
             NetworkMessage::Ack,
         ] {
-            let env = seal(&peer, 7, &msg, &dag())
-                .await
-                .expect("heartbeats must be sealable");
+            let env = seal(&peer, 7, &msg).expect("heartbeats must be sealable");
             assert!(open(&trust, &mut guard, &env, now_ms()).is_ok());
         }
     }
@@ -1877,7 +1758,6 @@ mod tests {
             addr,
             1,
             server.clone(),
-            Arc::new(dag()),
             cmd_tx,
             8,
             shutdown_rx,
@@ -1886,9 +1766,8 @@ mod tests {
         tokio::spawn(async move { net.serve(listener).await });
 
         let mut stream = TcpStream::connect(addr).await.unwrap();
-        let d = dag();
         for msg in [NetworkMessage::handshake(2), NetworkMessage::Ping] {
-            let bytes = seal(&peer, 2, &msg, &d).await.unwrap().encode();
+            let bytes = seal(&peer, 2, &msg).unwrap().encode();
             stream
                 .write_all(&(bytes.len() as u32).to_be_bytes())
                 .await
@@ -1952,7 +1831,6 @@ mod tests {
             addr,
             1,
             a.clone(),
-            Arc::new(dag()),
             reg_a.clone(),
             tx_a,
         ));
@@ -1962,16 +1840,7 @@ mod tests {
         let listener = TcpListener::bind(addr).await.unwrap();
         let (tx_b, _rx_b) = mpsc::channel(8);
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
-        let net = P2PNetwork::new(
-            addr,
-            2,
-            b,
-            Arc::new(dag()),
-            tx_b,
-            8,
-            shutdown_rx,
-            PeerRegistry::new(trust_b),
-        );
+        let net = P2PNetwork::new(addr, 2, b, tx_b, 8, shutdown_rx, PeerRegistry::new(trust_b));
         tokio::spawn(async move { net.serve(listener).await });
 
         for _ in 0..60 {
@@ -1998,7 +1867,6 @@ mod tests {
             addr,
             1,
             server,
-            Arc::new(dag()),
             cmd_tx,
             8,
             shutdown_rx,
@@ -2016,9 +1884,8 @@ mod tests {
             })
         };
         let mut stream = TcpStream::connect(addr).await.unwrap();
-        let d = dag();
         for msg in [NetworkMessage::handshake(2), report(2), report(9)] {
-            let bytes = seal(&peer, 2, &msg, &d).await.unwrap().encode();
+            let bytes = seal(&peer, 2, &msg).unwrap().encode();
             let _ = stream.write_all(&(bytes.len() as u32).to_be_bytes()).await;
             let _ = stream.write_all(&bytes).await;
         }
@@ -2050,7 +1917,6 @@ mod tests {
             addr,
             1,
             server,
-            Arc::new(dag()),
             cmd_tx,
             8,
             shutdown_rx,
@@ -2059,12 +1925,9 @@ mod tests {
         tokio::spawn(async move { net.serve(listener).await });
 
         let mut stream = TcpStream::connect(addr).await.unwrap();
-        let d = dag();
         let frames = [
-            seal(&a, 2, &NetworkMessage::handshake(2), &d)
-                .await
-                .unwrap(),
-            seal(&b, 3, &block_cmd("10.0.0.3"), &d).await.unwrap(),
+            seal(&a, 2, &NetworkMessage::handshake(2)).unwrap(),
+            seal(&b, 3, &block_cmd("10.0.0.3")).unwrap(),
         ];
         for env in frames {
             let bytes = env.encode();
@@ -2086,10 +1949,7 @@ mod tests {
         // must never yield an accepted message.
         let peer = NodeCrypto::generate();
         let trust = trust_with(7, &peer);
-        let frame = seal(&peer, 7, &NetworkMessage::Ping, &dag())
-            .await
-            .unwrap()
-            .encode();
+        let frame = seal(&peer, 7, &NetworkMessage::Ping).unwrap().encode();
         let accepted = |bytes: &[u8]| {
             SecureEnvelope::decode(bytes)
                 .ok()
@@ -2115,7 +1975,7 @@ mod tests {
         use ml_dsa::Signer;
         let peer = NodeCrypto::generate();
         let trust = trust_with(7, &peer);
-        let mut env = seal(&peer, 7, &NetworkMessage::Ping, &dag()).await.unwrap();
+        let mut env = seal(&peer, 7, &NetworkMessage::Ping).unwrap();
         let unsigned = unsigned_bytes(
             env.version,
             env.sender_id,
@@ -2182,7 +2042,6 @@ mod tests {
             addr,
             1,
             server.clone(),
-            Arc::new(dag()),
             cmd_tx,
             8,
             shutdown_rx,
@@ -2197,9 +2056,8 @@ mod tests {
             wire_max: WIRE_VERSION_MAX + 2,
         };
         let mut stream = TcpStream::connect(addr).await.unwrap();
-        let d = dag();
         for msg in [future, NetworkMessage::Ping] {
-            let bytes = seal(&peer, 2, &msg, &d).await.unwrap().encode();
+            let bytes = seal(&peer, 2, &msg).unwrap().encode();
             let _ = stream.write_all(&(bytes.len() as u32).to_be_bytes()).await;
             let _ = stream.write_all(&bytes).await;
         }
@@ -2308,13 +2166,12 @@ mod tests {
     async fn measure_seal_and_open() {
         let peer = NodeCrypto::generate();
         let trust = trust_with(7, &peer);
-        let d = dag();
         let msg = block_cmd("10.0.0.9");
         let n = 500;
         let t = std::time::Instant::now();
         let mut envs = Vec::new();
         for _ in 0..n {
-            envs.push(seal(&peer, 7, &msg, &d).await.unwrap());
+            envs.push(seal(&peer, 7, &msg).unwrap());
         }
         let sealed = t.elapsed();
         let t = std::time::Instant::now();
