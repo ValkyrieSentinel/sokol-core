@@ -194,8 +194,15 @@ Sokol enforces decisions made by detectors you already run. `sokol-suricata` fol
 EVE log and sends each alert at or above `--max-severity` (default 2) to the node as a signal:
 
 ```shell
-sokol-suricata --eve /var/log/suricata/eve.json --ipc-socket /run/sokol/sokol.sock
+sokol-suricata --eve /var/log/suricata/eve.json --ipc-socket /run/sokol/sokol.sock \
+    --cursor-file /var/lib/sokol/suricata.cursor
 ```
+
+With `--cursor-file` the adapter remembers where it got to (the oldest alert the node has not
+answered yet) and resumes there after a restart, so alerts written while it was down are not
+lost; a file rotated meanwhile is read from its start. Alerts older than `--max-alert-age-secs`
+(default 600) are skipped, so catching up after a long outage does not turn old events into new
+blocks. Replays are safe: the node recognises an alert it already acted on.
 
 The node blocks the offending address in XDP, shares the block with its mesh peers and records the
 rule in the audit log (`suricata: sid:<id> <signature>`). If the alert fired on this node's own
