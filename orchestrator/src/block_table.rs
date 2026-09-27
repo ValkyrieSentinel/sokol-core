@@ -562,6 +562,43 @@ impl<B: Blocklist> BlockTable<B> {
         (self.events.len(), self.events_evicted)
     }
 
+    /// Re-checks every known claim against a changed never-block policy (the host's addresses or
+    /// gateways moved). A claim whose target became protected stops counting now (its kernel
+    /// entry is removed, a peer's slot freed); one whose target is no longer protected counts
+    /// again (a peer's claim queues for a slot). Returns the targets no longer blocked.
+    pub fn recheck(&mut self, allowed: impl Fn(IpNet) -> bool, now_ms: u64) -> Vec<IpNet> {
+        let mut changed: Vec<(ClaimId, IpNet, bool)> = Vec::new();
+        for (id, h) in self.claims.iter_mut() {
+            let ok = allowed(h.net);
+            if ok != h.allowed {
+                h.allowed = ok;
+                changed.push((id.clone(), h.net, ok));
+            }
+        }
+        for (id, _, ok) in &changed {
+            if *ok {
+                let queue = self.claims.get(id).and_then(|h| {
+                    let waits = h.claim.issuer != self.node_id
+                        && !h.in_quota
+                        && h.claim.live_at(now_ms)
+                        && !self.retracted(id, h)
+                        && self.lease_ends.get(id).is_none_or(|(end, _)| *end > now_ms);
+                    waits.then_some(h.claim.issuer)
+                });
+                if let Some(issuer) = queue {
+                    let q = self.waiting.entry(issuer).or_default();
+                    if !q.contains(id) {
+                        q.push_back(id.clone());
+                    }
+                }
+            } else {
+                self.release_slot(id);
+            }
+        }
+        let nets = changed.into_iter().map(|(_, net, _)| net).collect();
+        self.settle(nets, now_ms)
+    }
+
     /// Remembers where a peer claim's lease ends if the local cap cuts it short. The end only
     /// ever moves earlier: a lease shortened once (e.g. after a clock step) is not lengthened by
     /// a later restart, so records timed by it (an operator lift) outlive it.
@@ -1044,8 +1081,12 @@ impl<B: Blocklist> BlockTable<B> {
                 if cap <= now_ms {
                     continue;
                 }
-                let retracted = self.claims.get(&id).is_some_and(|h| self.retracted(&id, h));
-                if retracted {
+                // A claim retracted or refused by the policy while it waited takes no slot.
+                let cannot_count = self
+                    .claims
+                    .get(&id)
+                    .is_some_and(|h| !h.allowed || self.retracted(&id, h));
+                if cannot_count {
                     continue;
                 }
                 if let Some(h) = self.claims.get_mut(&id) {
@@ -2371,6 +2412,45 @@ mod tests {
     }
 
     #[test]
+    fn a_target_that_becomes_protected_is_released_and_its_waiting_claims_stay_out() {
+        // Found by the machine: a peer's claim waiting for a slot whose target became protected
+        // was still promoted to a slot.
+        let mut t = table(1, 64);
+        one_slot(&mut t, 2, T0);
+        let (a, b) = (
+            peer_claim(2, "203.0.113.80", T0),
+            peer_claim(2, "203.0.113.81", T0),
+        );
+        let a_id = a.id();
+        assert_eq!(t.adopt(a, true, T0), Adoption::Enforced);
+        assert_eq!(t.adopt(b, true, T0), Adoption::Held("quota"));
+        let protected = ip("203.0.113.81");
+        assert!(t.recheck(|net| net != protected, T0).is_empty());
+        t.retract(2, &[a_id], T0 + S); // frees the only slot
+        t.tick(T0 + S);
+        assert!(
+            !t.is_blocked(protected),
+            "a protected target was promoted to a slot"
+        );
+        assert_eq!(t.active_by_issuer.get(&2).copied().unwrap_or(0), 0);
+        // Protected while blocked: released at once; unprotected again: enforced again.
+        let c = peer_claim(3, "203.0.113.82", T0);
+        assert_eq!(t.adopt(c, true, T0 + S), Adoption::Enforced);
+        let now_protected = ip("203.0.113.82");
+        assert_eq!(
+            t.recheck(|net| net != now_protected, T0 + S),
+            vec![now_protected]
+        );
+        assert!(!t.is_blocked(now_protected));
+        t.recheck(|_| true, T0 + 2 * S);
+        t.tick(T0 + 2 * S);
+        assert!(
+            t.is_blocked(now_protected),
+            "no longer protected: the claim counts again"
+        );
+    }
+
+    #[test]
     fn an_ended_lease_stays_ended_when_the_clock_steps_back() {
         let mut t = table(1, 64);
         let c = peer_claim(2, "203.0.113.72", T0);
@@ -2501,6 +2581,10 @@ mod tests {
                 mask: u8,
             },
             Restart,
+            /// The host's protected set changes (addresses or gateways moved).
+            Protect {
+                mask: u8,
+            },
         }
 
         fn op() -> impl Strategy<Value = Op> {
@@ -2531,6 +2615,7 @@ mod tests {
                 1 => any::<bool>().prop_map(Op::FailDelete),
                 1 => any::<u8>().prop_map(|mask| Op::Pin { mask }),
                 1 => Just(Op::Restart),
+                1 => any::<u8>().prop_map(|mask| Op::Protect { mask }),
             ]
         }
 
@@ -2672,6 +2757,8 @@ mod tests {
             let mut known: Vec<Claim> = Vec::new();
             // Ghost state: claims the operator lifted, kept outside the table.
             let mut lifted: HashSet<ClaimId> = HashSet::new();
+            // Targets the host protects now (Op::Protect); enforcement must never cover them.
+            let mut protected: HashSet<IpNet> = HashSet::new();
             let lift_where = |t: &BlockTable<FakeLists>,
                               lifted: &mut HashSet<ClaimId>,
                               f: &dyn Fn(&Held) -> bool| {
@@ -2686,6 +2773,10 @@ mod tests {
                     Op::Local { t: i, kind } => {
                         let kind = [ClaimKind::Detector, ClaimKind::Operator, ClaimKind::Static]
                             [kind as usize];
+                        // The node refuses protected targets before any claim exists.
+                        if protected.contains(&canonical(ip(TARGETS[i]))) {
+                            continue;
+                        }
                         if let Ok(a) = t.add_local(ip(TARGETS[i]), kind, "fuzz", now) {
                             // A lifted operator ban is deleted, so the same bytes again (same
                             // millisecond) are a new ban.
@@ -2713,6 +2804,9 @@ mod tests {
                             reason: "r".repeat(reason as usize),
                         };
                         known.push(claim.clone());
+                        // As in the node: the verdict depends on the target only.
+                        let _ = allowed;
+                        let allowed = !protected.contains(&canonical(ip(TARGETS[i])));
                         t.adopt(claim, allowed, now);
                     }
                     Op::Retract { issuer, pick } => {
@@ -2750,6 +2844,16 @@ mod tests {
                         t.tick(now);
                     }
                     Op::FailDelete(on) => t.lists.fail_delete = on,
+                    Op::Protect { mask } => {
+                        protected = TARGETS
+                            .iter()
+                            .enumerate()
+                            .filter(|(i, _)| mask & (1 << i) != 0)
+                            .map(|(_, t)| canonical(ip(t)))
+                            .collect();
+                        let p = protected.clone();
+                        t.recheck(|net| !p.contains(&net), now);
+                    }
                     Op::Pin { mask } => {
                         let pinned = PEERS
                             .iter()
@@ -2779,7 +2883,12 @@ mod tests {
                         let mut fresh = table(1, 1024);
                         fresh.lists.fail_delete = t.lists.fail_delete;
                         configure(&mut fresh, now);
-                        fresh.restore(serde_json::from_slice(&bytes).unwrap(), |_| true, now);
+                        let p = protected.clone();
+                        fresh.restore(
+                            serde_json::from_slice(&bytes).unwrap(),
+                            |net| !p.contains(&net),
+                            now,
+                        );
                         fresh.tick(now);
                         let own_after: HashSet<IpNet> = fresh.applied.clone();
                         prop_assert_eq!(
@@ -2809,7 +2918,8 @@ mod tests {
                             if by_issuer {
                                 fresh.retract(c.issuer, std::slice::from_ref(&id), now);
                             } else if h.claim.live_at(now) {
-                                fresh.adopt(c.clone(), h.allowed, now);
+                                let allowed = c.net().is_none_or(|n| !protected.contains(&n));
+                                fresh.adopt(c.clone(), allowed, now);
                             }
                         }
                         fresh.tick(now);
@@ -2834,6 +2944,13 @@ mod tests {
                     }
                 }
                 check(&t, now, false)?;
+                for net in t.applied.iter().filter(|n| !t.pending.contains(n)) {
+                    prop_assert!(
+                        !protected.contains(net),
+                        "{} is protected but enforced",
+                        net
+                    );
+                }
                 for id in &lifted {
                     if let Some(h) = t.claims.get(id) {
                         prop_assert!(

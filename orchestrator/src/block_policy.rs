@@ -9,6 +9,7 @@ pub const LOCAL_ADDRESS: &str = "address of this node";
 
 pub const PREFIX_TOO_WIDE: &str = "prefix wider than --min-block-prefix-v4/-v6 allows";
 
+#[derive(Clone)]
 pub struct BlockPolicy {
     protected: Vec<(IpNet, &'static str)>,
     /// Shortest prefix a block may have: a detector mistake must not cut off half the internet.
@@ -86,14 +87,69 @@ impl BlockPolicy {
         }
     }
 
-    /// Adds every address configured on this host's interfaces and its default gateways.
-    pub fn protect_host_addresses(&mut self) {
-        for ip in local_interface_addresses() {
-            self.protect_ip(ip, LOCAL_ADDRESS);
+    /// This policy plus the host's own addresses and default gateways.
+    pub fn with_host(&self, host: &HostView) -> Self {
+        let mut policy = self.clone();
+        for ip in &host.addresses {
+            policy.protect_ip(*ip, LOCAL_ADDRESS);
         }
-        for ip in default_gateways() {
-            self.protect_ip(ip, "default gateway");
+        for ip in &host.gateways {
+            policy.protect_ip(*ip, "default gateway");
         }
+        policy
+    }
+}
+
+/// The host facts the policy protects, as read now. Compared between reads to notice a change.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HostView {
+    pub addresses: std::collections::BTreeSet<IpAddr>,
+    pub gateways: std::collections::BTreeSet<IpAddr>,
+}
+
+impl HostView {
+    /// Reads the interface addresses and default gateways. An error (not an empty result) when
+    /// they cannot be read, so a failed read never looks like "nothing to protect".
+    pub fn discover() -> Result<Self, String> {
+        Ok(Self {
+            addresses: local_interface_addresses()?
+                .into_iter()
+                .map(canonical)
+                .collect(),
+            gateways: default_gateways()?.into_iter().map(canonical).collect(),
+        })
+    }
+
+    /// What `self` protects that `before` did not, and the reverse.
+    pub fn diff(&self, before: &HostView) -> (Vec<IpAddr>, Vec<IpAddr>) {
+        let now: std::collections::BTreeSet<&IpAddr> =
+            self.addresses.iter().chain(&self.gateways).collect();
+        let was: std::collections::BTreeSet<&IpAddr> =
+            before.addresses.iter().chain(&before.gateways).collect();
+        (
+            now.difference(&was).map(|ip| **ip).collect(),
+            was.difference(&now).map(|ip| **ip).collect(),
+        )
+    }
+}
+
+/// The policy in force, replaced as a whole when the host changes; readers take a snapshot.
+#[derive(Clone)]
+pub struct PolicyHandle(std::sync::Arc<std::sync::RwLock<std::sync::Arc<BlockPolicy>>>);
+
+impl PolicyHandle {
+    pub fn new(policy: BlockPolicy) -> Self {
+        Self(std::sync::Arc::new(std::sync::RwLock::new(
+            std::sync::Arc::new(policy),
+        )))
+    }
+
+    pub fn current(&self) -> std::sync::Arc<BlockPolicy> {
+        self.0.read().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    pub fn replace(&self, policy: BlockPolicy) {
+        *self.0.write().unwrap_or_else(|p| p.into_inner()) = std::sync::Arc::new(policy);
     }
 }
 
@@ -108,16 +164,16 @@ fn canonical(ip: IpAddr) -> IpAddr {
     }
 }
 
-fn local_interface_addresses() -> Vec<IpAddr> {
+fn local_interface_addresses() -> Result<Vec<IpAddr>, String> {
     let mut out = Vec::new();
     let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
     // SAFETY: getifaddrs allocates a list that we walk read-only and release with freeifaddrs.
     unsafe {
         if libc::getifaddrs(&mut head) != 0 {
-            log::warn!(
-                "[BlockPolicy] getifaddrs failed; this node's own addresses are not protected"
-            );
-            return out;
+            return Err(format!(
+                "getifaddrs failed: {}",
+                std::io::Error::last_os_error()
+            ));
         }
         let mut cur = head;
         while !cur.is_null() {
@@ -141,18 +197,21 @@ fn local_interface_addresses() -> Vec<IpAddr> {
         }
         libc::freeifaddrs(head);
     }
-    out
+    Ok(out)
 }
 
-fn default_gateways() -> Vec<IpAddr> {
-    let mut out = Vec::new();
-    if let Ok(table) = std::fs::read_to_string("/proc/net/route") {
-        out.extend(parse_ipv4_default_gateways(&table));
+fn default_gateways() -> Result<Vec<IpAddr>, String> {
+    let read = |path: &str| {
+        std::fs::read_to_string(path).map_err(|e| format!("cannot read {}: {}", path, e))
+    };
+    let mut out = parse_ipv4_default_gateways(&read("/proc/net/route")?);
+    // A host without IPv6 has no ipv6_route: that is not a failure.
+    match std::fs::read_to_string("/proc/net/ipv6_route") {
+        Ok(table) => out.extend(parse_ipv6_default_gateways(&table)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("cannot read /proc/net/ipv6_route: {}", e)),
     }
-    if let Ok(table) = std::fs::read_to_string("/proc/net/ipv6_route") {
-        out.extend(parse_ipv6_default_gateways(&table));
-    }
-    out
+    Ok(out)
 }
 
 /// `/proc/net/route`: Iface Destination Gateway ... in little-endian hex.
@@ -196,6 +255,36 @@ mod tests {
 
     fn ip(s: &str) -> IpAddr {
         s.parse().unwrap()
+    }
+
+    #[test]
+    fn a_host_view_protects_its_addresses_and_reports_changes() {
+        let base = BlockPolicy::builtin();
+        let mut view = HostView::default();
+        view.addresses.insert(ip("10.0.0.5"));
+        view.gateways.insert(ip("10.0.0.1"));
+        let policy = base.with_host(&view);
+        assert_eq!(policy.check(ip("10.0.0.5")), Err(LOCAL_ADDRESS));
+        assert_eq!(policy.check(ip("10.0.0.1")), Err("default gateway"));
+        assert!(
+            base.check(ip("10.0.0.5")).is_ok(),
+            "the base policy is not changed"
+        );
+        let mut moved = view.clone();
+        moved.addresses.remove(&ip("10.0.0.5"));
+        moved.addresses.insert(ip("::ffff:10.0.0.6"));
+        let moved = HostView {
+            addresses: moved.addresses.into_iter().map(canonical).collect(),
+            ..moved
+        };
+        assert_eq!(
+            moved.diff(&view),
+            (vec![ip("10.0.0.6")], vec![ip("10.0.0.5")])
+        );
+        assert!(
+            HostView::discover().is_ok(),
+            "this host's addresses can be read"
+        );
     }
 
     #[test]

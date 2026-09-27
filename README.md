@@ -310,6 +310,10 @@ Flowspec). A prefix is refused if it is wider than `--min-block-prefix-v4` (defa
 `--min-block-prefix-v6` (default 48), or if it contains or lies inside any protected address or range
 below — a detector mistake must not cut the node off.
 
+The node re-reads its addresses and default gateways every 2 s: an address that moves onto
+this host is released at once if it was blocked, and refused afterwards
+(`sokol_protected_refresh_ok` shows the reads work).
+
 Some addresses are never blocked, whether the request comes from `--block`, the control
 socket, a trap or the mesh: loopback, multicast, IPv6 link-local, every address of this node,
 its default gateways and its `--seed-peer`s. Add operator and bastion networks explicitly:
