@@ -274,6 +274,8 @@ pub struct Added {
     pub claim: Claim,
     pub ttl: Option<Duration>,
     pub applied: Result<(), MapError>,
+    /// A new claim (to share); false when the repeat was the running decision (R26-05).
+    pub new: bool,
 }
 
 /// Result of offering a peer's claim.
@@ -756,6 +758,7 @@ impl<B: Blocklist> BlockTable<B> {
                     claim,
                     ttl: left,
                     applied,
+                    new: false,
                 });
             }
         }
@@ -805,6 +808,7 @@ impl<B: Blocklist> BlockTable<B> {
             claim,
             ttl,
             applied,
+            new: true,
         })
     }
 
@@ -1775,6 +1779,23 @@ mod tests {
         }
         let (outcomes, lost) = t.take_outcomes();
         assert_eq!((outcomes.len(), lost), (MAX_OUTCOMES, 3));
+    }
+
+    #[test]
+    fn a_repeat_merged_into_the_running_claim_is_not_new() {
+        let mut t = table(1, 64);
+        let a = ip("203.0.113.40");
+        assert!(t.add_local(a, ClaimKind::Detector, "x", T0).unwrap().new);
+        assert!(
+            t.add_local(a, ClaimKind::Detector, "x", T0).unwrap().new,
+            "escalation"
+        );
+        // At the cap, repeats within a quarter of the lifetime are the same decision.
+        for _ in 0..8 {
+            let _ = t.add_local(a, ClaimKind::Detector, "x", T0);
+        }
+        let repeat = t.add_local(a, ClaimKind::Detector, "x", T0).unwrap();
+        assert!(!repeat.new, "the running claim must not be shared again");
     }
 
     #[test]
