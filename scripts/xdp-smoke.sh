@@ -272,6 +272,8 @@ PY
 check "a flooding IPC client gets an answer to every line" test "$(cat "$WORK/ipc-flood.txt")" = 6000
 check "and it was paced past its burst" bash -c "sleep 1.2; test \"\$(curl -s http://127.0.0.1:9469/metrics | awk '\$1 == \"sokol_ipc_lines_delayed_total\" { print \$2 }')\" -gt 0"
 check "the binary names its build" bash -c "'$BIN' --version | grep -q '(build '"
+check "--xdp-mode auto runs in native mode where the driver takes it (veth)" \
+    bash -c "curl -s http://127.0.0.1:9469/metrics | grep -q '^sokol_xdp_mode{mode=\"native\"} 1'"
 check "the running build is in the metrics" \
     bash -c "curl -s http://127.0.0.1:9469/metrics | grep -q '^sokol_build_info{version=.*,build=.*} 1'"
 # A support bundle has what a remote diagnosis needs and never the node key.

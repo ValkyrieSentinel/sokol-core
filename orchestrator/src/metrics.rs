@@ -48,6 +48,7 @@ pub struct Snapshot {
     pub mesh_dropped_bulk: u64,
     pub ipc_lines_delayed: u64,
     pub tick_secs: f64,
+    pub xdp_native: bool,
     pub outcomes: OutcomeStats,
     pub tick_max_secs: f64,
     pub audit_write_errors: u64,
@@ -81,6 +82,17 @@ pub fn render(s: &Snapshot) -> String {
         env!("SOKOL_BUILD_ID")
     );
 
+    family(
+        &mut out,
+        "sokol_xdp_mode",
+        "gauge",
+        "1 for the mode the XDP program runs in: native (driver) or generic (slower fallback).",
+    );
+    let _ = writeln!(
+        out,
+        "sokol_xdp_mode{{mode=\"{}\"}} 1",
+        if s.xdp_native { "native" } else { "generic" }
+    );
     family(
         &mut out,
         "sokol_xdp_rx_packets_total",

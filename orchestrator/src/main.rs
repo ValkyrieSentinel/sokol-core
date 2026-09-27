@@ -1258,20 +1258,38 @@ async fn main() -> Result<(), anyhow::Error> {
         .program_mut("sentinel_vfr_filter")
         .ok_or_else(|| anyhow::anyhow!("Critical: Program sentinel_vfr_filter not found in ELF"))?;
     let program: &mut Xdp = prog_mut.try_into()?;
-    let _link = program
-        .attach(&args.interface, args.xdp_mode.flags())
-        .map_err(|e| {
+    // `auto` means: driver (native) mode where the driver takes it, otherwise generic. A driver
+    // can support XDP and still refuse it on a given device (virtio_net whose host enforces
+    // checksum/GRO offloads, e.g. Apple Virtualization): without the fallback the node would not
+    // start at all there.
+    let attach = |program: &mut Xdp, mode: XdpMode| {
+        program.attach(&args.interface, mode.flags()).map_err(|e| {
             anyhow::anyhow!(
                 "XDP attach to {} in {:?} mode failed: {}",
                 args.interface,
-                args.xdp_mode,
+                mode,
                 e
             )
-        })?;
+        })
+    };
+    let (_link, xdp_mode) = match args.xdp_mode {
+        XdpMode::Auto => match attach(program, XdpMode::Native) {
+            Ok(link) => (link, XdpMode::Native),
+            Err(e) => {
+                log::warn!(
+                    "{:#}; falling back to generic mode (slower: packets reach XDP after the \
+                     kernel has built its buffers). The kernel log names the driver's reason.",
+                    e
+                );
+                (attach(program, XdpMode::Generic)?, XdpMode::Generic)
+            }
+        },
+        mode => (attach(program, mode)?, mode),
+    };
     log::info!(
         "XDP program successfully locked and attached to interface: {} (mode: {:?})",
         args.interface,
-        args.xdp_mode
+        xdp_mode
     );
 
     let blocklist_v4_data = bpf
@@ -2380,6 +2398,7 @@ async fn main() -> Result<(), anyhow::Error> {
                 let tick_secs = tick_started.elapsed().as_secs_f64();
                 tick_max_secs = tick_max_secs.max(tick_secs);
                 snapshot.tick_secs = tick_secs;
+                snapshot.xdp_native = matches!(xdp_mode, XdpMode::Native);
                 snapshot.outcomes = outcome_stats;
                 snapshot.tick_max_secs = tick_max_secs;
                 snapshot.protected_refresh_ok =
