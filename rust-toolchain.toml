@@ -1,3 +1,4 @@
 [toolchain]
-channel = "nightly"
-components = ["rust-src"]
+# Pinned (reproducible builds): bump deliberately, together with the CI run that proves it.
+channel = "nightly-2026-09-24"
+components = ["rust-src", "clippy", "rustfmt"]
