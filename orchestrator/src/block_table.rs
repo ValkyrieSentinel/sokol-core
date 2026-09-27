@@ -307,6 +307,8 @@ pub struct BlockTable<B = KernelBlocklist> {
     by_target: HashMap<IpNet, HashSet<ClaimId>>,
     applied: HashSet<IpNet>,
     pending: HashSet<IpNet>,
+    /// When each pending target first failed (for the age of the oldest).
+    pending_since: HashMap<IpNet, u64>,
     /// Targets to retry, oldest first (R26-06): each is retried at most once per tick, and a
     /// target that keeps failing goes to the back, so it cannot starve the others.
     retry: std::collections::VecDeque<IpNet>,
@@ -355,6 +357,7 @@ impl<B: Blocklist> BlockTable<B> {
             by_target: HashMap::new(),
             applied: HashSet::new(),
             pending: HashSet::new(),
+            pending_since: HashMap::new(),
             retry: std::collections::VecDeque::new(),
             queued: HashSet::new(),
             strikes: HashMap::new(),
@@ -511,8 +514,10 @@ impl<B: Blocklist> BlockTable<B> {
         };
         if result.is_ok() {
             self.pending.remove(&net);
+            self.pending_since.remove(&net);
         } else {
             self.pending.insert(net);
+            self.pending_since.entry(net).or_insert(now_ms);
             if self.queued.insert(net) {
                 self.retry.push_back(net);
             }
@@ -1158,6 +1163,16 @@ impl<B: Blocklist> BlockTable<B> {
     /// Targets whose kernel entry does not yet match the claims.
     pub fn pending(&self) -> usize {
         self.pending.len()
+    }
+
+    /// How long the oldest pending map operation has been failing.
+    pub fn oldest_pending(&self, now_ms: u64) -> Duration {
+        self.pending_since
+            .values()
+            .min()
+            .map_or(Duration::ZERO, |since| {
+                Duration::from_millis(now_ms.saturating_sub(*since))
+            })
     }
 
     pub fn is_blocked(&self, net: IpNet) -> bool {
@@ -2652,6 +2667,11 @@ mod tests {
             prop_assert!(
                 t.pending.iter().all(|n| t.queued.contains(n)),
                 "every pending target is queued for retry"
+            );
+            prop_assert!(
+                t.pending.len() == t.pending_since.len()
+                    && t.pending.iter().all(|n| t.pending_since.contains_key(n)),
+                "pending ages follow the pending set"
             );
             for (issuer, n) in &t.active_by_issuer {
                 let held = t

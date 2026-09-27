@@ -56,6 +56,118 @@ pub const MAX_CLOCK_SKEW_MS: u64 = 30_000;
 const MAX_REPLAY_ENTRIES: usize = 100_000;
 pub const MAX_FRAME_BYTES: usize = 128 * 1024;
 
+// ---- Resource limits of the mesh transport (see ARCHITECTURE, ADR-0013) ----
+
+/// A connection must authenticate (its handshake) within this long.
+pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Connections not yet authenticated, at once, in total and from one address: an unknown
+/// party cannot hold the slots pinned peers need.
+pub const MAX_PENDING_HANDSHAKES: usize = 16;
+pub const MAX_PENDING_PER_ADDRESS: usize = 2;
+/// Frames and bytes an authenticated peer may send, per second and as a burst (a full snapshot
+/// fits the burst). Past that the reader waits: the peer is slowed by TCP, nothing is dropped.
+pub const FRAMES_PER_SEC: f64 = 500.0;
+pub const FRAME_BURST: f64 = 5_000.0;
+pub const BYTES_PER_SEC: f64 = 4.0 * 1024.0 * 1024.0;
+pub const BYTE_BURST: f64 = 32.0 * 1024.0 * 1024.0;
+
+/// A token bucket; `take` says how long to wait before the cost may be spent.
+#[derive(Debug)]
+pub struct Bucket {
+    rate: f64,
+    burst: f64,
+    tokens: f64,
+    at: std::time::Instant,
+}
+
+impl Bucket {
+    pub fn new(rate: f64, burst: f64) -> Self {
+        Self {
+            rate,
+            burst,
+            tokens: burst,
+            at: std::time::Instant::now(),
+        }
+    }
+
+    /// Spends `cost` (going into debt if needed) and returns the wait until the debt is paid.
+    pub fn take(&mut self, cost: f64, now: std::time::Instant) -> Duration {
+        let elapsed = now.saturating_duration_since(self.at).as_secs_f64();
+        self.at = now;
+        self.tokens = (self.tokens + elapsed * self.rate).min(self.burst) - cost;
+        if self.tokens >= 0.0 {
+            Duration::ZERO
+        } else {
+            Duration::from_secs_f64(-self.tokens / self.rate)
+        }
+    }
+}
+
+/// Counters of the transport's limits, for the metrics.
+#[derive(Default)]
+pub struct MeshStats {
+    pub handshakes_refused: std::sync::atomic::AtomicU64,
+    pub handshake_timeouts: std::sync::atomic::AtomicU64,
+    pub frames_delayed: std::sync::atomic::AtomicU64,
+}
+
+/// Admission of connections that have not authenticated yet.
+#[derive(Clone)]
+pub struct Admission {
+    pending: Arc<Semaphore>,
+    per_address: Arc<std::sync::Mutex<HashMap<std::net::IpAddr, usize>>>,
+}
+
+/// Held by a connection until it authenticates (or ends).
+pub struct HandshakeTicket {
+    _permit: tokio::sync::OwnedSemaphorePermit,
+    address: std::net::IpAddr,
+    per_address: Arc<std::sync::Mutex<HashMap<std::net::IpAddr, usize>>>,
+}
+
+impl Drop for HandshakeTicket {
+    fn drop(&mut self) {
+        let mut counts = self.per_address.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(n) = counts.get_mut(&self.address) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                counts.remove(&self.address);
+            }
+        }
+    }
+}
+
+impl Default for Admission {
+    fn default() -> Self {
+        Self::new(MAX_PENDING_HANDSHAKES)
+    }
+}
+
+impl Admission {
+    pub fn new(pending: usize) -> Self {
+        Self {
+            pending: Arc::new(Semaphore::new(pending)),
+            per_address: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// A ticket for a new, unauthenticated connection from `address`, if there is room.
+    pub fn admit(&self, address: std::net::IpAddr) -> Option<HandshakeTicket> {
+        let mut counts = self.per_address.lock().unwrap_or_else(|p| p.into_inner());
+        let n = counts.entry(address).or_insert(0);
+        if *n >= MAX_PENDING_PER_ADDRESS {
+            return None;
+        }
+        let permit = self.pending.clone().try_acquire_owned().ok()?;
+        *n += 1;
+        Some(HandshakeTicket {
+            _permit: permit,
+            address,
+            per_address: self.per_address.clone(),
+        })
+    }
+}
+
 pub fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -732,6 +844,7 @@ pub struct PeerRegistry {
     /// Swapped as a whole by `reload`, so a message is checked against one consistent store.
     trust: Arc<std::sync::RwLock<Arc<TrustStore>>>,
     replay: Arc<std::sync::Mutex<ReplayGuard>>,
+    pub stats: Arc<MeshStats>,
 }
 
 impl PeerRegistry {
@@ -741,6 +854,7 @@ impl PeerRegistry {
             peer_up: Arc::new(std::sync::Mutex::new(None)),
             trust: Arc::new(std::sync::RwLock::new(Arc::new(trust))),
             replay: Arc::new(std::sync::Mutex::new(ReplayGuard::default())),
+            stats: Arc::new(MeshStats::default()),
         }
     }
 
@@ -927,6 +1041,7 @@ impl P2PNetwork {
         );
 
         let semaphore = Arc::new(Semaphore::new(self.max_connections));
+        let admission = Admission::default();
         let mut shutdown_rx = self.shutdown_rx.clone();
 
         loop {
@@ -947,6 +1062,11 @@ impl P2PNetwork {
                         }
                     };
 
+                    let Some(ticket) = admission.admit(peer_addr.ip()) else {
+                        self.registry.stats.handshakes_refused.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        debug!("[P2P] Too many unauthenticated connections; refusing {}", peer_addr);
+                        continue;
+                    };
                     let permit = match semaphore.clone().try_acquire_owned() {
                         Ok(permit) => permit,
                         Err(_) => {
@@ -962,7 +1082,7 @@ impl P2PNetwork {
                     let registry = self.registry.clone();
 
                     tokio::spawn(async move {
-                        if let Err(e) = run_connection(stream, peer_addr, node_id, crypto, cmd_tx, registry).await {
+                        if let Err(e) = run_connection(stream, peer_addr, node_id, crypto, cmd_tx, registry, Some(ticket)).await {
                             warn!("[P2P] Connection with {} closed: {:#}", peer_addr, e);
                         }
                         drop(permit);
@@ -987,7 +1107,7 @@ pub async fn connect_to_peer(
         .await
         .context(format!("Failed to connect to outbound peer {}", peer_addr))?;
     info!("[P2P] Connected to outbound peer: {}", peer_addr);
-    run_connection(stream, peer_addr, node_id, crypto, cmd_tx, registry).await
+    run_connection(stream, peer_addr, node_id, crypto, cmd_tx, registry, None).await
 }
 
 /// Delay before the next dial: doubles from 1 s up to 30 s, and starts over after a connection
@@ -1041,6 +1161,7 @@ async fn run_connection(
     crypto: Arc<NodeCrypto>,
     cmd_tx: mpsc::Sender<MeshCommand>,
     registry: PeerRegistry,
+    ticket: Option<HandshakeTicket>,
 ) -> Result<()> {
     // Mesh messages are small and latency-sensitive.
     let _ = stream.set_nodelay(true);
@@ -1062,6 +1183,7 @@ async fn run_connection(
         registry.clone(),
         tx,
         conn_id,
+        ticket,
     )
     .await;
     registry.remove_peer(&peer_addr, conn_id).await;
@@ -1125,12 +1247,25 @@ async fn handle_reader_loop(
     registry: PeerRegistry,
     writer_tx: mpsc::Sender<SecureEnvelope>,
     conn_id: u64,
+    mut ticket: Option<HandshakeTicket>,
 ) -> Result<()> {
+    use std::sync::atomic::Ordering;
     let mut len_buf = [0u8; 4];
     let mut authenticated_peer: Option<u64> = None;
+    let handshake_deadline = tokio::time::Instant::now() + HANDSHAKE_TIMEOUT;
+    let (mut frames, mut bytes) = (
+        Bucket::new(FRAMES_PER_SEC, FRAME_BURST),
+        Bucket::new(BYTES_PER_SEC, BYTE_BURST),
+    );
 
     loop {
-        match timeout(Duration::from_secs(30), reader.read_exact(&mut len_buf)).await {
+        // Until it authenticates, a connection gets HANDSHAKE_TIMEOUT in all; after, 30 s of
+        // silence (heartbeats come every 10 s).
+        let deadline = match authenticated_peer {
+            None => handshake_deadline,
+            Some(_) => tokio::time::Instant::now() + Duration::from_secs(30),
+        };
+        match tokio::time::timeout_at(deadline, reader.read_exact(&mut len_buf)).await {
             Ok(Ok(_)) => {}
             Ok(Err(e))
                 if e.kind() == ErrorKind::UnexpectedEof
@@ -1140,6 +1275,13 @@ async fn handle_reader_loop(
                 return Ok(());
             }
             Ok(Err(e)) => bail!("read error: {}", e),
+            Err(_) if authenticated_peer.is_none() => {
+                registry
+                    .stats
+                    .handshake_timeouts
+                    .fetch_add(1, Ordering::Relaxed);
+                bail!("no handshake within {:?}", HANDSHAKE_TIMEOUT)
+            }
             Err(_) => bail!("heartbeat/read timeout"),
         }
 
@@ -1148,8 +1290,27 @@ async fn handle_reader_loop(
             bail!("frame of {} bytes exceeds limit", payload_len);
         }
 
+        // An authenticated peer is paced: past its budget the reader waits (TCP slows the peer).
+        if authenticated_peer.is_some() {
+            let now = std::time::Instant::now();
+            let wait = frames
+                .take(1.0, now)
+                .max(bytes.take(payload_len as f64, now));
+            if !wait.is_zero() {
+                registry
+                    .stats
+                    .frames_delayed
+                    .fetch_add(1, Ordering::Relaxed);
+                tokio::time::sleep(wait).await;
+            }
+        }
+
         let mut payload = vec![0u8; payload_len];
-        match timeout(Duration::from_secs(5), reader.read_exact(&mut payload)).await {
+        let frame_deadline = match authenticated_peer {
+            None => handshake_deadline,
+            Some(_) => tokio::time::Instant::now() + Duration::from_secs(5),
+        };
+        match tokio::time::timeout_at(frame_deadline, reader.read_exact(&mut payload)).await {
             Ok(Ok(_)) => {}
             Ok(Err(e)) => bail!("read error: {}", e),
             Err(_) => bail!("timeout reading frame"),
@@ -1214,6 +1375,8 @@ async fn handle_reader_loop(
                     "[P2P] Node {} at {}: mesh protocol v{}",
                     node_id, peer_addr, version
                 );
+                // Authenticated: its handshake slot goes back to the pool.
+                drop(ticket.take());
                 if node_id != envelope.sender_id {
                     bail!(
                         "handshake node_id {} differs from signer {}",
@@ -2416,5 +2579,215 @@ mod tests {
             created.public_key_hex()
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- Resource limits ----
+
+    #[test]
+    fn a_bucket_allows_its_burst_then_paces() {
+        let t0 = std::time::Instant::now();
+        let mut b = Bucket::new(10.0, 3.0);
+        for _ in 0..3 {
+            assert_eq!(b.take(1.0, t0), Duration::ZERO);
+        }
+        let wait = b.take(1.0, t0);
+        assert!((wait.as_secs_f64() - 0.1).abs() < 1e-6, "{:?}", wait);
+        assert_eq!(
+            b.take(0.0, t0 + Duration::from_millis(100)),
+            Duration::ZERO,
+            "repaid"
+        );
+        assert_eq!(
+            Bucket::new(10.0, 3.0).take(0.0, t0 + Duration::from_secs(60)),
+            Duration::ZERO,
+            "idle time refills only up to the burst"
+        );
+    }
+
+    #[test]
+    fn pending_handshakes_are_bounded_per_address_and_in_total() {
+        let a: std::net::IpAddr = "192.0.2.1".parse().unwrap();
+        let admission = Admission::new(3);
+        let t1 = admission.admit(a).unwrap();
+        let _t2 = admission.admit(a).unwrap();
+        assert!(admission.admit(a).is_none(), "a third from one address");
+        let _t3 = admission.admit("192.0.2.2".parse().unwrap()).unwrap();
+        assert!(
+            admission.admit("192.0.2.3".parse().unwrap()).is_none(),
+            "total reached"
+        );
+        drop(t1);
+        assert!(
+            admission.admit(a).is_some(),
+            "an authenticated (or closed) one frees its slot"
+        );
+    }
+
+    async fn listening_node() -> (
+        SocketAddr,
+        PeerRegistry,
+        NodeCrypto,
+        mpsc::Receiver<MeshCommand>,
+        watch::Sender<bool>,
+    ) {
+        let server = Arc::new(NodeCrypto::generate());
+        let peer = NodeCrypto::generate();
+        let registry = PeerRegistry::new(trust_with(2, &peer));
+        let (cmd_tx, cmd_rx) = mpsc::channel(10_000);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let net = P2PNetwork::new(addr, 1, server, cmd_tx, 100, shutdown_rx, registry.clone());
+        tokio::spawn(async move { net.serve(listener).await });
+        (addr, registry, peer, cmd_rx, shutdown_tx)
+    }
+
+    #[tokio::test]
+    async fn silent_connections_cannot_hold_the_node() {
+        use std::sync::atomic::Ordering;
+        let (addr, registry, _peer, _rx, _stop) = listening_node().await;
+        let silent1 = TcpStream::connect(addr).await.unwrap();
+        let silent2 = TcpStream::connect(addr).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        // A third from the same address is refused at once: the node closes it.
+        let mut third = TcpStream::connect(addr).await.unwrap();
+        let mut buf = [0u8; 1];
+        let closed = timeout(Duration::from_secs(2), third.read(&mut buf)).await;
+        assert!(
+            matches!(closed, Ok(Ok(0)) | Ok(Err(_))),
+            "the third was served"
+        );
+        assert_eq!(registry.stats.handshakes_refused.load(Ordering::Relaxed), 1);
+        // The silent ones are closed after HANDSHAKE_TIMEOUT.
+        let started = std::time::Instant::now();
+        for mut s in [silent1, silent2] {
+            loop {
+                match timeout(HANDSHAKE_TIMEOUT * 2, s.read(&mut [0u8; 8192])).await {
+                    Ok(Ok(0)) | Ok(Err(_)) => break,
+                    Ok(Ok(_)) => continue, // the node's own handshake
+                    Err(_) => panic!("a silent connection stayed open"),
+                }
+            }
+        }
+        assert!(started.elapsed() < HANDSHAKE_TIMEOUT + Duration::from_secs(2));
+        assert_eq!(registry.stats.handshake_timeouts.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn a_fast_peer_is_paced_not_dropped() {
+        use std::sync::atomic::Ordering;
+        let (addr, registry, peer, mut rx, _stop) = listening_node().await;
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let n = FRAME_BURST as usize + 500;
+        let mut frames = Vec::with_capacity(n + 1);
+        frames.push(
+            seal(&peer, 2, &NetworkMessage::handshake(2))
+                .unwrap()
+                .encode(),
+        );
+        for i in 0..n {
+            frames.push(
+                seal(
+                    &peer,
+                    2,
+                    &block_cmd(&format!("10.1.{}.{}", i / 250, i % 250)),
+                )
+                .unwrap()
+                .encode(),
+            );
+        }
+        let writer = tokio::spawn(async move {
+            for bytes in frames {
+                let mut frame = (bytes.len() as u32).to_be_bytes().to_vec();
+                frame.extend_from_slice(&bytes);
+                stream.write_all(&frame).await.unwrap();
+            }
+            stream
+        });
+        let mut got = 0;
+        while got < n {
+            match timeout(Duration::from_secs(10), rx.recv()).await {
+                Ok(Some(_)) => got += 1,
+                _ => panic!("only {} of {} commands arrived", got, n),
+            }
+        }
+        let _stream = writer.await.unwrap();
+        assert!(
+            registry.stats.frames_delayed.load(Ordering::Relaxed) > 0,
+            "past the burst, frames must be paced"
+        );
+    }
+
+    /// Costs behind the resource contract (ADR-0013); run with --ignored --nocapture.
+    #[test]
+    #[ignore]
+    fn measure_resource_costs() {
+        use crate::block_table::{Claim, ClaimKind, MAX_REASON_BYTES};
+        use crate::mesh_sync::pack_snapshot;
+        let peer = NodeCrypto::generate();
+        let trust = trust_with(1, &peer);
+        let claim = |i: u32, reason: usize| Claim {
+            issuer: 1,
+            kind: ClaimKind::Detector,
+            target: format!("10.{}.{}.{}", i / 65536, (i / 256) % 256, i % 256),
+            issued_ms: now_ms(),
+            expires_ms: Some(now_ms() + 3_600_000),
+            reason: "r".repeat(reason),
+        };
+        // 1. The largest frame an authenticated peer can send: a full snapshot frame.
+        let big = pack_snapshot(
+            1,
+            (0..3000).map(|i| claim(i, MAX_REASON_BYTES)).collect(),
+            vec![],
+        );
+        let env = seal(&peer, 1, &NetworkMessage::Command(big[0].clone())).unwrap();
+        let frame = env.encode();
+        let n = 50;
+        let t = std::time::Instant::now();
+        for _ in 0..n {
+            let e = SecureEnvelope::decode(&frame).unwrap();
+            let _ = open(&trust, &mut ReplayGuard::default(), &e, now_ms()).unwrap();
+        }
+        println!(
+            "open of a {} KiB snapshot frame: {:.2} ms",
+            frame.len() / 1024,
+            t.elapsed().as_secs_f64() * 1000.0 / n as f64
+        );
+        // 2. One answer to SyncRequest at the claim cap: pack and seal every frame.
+        for count in [1_000u32, 65_536] {
+            let claims: Vec<Claim> = (0..count).map(|i| claim(i, 40)).collect();
+            let t = std::time::Instant::now();
+            let msgs = pack_snapshot(1, claims, vec![]);
+            let mut bytes = 0;
+            for m in &msgs {
+                bytes += seal(&peer, 1, &NetworkMessage::Command(m.clone()))
+                    .unwrap()
+                    .encode()
+                    .len();
+            }
+            println!(
+                "snapshot of {} claims: {} frames, {} KiB, {:.1} ms to pack and sign",
+                count,
+                msgs.len(),
+                bytes / 1024,
+                t.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+        // 3. A stranger's 128 KiB frame: decoded, refused on the unknown sender.
+        let mut stranger = env.clone();
+        stranger.sender_id = 99;
+        stranger.payload = vec![b' '; MAX_FRAME_BYTES - 4000];
+        let frame = stranger.encode();
+        let n = 1000;
+        let t = std::time::Instant::now();
+        for _ in 0..n {
+            let e = SecureEnvelope::decode(&frame).unwrap();
+            assert!(open(&trust, &mut ReplayGuard::default(), &e, now_ms()).is_err());
+        }
+        println!(
+            "refusing a stranger's {} KiB frame: {:.1} us",
+            frame.len() / 1024,
+            t.elapsed().as_secs_f64() * 1e6 / n as f64
+        );
     }
 }
