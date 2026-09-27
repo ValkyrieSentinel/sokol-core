@@ -1,0 +1,14 @@
+{
+  "exit": 0,
+  "command": [
+    "docker",
+    "run",
+    "--name",
+    "sokol-review-0927",
+    "-i",
+    "sokol-build",
+    "sh",
+    "-c",
+    "tar -xf - -C /src && rustup toolchain install nightly-2026-09-24 --component rust-src --component clippy --component rustfmt && (cd ebpf && cargo build --release --locked) && cargo test --release --locked && cargo clippy --release --locked --all-targets -- -D warnings"
+  ]
+}
