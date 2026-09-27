@@ -23,7 +23,7 @@ use std::process::Command;
 use std::thread;
 use std::time::Duration;
 
-use common::audit_log::{verify_chain, AuditReader};
+use common::audit_log::{rotated_segments, verify_chain, AuditReader};
 
 const DB_FILE: &str = "/var/lib/sokol/audit.log";
 
@@ -224,11 +224,103 @@ fn dump(path: &str) -> ! {
     }
 }
 
+/// One `BLOCK_OUTCOME` record: packets dropped (`None`: unknown), seconds in force, cause.
+fn parse_outcome(text: &str) -> Option<(Option<u64>, u64, String)> {
+    let rest = text.strip_prefix("BLOCK_OUTCOME|")?;
+    let (fields, cause) = match rest.split_once("|Cause:") {
+        Some((fields, cause)) => (fields, cause.to_string()),
+        None => (rest, "unknown".to_string()),
+    };
+    let field = |name: &str| {
+        fields
+            .split('|')
+            .find_map(|f| f.strip_prefix(name))
+            .map(str::to_string)
+    };
+    let dropped = field("Dropped:")?.parse().ok();
+    let seconds = field("Seconds:")?.parse().ok()?;
+    Some((dropped, seconds, cause))
+}
+
+/// Groups causes by what decided them, not by the details that vary between decisions: the
+/// text before a parenthesis (CrowdSec appends the remaining duration), at most 80 characters.
+fn cause_key(cause: &str) -> String {
+    let base = cause.split(" (").next().unwrap_or(cause).trim();
+    base.chars().take(80).collect()
+}
+
+#[derive(Default, Debug, PartialEq)]
+struct CauseStats {
+    blocks: u64,
+    dropped_nothing: u64,
+    unknown: u64,
+    packets: u64,
+    seconds: Vec<u64>,
+}
+
+fn summarize<'a>(records: impl Iterator<Item = &'a str>) -> Vec<(String, CauseStats)> {
+    let mut by: std::collections::BTreeMap<String, CauseStats> = Default::default();
+    for text in records {
+        let Some((dropped, seconds, cause)) = parse_outcome(text) else {
+            continue;
+        };
+        let s = by.entry(cause_key(&cause)).or_default();
+        s.blocks += 1;
+        match dropped {
+            Some(0) => s.dropped_nothing += 1,
+            Some(n) => s.packets += n,
+            None => s.unknown += 1,
+        }
+        s.seconds.push(seconds);
+    }
+    let mut out: Vec<(String, CauseStats)> = by.into_iter().collect();
+    out.sort_by(|a, b| b.1.blocks.cmp(&a.1.blocks).then(a.0.cmp(&b.0)));
+    out
+}
+
+/// `monitor --outcomes [path]`: what the node's blocks did, by the decision behind them, over
+/// the whole retained audit chain. Evidence for reviewing detectors and TTLs, not a verdict.
+fn outcomes(path: &str) -> ! {
+    let mut files: Vec<std::path::PathBuf> = rotated_segments(Path::new(path))
+        .map(|segs| segs.into_iter().map(|(_, p)| p).collect())
+        .unwrap_or_default();
+    files.push(Path::new(path).to_path_buf());
+    let mut texts = Vec::new();
+    for file in &files {
+        let Ok(mut reader) = AuditReader::open(file) else {
+            continue;
+        };
+        while let Ok(Some(r)) = reader.next_record() {
+            texts.push(String::from_utf8_lossy(&r.payload).into_owned());
+        }
+    }
+    let rows = summarize(texts.iter().map(String::as_str));
+    println!(
+        "{:>7} {:>9} {:>11} {:>9}  cause",
+        "blocks", "idle %", "packets", "median s"
+    );
+    for (cause, s) in rows {
+        let mut secs = s.seconds.clone();
+        secs.sort_unstable();
+        let median = secs.get(secs.len() / 2).copied().unwrap_or(0);
+        println!(
+            "{:>7} {:>8.0}% {:>11} {:>9}  {}",
+            s.blocks,
+            100.0 * s.dropped_nothing as f64 / s.blocks.max(1) as f64,
+            s.packets,
+            median,
+            cause
+        );
+    }
+    std::process::exit(0)
+}
+
 fn main() -> io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
         Some("--verify") => verify(args.get(2).map(String::as_str).unwrap_or(DB_FILE)),
         Some("--dump") => dump(args.get(2).map(String::as_str).unwrap_or(DB_FILE)),
+        Some("--outcomes") => outcomes(args.get(2).map(String::as_str).unwrap_or(DB_FILE)),
         _ => {}
     }
 
@@ -305,5 +397,41 @@ fn main() -> io::Result<()> {
 
         println!("\n[Press Ctrl+C to exit]");
         thread::sleep(Duration::from_secs(2));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn outcomes_are_grouped_by_the_decision_behind_them() {
+        let records = [
+            "BLOCK_OUTCOME|IP:198.51.100.1|Dropped:0|Seconds:900|Cause:detector: crowdsec: ssh-bf (origin crowdsec, crowdsec duration 3h59m)",
+            "BLOCK_OUTCOME|IP:198.51.100.2|Dropped:40|Seconds:600|Cause:detector: crowdsec: ssh-bf (origin crowdsec, crowdsec duration 1h2m)",
+            "BLOCK_OUTCOME|IP:198.51.100.3|Dropped:unknown|Seconds:30|Cause:operator: ban",
+            "BLOCK_OUTCOME|IP:198.51.100.4|Dropped:5|Seconds:10",
+            "BLOCK_EXPIRED_V4|IP:198.51.100.9",
+        ];
+        let rows = summarize(records.iter().copied());
+        assert_eq!(
+            rows[0].0, "detector: crowdsec: ssh-bf",
+            "durations do not split a cause"
+        );
+        assert_eq!(
+            (
+                rows[0].1.blocks,
+                rows[0].1.dropped_nothing,
+                rows[0].1.packets
+            ),
+            (2, 1, 40)
+        );
+        let operator = rows.iter().find(|r| r.0 == "operator: ban").unwrap();
+        assert_eq!(operator.1.unknown, 1);
+        assert!(
+            rows.iter().any(|r| r.0 == "unknown"),
+            "a record without a cause still counts"
+        );
+        assert_eq!(rows.iter().map(|r| r.1.blocks).sum::<u64>(), 4);
     }
 }

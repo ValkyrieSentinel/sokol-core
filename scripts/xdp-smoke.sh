@@ -251,6 +251,10 @@ BUSY_DROPPED=$(grep -o "Outcome of the block of $OUT_BUSY: [0-9]* packets" "$LOG
 check "a lifted block records the packets it dropped ($BUSY_DROPPED >= 5)" test "${BUSY_DROPPED:-0}" -ge 5
 check "a block that saw no traffic records that it dropped none" \
     grep -q "Outcome of the block of $OUT_IDLE: 0 packets dropped" "$LOG"
+check "an outcome names the decision behind the block" \
+    grep -aq "BLOCK_OUTCOME|IP:$OUT_BUSY|Dropped:[0-9]*|Seconds:[0-9]*|Cause:operator: operator" "$WORK/events.sntl"
+check "monitor --outcomes summarises outcomes by cause" bash -c \
+    "'$(dirname "$BIN")/monitor' --outcomes '$WORK/events.sntl' | grep -Eq '^ +[0-9]+ +[0-9]+% +[0-9]+ +[0-9]+  operator: '"
 check "outcomes are in the audit log and the metrics" bash -c \
     "grep -aq 'BLOCK_OUTCOME|IP:$OUT_BUSY|Dropped:' '$WORK/events.sntl' && test \"\$(curl -s http://127.0.0.1:9469/metrics | awk '\$1 == \"sokol_block_outcomes_total{effect=\\\"none\\\"}\" { print \$2 }')\" -ge 1"
 check "the maintenance tick is measured and takes well under its period" \

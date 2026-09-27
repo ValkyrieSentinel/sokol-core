@@ -150,6 +150,9 @@ fn bounded_reason(reason: &str) -> String {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Outcome {
     pub net: IpNet,
+    /// Who decided it and why: the earliest claim in force when the entry was applied
+    /// (`detector`, `operator`, `static` or `peer <id>`, then the claim's reason).
+    pub cause: String,
     /// Packets it dropped; `None` if the counter could not be read.
     pub hits: Option<u64>,
     pub applied_ms: u64,
@@ -350,8 +353,9 @@ pub struct BlockTable<B = KernelBlocklist> {
     pending: HashSet<IpNet>,
     /// When each pending target first failed (for the age of the oldest).
     pending_since: HashMap<IpNet, u64>,
-    /// When each applied target entered the kernel map.
+    /// When each applied target entered the kernel map, and the decision that put it there.
     applied_at: HashMap<IpNet, u64>,
+    applied_cause: HashMap<IpNet, String>,
     /// What removed kernel entries did while they were in force, oldest first (bounded).
     outcomes: std::collections::VecDeque<Outcome>,
     outcomes_dropped: u64,
@@ -407,6 +411,7 @@ impl<B: Blocklist> BlockTable<B> {
             pending: HashSet::new(),
             pending_since: HashMap::new(),
             applied_at: HashMap::new(),
+            applied_cause: HashMap::new(),
             outcomes: std::collections::VecDeque::new(),
             outcomes_dropped: 0,
             retry: std::collections::VecDeque::new(),
@@ -551,10 +556,14 @@ impl<B: Blocklist> BlockTable<B> {
         let want = self.wanted(&net, now_ms);
         let have = self.applied.contains(&net);
         let result = match (want, have) {
-            (true, false) => self.lists.add(net).map(|()| {
-                self.applied.insert(net);
-                self.applied_at.insert(net, now_ms);
-            }),
+            (true, false) => {
+                let cause = self.cause(&net, now_ms);
+                self.lists.add(net).map(|()| {
+                    self.applied.insert(net);
+                    self.applied_at.insert(net, now_ms);
+                    self.applied_cause.insert(net, cause);
+                })
+            }
             (false, true) => {
                 // Read the entry's effect before it goes (packets arriving in between are lost
                 // to the count, not to enforcement).
@@ -563,8 +572,10 @@ impl<B: Blocklist> BlockTable<B> {
                     Ok(()) | Err(MapError::KeyNotFound) => {
                         self.applied.remove(&net);
                         let since = self.applied_at.remove(&net).unwrap_or(now_ms);
+                        let cause = self.applied_cause.remove(&net).unwrap_or_default();
                         self.record_outcome(Outcome {
                             net,
+                            cause,
                             hits,
                             applied_ms: since,
                             removed_ms: now_ms,
@@ -629,6 +640,33 @@ impl<B: Blocklist> BlockTable<B> {
     /// (remembered event ids, ids forgotten early because the memory was full)
     pub fn event_memory(&self) -> (usize, u64) {
         (self.events.len(), self.events_evicted)
+    }
+
+    /// The earliest claim in force on `net`, as `<who>: <reason>`.
+    fn cause(&self, net: &IpNet, now_ms: u64) -> String {
+        let first = self
+            .by_target
+            .get(net)
+            .into_iter()
+            .flatten()
+            .filter_map(|id| {
+                self.claims
+                    .get(id)
+                    .filter(|h| self.effective(id, h, now_ms))
+            })
+            .min_by_key(|h| (h.claim.issued_ms, h.claim.issuer));
+        match first {
+            Some(h) => {
+                let who = match (h.claim.kind, h.claim.issuer == self.node_id) {
+                    (ClaimKind::Static, _) => "static".to_string(),
+                    (ClaimKind::Operator, _) => "operator".to_string(),
+                    (ClaimKind::Detector, true) => "detector".to_string(),
+                    (ClaimKind::Detector, false) => format!("peer {}", h.claim.issuer),
+                };
+                format!("{}: {}", who, h.claim.reason)
+            }
+            None => "unknown".to_string(),
+        }
     }
 
     fn record_outcome(&mut self, outcome: Outcome) {
@@ -1778,12 +1816,14 @@ mod tests {
             vec![
                 Outcome {
                     net: busy,
+                    cause: "detector: test".into(),
                     hits: Some(42),
                     applied_ms: T0,
                     removed_ms: T0 + 11 * S
                 },
                 Outcome {
                     net: idle,
+                    cause: "detector: test".into(),
                     hits: Some(0),
                     applied_ms: T0,
                     removed_ms: expired_at
@@ -1791,6 +1831,27 @@ mod tests {
             ]
         );
         assert!(t.take_outcomes().0.is_empty(), "collected once");
+    }
+
+    #[test]
+    fn an_outcome_names_the_decision_that_applied_the_block() {
+        let mut t = table(1, 64);
+        let net = ip("203.0.113.60");
+        let peer = Claim {
+            issuer: 2,
+            kind: ClaimKind::Detector,
+            target: "203.0.113.60".into(),
+            issued_ms: T0 - S,
+            expires_ms: Some(T0 + 600 * S),
+            reason: "suricata: sid:2001219".into(),
+        };
+        t.adopt(peer, true, T0);
+        // A later local decision on the same target does not change who applied it.
+        t.add_local(net, ClaimKind::Operator, "ban", T0 + S)
+            .unwrap();
+        t.lift(net, T0 + 2 * S).unwrap();
+        let (outcomes, _) = t.take_outcomes();
+        assert_eq!(outcomes[0].cause, "peer 2: suricata: sid:2001219");
     }
 
     #[test]
@@ -2901,6 +2962,11 @@ mod tests {
             prop_assert!(
                 t.pending.iter().all(|n| t.queued.contains(n)),
                 "every pending target is queued for retry"
+            );
+            prop_assert!(
+                t.applied_cause.len() == t.applied.len()
+                    && t.applied.iter().all(|n| t.applied_cause.contains_key(n)),
+                "the cause is known exactly for applied targets"
             );
             prop_assert!(
                 t.applied_at.len() == t.applied.len()
