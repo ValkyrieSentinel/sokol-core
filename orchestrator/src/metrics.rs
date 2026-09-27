@@ -183,7 +183,7 @@ pub fn render(s: &Snapshot) -> String {
         &mut out,
         "sokol_p2p_active_peers",
         "gauge",
-        "Authenticated mesh peers connected.",
+        "Authenticated mesh nodes connected (a node with two connections counts once).",
     );
     let _ = writeln!(out, "sokol_p2p_active_peers {}", s.p2p_peers);
     family(

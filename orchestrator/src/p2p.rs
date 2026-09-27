@@ -971,8 +971,12 @@ impl PeerRegistry {
         self.trust.read().unwrap_or_else(|p| p.into_inner()).len()
     }
 
+    /// Authenticated nodes connected now. Two nodes that list each other as seeds hold two
+    /// connections, one dialed by each; they count once.
     pub async fn peer_count(&self) -> usize {
-        self.peers.read().await.len()
+        let peers = self.peers.read().await;
+        let nodes: std::collections::HashSet<u64> = peers.values().map(|(_, id, _)| *id).collect();
+        nodes.len()
     }
 
     pub async fn remove_peer(&self, addr: &SocketAddr, conn_id: u64) {
@@ -1005,10 +1009,26 @@ impl PeerRegistry {
         // Never wait for a slow or dead peer: a full queue would stall the caller (the main
         // tick, IPC handling) behind one bad link. A peer that misses a block catches up through
         // BlockSync when it reconnects.
+        // Once per node: its newest connection first, an older one if that queue is full.
         let peers = self.peers.read().await;
+        let mut by_node: HashMap<u64, Vec<(u64, &SocketAddr, &PeerLink)>> = HashMap::new();
+        for (addr, (link, id, conn)) in peers.iter() {
+            by_node.entry(*id).or_default().push((*conn, addr, link));
+        }
         let urgent = command.urgent();
-        for (addr, (link, _, _)) in peers.iter() {
-            if let Err(e) = link.for_command(command).try_send(envelope.clone()) {
+        for mut links in by_node.into_values() {
+            links.sort_unstable_by_key(|(conn, _, _)| std::cmp::Reverse(*conn));
+            let mut last = None;
+            for (_, addr, link) in &links {
+                match link.for_command(command).try_send(envelope.clone()) {
+                    Ok(()) => {
+                        last = None;
+                        break;
+                    }
+                    Err(e) => last = Some((*addr, e)),
+                }
+            }
+            if let Some((addr, e)) = last {
                 let counter = if urgent {
                     &self.stats.dropped_urgent
                 } else {
@@ -2012,6 +2032,71 @@ mod tests {
         );
         registry.remove_peer(&addr, 2).await;
         assert_eq!(registry.peer_count().await, 0);
+    }
+
+    /// Two nodes that list each other as seeds hold two connections, one dialed by each. That is
+    /// still one peer: counted once, and sent each broadcast once.
+    #[tokio::test]
+    async fn two_connections_to_one_node_are_one_peer() {
+        let registry = PeerRegistry::new(TrustStore::default());
+        let crypto = NodeCrypto::generate();
+        let (in_tx, mut in_rx) = mpsc::channel(8);
+        let (out_tx, mut out_rx) = mpsc::channel(8);
+        registry
+            .add_peer("10.0.0.2:41000".parse().unwrap(), one_queue(in_tx), 2, 1)
+            .await;
+        registry
+            .add_peer("10.0.0.2:7946".parse().unwrap(), one_queue(out_tx), 2, 2)
+            .await;
+        assert_eq!(registry.peer_count().await, 1, "one node, two connections");
+
+        registry
+            .broadcast(&alert("203.0.113.1"), 1, &crypto)
+            .await
+            .unwrap();
+        let mut delivered = 0;
+        while in_rx.try_recv().is_ok() || out_rx.try_recv().is_ok() {
+            delivered += 1;
+        }
+        assert_eq!(delivered, 1, "the node gets the broadcast once");
+    }
+
+    /// When one of a node's connections is stuck, its broadcast goes over the other.
+    #[tokio::test]
+    async fn broadcast_uses_another_connection_when_one_is_stuck() {
+        let registry = PeerRegistry::new(TrustStore::default());
+        let crypto = NodeCrypto::generate();
+        let (ok_tx, mut ok_rx) = mpsc::channel(8);
+        let (stuck_tx, _stuck_rx) = mpsc::channel(1);
+        stuck_tx
+            .try_send(seal(&crypto, 1, &NetworkMessage::Ping).unwrap())
+            .unwrap();
+        for (port, link, conn) in [(41000, ok_tx, 1), (7946, stuck_tx, 2)] {
+            registry
+                .add_peer(
+                    format!("10.0.0.2:{port}").parse().unwrap(),
+                    one_queue(link),
+                    2,
+                    conn,
+                )
+                .await;
+        }
+        registry
+            .broadcast(&alert("203.0.113.1"), 1, &crypto)
+            .await
+            .unwrap();
+        assert!(
+            ok_rx.try_recv().is_ok(),
+            "delivered over the healthy connection"
+        );
+        assert_eq!(
+            registry
+                .stats
+                .dropped_bulk
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "not counted as dropped"
+        );
     }
 
     /// A peer whose queue is full must not block a broadcast to everyone else.
