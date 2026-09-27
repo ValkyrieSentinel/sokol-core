@@ -128,7 +128,8 @@ v1 and v2 nodes cannot verify each other, so a mesh is upgraded in one window; e
 enforcing its own decisions (and its operator bans) the whole time, only mesh sharing pauses.
 
 1. Upgrade the binary on every node and restart it. At startup a v1 key file (raw Dilithium3,
-   5952 bytes) is moved to `node.key.dilithium3.retired` and a new ML-DSA identity is created;
+   5952 bytes) is kept as `node.key.dilithium3.retired` (or `.retired.1`, ... if that name is
+   taken; an existing backup is never overwritten) and a new ML-DSA identity is created;
    the log prints its public key. `--print-public-key` prints it too.
 2. Put the new `mldsa65:` keys into every peers file and send `RELOAD_PEERS`. Until then a peer
    listed with only an old (unprefixed) key is not trusted; startup and `RELOAD_PEERS` name it

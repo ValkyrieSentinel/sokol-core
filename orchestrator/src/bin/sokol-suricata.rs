@@ -19,6 +19,7 @@
         clippy::unwrap_used,
         clippy::expect_used,
         clippy::indexing_slicing,
+        clippy::string_slice,
         clippy::panic,
         clippy::unreachable,
         clippy::todo,
@@ -127,7 +128,11 @@ fn decide(line: &str, filter: &Filter) -> Option<Alert> {
         .take(160)
         .collect();
     Some(Alert {
-        event: blake3::hash(line.as_bytes()).to_hex()[..32].to_string(),
+        event: blake3::hash(line.as_bytes())
+            .to_hex()
+            .chars()
+            .take(32)
+            .collect(),
         src,
         dst,
         sid,

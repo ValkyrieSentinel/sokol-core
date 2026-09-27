@@ -396,10 +396,19 @@ issuer (вузол) · kind · target (канонічний) · issued_ms · exp
   з'єднання отримує найбільшу спільну. Якщо спільної немає, вузол закриває з'єднання й пише
   в лог обидва діапазони. Кадр v1 (`bincode` без magic) розпізнається й відхиляється з
   проханням оновити пір, а не з помилкою розбору.
-- **Перехід з v1.** Файл ключа v1 (сирий Dilithium3, 5952 байти) при старті відкладається в
-  `*.dilithium3.retired`, і створюється нова ідентичність ML-DSA. Вузол не зупиняється, бо
+- **Перехід з v1.** Файл ключа v1 (сирий Dilithium3, 5952 байти) при старті зберігається під
+  першим вільним іменем `*.dilithium3.retired[.N]` (жорстке посилання, що ніколи не
+  перезаписує наявну копію), і створюється нова ідентичність ML-DSA: `*.new` →
+  `rename` поверх ключа, з fsync каталогу після кожного кроку. Жоден збій не губить жодного
+  ключа (R27-06). Вузол не зупиняється, бо
   локальний захист важливіший за меш. Пір, указаний у peers-файлі лише старим ключем, не
-  довіряється, але й не валить ні старт, ні `RELOAD_PEERS`: відповідь його називає. Порядок
+  довіряється, але й не валить ні старт, ні `RELOAD_PEERS`: відповідь його називає.
+  Старим вважається лише точний формат v1 (3904 шістнадцяткові цифри). Будь-що інше без
+  `mldsa65:` (наприклад, помилка в префіксі) — це помилка конфігурації, і чинна довіра
+  лишається (R27-02). `RELOAD_PEERS` також відмовляє, якщо пір, якому зараз довіряють за
+  ключем ML-DSA, у новому файлі має лише старий ключ. Дублікати `node_id` перевіряються
+  незалежно від формату ключа. Розбір ключа йде побайтово, лише ASCII: багатобайтовий символ
+  тепер помилка, а не паніка (R27-01). Порядок
   оновлення описано в README.
 - **Прив'язка з'єднання.** Перше повідомлення має бути рукостисканням. Після нього з'єднання
   говорить лише від імені того, хто в ньому назвався.
@@ -415,7 +424,11 @@ issuer (вузол) · kind · target (канонічний) · issued_ms · exp
 `a_signature_made_for_another_context_does_not_verify`, `frames_of_other_protocol_versions_are_named`,
 `a_peer_without_a_common_version_is_disconnected`,
 `a_legacy_key_file_is_retired_and_a_new_identity_created`,
-`legacy_peer_keys_are_not_trusted_but_do_not_stop_the_node`. Smoke: «a legacy key file is
+`legacy_peer_keys_are_not_trusted_but_do_not_stop_the_node`, `no_key_text_panics` (proptest,
+довільний UTF-8), `a_mistyped_prefix_is_an_error_not_a_legacy_key`,
+`duplicate_ids_are_refused_even_when_one_is_legacy`,
+`a_reload_cannot_demote_a_trusted_peer_to_a_legacy_key`,
+`migration_never_overwrites_an_existing_backup`. Smoke: «a legacy key file is
 retired and replaced by an ML-DSA identity», «RELOAD_PEERS names a peer listed with only a
 legacy key».
 
@@ -813,8 +826,10 @@ sudo scripts/xdp-smoke.sh target/release/orchestrator
 Release збирається з `panic = "abort"`, тож паніка на шляху даних зупиняє весь вузол. Причиною
 може бути `unwrap`, вихід за межі масиву чи `expect` на кадрі піра, рядку IPC, з'єднанні з
 пасткою або файлі. Тому в усіх корнях крейтів (`main.rs`, кожен `bin/`, `common`) поза тестами
-заборонено `clippy::{unwrap_used, expect_used, indexing_slicing, panic, unreachable, todo,
-unimplemented}`. Порушення валить крок Clippy у CI.
+заборонено `clippy::{unwrap_used, expect_used, indexing_slicing, string_slice, panic,
+unreachable, todo, unimplemented}`. `string_slice` додано після R27-01: `indexing_slicing`
+не ловить нарізання `str`, і `&s[i..i + 2]` у розборі hex панікував на багатобайтовому
+символі. Лінт — корисний фільтр, а не доказ відсутності паніки. Порушення валить крок Clippy у CI.
 
 Єдиний виняток — `Claim::id`: серіалізація цієї структури не може впасти. Виняток позначено
 локальним `allow` з причиною.

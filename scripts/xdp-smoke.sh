@@ -285,6 +285,10 @@ printf '[{"node_id": 2, "public_key": "%s"}, {"node_id": 9, "public_key": "%s"}]
     "$PEER_KEY_HEX" "$LEGACY_HEX" >"$WORK/peers.json"
 check "RELOAD_PEERS names a peer listed with only a legacy key and keeps the others" \
     bash -c "printf 'RELOAD_PEERS\\n' | nc -U -q1 '$WORK/control.sock' | grep -q '^OK 1 pinned peers; not trusted until their ML-DSA key is listed (legacy key only): \\[9\\]'"
+# R27-02: a mistyped algorithm prefix is an error; the current trust (node 2) stays.
+printf '[{"node_id": 2, "public_key": "%s"}]' "$(echo "$PEER_KEY_HEX" | sed 's/^mldsa65:/mldsa6S:/')" >"$WORK/peers.json"
+check "RELOAD_PEERS refuses a mistyped key prefix instead of revoking the peer" \
+    bash -c "printf 'RELOAD_PEERS\\n' | nc -U -q1 '$WORK/control.sock' | grep -q '^ERR .*neither .mldsa65:<hex>. nor a legacy'"
 printf 'not json' >"$WORK/peers.json"
 check "RELOAD_PEERS keeps the current trust when the file is broken" bash -c "printf 'RELOAD_PEERS\\n' | nc -U -q1 '$WORK/control.sock' | grep -q 'previous trust store kept'"
 OPERATOR_BIN="$(dirname "$BIN")/sokol-operator"
