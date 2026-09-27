@@ -10,8 +10,8 @@
 #       not as a number. The node's own audit time for the block is reported next to it.
 #
 #   sudo bench/local.sh fill <orchestrator> [count]
-#       B7: <count> blocks (default 65 536, the map capacity) over one IPC connection with a 20 s
-#       TTL: signal rate, time until all are in the kernel map, memory, legitimate traffic
+#       B7: <count> blocks (default 65 536, the map capacity) over two IPC connections (the socket
+#       is paced at 2 000 lines/s in all) with a TTL that outlasts the fill: signal rate, time until all are in the kernel map, memory, legitimate traffic
 #       during the fill, and time until all have expired again. Postconditions are checked, not
 #       assumed: the run fails if the map never holds them all or they never all expire, and a
 #       packet witness (sampled blocked addresses sending real packets) must see them dropped
@@ -33,6 +33,7 @@ cleanup() {
     rm -rf "$WORK"
 }
 trap cleanup EXIT
+trap "exit 130" INT TERM   # a killed run still removes its namespaces and nodes
 ip link del "$HIF" 2>/dev/null || true; ip netns del "$NS" 2>/dev/null || true
 
 ip netns add "$NS"
@@ -114,7 +115,10 @@ latency)
     ;;
 fill)
     COUNT=${ARG:-65536}
-    start --block-ttl 20 --block-ttl-max 20
+    # The IPC socket takes 2 000 lines/s in all (ADR-0013); signals go over two connections and
+    # the TTL outlasts the paced fill, so the map can hold them all at once.
+    TTL=$(( COUNT / 2000 + 40 ))
+    start --block-ttl "$TTL" --block-ttl-max "$TTL"
     # Packet witness: a few of the addresses that will be blocked, sending real packets.
     WITNESS=()
     for i in 7 4099 20011 40009 $((COUNT - 1)); do
@@ -130,34 +134,39 @@ fill)
     ip netns exec "$NS" ping -i 0.05 -I 10.241.0.2 "$HOST" >"$WORK/legit.ping" 2>&1 &
     lp=$!
     t0=$(date +%s%3N)
-    awk -v n="$COUNT" 'BEGIN { for (i = 0; i < n; i++) printf "DROP_IMMEDIATE:100.%d.%d.%d\n", 64 + int(i / 65536) % 64, int(i / 256) % 256, i % 256 }' \
-        | nc -U -q1 "$WORK/ipc.sock"
+    senders=()
+    for half in 0 1; do
+        awk -v n="$COUNT" -v h="$half" 'BEGIN { for (i = h; i < n; i += 2) printf "DROP_IMMEDIATE:100.%d.%d.%d\n", 64 + int(i / 65536) % 64, int(i / 256) % 256, i % 256 }' \
+            | nc -U -q1 "$WORK/ipc.sock" &
+        senders+=($!)
+    done
+    wait "${senders[@]}"   # not a bare wait: the node and the ping run in the background too
     t_sent=$(date +%s%3N)
     filled=""; peak=0
-    for _ in $(seq 1 1200); do
+    for _ in $(seq 1 $(( TTL * 10 ))); do
         now=$(metric 'sokol_blocks_active{family="ipv4"}'); now=${now:-0}
         [ "$now" -gt "$peak" ] && peak=$now
         [ "$now" = "$COUNT" ] && { filled=1; break; }
         sleep 0.1
     done
     t_all=$(date +%s%3N)
-    [ -n "$filled" ] || { echo "FAIL the kernel map never held all $COUNT blocks within 120 s (peak $peak, capacity $(metric sokol_blocks_capacity), pending now $(metric sokol_blocks_pending))"; exit 1; }
+    [ -n "$filled" ] || { echo "FAIL the kernel map never held all $COUNT blocks within $TTL s (peak $peak, capacity $(metric sokol_blocks_capacity), pending now $(metric sokol_blocks_pending))"; exit 1; }
     during=$(witness_pass)
     [ "$during" = 0 ] || { echo "FAIL witness: $during of ${#WITNESS[@]} blocked addresses still reach the node"; exit 1; }
     rss1=$(grep VmRSS /proc/"$ORCH"/status | awk '{print $2}')
     echo "B7 $COUNT signals written in $((t_sent - t0)) ms; all $COUNT in the kernel map after $((t_all - t0)) ms ($(( COUNT * 1000 / (t_all - t0 + 1) )) blocks/s); witness: ${#WITNESS[@]}/${#WITNESS[@]} sampled addresses dropped"
     echo "   RSS $((rss0 / 1024)) MB -> $((rss1 / 1024)) MB; watermark logged: $(grep -c 'blocklist is' "$WORK/node.log")"
     gone=""
-    for _ in $(seq 1 600); do
+    for _ in $(seq 1 $(( (TTL + 60) * 10 ))); do
         [ "$(metric 'sokol_blocks_active{family="ipv4"}')" = "0" ] && { gone=1; break; }
         sleep 0.1
     done
     t_gone=$(date +%s%3N)
     kill -INT "$lp" 2>/dev/null || true; wait "$lp" 2>/dev/null || true
-    [ -n "$gone" ] || { echo "FAIL $(metric 'sokol_blocks_active{family="ipv4"}') blocks still active 60 s after the fill (TTL 20 s)"; exit 1; }
+    [ -n "$gone" ] || { echo "FAIL $(metric 'sokol_blocks_active{family="ipv4"}') blocks still active $((TTL + 60)) s after the fill (TTL $TTL s)"; exit 1; }
     after=$(witness_pass)
     [ "$after" = "${#WITNESS[@]}" ] || { echo "FAIL witness: only $after of ${#WITNESS[@]} addresses pass again after the expiry"; exit 1; }
-    echo "   all expired $((t_gone - t_all)) ms after the fill completed (TTL 20 s); witness: all pass again"
+    echo "   all expired $((t_gone - t_all)) ms after the fill completed (TTL $TTL s); witness: all pass again"
     echo "   legitimate ping during the test: $(grep -E 'packet loss' "$WORK/legit.ping")"
     echo "   rtt: $(grep -E 'rtt' "$WORK/legit.ping")"
     ;;
