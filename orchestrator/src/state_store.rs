@@ -320,6 +320,27 @@ pub fn read_state(path: &Path) -> Result<Option<Persisted>, Restore> {
             })
         }
     };
+    // The layout is checked first, so a file of another schema is named as such, not as corrupt.
+    #[derive(serde::Deserialize)]
+    struct Head {
+        schema: Option<u32>,
+    }
+    if let Ok(Head {
+        schema: Some(schema),
+    }) = serde_json::from_slice::<Head>(&bytes)
+    {
+        if schema != crate::block_table::STATE_SCHEMA {
+            return Err(Restore::Failed {
+                why: format!(
+                    "{} has state schema {}, this build reads {} (no migration)",
+                    path.display(),
+                    schema,
+                    crate::block_table::STATE_SCHEMA
+                ),
+                kept: keep_aside(path),
+            });
+        }
+    }
     serde_json::from_slice::<Persisted>(&bytes)
         .map(Some)
         .map_err(|e| Restore::Failed {
@@ -495,6 +516,37 @@ mod tests {
         assert!(
             matches!(read_state(&dir), Err(Restore::Failed { kept: None, .. })),
             "an unreadable path is a failure, not a first start"
+        );
+    }
+
+    #[test]
+    fn another_schema_is_refused_by_name_and_an_unversioned_file_is_schema_1() {
+        let path = temp("schema");
+        save_state(&path, &state(2)).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("\"schema\":1"),
+            "the schema is written: {}",
+            text
+        );
+
+        std::fs::write(&path, text.replace("\"schema\":1", "\"schema\":2")).unwrap();
+        match read_state(&path) {
+            Err(Restore::Failed { why, kept: Some(_) }) => {
+                assert!(
+                    why.contains("state schema 2, this build reads 1"),
+                    "{}",
+                    why
+                )
+            }
+            other => panic!("expected a refused schema, got {:?}", other),
+        }
+
+        std::fs::write(&path, text.replace("\"schema\":1,", "")).unwrap();
+        assert_eq!(
+            read_state(&path).unwrap().unwrap(),
+            state(2),
+            "a file from before the field reads as schema 1"
         );
     }
 
