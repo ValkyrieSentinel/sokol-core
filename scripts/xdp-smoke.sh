@@ -238,6 +238,21 @@ for _ in $(seq 1 30); do grep -q "Protected host addresses changed: +\[\] -\[$MO
 check "once the address leaves the node it is no longer protected" \
     bash -c "printf 'BAN_IP:$MOVED_IP\\n' | nc -U -q1 '$WORK/control.sock' | grep -q '^OK'"
 check "host addresses are being re-read" test "$(metric sokol_protected_refresh_ok)" = 1
+# Outcomes: each block counts the packets it drops in the kernel; its removal records that.
+OUT_BUSY=10.231.0.17; OUT_IDLE=10.231.0.18
+ip netns exec "$NS" ip addr add "$OUT_BUSY/24" dev "$PEER_IF"
+printf 'BAN_IP:%s\n' "$OUT_BUSY" | nc -U -q1 "$WORK/control.sock" >/dev/null
+printf 'BAN_IP:%s\n' "$OUT_IDLE" | nc -U -q1 "$WORK/control.sock" >/dev/null
+ip netns exec "$NS" ping -c 5 -i 0.2 -W 1 -I "$OUT_BUSY" "$HOST_IP" >/dev/null 2>&1 || true
+printf 'UNBAN_IP:%s\n' "$OUT_BUSY" | nc -U -q1 "$WORK/control.sock" >/dev/null
+printf 'UNBAN_IP:%s\n' "$OUT_IDLE" | nc -U -q1 "$WORK/control.sock" >/dev/null
+sleep 1.5
+BUSY_DROPPED=$(grep -o "Outcome of the block of $OUT_BUSY: [0-9]* packets" "$LOG" | tail -1 | awk '{print $(NF-1)}')
+check "a lifted block records the packets it dropped ($BUSY_DROPPED >= 5)" test "${BUSY_DROPPED:-0}" -ge 5
+check "a block that saw no traffic records that it dropped none" \
+    grep -q "Outcome of the block of $OUT_IDLE: 0 packets dropped" "$LOG"
+check "outcomes are in the audit log and the metrics" bash -c \
+    "grep -aq 'BLOCK_OUTCOME|IP:$OUT_BUSY|Dropped:' '$WORK/events.sntl' && test \"\$(curl -s http://127.0.0.1:9469/metrics | awk '\$1 == \"sokol_block_outcomes_total{effect=\\\"none\\\"}\" { print \$2 }')\" -ge 1"
 check "the maintenance tick is measured and takes well under its period" \
     awk -v t="$(metric sokol_tick_seconds_max)" 'BEGIN { exit !(t != "" && t < 0.5) }'
 check "mesh admission counters are exported" \

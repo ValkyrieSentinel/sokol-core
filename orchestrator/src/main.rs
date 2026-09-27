@@ -1273,9 +1273,15 @@ async fn main() -> Result<(), anyhow::Error> {
         base: Duration::from_secs(args.block_ttl),
         max: Duration::from_secs(args.block_ttl_max.max(args.block_ttl)),
     };
+    let block_hits = PerCpuArray::<MapData, u64>::try_from(
+        bpf.take_map("BLOCK_HITS")
+            .ok_or_else(|| anyhow::anyhow!("BLOCK_HITS missing"))?,
+    )?;
     let blocks: SharedBlockTable = Arc::new(tokio::sync::Mutex::new(BlockTable::new(
         blocklist_v4_trie,
         blocklist_v6_trie,
+        block_hits,
+        aya::util::nr_cpus()?,
         ttl_policy,
         args.node_id,
     )));
@@ -2139,6 +2145,7 @@ async fn main() -> Result<(), anyhow::Error> {
 
     let mut ticker = tokio::time::interval(Duration::from_secs(1));
     let mut tick_max_secs = 0.0f64;
+    let mut outcome_stats = metrics::OutcomeStats::default();
     let mut shutdown_rx_loop = shutdown_rx.clone();
     let node_id_hb = args.node_id;
     let p2p_bind_hb = args.p2p_bind.clone();
@@ -2203,11 +2210,41 @@ async fn main() -> Result<(), anyhow::Error> {
                 let tick_started = std::time::Instant::now();
                 atp_controller.reset();
 
-                let released = blocks.lock().await.tick(now_ms());
+                let (released, (outcomes, outcomes_dropped)) = {
+                    let mut table = blocks.lock().await;
+                    let released = table.tick(now_ms());
+                    (released, table.take_outcomes())
+                };
                 for ip in released {
                     log::info!("[BlockTable] Block for {} expired; traffic allowed again", show(&ip));
                     sntl_db.append(format!("BLOCK_EXPIRED_{}|IP:{}", ip_tag(ip), show(&ip)));
                 }
+                // The node's memory of consequences: what every removed block actually did.
+                for o in outcomes {
+                    let seconds = o.removed_ms.saturating_sub(o.applied_ms) / 1000;
+                    let hits = o.hits.map_or_else(|| "unknown".to_string(), |h| h.to_string());
+                    log::info!(
+                        "[BlockTable] Outcome of the block of {}: {} packets dropped in {} s",
+                        show(&o.net),
+                        hits,
+                        seconds
+                    );
+                    sntl_db.append(format!(
+                        "BLOCK_OUTCOME|IP:{}|Dropped:{}|Seconds:{}",
+                        show(&o.net),
+                        hits,
+                        seconds
+                    ));
+                    match o.hits {
+                        Some(0) => outcome_stats.idle += 1,
+                        Some(h) => {
+                            outcome_stats.effective += 1;
+                            outcome_stats.hits += h;
+                        }
+                        None => outcome_stats.unknown += 1,
+                    }
+                }
+                outcome_stats.dropped += outcomes_dropped;
 
                 // ADR-4: this node's decisions and lifts survive a restart (<= 1 tick for detector
                 // decisions; operator decisions are written before they are answered).
@@ -2300,6 +2337,7 @@ async fn main() -> Result<(), anyhow::Error> {
                 let tick_secs = tick_started.elapsed().as_secs_f64();
                 tick_max_secs = tick_max_secs.max(tick_secs);
                 snapshot.tick_secs = tick_secs;
+                snapshot.outcomes = outcome_stats;
                 snapshot.tick_max_secs = tick_max_secs;
                 snapshot.protected_refresh_ok =
                     host_read_ok.load(std::sync::atomic::Ordering::Relaxed);
