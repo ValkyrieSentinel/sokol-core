@@ -1,0 +1,46 @@
+# cargo-deny: dependency policy checked in CI (`cargo deny check`).
+[graph]
+all-features = true
+
+[advisories]
+# RustSec: known vulnerabilities fail; unmaintained crates are reported for our direct deps.
+version = 2
+yanked = "deny"
+unmaintained = "workspace"
+# Known and tracked: each is unmaintained, none has a known vulnerability. New advisories fail.
+ignore = [
+    # bincode 1.x frames the mesh envelope. Replacing it changes the wire format, so it goes
+    # together with protocol versioning (roadmap, milestone 2).
+    { id = "RUSTSEC-2025-0141", reason = "mesh envelope framing; replaced with the wire-format versioning" },
+    # pqcrypto-dilithium is superseded by pqcrypto-mldsa (ML-DSA, FIPS 204), and PQClean, which
+    # both wrap, is being archived. Moving to ML-DSA changes keys and signatures: its own change.
+    { id = "RUSTSEC-2024-0380", reason = "move to ML-DSA (FIPS 204) is a key/signature format change" },
+    { id = "RUSTSEC-2026-0162", reason = "pqcrypto-traits goes with the ML-DSA migration" },
+]
+
+[licenses]
+version = 2
+# Permissive licenses only: the code is proprietary, so copyleft dependencies are not allowed.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "Zlib",
+    "Unicode-3.0",
+    "CC0-1.0",
+]
+confidence-threshold = 0.9
+# Our own crates are not published and carry no license field.
+private = { ignore = true }
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

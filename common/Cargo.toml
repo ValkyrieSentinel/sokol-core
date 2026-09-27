@@ -2,6 +2,7 @@
 name = "common"
 version = "0.1.0"
 edition = "2021"
+publish = false
 
 [dependencies]
 blake3 = { version = "1.5", optional = true }
@@ -9,3 +10,5 @@ blake3 = { version = "1.5", optional = true }
 [features]
 default = ["std"]
 std = ["dep:blake3"]
+[dev-dependencies]
+proptest = { version = "1", default-features = false, features = ["std"] }

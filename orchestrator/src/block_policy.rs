@@ -32,7 +32,8 @@ impl BlockPolicy {
         Self {
             protected: builtin
                 .iter()
-                .map(|(net, why)| (net.parse().expect("builtin CIDR"), *why))
+                // Every entry parses (test `builtin_ranges_all_parse`).
+                .filter_map(|(net, why)| net.parse().ok().map(|net| (net, *why)))
                 .collect(),
             min_prefix_v4: 16,
             min_prefix_v6: 48,
@@ -160,11 +161,12 @@ fn parse_ipv4_default_gateways(table: &str) -> Vec<IpAddr> {
         .lines()
         .skip(1)
         .filter_map(|line| {
-            let cols: Vec<&str> = line.split_whitespace().collect();
-            if cols.len() < 3 || cols[1] != "00000000" {
+            let mut cols = line.split_whitespace();
+            let (_iface, destination, gateway) = (cols.next()?, cols.next()?, cols.next()?);
+            if destination != "00000000" {
                 return None;
             }
-            let gw = u32::from_str_radix(cols[2], 16).ok()?;
+            let gw = u32::from_str_radix(gateway, 16).ok()?;
             (gw != 0).then(|| IpAddr::V4(Ipv4Addr::from(u32::from_be(gw))))
         })
         .collect()
@@ -175,11 +177,14 @@ fn parse_ipv6_default_gateways(table: &str) -> Vec<IpAddr> {
     table
         .lines()
         .filter_map(|line| {
-            let cols: Vec<&str> = line.split_whitespace().collect();
-            if cols.len() < 5 || cols[1] != "00" || cols[0].chars().any(|c| c != '0') {
+            let mut cols = line.split_whitespace();
+            let destination = cols.next()?;
+            let prefix_len = cols.next()?;
+            let next_hop = cols.nth(2)?;
+            if prefix_len != "00" || destination.chars().any(|c| c != '0') {
                 return None;
             }
-            let hop = u128::from_str_radix(cols[4], 16).ok()?;
+            let hop = u128::from_str_radix(next_hop, 16).ok()?;
             (hop != 0).then(|| IpAddr::V6(Ipv6Addr::from(hop)))
         })
         .collect()
@@ -191,6 +196,12 @@ mod tests {
 
     fn ip(s: &str) -> IpAddr {
         s.parse().unwrap()
+    }
+
+    #[test]
+    fn builtin_ranges_all_parse() {
+        // builtin() skips an entry that does not parse; none may.
+        assert_eq!(BlockPolicy::builtin().protected.len(), 8);
     }
 
     #[test]

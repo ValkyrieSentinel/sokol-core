@@ -114,6 +114,9 @@ pub type ClaimId = String;
 
 impl Claim {
     pub fn id(&self) -> ClaimId {
+        // Integers, strings and a unit enum: serialization cannot fail, and a fallback would
+        // give distinct claims one id.
+        #[allow(clippy::expect_used, reason = "serializing this struct cannot fail")]
         let bytes = serde_json::to_vec(self).expect("claim serializes");
         blake3::hash(&bytes).to_hex().to_string()
     }
@@ -639,13 +642,12 @@ impl<B: Blocklist> BlockTable<B> {
                 (Some(have), Some(want), Some(t)) => want < have.saturating_add(ms(t) / 4),
                 (Some(have), Some(want), None) => have >= want,
             };
-            if enough {
-                let id = own
-                    .iter()
-                    .find(|(_, e)| *e == longest)
-                    .map(|(id, _)| id.clone())
-                    .expect("longest is one of them");
-                let claim = self.claims[&id].claim.clone();
+            let running = own
+                .iter()
+                .find(|(_, e)| *e == longest)
+                .and_then(|(id, _)| self.claims.get(id))
+                .map(|h| h.claim.clone());
+            if let Some(claim) = running.filter(|_| enough) {
                 let applied = self.reconcile(net, now_ms);
                 let left = claim
                     .expires_ms
@@ -774,8 +776,11 @@ impl<B: Blocklist> BlockTable<B> {
         );
         let was = self.applied.contains(&net);
         let result = self.reconcile(net, now_ms);
-        let held = &self.claims[&id];
-        match (result, self.hold_reason(&id, held, now_ms)) {
+        let reason = self
+            .claims
+            .get(&id)
+            .and_then(|held| self.hold_reason(&id, held, now_ms));
+        match (result, reason) {
             (Ok(()), None) if !was && self.applied.contains(&net) => Adoption::Enforced,
             (Ok(()), None) => Adoption::Held("already blocked"),
             (Err(_), None) => Adoption::Held("map"),
@@ -902,7 +907,9 @@ impl<B: Blocklist> BlockTable<B> {
         let mut liftable = Vec::new();
         let (mut has_static, mut blocked) = (false, false);
         for id in ids {
-            let h = &self.claims[&id];
+            let Some(h) = self.claims.get(&id) else {
+                continue;
+            };
             let effective = self.effective(&id, h, now_ms);
             if h.claim.kind == ClaimKind::Static {
                 has_static |= effective;
@@ -945,7 +952,10 @@ impl<B: Blocklist> BlockTable<B> {
             .filter(|(_, h)| h.claim.kind != ClaimKind::Static)
             .map(|(id, _)| id.clone())
             .collect();
-        let nets: Vec<IpNet> = ids.iter().map(|id| self.claims[id].net).collect();
+        let nets: Vec<IpNet> = ids
+            .iter()
+            .filter_map(|id| self.claims.get(id).map(|h| h.net))
+            .collect();
         let lifted = self.lift_ids(ids);
         (self.settle(nets, now_ms), lifted)
     }
@@ -958,7 +968,10 @@ impl<B: Blocklist> BlockTable<B> {
             .filter(|(_, h)| h.claim.kind == ClaimKind::Detector)
             .map(|(id, _)| id.clone())
             .collect();
-        let nets: Vec<IpNet> = ids.iter().map(|id| self.claims[id].net).collect();
+        let nets: Vec<IpNet> = ids
+            .iter()
+            .filter_map(|id| self.claims.get(id).map(|h| h.net))
+            .collect();
         let lifted = self.lift_ids(ids);
         (self.settle(nets, now_ms), lifted)
     }
@@ -1286,10 +1299,11 @@ impl Watermark {
     /// Returns a message when a family crosses the watermark in either direction.
     pub fn update(&mut self, (v4, v6): (usize, usize), capacity: usize) -> Vec<String> {
         let mut messages = Vec::new();
-        for (i, (name, used)) in [("IPv4", v4), ("IPv6", v6)].into_iter().enumerate() {
+        let families = [("IPv4", v4), ("IPv6", v6)];
+        for ((name, used), was_above) in families.into_iter().zip(self.above.iter_mut()) {
             let above = used as f64 >= capacity as f64 * WATERMARK;
-            if above != self.above[i] {
-                self.above[i] = above;
+            if above != *was_above {
+                *was_above = above;
                 messages.push(if above {
                     format!(
                         "{} blocklist is {}/{} full; new blocks will fail at capacity",

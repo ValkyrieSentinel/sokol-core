@@ -154,8 +154,13 @@ impl<R: Read + Seek> AuditReader<R> {
         if !read_full(&mut self.inner, &mut rest)? {
             return Ok(false);
         }
-        let start = u64::from_le_bytes(rest[0..8].try_into().unwrap());
-        let prev: [u8; CHAIN_LEN] = rest[8..].try_into().unwrap();
+        let (Some(start), Some(prev)) = (chunk::<8>(&rest, 0), chunk::<CHAIN_LEN>(&rest, 8)) else {
+            return Err(AuditError::Corrupt {
+                offset: 0,
+                reason: "short segment header",
+            });
+        };
+        let start = u64::from_le_bytes(start);
         self.segment_start = Some((start, prev));
         self.next_seq = start;
         self.chain = prev;
@@ -191,12 +196,20 @@ impl<R: Read + Seek> AuditReader<R> {
             offset: self.offset,
             reason,
         };
-        if header[0..4] != MAGIC {
+        let (Some(magic), Some(len), Some(seq), Some(timestamp_ms)) = (
+            chunk::<4>(&header, 0),
+            chunk::<4>(&header, 4),
+            chunk::<8>(&header, 8),
+            chunk::<8>(&header, 16),
+        ) else {
+            return Err(corrupt("short record header"));
+        };
+        if magic != MAGIC {
             return Err(corrupt("bad record magic (not a sokol audit log v2?)"));
         }
-        let len = u32::from_le_bytes(header[4..8].try_into().unwrap()) as usize;
-        let seq = u64::from_le_bytes(header[8..16].try_into().unwrap());
-        let timestamp_ms = u64::from_le_bytes(header[16..24].try_into().unwrap());
+        let len = u32::from_le_bytes(len) as usize;
+        let seq = u64::from_le_bytes(seq);
+        let timestamp_ms = u64::from_le_bytes(timestamp_ms);
         if len > MAX_PAYLOAD {
             return Err(corrupt("record length exceeds maximum"));
         }
@@ -205,7 +218,9 @@ impl<R: Read + Seek> AuditReader<R> {
         if !read_full(&mut self.inner, &mut body)? {
             return Ok(None);
         }
-        let chain: [u8; CHAIN_LEN] = body[len..].try_into().unwrap();
+        let Some(chain) = chunk::<CHAIN_LEN>(&body, len) else {
+            return Err(corrupt("short record"));
+        };
         body.truncate(len);
 
         if seq != self.next_seq {
@@ -227,11 +242,16 @@ impl<R: Read + Seek> AuditReader<R> {
     }
 }
 
+/// The `N` bytes of `b` at `at`, if there are that many.
+fn chunk<const N: usize>(b: &[u8], at: usize) -> Option<[u8; N]> {
+    b.get(at..at.checked_add(N)?)?.try_into().ok()
+}
+
 /// `Ok(false)` if EOF is reached before `buf` is full.
 fn read_full<R: Read>(r: &mut R, buf: &mut [u8]) -> io::Result<bool> {
     let mut filled = 0;
     while filled < buf.len() {
-        match r.read(&mut buf[filled..]) {
+        match r.read(buf.get_mut(filled..).unwrap_or_default()) {
             Ok(0) => return Ok(false),
             Ok(n) => filled += n,
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
@@ -284,8 +304,11 @@ pub fn rotated_segments(path: &Path) -> io::Result<Vec<(u64, PathBuf)>> {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().to_string();
         if let Some(suffix) = name.strip_prefix(&base) {
+            // Twenty digits can still exceed u64 (a stray file must not stop the node).
             if suffix.len() == 20 && suffix.bytes().all(|b| b.is_ascii_digit()) {
-                out.push((suffix.parse().unwrap(), entry.path()));
+                if let Ok(start) = suffix.parse() {
+                    out.push((start, entry.path()));
+                }
             }
         }
     }
@@ -702,6 +725,18 @@ mod tests {
         max_bytes: 200,
         keep: 3,
     };
+
+    #[test]
+    fn a_stray_file_with_an_oversized_suffix_is_ignored() {
+        // Twenty digits that overflow u64 used to panic, which aborts the node at startup.
+        let path = temp_path("stray-suffix");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut stray = path.as_os_str().to_owned();
+        stray.push(".99999999999999999999");
+        std::fs::write(&stray, b"x").unwrap();
+        assert_eq!(rotated_segments(&path).unwrap(), vec![]);
+        std::fs::remove_file(&stray).unwrap();
+    }
 
     #[test]
     fn rotation_keeps_one_chain_across_segments() {

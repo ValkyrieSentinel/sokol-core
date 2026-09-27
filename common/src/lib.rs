@@ -1,4 +1,20 @@
 #![cfg_attr(not(feature = "std"), no_std)]
+// Release builds abort on panic (panic = "abort"), so a panic reachable from input (a peer's
+// frame, an IPC line, a trap connection, a file) stops the node. Outside tests, code must not
+// be able to panic: no unwrap/expect, no unchecked indexing or slicing, no panic!-family macros.
+// A provably safe exception is allowed locally, with its reason.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented
+    )
+)]
 
 #[cfg(feature = "std")]
 extern crate std;

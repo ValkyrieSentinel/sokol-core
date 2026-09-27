@@ -8,6 +8,23 @@
 //! ```text
 //! sokol-suricata --eve /var/log/suricata/eve.json --ipc-socket /run/sokol/sokol.sock --max-severity 2
 //! ```
+
+// Release builds abort on panic (panic = "abort"), so a panic reachable from input (a peer's
+// frame, an IPC line, a trap connection, a file) stops the node. Outside tests, code must not
+// be able to panic: no unwrap/expect, no unchecked indexing or slicing, no panic!-family macros.
+// A provably safe exception is allowed locally, with its reason.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented
+    )
+)]
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Seek, SeekFrom};
@@ -212,7 +229,9 @@ impl Follower {
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(e) => return Err(e),
         }
-        let reader = self.reader.as_mut().expect("opened above");
+        let Some(reader) = self.reader.as_mut() else {
+            return Ok(Vec::new());
+        };
         let mut lines = Vec::new();
         loop {
             let mut chunk = String::new();

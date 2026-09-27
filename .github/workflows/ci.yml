@@ -12,6 +12,8 @@ env:
   BPF_LINKER_SHA256: e058a6aecc9e65fa4c977b298a8e4b738424d7629769fd352eed409fb57e16e8
   GOBGP_VERSION: 4.9.0
   GOBGP_SHA256: 653f52cd11614cff847c9a70dd800b1d2746e61d5796744f591388db7084a038
+  CARGO_DENY_VERSION: 0.20.2
+  CARGO_DENY_SHA256: 9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f
 
 jobs:
   build-test-smoke:
@@ -46,6 +48,14 @@ jobs:
         run: |
           cargo fmt --all --check
           (cd ebpf && cargo fmt --check)
+
+      - name: Dependency policy (cargo-deny, deny.toml)
+        run: |
+          curl -sSfL -o /tmp/cargo-deny.tar.gz "https://github.com/EmbarkStudios/cargo-deny/releases/download/${CARGO_DENY_VERSION}/cargo-deny-${CARGO_DENY_VERSION}-x86_64-unknown-linux-musl.tar.gz"
+          echo "${CARGO_DENY_SHA256}  /tmp/cargo-deny.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/cargo-deny.tar.gz -C /tmp --strip-components=1
+          /tmp/cargo-deny check
+          /tmp/cargo-deny --manifest-path ebpf/Cargo.toml check
 
       - name: Build eBPF program
         working-directory: ebpf

@@ -1,3 +1,19 @@
+// Release builds abort on panic (panic = "abort"), so a panic reachable from input (a peer's
+// frame, an IPC line, a trap connection, a file) stops the node. Outside tests, code must not
+// be able to panic: no unwrap/expect, no unchecked indexing or slicing, no panic!-family macros.
+// A provably safe exception is allowed locally, with its reason.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented
+    )
+)]
 use std::collections::HashMap;
 use std::io::{self, Write};
 use std::net::Ipv4Addr;
@@ -38,10 +54,10 @@ fn read_new_events(reader: &mut Option<Reader>, events: &mut Vec<AuditEvent>) ->
             events.clear();
         }
     }
-    if reader.is_none() {
-        *reader = Some(AuditReader::open(path)?);
-    }
-    let r = reader.as_mut().unwrap();
+    let r = match reader {
+        Some(r) => r,
+        None => reader.insert(AuditReader::open(path)?),
+    };
 
     loop {
         let record = match r.next_record() {
@@ -140,11 +156,8 @@ fn get_ebpf_active_blocks() -> Vec<String> {
                         .filter_map(|s| u8::from_str_radix(s, 16).ok())
                         .collect();
 
-                    if hex_bytes.len() >= 8 {
-                        let ip = format!(
-                            "{}.{}.{}.{}",
-                            hex_bytes[4], hex_bytes[5], hex_bytes[6], hex_bytes[7]
-                        );
+                    if let Some([a, b, c, d]) = hex_bytes.get(4..8) {
+                        let ip = format!("{}.{}.{}.{}", a, b, c, d);
                         banned_ips.push(ip);
                     }
                 }
@@ -283,7 +296,7 @@ fn main() -> io::Result<()> {
 
         let start = events.len().saturating_sub(8);
 
-        for ev in &events[start..] {
+        for ev in events.iter().skip(start) {
             println!(
                 "{:<6} | {:<15} | {:<18.18} | {:<6} | {:<20.20}",
                 ev.seq, ev.ip, ev.tier, ev.payload_len, ev.payload_snippet

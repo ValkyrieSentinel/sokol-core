@@ -1,3 +1,19 @@
+// Release builds abort on panic (panic = "abort"), so a panic reachable from input (a peer's
+// frame, an IPC line, a trap connection, a file) stops the node. Outside tests, code must not
+// be able to panic: no unwrap/expect, no unchecked indexing or slicing, no panic!-family macros.
+// A provably safe exception is allowed locally, with its reason.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented
+    )
+)]
 use axum::{
     extract::{Json, State},
     response::sse::Event,
@@ -78,7 +94,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let program: &mut Xdp = ebpf
         .program_mut("sentinel_vfr_filter")
-        .unwrap()
+        .ok_or("XDP program sentinel_vfr_filter not found in the eBPF object")?
         .try_into()?;
     program.load()?;
     let link_id = program.attach(&iface, XdpFlags::default())?;
@@ -112,10 +128,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/client/list/update", post(client_update_list))
         .with_state(state);
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:3001")
-        .await
-        .unwrap();
-    axum::serve(listener, app).await.unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:3001").await?;
+    axum::serve(listener, app).await?;
 
     Ok(())
 }

@@ -1,4 +1,20 @@
 #![allow(dead_code)]
+// Release builds abort on panic (panic = "abort"), so a panic reachable from input (a peer's
+// frame, an IPC line, a trap connection, a file) stops the node. Outside tests, code must not
+// be able to panic: no unwrap/expect, no unchecked indexing or slicing, no panic!-family macros.
+// A provably safe exception is allowed locally, with its reason.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented
+    )
+)]
 pub use mesh_sync::{AlertLevel, MeshCommand, MeshOrchestrator};
 mod attack_reports;
 mod block_policy;
@@ -1440,8 +1456,10 @@ async fn main() -> Result<(), anyhow::Error> {
 
     let dag_tracker = Arc::new(tokio::sync::Mutex::new(DagTracker::new()));
 
-    let p2p_bind_addr: std::net::SocketAddr =
-        args.p2p_bind.parse().expect("Invalid P2P bind address");
+    let p2p_bind_addr: std::net::SocketAddr = args
+        .p2p_bind
+        .parse()
+        .map_err(|e| anyhow::anyhow!("invalid --p2p-bind address '{}': {}", args.p2p_bind, e))?;
 
     let p2p_network = P2PNetwork::new(
         p2p_bind_addr,
@@ -1735,10 +1753,13 @@ async fn main() -> Result<(), anyhow::Error> {
         }
     });
 
-    let upstream_router_addr: std::net::SocketAddr = args
-        .upstream_router
-        .parse()
-        .expect("Invalid upstream router address");
+    let upstream_router_addr: std::net::SocketAddr = args.upstream_router.parse().map_err(|e| {
+        anyhow::anyhow!(
+            "invalid upstream router address '{}': {}",
+            args.upstream_router,
+            e
+        )
+    })?;
     let mesh_orchestrator = MeshOrchestrator::new(
         bird_eye,
         telemetry_rx,

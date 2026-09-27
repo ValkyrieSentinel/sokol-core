@@ -125,9 +125,12 @@ impl NodeCrypto {
         if bytes.len() != pk_len + sk_len {
             bail!("expected {} bytes, found {}", pk_len + sk_len, bytes.len());
         }
-        let public_key = DilithiumPublic::from_bytes(&bytes[..pk_len])
+        let (public, secret) = bytes
+            .split_at_checked(pk_len)
+            .ok_or_else(|| anyhow::anyhow!("key file too short"))?;
+        let public_key = DilithiumPublic::from_bytes(public)
             .map_err(|e| anyhow::anyhow!("invalid public key: {:?}", e))?;
-        let secret_key = DilithiumSecret::from_bytes(&bytes[pk_len..])
+        let secret_key = DilithiumSecret::from_bytes(secret)
             .map_err(|e| anyhow::anyhow!("invalid secret key: {:?}", e))?;
         Ok(Self {
             public_key,
