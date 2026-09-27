@@ -14,6 +14,8 @@ pub struct Snapshot {
     pub blocks_active_v6: usize,
     pub blocks_capacity: usize,
     pub blocks_pending: usize,
+    pub event_ids_remembered: usize,
+    pub event_ids_evicted: u64,
     pub p2p_peers: usize,
     pub audit_queue_overflow: u64,
     pub defense_strict: bool,
@@ -110,6 +112,20 @@ pub fn render(s: &Snapshot) -> String {
         "Targets whose kernel entry does not match the block decisions yet (retried every second).",
     );
     let _ = writeln!(out, "sokol_blocks_pending {}", s.blocks_pending);
+    family(
+        &mut out,
+        "sokol_event_ids_remembered",
+        "gauge",
+        "Detector event ids remembered to recognise resends.",
+    );
+    let _ = writeln!(out, "sokol_event_ids_remembered {}", s.event_ids_remembered);
+    family(
+        &mut out,
+        "sokol_event_ids_evicted_total",
+        "counter",
+        "Event ids forgotten early because the memory was full (a resend of one adds a strike).",
+    );
+    let _ = writeln!(out, "sokol_event_ids_evicted_total {}", s.event_ids_evicted);
     family(
         &mut out,
         "sokol_p2p_active_peers",

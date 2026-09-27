@@ -9,6 +9,11 @@
 //! alert fired on our own outbound traffic, e.g. a beacon to a malicious host), the destination
 //! is blocked instead. Every other protection of the block policy still applies.
 //!
+//! An adapter that can name the event it reports sends `SIGNAL#<event id>:...` instead. The id
+//! (1-64 of `A-Z a-z 0-9 . _ -`) is unique per source; the node acts on a (source, id) once
+//! within `EVENT_MEMORY`, so a replay after a lost ACK or an adapter restart gets
+//! `OK duplicate` and adds no strike. Lines without an id are always new events.
+//!
 //! The source may also be a CIDR prefix (e.g. a CrowdSec range decision); a prefix is blocked
 //! as given, never swapped for the destination.
 use std::net::IpAddr;
@@ -24,6 +29,29 @@ pub struct Signal {
     pub src: IpNet,
     pub dst: Option<IpNet>,
     pub reason: String,
+}
+
+/// Splits `SIGNAL:<payload>` and `SIGNAL#<event id>:<payload>`; `None` for any other line.
+pub fn split_verb(line: &str) -> Option<(Option<&str>, &str)> {
+    let rest = line.strip_prefix("SIGNAL")?;
+    if let Some(payload) = rest.strip_prefix(':') {
+        return Some((None, payload));
+    }
+    let (id, payload) = rest.strip_prefix('#')?.split_once(':')?;
+    Some((Some(id), payload))
+}
+
+/// Checks an event id.
+pub fn event_id(id: &str) -> Result<&str, String> {
+    if (1..=64).contains(&id.len())
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    {
+        Ok(id)
+    } else {
+        Err(format!("invalid event id '{}'", id))
+    }
 }
 
 pub fn parse(payload: &str) -> Result<Signal, String> {
@@ -100,6 +128,21 @@ mod tests {
         p.protect_ip("10.0.0.1".parse().unwrap(), LOCAL_ADDRESS);
         p.protect_ip("10.0.0.254".parse().unwrap(), "default gateway");
         p
+    }
+
+    #[test]
+    fn splits_the_verb_and_the_event_id() {
+        assert_eq!(split_verb("SIGNAL:a|b"), Some((None, "a|b")));
+        assert_eq!(split_verb("SIGNAL#cs-17:a|b"), Some((Some("cs-17"), "a|b")));
+        assert_eq!(split_verb("SIGNAL#:a"), Some((Some(""), "a")));
+        assert_eq!(split_verb("SIGNALS:a"), None);
+        assert_eq!(split_verb("SIGNAL#17"), None);
+        assert_eq!(split_verb("DROP_IMMEDIATE:1.2.3.4"), None);
+        assert!(event_id("crowdsec.17_a-B").is_ok());
+        assert!(event_id("").is_err());
+        assert!(event_id(&"x".repeat(65)).is_err());
+        assert!(event_id("a b").is_err());
+        assert!(event_id("a|b").is_err());
     }
 
     #[test]
