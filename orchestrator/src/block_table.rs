@@ -21,7 +21,7 @@ use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
 
 use aya::maps::lpm_trie::Key;
-use aya::maps::{LpmTrie, MapData, MapError};
+use aya::maps::{LpmTrie, MapData, MapError, PerCpuArray, PerCpuValues};
 
 /// How long an address's past blocks count towards escalation.
 pub const STRIKE_MEMORY: Duration = Duration::from_secs(24 * 3600);
@@ -144,6 +144,20 @@ fn bounded_reason(reason: &str) -> String {
     }
     reason.get(..end).unwrap_or_default().to_string()
 }
+
+/// What a kernel entry did while it was in force: its observed effect, for the audit (the
+/// node's memory of consequences) and for later review of its own decisions.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Outcome {
+    pub net: IpNet,
+    /// Packets it dropped; `None` if the counter could not be read.
+    pub hits: Option<u64>,
+    pub applied_ms: u64,
+    pub removed_ms: u64,
+}
+
+/// Outcomes kept until collected (one tick normally empties them).
+pub const MAX_OUTCOMES: usize = 4096;
 
 /// Pending kernel operations retried per tick (a full map must not cost a syscall per entry per s).
 pub const MAX_RETRIES_PER_TICK: usize = 256;
@@ -311,6 +325,11 @@ pub struct BlockTable<B = KernelBlocklist> {
     pending: HashSet<IpNet>,
     /// When each pending target first failed (for the age of the oldest).
     pending_since: HashMap<IpNet, u64>,
+    /// When each applied target entered the kernel map.
+    applied_at: HashMap<IpNet, u64>,
+    /// What removed kernel entries did while they were in force, oldest first (bounded).
+    outcomes: std::collections::VecDeque<Outcome>,
+    outcomes_dropped: u64,
     /// Targets to retry, oldest first (R26-06): each is retried at most once per tick, and a
     /// target that keeps failing goes to the back, so it cannot starve the others.
     retry: std::collections::VecDeque<IpNet>,
@@ -341,10 +360,12 @@ impl BlockTable<KernelBlocklist> {
     pub fn new(
         v4: LpmTrie<MapData, [u8; 4], u32>,
         v6: LpmTrie<MapData, [u8; 16], u32>,
+        hits: PerCpuArray<MapData, u64>,
+        cpus: usize,
         policy: TtlPolicy,
         node_id: u64,
     ) -> Self {
-        Self::with_lists(KernelBlocklist { v4, v6 }, policy, node_id)
+        Self::with_lists(KernelBlocklist::new(v4, v6, hits, cpus), policy, node_id)
     }
 }
 
@@ -360,6 +381,9 @@ impl<B: Blocklist> BlockTable<B> {
             applied: HashSet::new(),
             pending: HashSet::new(),
             pending_since: HashMap::new(),
+            applied_at: HashMap::new(),
+            outcomes: std::collections::VecDeque::new(),
+            outcomes_dropped: 0,
             retry: std::collections::VecDeque::new(),
             queued: HashSet::new(),
             strikes: HashMap::new(),
@@ -504,14 +528,27 @@ impl<B: Blocklist> BlockTable<B> {
         let result = match (want, have) {
             (true, false) => self.lists.add(net).map(|()| {
                 self.applied.insert(net);
+                self.applied_at.insert(net, now_ms);
             }),
-            (false, true) => match self.lists.delete(net) {
-                Ok(()) | Err(MapError::KeyNotFound) => {
-                    self.applied.remove(&net);
-                    Ok(())
+            (false, true) => {
+                // Read the entry's effect before it goes (packets arriving in between are lost
+                // to the count, not to enforcement).
+                let hits = self.lists.hits(net);
+                match self.lists.delete(net) {
+                    Ok(()) | Err(MapError::KeyNotFound) => {
+                        self.applied.remove(&net);
+                        let since = self.applied_at.remove(&net).unwrap_or(now_ms);
+                        self.record_outcome(Outcome {
+                            net,
+                            hits,
+                            applied_ms: since,
+                            removed_ms: now_ms,
+                        });
+                        Ok(())
+                    }
+                    Err(e) => Err(e),
                 }
-                Err(e) => Err(e),
-            },
+            }
             _ => Ok(()),
         };
         if result.is_ok() {
@@ -567,6 +604,21 @@ impl<B: Blocklist> BlockTable<B> {
     /// (remembered event ids, ids forgotten early because the memory was full)
     pub fn event_memory(&self) -> (usize, u64) {
         (self.events.len(), self.events_evicted)
+    }
+
+    fn record_outcome(&mut self, outcome: Outcome) {
+        if self.outcomes.len() >= MAX_OUTCOMES {
+            self.outcomes.pop_front();
+            self.outcomes_dropped += 1;
+        }
+        self.outcomes.push_back(outcome);
+    }
+
+    /// Outcomes of kernel entries removed since the last call, oldest first, and how many were
+    /// dropped because nobody collected them in time.
+    pub fn take_outcomes(&mut self) -> (Vec<Outcome>, u64) {
+        let dropped = std::mem::take(&mut self.outcomes_dropped);
+        (self.outcomes.drain(..).collect(), dropped)
     }
 
     /// Re-checks every known claim against a changed never-block policy (the host's addresses or
@@ -1417,39 +1469,108 @@ impl Watermark {
 pub trait Blocklist {
     fn add(&mut self, net: IpNet) -> Result<(), MapError>;
     fn delete(&mut self, net: IpNet) -> Result<(), MapError>;
+    /// Packets the entry for `net` has dropped so far (the XDP program counts them in the
+    /// entry's value); `None` if it cannot be read.
+    fn hits(&self, net: IpNet) -> Option<u64>;
 }
 
-/// The XDP program's LPM tries.
+/// The XDP program's LPM tries and their per-CPU drop counters. Each entry's value is its
+/// counter slot; slots are handed out here and zeroed before reuse.
 pub struct KernelBlocklist {
     v4: LpmTrie<MapData, [u8; 4], u32>,
     v6: LpmTrie<MapData, [u8; 16], u32>,
+    hits: PerCpuArray<MapData, u64>,
+    cpus: usize,
+    free_slots: Vec<u32>,
+    slot_of: HashMap<IpNet, u32>,
+}
+
+impl KernelBlocklist {
+    pub fn new(
+        v4: LpmTrie<MapData, [u8; 4], u32>,
+        v6: LpmTrie<MapData, [u8; 16], u32>,
+        hits: PerCpuArray<MapData, u64>,
+        cpus: usize,
+    ) -> Self {
+        Self {
+            v4,
+            v6,
+            hits,
+            cpus,
+            free_slots: (0..common::BLOCK_HIT_SLOTS).rev().collect(),
+            slot_of: HashMap::new(),
+        }
+    }
+
+    fn zero(&mut self, slot: u32) -> Result<(), MapError> {
+        // Only an empty vector is refused, and `cpus` (the kernel's possible CPUs) is never 0.
+        let zeros =
+            PerCpuValues::try_from(vec![0u64; self.cpus]).map_err(|_| MapError::OutOfBounds {
+                index: slot,
+                max_entries: common::BLOCK_HIT_SLOTS,
+            })?;
+        self.hits.set(slot, zeros, 0)
+    }
 }
 
 impl Blocklist for KernelBlocklist {
     fn add(&mut self, net: IpNet) -> Result<(), MapError> {
-        match net {
+        let slot = match self.slot_of.get(&net) {
+            Some(slot) => *slot,
+            None => self.free_slots.pop().ok_or(MapError::OutOfBounds {
+                index: common::BLOCK_HIT_SLOTS,
+                max_entries: common::BLOCK_HIT_SLOTS,
+            })?,
+        };
+        let result = self.zero(slot).and_then(|()| match net {
             IpNet::V4(n) => self.v4.insert(
                 &Key::new(n.prefix_len() as u32, n.network().octets()),
-                1u32,
+                slot,
                 0,
             ),
             IpNet::V6(n) => self.v6.insert(
                 &Key::new(n.prefix_len() as u32, n.network().octets()),
-                1u32,
+                slot,
                 0,
             ),
+        });
+        match result {
+            Ok(()) => {
+                self.slot_of.insert(net, slot);
+                Ok(())
+            }
+            Err(e) => {
+                if self.slot_of.get(&net) != Some(&slot) {
+                    self.free_slots.push(slot);
+                }
+                Err(e)
+            }
         }
     }
 
     fn delete(&mut self, net: IpNet) -> Result<(), MapError> {
-        match net {
+        let result = match net {
             IpNet::V4(n) => self
                 .v4
                 .remove(&Key::new(n.prefix_len() as u32, n.network().octets())),
             IpNet::V6(n) => self
                 .v6
                 .remove(&Key::new(n.prefix_len() as u32, n.network().octets())),
+        };
+        // The slot is free once the entry is gone (a packet in flight may still count into it;
+        // it is zeroed before reuse).
+        if matches!(result, Ok(()) | Err(MapError::KeyNotFound)) {
+            if let Some(slot) = self.slot_of.remove(&net) {
+                self.free_slots.push(slot);
+            }
         }
+        result
+    }
+
+    fn hits(&self, net: IpNet) -> Option<u64> {
+        let slot = self.slot_of.get(&net)?;
+        let per_cpu = self.hits.get(slot, 0).ok()?;
+        Some(per_cpu.iter().fold(0u64, |sum, v| sum.saturating_add(*v)))
     }
 }
 
@@ -1475,6 +1596,8 @@ mod tests {
         capacity: usize,
         fail_delete: bool,
         deletes: usize,
+        /// Packets "dropped" per entry, set by tests.
+        hits: HashMap<IpNet, u64>,
     }
 
     impl Blocklist for FakeLists {
@@ -1500,6 +1623,12 @@ mod tests {
                 Err(MapError::KeyNotFound)
             }
         }
+
+        fn hits(&self, net: IpNet) -> Option<u64> {
+            self.nets
+                .contains(&net)
+                .then(|| self.hits.get(&net).copied().unwrap_or(0))
+        }
     }
 
     fn table(node: u64, capacity: usize) -> BlockTable<FakeLists> {
@@ -1509,6 +1638,7 @@ mod tests {
                 capacity,
                 fail_delete: false,
                 deletes: 0,
+                hits: HashMap::new(),
             },
             POLICY,
             node,
@@ -1601,6 +1731,57 @@ mod tests {
     }
 
     #[test]
+    fn every_removed_block_leaves_its_outcome() {
+        let mut t = table(1, 64);
+        let (busy, idle) = (ip("203.0.113.50"), ip("203.0.113.51"));
+        detect(&mut t, "203.0.113.50", T0);
+        detect(&mut t, "203.0.113.51", T0);
+        t.lists.hits.insert(busy, 42);
+        // A failed delete leaves no outcome: the entry is still in force.
+        t.lists.fail_delete = true;
+        t.lift(busy, T0 + 10 * S).unwrap();
+        assert!(t.take_outcomes().0.is_empty());
+        t.lists.fail_delete = false;
+        t.tick(T0 + 11 * S); // the retry succeeds
+        let expired_at = T0 + ms(POLICY.base);
+        t.tick(expired_at);
+        let (outcomes, lost) = t.take_outcomes();
+        assert_eq!(lost, 0);
+        assert_eq!(
+            outcomes,
+            vec![
+                Outcome {
+                    net: busy,
+                    hits: Some(42),
+                    applied_ms: T0,
+                    removed_ms: T0 + 11 * S
+                },
+                Outcome {
+                    net: idle,
+                    hits: Some(0),
+                    applied_ms: T0,
+                    removed_ms: expired_at
+                },
+            ]
+        );
+        assert!(t.take_outcomes().0.is_empty(), "collected once");
+    }
+
+    #[test]
+    fn uncollected_outcomes_are_bounded_and_counted() {
+        let mut t = table(1, MAX_OUTCOMES + 10);
+        for i in 0..(MAX_OUTCOMES + 3) as u32 {
+            let net = host(std::net::IpAddr::V4(std::net::Ipv4Addr::from(
+                0x0A00_0000 + i,
+            )));
+            t.add_local(net, ClaimKind::Operator, "x", T0).unwrap();
+            t.lift(net, T0 + S).unwrap();
+        }
+        let (outcomes, lost) = t.take_outcomes();
+        assert_eq!((outcomes.len(), lost), (MAX_OUTCOMES, 3));
+    }
+
+    #[test]
     fn a_repeat_merged_into_the_running_claim_is_not_new() {
         let mut t = table(1, 64);
         let a = ip("203.0.113.40");
@@ -1670,6 +1851,7 @@ mod tests {
                 capacity: 8,
                 fail_delete: false,
                 deletes: 0,
+                hits: HashMap::new(),
             },
             TtlPolicy {
                 base: Duration::ZERO,
@@ -1781,6 +1963,7 @@ mod tests {
                 capacity: 64,
                 fail_delete: false,
                 deletes: 0,
+                hits: HashMap::new(),
             },
             TtlPolicy {
                 base: Duration::from_secs(7 * 86_400),
@@ -1831,6 +2014,7 @@ mod tests {
                 capacity: 8,
                 fail_delete: false,
                 deletes: 0,
+                hits: HashMap::new(),
             },
             TtlPolicy {
                 base: Duration::ZERO,
@@ -2203,6 +2387,7 @@ mod tests {
                 capacity: 8,
                 fail_delete: false,
                 deletes: 0,
+                hits: HashMap::new(),
             },
             TtlPolicy {
                 base: Duration::ZERO,
@@ -2305,6 +2490,7 @@ mod tests {
                 capacity: 1024,
                 fail_delete: false,
                 deletes: 0,
+                hits: HashMap::new(),
             },
             TtlPolicy {
                 base: Duration::ZERO,
@@ -2344,6 +2530,7 @@ mod tests {
                 capacity: 8,
                 fail_delete: false,
                 deletes: 0,
+                hits: HashMap::new(),
             },
             TtlPolicy {
                 base: Duration::ZERO,
@@ -2688,6 +2875,11 @@ mod tests {
             prop_assert!(
                 t.pending.iter().all(|n| t.queued.contains(n)),
                 "every pending target is queued for retry"
+            );
+            prop_assert!(
+                t.applied_at.len() == t.applied.len()
+                    && t.applied.iter().all(|n| t.applied_at.contains_key(n)),
+                "the applied time is known exactly for applied targets"
             );
             prop_assert!(
                 t.pending.len() == t.pending_since.len()

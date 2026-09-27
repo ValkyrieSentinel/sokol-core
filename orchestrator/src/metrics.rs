@@ -3,6 +3,21 @@ use std::fmt::Write;
 
 use common::{drop_reason, DROP_REASON_SLOTS};
 
+/// What removed blocks did while in force (from the XDP hit counters).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct OutcomeStats {
+    /// Blocks that dropped at least one packet.
+    pub effective: u64,
+    /// Blocks that dropped nothing: nothing came, or the decision was not needed.
+    pub idle: u64,
+    /// Blocks whose counter could not be read.
+    pub unknown: u64,
+    /// Packets dropped by removed blocks.
+    pub hits: u64,
+    /// Outcomes lost before they were collected.
+    pub dropped: u64,
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Snapshot {
     pub rx_packets: u64,
@@ -33,6 +48,7 @@ pub struct Snapshot {
     pub mesh_dropped_bulk: u64,
     pub ipc_lines_delayed: u64,
     pub tick_secs: f64,
+    pub outcomes: OutcomeStats,
     pub tick_max_secs: f64,
     pub audit_write_errors: u64,
     pub audit_lost: u64,
@@ -248,6 +264,41 @@ pub fn render(s: &Snapshot) -> String {
         family(&mut out, name, "counter", help);
         let _ = writeln!(out, "{} {}", name, value);
     }
+    family(
+        &mut out,
+        "sokol_block_outcomes_total",
+        "counter",
+        "Removed blocks by observed effect: dropped packets, dropped none, counter unreadable.",
+    );
+    for (effect, n) in [
+        ("dropped", s.outcomes.effective),
+        ("none", s.outcomes.idle),
+        ("unknown", s.outcomes.unknown),
+    ] {
+        let _ = writeln!(
+            out,
+            "sokol_block_outcomes_total{{effect=\"{}\"}} {}",
+            effect, n
+        );
+    }
+    family(
+        &mut out,
+        "sokol_block_outcome_packets_total",
+        "counter",
+        "Packets dropped by blocks, counted when each block is removed.",
+    );
+    let _ = writeln!(out, "sokol_block_outcome_packets_total {}", s.outcomes.hits);
+    family(
+        &mut out,
+        "sokol_block_outcomes_lost_total",
+        "counter",
+        "Block outcomes lost before they were collected.",
+    );
+    let _ = writeln!(
+        out,
+        "sokol_block_outcomes_lost_total {}",
+        s.outcomes.dropped
+    );
     family(
         &mut out,
         "sokol_mesh_broadcasts_dropped_total",

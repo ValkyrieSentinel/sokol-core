@@ -10,8 +10,8 @@ use aya_ebpf::{
 use core::mem;
 
 use common::{
-    config_flags, drop_reason, DropEvent, PacketStats, BLOCKLIST_CAPACITY, DROP_REASON_SLOTS,
-    MAX_EVENTS_PER_CPU_PER_SEC,
+    config_flags, drop_reason, DropEvent, PacketStats, BLOCKLIST_CAPACITY, BLOCK_HIT_SLOTS,
+    DROP_REASON_SLOTS, MAX_EVENTS_PER_CPU_PER_SEC,
 };
 
 const ETH_P_IP: u16 = 0x0800;
@@ -104,6 +104,8 @@ pub struct TcpHdr {
     pub urg_ptr: u16,
 }
 
+/// Blocked prefixes. The value is the entry's slot in BLOCK_HITS, where the packets it drops
+/// are counted (read by user space when the entry is removed).
 #[map]
 static BLOCKLIST_V4: LpmTrie<[u8; 4], u32> =
     LpmTrie::with_max_entries(BLOCKLIST_CAPACITY, BPF_F_NO_PREALLOC);
@@ -111,6 +113,20 @@ static BLOCKLIST_V4: LpmTrie<[u8; 4], u32> =
 #[map]
 static BLOCKLIST_V6: LpmTrie<[u8; 16], u32> =
     LpmTrie::with_max_entries(BLOCKLIST_CAPACITY, BPF_F_NO_PREALLOC);
+
+/// Per-CPU drop counters, one slot per blocklist entry. A per-CPU array needs no atomics: an
+/// atomic add on the trie's own value is misaligned for IPv4 keys (the value follows a 4-byte
+/// key inside the kernel's trie node) and faulted an arm64 kernel.
+#[map]
+static BLOCK_HITS: PerCpuArray<u64> = PerCpuArray::with_max_entries(BLOCK_HIT_SLOTS, 0);
+
+#[inline(always)]
+fn count_hit(slot: &u32) {
+    if let Some(hits) = BLOCK_HITS.get_ptr_mut(*slot) {
+        // SAFETY: a per-CPU slot is touched only by this CPU while the program runs.
+        unsafe { *hits = (*hits).wrapping_add(1) };
+    }
+}
 
 #[map]
 static STATS: PerCpuArray<PacketStats> = PerCpuArray::with_max_entries(1, 0);
@@ -339,7 +355,7 @@ fn try_sentinel_vfr_filter(ctx: &XdpContext) -> Result<u32, ()> {
             let dst_bytes = dst_u32.to_ne_bytes();
 
             let key = Key::new(32, src_bytes);
-            is_blocked = BLOCKLIST_V4.get(&key).is_some();
+            is_blocked = BLOCKLIST_V4.get(&key).map(count_hit).is_some();
 
             protocol =
                 unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*ip_ptr).protocol)) };
@@ -405,7 +421,7 @@ fn try_sentinel_vfr_filter(ctx: &XdpContext) -> Result<u32, ()> {
                 unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*ip6_ptr).dst_addr)) };
 
             let key = Key::new(128, src_ip_16);
-            is_blocked = BLOCKLIST_V6.get(&key).is_some();
+            is_blocked = BLOCKLIST_V6.get(&key).map(count_hit).is_some();
 
             let next_hdr =
                 unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*ip6_ptr).next_header)) };
