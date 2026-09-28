@@ -1,0 +1,16 @@
+# nodes=3 netem='none' host=aarch64 cpus=10 kernel=6.8.0-142-generic
+# full mesh after 1s: 3/3 nodes see 2 peers
+PASS C1 node 3 at +20 s is in the full mesh
+PASS C2 node 1's block reached node 3 in 0 s
+PASS C3 node 3 (+20 s) let the block expire 20 s before node 1
+PASS C4 node 3 at +60 s left node 1's mesh after 3 s
+PASS C5 node 3 still blocks its own detector's target; node 1 did not get it
+PASS C6 node 3 back at +0 rejoined node 1 after 2 s
+PASS C7 node 1 got node 3's block 0 s after the rejoin
+OBS  S4 node 2 stepped +3600 s holding a fresh 60 s block: it lasted 1 s more (real)
+OBS  S4 node 2 stepped -3600 s holding a fresh 60 s block: it lasted over 150 s more (real)
+OBS  node 1 log: [2026-09-28T11:32:04Z ERROR orchestrator::p2p] [SECURITY ALERT] Rejected envelope from 10.240.0.3:44420 claiming node 3: StaleTimestamp
+OBS  node 2 log: [2026-09-28T11:32:04Z ERROR orchestrator::p2p] [SECURITY ALERT] Rejected envelope from 10.240.0.3:42248 claiming node 3: StaleTimestamp
+OBS  node 3 log: [2026-09-28T11:33:03Z ERROR orchestrator::p2p] [SECURITY ALERT] Rejected envelope from 10.240.0.2:7946 claiming node 2: StaleTimestamp
+PASS C8 no node exited
+PASS C9 no tick over 500 ms
