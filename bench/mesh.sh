@@ -7,6 +7,7 @@
 #   sudo bench/mesh.sh partition   <orchestrator> <monitor> <N> <seconds down> [netem args...]
 #   sudo bench/mesh.sh soak        <orchestrator> <monitor> <N> <minutes> [netem args...]
 #   sudo bench/mesh.sh recover     <orchestrator> <monitor> <N> [signals] [netem args...]
+#   sudo bench/mesh.sh clock       <orchestrator> <monitor> 3        (needs libfaketime)
 #
 # propagation: a block is issued on node 1 `rounds` times; for every other node the delay
 #              until its MESH_BLOCK record is reported (min / median / p95 / max, and the
@@ -36,11 +37,31 @@
 #              If no broadcast was dropped the repair path was not exercised: the run reports
 #              NOT EXERCISED and fails, whatever L1-L5 say.
 #
+# clock:       node clocks that disagree or jump (ADR-0003: expiry is absolute, envelopes are
+#              accepted within 30 s). Every node runs under libfaketime reading its offset from
+#              $WORK/n<i>/clock live; only the wall clock is shifted (NTP steps it, monotonic
+#              time is untouched). Block TTL 60 s. Limits, fixed before the first run:
+#                S1 node 3 at +20 s: C1 full mesh; C2 node 1's block reaches node 3;
+#                   C3 node 3 lets it expire 17-23 s (real time) before node 1 does.
+#                S2 node 3 steps to +60 s: C4 within 45 s node 1 sees 1 peer (node 3 is out);
+#                   C5 node 3 still blocks its own detector's target, node 1 does not get it.
+#                S3 node 3 back to +0: C6 within 60 s node 1 sees 2 peers again;
+#                   C7 within 60 s after that node 1 holds node 3's block.
+#                S4 exploratory, observations only: node 2 steps +3600 s and then -3600 s while
+#                   holding its own block; how long each block lasts in real time is printed.
+#              C8 no node exits; C9 no tick over 500 ms.
+#
 # netem args are applied to every node's link, e.g. `delay 100ms 20ms loss 10%`.
 set -euo pipefail
 
 MODE=$1; BIN=$2; MON=$3; N=$4; shift 4
 ARG=${1:-20}; [ $# -gt 0 ] && shift
+[ "$MODE" = clock ] && TTL=${TTL:-60}
+if [ "$MODE" = clock ]; then
+    [ "$N" = 3 ] || { echo "clock mode runs on 3 nodes"; exit 2; }
+    FAKETIME_LIB=$(ls /usr/lib/*/faketime/libfaketime.so.1 2>/dev/null | head -1)
+    [ -n "$FAKETIME_LIB" ] || { echo "clock mode needs libfaketime (apt install faketime)"; exit 2; }
+fi
 [ "$MODE" = soak ] && TTL=${TTL:-300}   # blocks expire during the soak, so the table churns
 NETEM="$*"
 WORK="$(mktemp -d)"
@@ -102,7 +123,13 @@ start_node() {   # start_node <i> [last seed]: (re)starts node i with its key, s
     for j in $(seq 1 "${2:-$N}"); do [ "$j" != "$i" ] && seeds+=(--seed-peer "10.240.0.$j:7946"); done
     # ip netns exec, not in_ns: a backgrounded function would be a subshell, and $! must be
     # the node itself (the soak reads its /proc entry and restarts it).
-    ip netns exec "sk-n$i" "$BIN" --interface "skv$i" --node-id "$i" --xdp-mode generic \
+    local pre=()
+    if [ "$MODE" = clock ]; then
+        [ -f "$WORK/n$i/clock" ] || echo "+0" >"$WORK/n$i/clock"
+        pre=(env "LD_PRELOAD=$FAKETIME_LIB" "FAKETIME_TIMESTAMP_FILE=$WORK/n$i/clock"
+            FAKETIME_NO_CACHE=1 DONT_FAKE_MONOTONIC=1)
+    fi
+    ip netns exec "sk-n$i" "${pre[@]}" "$BIN" --interface "skv$i" --node-id "$i" --xdp-mode generic \
         --db-path "$WORK/n$i/audit.log" --key-file "$WORK/n$i/node.key" \
         --ipc-socket "$WORK/n$i/ipc.sock" --control-socket "$WORK/n$i/ctl.sock" \
         --p2p-bind "10.240.0.$i:7946" --peers-file "$WORK/n$i/peers.json" \
@@ -124,6 +151,7 @@ for i in $(seq 1 "$N"); do
         done
         printf ']'
     } >"$WORK/n$i/peers.json"
+    [ "$MODE" = clock ] && [ "$i" = 3 ] && echo "+20" >"$WORK/n3/clock"   # S1
     start_node "$i" $((i - 1))
 done
 
@@ -360,6 +388,66 @@ PY
         { [ -e "/proc/$pid" ] && [ "$(awk '{print $3}' "/proc/$pid/stat")" != Z ]; } || { echo "     node $i exited"; dead=1; }
     done
     if [ $dead = 0 ]; then echo "PASS L5 no node exited"; else echo "FAIL L5 a node exited"; fail=1; fi
+    exit $fail
+    ;;
+clock)
+    fail=0
+    pass() { echo "PASS $*"; }
+    flunk() { echo "FAIL $*"; fail=1; }
+    active() { local v; v=$(metric "$1" 'sokol_blocks_active{family="ipv4"}'); echo "${v:-down}"; }
+    signal_at() { printf 'SIGNAL:clock|%s|-|clock test\n' "$2" | in_ns "$1" nc -U -q1 "$WORK/n$1/ipc.sock" >/dev/null; }
+    wait_for() {   # wait_for <seconds> '<condition>': seconds taken, or failure on timeout
+        # The condition is a string evaluated on every try: passed as words, a $(metric ...)
+        # in it would be expanded once, at the call.
+        local t0=$SECONDS
+        until eval "$2"; do [ $((SECONDS - t0)) -ge "$1" ] && return 1; sleep 0.5; done
+        echo $((SECONDS - t0))
+    }
+    # S1 (node 3 was started at +20 s: see below)
+    [ "$(metric 1 sokol_p2p_active_peers)" = 2 ] && [ "$(metric 3 sokol_p2p_active_peers)" = 2 ] \
+        && pass "C1 node 3 at +20 s is in the full mesh" || flunk "C1 mesh with node 3 at +20 s: node 1 sees $(metric 1 sokol_p2p_active_peers), node 3 sees $(metric 3 sokol_p2p_active_peers)"
+    signal_at 1 198.18.7.1
+    if t=$(wait_for 10 'test "$(active 3)" = 1'); then pass "C2 node 1's block reached node 3 in ${t} s"; else flunk "C2 node 3 never got node 1's block"; fi
+    t_3=""; t_1=""; t0=$SECONDS
+    while [ $((SECONDS - t0)) -lt 120 ] && [ -z "$t_1" ]; do
+        [ -z "$t_3" ] && [ "$(active 3)" = 0 ] && t_3=$SECONDS
+        [ "$(active 1)" = 0 ] && t_1=$SECONDS
+        sleep 0.5
+    done
+    if [ -n "$t_1" ] && [ -n "$t_3" ] && [ $((t_1 - t_3)) -ge 17 ] && [ $((t_1 - t_3)) -le 23 ]; then
+        pass "C3 node 3 (+20 s) let the block expire $((t_1 - t_3)) s before node 1"
+    else flunk "C3 expiry: node 3 at ${t_3:-never}, node 1 at ${t_1:-never} (script seconds)"; fi
+    # S2
+    echo "+60" >"$WORK/n3/clock"
+    if t=$(wait_for 45 'test "$(metric 1 sokol_p2p_active_peers)" = 1'); then pass "C4 node 3 at +60 s left node 1's mesh after ${t} s"
+    else flunk "C4 node 1 still sees $(metric 1 sokol_p2p_active_peers) peers 45 s after node 3 stepped to +60 s"; fi
+    signal_at 3 198.18.7.3
+    sleep 3
+    if [ "$(active 3)" = 1 ] && [ "$(active 1)" = 0 ]; then pass "C5 node 3 still blocks its own detector's target; node 1 did not get it"
+    else flunk "C5 node 3 holds $(active 3), node 1 holds $(active 1)"; fi
+    # S3
+    echo "+0" >"$WORK/n3/clock"
+    if t=$(wait_for 60 'test "$(metric 1 sokol_p2p_active_peers)" = 2'); then pass "C6 node 3 back at +0 rejoined node 1 after ${t} s"
+        if t=$(wait_for 60 'test "$(active 1)" = 1'); then pass "C7 node 1 got node 3's block ${t} s after the rejoin"
+        else flunk "C7 node 1 never got node 3's block"; fi
+    else flunk "C6 node 1 sees $(metric 1 sokol_p2p_active_peers) peers 60 s after node 3 came back"; flunk "C7 not reached"; fi
+    # S4 (exploratory)
+    signal_at 2 198.18.7.21; sleep 2
+    echo "+3600" >"$WORK/n2/clock"; t0=$SECONDS
+    t=$(wait_for 90 'test "$(active 2)" = 0' || true)
+    echo "OBS  S4 node 2 stepped +3600 s holding a fresh 60 s block: it lasted ${t:-over 90} s more (real)"
+    echo "+0" >"$WORK/n2/clock"; sleep 3
+    signal_at 2 198.18.7.22; sleep 2
+    echo "-3600" >"$WORK/n2/clock"
+    t=$(wait_for 150 'test "$(active 2)" = 0' || true)
+    echo "OBS  S4 node 2 stepped -3600 s holding a fresh 60 s block: it lasted ${t:-over 150} s more (real)"
+    echo "+0" >"$WORK/n2/clock"
+    for i in $(seq 1 "$N"); do grep -h 'Rejected envelope\|StaleTimestamp' "$WORK/n$i/node.log" | head -1 | sed "s/^/OBS  node $i log: /" | cut -c1-200; done
+    dead=0
+    for i in $(seq 1 "$N"); do pid=${NODE_PID[$i]}; { [ -e "/proc/$pid" ] && [ "$(awk '{print $3}' "/proc/$pid/stat")" != Z ]; } || dead=1; done
+    [ $dead = 0 ] && pass "C8 no node exited" || flunk "C8 a node exited"
+    tick=0; for i in $(seq 1 "$N"); do awk -v t="$(metric "$i" sokol_tick_seconds_max)" 'BEGIN { exit !(t == "" || t > 0.5) }' && tick=1; done
+    [ $tick = 0 ] && pass "C9 no tick over 500 ms" || flunk "C9 a tick over 500 ms"
     exit $fail
     ;;
 *) echo "unknown mode $MODE"; exit 2 ;;
