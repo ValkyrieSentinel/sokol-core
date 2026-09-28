@@ -28,6 +28,7 @@ mod kernel_events;
 mod mesh_sync;
 mod metrics;
 mod p2p;
+mod replay;
 mod signal;
 mod sokol;
 mod state_store;
@@ -424,6 +425,12 @@ struct Args {
     #[arg(long)]
     print_public_key: bool,
 
+    /// Replay this node's detector decisions from an audit log with this build's code, report
+    /// what is reproduced, mismatched or lacks context, then exit (ADR-0016). Exit status:
+    /// 0 all replayable decisions reproduced, 1 a mismatch, 2 nothing could be replayed.
+    #[arg(long, value_name = "AUDIT_LOG")]
+    replay: Option<std::path::PathBuf>,
+
     /// Address or CIDR that must never be blocked (operator/bastion networks, mesh peers).
     /// Loopback, this node's addresses, default gateways and seed peers are always protected.
     #[arg(long, value_name = "CIDR")]
@@ -654,16 +661,21 @@ async fn execute_control(cmd: control::ControlCommand, ctx: &ControlCtx) -> Stri
             if let Err(why) = policy.check_net(ip) {
                 return format!("ERR {} is protected ({})", shown, why);
             }
-            let added =
-                match blocks
-                    .lock()
-                    .await
-                    .add_local(ip, ClaimKind::Operator, "operator", now_ms())
-                {
-                    Ok(added) => added,
-                    Err(why) => return format!("ERR {} not banned: {}", shown, why),
-                };
-            sntl_db.append(format!("OPERATOR_BAN_{}|IP:{}", ip_tag(ip), shown));
+            let at = now_ms();
+            let added = match blocks
+                .lock()
+                .await
+                .add_local(ip, ClaimKind::Operator, "operator", at)
+            {
+                Ok(added) => added,
+                Err(why) => return format!("ERR {} not banned: {}", shown, why),
+            };
+            sntl_db.append(format!(
+                "OPERATOR_BAN_{}|IP:{}|At:{}",
+                ip_tag(ip),
+                shown,
+                at
+            ));
             match added.applied {
                 Ok(()) => {
                     log::warn!("[Control] Operator ban for {}", shown);
@@ -677,19 +689,21 @@ async fn execute_control(cmd: control::ControlCommand, ctx: &ControlCtx) -> Stri
         }
         ControlCommand::Unban(ip) => {
             let shown = show(&ip);
+            let at = now_ms();
             let (result, still_blocked) = {
                 let mut table = blocks.lock().await;
-                let result = table.lift(ip, now_ms());
+                let result = table.lift(ip, at);
                 (result, table.is_blocked(ip))
             };
             match result {
                 Ok(lifted) => {
                     log::warn!("[Control] Operator unban for {}", shown);
                     sntl_db.append(format!(
-                        "OPERATOR_UNBAN_{}|IP:{}|Claims:{}",
+                        "OPERATOR_UNBAN_{}|IP:{}|Claims:{}|At:{}",
                         ip_tag(ip),
                         shown,
-                        lifted.claims
+                        lifted.claims,
+                        at
                     ));
                     broadcast_retraction(ctx, lifted.retracted).await;
                     if still_blocked {
@@ -709,23 +723,33 @@ async fn execute_control(cmd: control::ControlCommand, ctx: &ControlCtx) -> Stri
             }
         }
         ControlCommand::FlushDynamic => {
-            let (released, lifted) = blocks.lock().await.flush_detector(now_ms());
+            let at = now_ms();
+            let (released, lifted) = blocks.lock().await.flush_detector(at);
             broadcast_retraction(ctx, lifted.retracted).await;
             log::warn!(
                 "[Control] Operator flushed {} dynamic blocks",
                 released.len()
             );
-            sntl_db.append(format!("OPERATOR_FLUSH|Released:{}", released.len()));
+            sntl_db.append(format!(
+                "OPERATOR_FLUSH|Released:{}|At:{}",
+                released.len(),
+                at
+            ));
             format!("OK released {} dynamic blocks", released.len())
         }
         ControlCommand::FlushAll => {
-            let (released, lifted) = blocks.lock().await.flush_all(now_ms());
+            let at = now_ms();
+            let (released, lifted) = blocks.lock().await.flush_all(at);
             broadcast_retraction(ctx, lifted.retracted).await;
             log::warn!(
                 "[Control] Operator flushed {} blocks (operator and dynamic)",
                 released.len()
             );
-            sntl_db.append(format!("OPERATOR_FLUSH_ALL|Released:{}", released.len()));
+            sntl_db.append(format!(
+                "OPERATOR_FLUSH_ALL|Released:{}|At:{}",
+                released.len(),
+                at
+            ));
             format!("OK released {} blocks", released.len())
         }
         ControlCommand::AcceptStateLoss => {
@@ -1084,9 +1108,18 @@ async fn enforce_block_local(
         ));
         return Enforcement::Refused;
     }
+    let now = now_ms();
+    // Replay context (ADR-0016): the exact decision time and the event id go into every
+    // decision record; the audit record's own timestamp is when it was written.
+    let context = format!(
+        "At:{}|Event:{}",
+        now,
+        event
+            .map(|(source, id)| format!("{}/{}", source, id))
+            .unwrap_or_else(|| "-".into())
+    );
     let added = {
         let mut table = blocks.lock().await;
-        let now = now_ms();
         // Checked and recorded under the same lock as the strike, so no state save sees one
         // without the other.
         if let Some((source, id)) = event {
@@ -1097,6 +1130,8 @@ async fn enforce_block_local(
                     id,
                     shown
                 );
+                drop(table);
+                sntl_db.append(format!("SIGNAL_DUPLICATE|IP:{}|{}", shown, context));
                 return Enforcement::Duplicate;
             }
         }
@@ -1107,13 +1142,14 @@ async fn enforce_block_local(
         Err(why) => {
             log::error!("[Local Security] Not blocking {}: {}", shown, why);
             sntl_db.append(format!(
-                "BLOCK_REFUSED|IP:{}|Why:{}|Reason:{}",
-                shown, why, reason
+                "BLOCK_REFUSED|IP:{}|Why:{}|Reason:{}|{}",
+                shown, why, reason, context
             ));
             return Enforcement::Refused;
         }
     };
     let ttl = added.ttl;
+    let claim = if added.new { "new" } else { "merged" };
     // A new claim is shared either way: peers can enforce it even if this node's map is full.
     // A repeat merged into the running claim is not signed and sent again (peers have it).
     if added.new {
@@ -1131,11 +1167,13 @@ async fn enforce_block_local(
                 reason
             );
             sntl_db.append(format!(
-                "DYNAMIC_BLOCK_{}|IP:{}|TTL:{}|Reason:{}|Enforced",
+                "DYNAMIC_BLOCK_{}|IP:{}|TTL:{}|Reason:{}|Enforced|Claim:{}|{}",
                 ip_tag(ip),
                 shown,
                 ttl_label(ttl),
-                reason
+                reason,
+                claim,
+                context
             ));
 
             let telemetry_msg = format!(
@@ -1153,8 +1191,13 @@ async fn enforce_block_local(
                 e
             );
             sntl_db.append(format!(
-                "BLOCK_PENDING|IP:{}|Error:{:?}|Reason:{}",
-                shown, e, reason
+                "BLOCK_PENDING|IP:{}|TTL:{}|Error:{:?}|Reason:{}|Claim:{}|{}",
+                shown,
+                ttl_label(ttl),
+                e,
+                reason,
+                claim,
+                context
             ));
             Enforcement::Pending
         }
@@ -1166,6 +1209,10 @@ async fn main() -> Result<(), anyhow::Error> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let args = Args::parse();
     log::info!("Sokol-Core {}", env!("SOKOL_VERSION"));
+
+    if let Some(path) = &args.replay {
+        std::process::exit(replay::print_report(path, env!("SOKOL_BUILD_ID")));
+    }
 
     let node_crypto = Arc::new(NodeCrypto::load_or_create(&args.key_file)?);
     if args.print_public_key {
@@ -1222,6 +1269,16 @@ async fn main() -> Result<(), anyhow::Error> {
         keep: args.audit_keep,
     });
     let sntl_db = Arc::new(SentinelDb::init(&args.db_path, rotation)?);
+    // Opens this run in the audit log with what its decisions depend on (ADR-0016).
+    sntl_db.append(
+        replay::StartContext {
+            build: env!("SOKOL_BUILD_ID").to_string(),
+            node: args.node_id,
+            ttl_base_secs: args.block_ttl,
+            ttl_max_secs: args.block_ttl_max.max(args.block_ttl),
+        }
+        .record(),
+    );
 
     #[cfg(debug_assertions)]
     let mut bpf = Bpf::load(include_bytes_aligned!(concat!(

@@ -580,6 +580,17 @@ printf 'BAN_IP:%s\n' "$PERSIST_IP" | nc -U -q1 "$WORK/control.sock" >/dev/null
 check "operator cannot lift a --block address" bash -c \
     "printf 'UNBAN_IP:$BLOCKED_IP\\n' | nc -U -q1 '$WORK/control.sock' | grep -q 'blocked by --block'"
 stop_orchestrator
+# ADR-0016: the first run started fresh, so its detector decisions (signals, resends, trap
+# hits, operator bans and lifts in between) replay from the audit log alone, with this build.
+"$BIN" --replay "$WORK/events.sntl" >"$WORK/replay.out" 2>&1 && REPLAY_STATUS=0 || REPLAY_STATUS=$?
+echo "      $(tail -1 "$WORK/replay.out")"
+check "the node's detector decisions replay from its audit log: all reproduced, none mismatched" \
+    bash -c "test $REPLAY_STATUS = 0 && grep -Eq ': [1-9][0-9]* reproduced, 0 mismatched' '$WORK/replay.out'"
+cp "$WORK/events.sntl" "$WORK/tampered.sntl"
+# Flip a bit (writing a fixed byte could leave it unchanged: that byte may already hold it).
+python3 -c "import sys; f = open(sys.argv[1], 'r+b'); f.seek(200); b = f.read(1)[0]; f.seek(200); f.write(bytes([b ^ 1]))" "$WORK/tampered.sntl"
+check "a log that does not verify is not replayed" bash -c \
+    "! '$BIN' --replay '$WORK/tampered.sntl' >'$WORK/replay-tampered.out' 2>&1; grep -q '^NOT REPLAYED' '$WORK/replay-tampered.out'"
 STATE_FILE=$LAST_STATE start_orchestrator
 check "an operator ban survives a restart" \
     bash -c "! ip netns exec $NS ping -c 2 -W 1 -I $PERSIST_IP $HOST_IP >/dev/null 2>&1"
