@@ -250,7 +250,6 @@ pub mod tcp_flags {
     }
 }
 
-pub mod atp;
 pub mod canonical;
 
 #[cfg(feature = "std")]
