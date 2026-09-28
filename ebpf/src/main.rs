@@ -11,7 +11,7 @@ use core::mem;
 
 use common::{
     config_flags, drop_reason, DropEvent, PacketStats, BLOCKLIST_CAPACITY, BLOCK_HIT_SLOTS,
-    DROP_REASON_SLOTS, MAX_EVENTS_PER_CPU_PER_SEC,
+    DROP_REASON_SLOTS, EVENTS_RING_BYTES, MAX_EVENTS_PER_CPU_PER_SEC,
 };
 
 const ETH_P_IP: u16 = 0x0800;
@@ -136,7 +136,7 @@ static STATS: PerCpuArray<PacketStats> = PerCpuArray::with_max_entries(1, 0);
 static CONFIG: Array<u32> = Array::with_max_entries(1, 0);
 
 #[map]
-static EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
+static EVENTS: RingBuf = RingBuf::with_byte_size(EVENTS_RING_BYTES, 0);
 
 #[inline(always)]
 fn ptr_at<T>(ctx: &XdpContext, offset: usize) -> Result<*const T, ()> {

@@ -17,11 +17,15 @@ use tokio::sync::watch;
 use crate::block_table::show;
 use crate::SentinelDb;
 
-/// CLI calls per round; the rest wait for the next round.
-pub const MAX_OPS_PER_TICK: usize = 64;
+/// Rule changes per round; the rest wait for the next round. An operation count, not a time
+/// budget: each change is a CLI call of up to CALL_TIMEOUT, after reading two RIB families, so
+/// a slow gobgpd can stretch a round to (2 + 64) × 5 s. The worker runs apart from the main
+/// tick (numerical review N06).
+pub const MAX_OPS_PER_ROUND: usize = 64;
 /// One gobgp call; a call that takes longer is killed, and its outcome is read back next round.
 pub const CALL_TIMEOUT: Duration = Duration::from_secs(5);
-/// Time allowed for withdrawing the node's rules on shutdown.
+/// Deadline for the attempt to withdraw the node's rules on shutdown: not a guarantee that any
+/// number of rules is withdrawn in it.
 pub const SHUTDOWN_BUDGET: Duration = Duration::from_secs(10);
 
 pub struct GobgpCli {
@@ -154,14 +158,14 @@ pub fn parse_own_rules(json: &[u8], community: u32) -> Result<HashSet<IpNet>, St
 }
 
 /// What to announce and withdraw so that `observed` becomes `wanted`, at most
-/// `MAX_OPS_PER_TICK` operations, withdrawals first (they unblock traffic).
+/// `MAX_OPS_PER_ROUND` operations, withdrawals first (they unblock traffic).
 pub fn plan(wanted: &HashSet<IpNet>, observed: &HashSet<IpNet>) -> (Vec<IpNet>, Vec<IpNet>) {
     let mut withdraw: Vec<IpNet> = observed.difference(wanted).copied().collect();
     let mut announce: Vec<IpNet> = wanted.difference(observed).copied().collect();
     withdraw.sort();
     announce.sort();
-    withdraw.truncate(MAX_OPS_PER_TICK);
-    announce.truncate(MAX_OPS_PER_TICK - withdraw.len());
+    withdraw.truncate(MAX_OPS_PER_ROUND);
+    announce.truncate(MAX_OPS_PER_ROUND - withdraw.len());
     (announce, withdraw)
 }
 
@@ -333,7 +337,7 @@ mod tests {
             .collect();
         let (announce, withdraw) = plan(&wanted, &observed);
         assert_eq!(withdraw.len(), 10);
-        assert_eq!(announce.len() + withdraw.len(), MAX_OPS_PER_TICK);
+        assert_eq!(announce.len() + withdraw.len(), MAX_OPS_PER_ROUND);
     }
 
     /// F04: a call that times out must not act later (the child is killed with the future).
