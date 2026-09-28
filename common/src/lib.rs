@@ -49,8 +49,32 @@ pub const DROP_REASON_SLOTS: usize = 16;
 pub const BLOCKLIST_CAPACITY: u32 = 65_536;
 /// Drop-counter slots: one per possible blocklist entry, IPv4 and IPv6 together.
 pub const BLOCK_HIT_SLOTS: u32 = 2 * BLOCKLIST_CAPACITY;
-/// Ring-buffer events allowed per CPU per second; the rest are only counted.
+/// Ring-buffer events allowed per CPU per second; the rest are only counted. Per CPU: a node
+/// with P busy CPUs can emit 64 × P events/s (numerical review N03).
 pub const MAX_EVENTS_PER_CPU_PER_SEC: u64 = 64;
+/// Size of the shared event ring buffer (a power of two, as the kernel requires).
+pub const EVENTS_RING_BYTES: u32 = 256 * 1024;
+/// Ring space one DropEvent takes: the record plus the kernel's 8-byte header, 8-aligned.
+pub const EVENT_RECORD_BYTES: usize = (abi::DROP_EVENT_SIZE + 8).div_ceil(8) * 8;
+
+/// What the per-CPU maps and the event path cost on this machine (N03): printed at start so a
+/// deployment sees the numbers that multiply with its CPU count.
+pub fn resource_estimate(possible_cpus: usize, online_cpus: usize) -> [(&'static str, u64); 4] {
+    let ring_records = EVENTS_RING_BYTES as u64 / EVENT_RECORD_BYTES as u64;
+    let events_per_sec = MAX_EVENTS_PER_CPU_PER_SEC * online_cpus as u64;
+    [
+        (
+            "block hit counters (bytes)",
+            u64::from(BLOCK_HIT_SLOTS) * 8 * possible_cpus as u64,
+        ),
+        ("event ceiling (events/s)", events_per_sec),
+        ("event ring (records)", ring_records),
+        (
+            "ring holds at the ceiling (ms)",
+            ring_records * 1000 / events_per_sec.max(1),
+        ),
+    ]
+}
 
 impl PacketStats {
     pub const ZERO: Self = Self {
@@ -118,6 +142,7 @@ pub mod abi {
         assert!(offset_of!(PacketStats, drops_by_reason) == 56);
         assert!(offset_of!(PacketStats, events_suppressed) == 56 + 8 * DROP_REASON_SLOTS);
         assert!(offset_of!(PacketStats, events_in_window) == 200);
+        assert!(super::EVENTS_RING_BYTES.is_power_of_two());
     };
 }
 
@@ -254,3 +279,19 @@ pub mod canonical;
 
 #[cfg(feature = "std")]
 pub mod audit_log;
+
+#[cfg(test)]
+mod resource_tests {
+    use super::*;
+
+    /// The figures the numerical review derived by hand (N03), as an independent oracle.
+    #[test]
+    fn the_resource_estimate_matches_the_review() {
+        let [counters, rate, records, hold] = resource_estimate(64, 64);
+        assert_eq!(counters.1, 64 * 1024 * 1024, "1 MiB per possible CPU");
+        assert_eq!(rate.1, 4096);
+        assert_eq!(EVENT_RECORD_BYTES, 312);
+        assert_eq!(records.1, 840);
+        assert_eq!(hold.1, 205);
+    }
+}

@@ -1375,6 +1375,21 @@ async fn main() -> Result<(), anyhow::Error> {
         bpf.take_map("BLOCK_HITS")
             .ok_or_else(|| anyhow::anyhow!("BLOCK_HITS missing"))?,
     )?;
+    // N03: the per-CPU numbers multiply with this machine's CPU count.
+    let possible_cpus = aya::util::nr_cpus()?;
+    let online_cpus = aya::util::online_cpus()
+        .map(|c| c.len())
+        .unwrap_or(possible_cpus);
+    log::info!(
+        "[Resources] {} possible / {} online CPUs: {}",
+        possible_cpus,
+        online_cpus,
+        common::resource_estimate(possible_cpus, online_cpus)
+            .iter()
+            .map(|(what, n)| format!("{} {}", what, n))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
     let blocks: SharedBlockTable = Arc::new(tokio::sync::Mutex::new(BlockTable::new(
         blocklist_v4_trie,
         blocklist_v6_trie,
