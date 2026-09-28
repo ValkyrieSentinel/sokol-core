@@ -1226,20 +1226,28 @@ async fn run_connection(
     tx.send(handshake).await?;
 
     let conn_id = NEXT_CONNECTION_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    spawn_peer_writer(rx, bulk_rx, writer, peer_addr, registry.clone(), conn_id);
+    let mut writer_task =
+        spawn_peer_writer(rx, bulk_rx, writer, peer_addr, registry.clone(), conn_id);
 
-    let result = handle_reader_loop(
-        &mut reader,
-        peer_addr,
-        node_id,
-        crypto.clone(),
-        cmd_tx,
-        registry.clone(),
-        link,
-        conn_id,
-        ticket,
-    )
-    .await;
+    // The connection ends as a whole, whichever side stops first. Reader done (EOF, a rejected
+    // envelope): stop the writer too, which drops its half of the socket, so the peer sees the
+    // end and redials. Left running, the writer and the ping loop kept the socket open and the
+    // peer never noticed. Writer done (a write timed out): stop reading from a dead link.
+    let result = tokio::select! {
+        r = handle_reader_loop(
+            &mut reader,
+            peer_addr,
+            node_id,
+            crypto.clone(),
+            cmd_tx,
+            registry.clone(),
+            link,
+            conn_id,
+            ticket,
+        ) => r,
+        _ = &mut writer_task => Err(anyhow::anyhow!("writing to {} stopped", peer_addr)),
+    };
+    writer_task.abort();
     registry.remove_peer(&peer_addr, conn_id).await;
     result
 }
@@ -1251,7 +1259,7 @@ fn spawn_peer_writer(
     peer_addr: SocketAddr,
     registry: PeerRegistry,
     conn_id: u64,
-) {
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
             // Urgent first; bulk only when nothing urgent is waiting.
@@ -1277,7 +1285,7 @@ fn spawn_peer_writer(
             }
         }
         registry.remove_peer(&peer_addr, conn_id).await;
-    });
+    })
 }
 
 fn spawn_ping_loop(ping_tx: mpsc::Sender<SecureEnvelope>, node_id: u64, crypto: Arc<NodeCrypto>) {
@@ -2776,6 +2784,41 @@ mod tests {
         let net = P2PNetwork::new(addr, 1, server, cmd_tx, 100, shutdown_rx, registry.clone());
         tokio::spawn(async move { net.serve(listener).await });
         (addr, registry, peer, cmd_rx, shutdown_tx)
+    }
+
+    /// A connection whose peer sent an envelope that does not authenticate is closed in both
+    /// directions. Before, only the reader stopped: the writer and its ping loop kept the socket
+    /// open, the peer kept receiving pings and never redialled, and only noticed when its own
+    /// writes backed up minutes later (seen as a node not rejoining after its clock was fixed).
+    #[tokio::test]
+    async fn a_rejected_envelope_closes_the_connection_both_ways() {
+        let (addr, _registry, peer, _rx, _stop) = listening_node().await;
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let send = |env: SecureEnvelope| {
+            let bytes = env.encode();
+            let mut frame = (bytes.len() as u32).to_be_bytes().to_vec();
+            frame.extend_from_slice(&bytes);
+            frame
+        };
+        let hello = seal(&peer, 2, &NetworkMessage::handshake(2)).unwrap();
+        stream.write_all(&send(hello)).await.unwrap();
+        let mut bad = seal(&peer, 2, &block_cmd("10.0.0.9")).unwrap();
+        if let Some(b) = bad.signature.first_mut() {
+            *b ^= 1;
+        }
+        stream.write_all(&send(bad)).await.unwrap();
+        // The node's handshake and pings may arrive first; then the stream must end.
+        let mut buf = [0u8; 8192];
+        let closed = timeout(Duration::from_secs(5), async {
+            loop {
+                match stream.read(&mut buf).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) => continue,
+                }
+            }
+        })
+        .await;
+        assert!(closed.is_ok(), "the node kept the rejected connection open");
     }
 
     #[tokio::test]
