@@ -20,6 +20,7 @@ pub use mesh_sync::{AlertLevel, MeshCommand, MeshOrchestrator};
 mod attack_reports;
 mod block_policy;
 mod block_table;
+mod clock_watch;
 pub mod cluster_state;
 mod control;
 mod defense;
@@ -2301,6 +2302,7 @@ async fn main() -> Result<(), anyhow::Error> {
         None => None,
     };
     let mut last_tick = std::time::Instant::now();
+    let mut clock_watch = clock_watch::ClockWatch::default();
 
     loop {
         tokio::select! {
@@ -2314,6 +2316,14 @@ async fn main() -> Result<(), anyhow::Error> {
             _ = ticker.tick() => {
                 let tick_started = std::time::Instant::now();
                 atp_controller.reset();
+                if let Some(step) = clock_watch.observe(now_ms(), tick_started) {
+                    log::warn!(
+                        "[Clock] Wall clock stepped {:+.1} s against the monotonic clock: every block's end moved with it{}",
+                        step as f64 / 1000.0,
+                        if step > 0 { " (blocks may have ended early)" } else { " (blocks last longer)" }
+                    );
+                    sntl_db.append(format!("CLOCK_STEP|By:{}ms|At:{}", step, now_ms()));
+                }
 
                 let (released, (outcomes, outcomes_dropped)) = {
                     let mut table = blocks.lock().await;
@@ -2447,6 +2457,11 @@ async fn main() -> Result<(), anyhow::Error> {
                     snapshot.mesh_sync_requests_throttled =
                         sync_throttled.load(Ordering::Relaxed);
                     snapshot.mesh_dropped_urgent = stats.dropped_urgent.load(Ordering::Relaxed);
+                    for (out, counter) in snapshot.mesh_rejected.iter_mut().zip(&stats.rejected) {
+                        *out = counter.load(Ordering::Relaxed);
+                    }
+                    snapshot.clock_steps = clock_watch.steps;
+                    snapshot.clock_last_step_ms = clock_watch.last_step_ms;
                     snapshot.mesh_dropped_bulk = stats.dropped_bulk.load(Ordering::Relaxed);
                     snapshot.ipc_lines_delayed = ipc_delayed_metrics.load(Ordering::Relaxed);
                 }

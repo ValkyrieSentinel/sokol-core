@@ -49,6 +49,10 @@ pub struct Snapshot {
     pub mesh_frames_delayed: u64,
     pub mesh_sync_requests_throttled: u64,
     pub mesh_dropped_urgent: u64,
+    /// Envelopes refused, in `p2p::EnvelopeError::LABELS` order.
+    pub mesh_rejected: [u64; 5],
+    pub clock_steps: u64,
+    pub clock_last_step_ms: i64,
     pub mesh_dropped_bulk: u64,
     pub ipc_lines_delayed: u64,
     pub tick_secs: f64,
@@ -377,6 +381,40 @@ pub fn render(s: &Snapshot) -> String {
     );
     family(
         &mut out,
+        "sokol_mesh_envelopes_rejected_total",
+        "counter",
+        "Mesh envelopes refused, by reason; stale_timestamp means a peer's clock is out of the 30 s window.",
+    );
+    for (label, n) in crate::p2p::EnvelopeError::LABELS
+        .iter()
+        .zip(s.mesh_rejected)
+    {
+        let _ = writeln!(
+            out,
+            "sokol_mesh_envelopes_rejected_total{{reason=\"{}\"}} {}",
+            label, n
+        );
+    }
+    family(
+        &mut out,
+        "sokol_clock_steps_total",
+        "counter",
+        "Wall-clock steps of 5 s or more against the monotonic clock; every block's end moved with them (ADR-0003).",
+    );
+    let _ = writeln!(out, "sokol_clock_steps_total {}", s.clock_steps);
+    family(
+        &mut out,
+        "sokol_clock_last_step_seconds",
+        "gauge",
+        "Size of the last wall-clock step: positive forward (blocks ended early), negative back (blocks last longer).",
+    );
+    let _ = writeln!(
+        out,
+        "sokol_clock_last_step_seconds {:.3}",
+        s.clock_last_step_ms as f64 / 1000.0
+    );
+    family(
+        &mut out,
         "sokol_ipc_lines_delayed_total",
         "counter",
         "Detector lines handled late because a connection or the IPC socket exceeded its rate.",
@@ -483,6 +521,9 @@ mod tests {
             rx_bytes: 1000,
             dropped_packets: 3,
             events_suppressed: 7,
+            mesh_rejected: [0, 0, 3, 0, 0],
+            clock_steps: 2,
+            clock_last_step_ms: -3_600_000,
             claims_waiting: 5,
             events_malformed: 2,
             strikes_remembered: 3,
@@ -502,6 +543,11 @@ mod tests {
         assert!(text.contains("sokol_xdp_dropped_packets_total{reason=\"blocklist\"} 2\n"));
         assert!(text.contains("sokol_xdp_dropped_packets_total{reason=\"fragment_blocked\"} 1\n"));
         assert!(text.contains("sokol_xdp_events_suppressed_total 7\n"));
+        assert!(
+            text.contains("sokol_mesh_envelopes_rejected_total{reason=\"stale_timestamp\"} 3\n")
+        );
+        assert!(text.contains("sokol_clock_steps_total 2\n"));
+        assert!(text.contains("sokol_clock_last_step_seconds -3600.000\n"));
         assert!(text.contains("sokol_claims_waiting 5\n"));
         assert!(text.contains("sokol_xdp_events_malformed_total 2\n"));
         assert!(text.contains("sokol_strikes_remembered 3\n"));
