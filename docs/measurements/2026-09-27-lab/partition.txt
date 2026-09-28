@@ -1,0 +1,5 @@
+# nodes=10 netem='none' host=aarch64 cpus=10 kernel=6.8.0-142-generic
+# full mesh after 3s: 10/10 nodes see 9 peers
+# node 10 cut for 30s; block issued 1 s into the partition
+node 10 learned the block 195 ms after the link came back
+node 10 sees 9/9 peers 741 ms after the link came back

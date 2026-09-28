@@ -1,0 +1,6 @@
+# host=aarch64 cpus=10 kernel=6.8.0-142-generic
+B7 65536 signals written in 28795 ms; all 65536 in the kernel map after 28805 ms (2275 blocks/s); witness: 5/5 sampled addresses dropped
+   RSS 27 MB -> 139 MB; watermark logged: 1
+   all expired 71257 ms after the fill completed (TTL 72 s); witness: all pass again
+   legitimate ping during the test: 1812 packets transmitted, 1812 received, 0% packet loss, time 100040ms
+   rtt: rtt min/avg/max/mdev = 0.006/0.084/2.700/0.101 ms
