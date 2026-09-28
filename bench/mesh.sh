@@ -6,6 +6,7 @@
 #   sudo bench/mesh.sh propagation <orchestrator> <monitor> <N> [rounds] [netem args...]
 #   sudo bench/mesh.sh partition   <orchestrator> <monitor> <N> <seconds down> [netem args...]
 #   sudo bench/mesh.sh soak        <orchestrator> <monitor> <N> <minutes> [netem args...]
+#   sudo bench/mesh.sh recover     <orchestrator> <monitor> <N> [signals] [netem args...]
 #
 # propagation: a block is issued on node 1 `rounds` times; for every other node the delay
 #              until its MESH_BLOCK record is reported (min / median / p95 / max, and the
@@ -20,6 +21,20 @@
 #              and tick time go to $BENCH_OUT/soak.csv (or the work dir). At the end: the mesh must
 #              agree on the active blocks, every audit chain must verify, no node may have
 #              panicked; memory growth after the first 5 minutes is reported. Block TTL: $TTL, default 300 s.
+#
+# recover:     recovery contract (docs/reviews/2026-09-28-transfer, T2). Node 1's link is held to
+#              $RECOVER_RATE (8mbit) and it gets <signals> (30000) detector events at the IPC rate,
+#              so its per-peer queues overflow. Limits, fixed before the first run:
+#                L1 node 1's control socket answers within 1000 ms throughout the flood;
+#                L2 no node's maintenance tick exceeds 500 ms (the runbook's alarm);
+#                L3 within 120 s after the flood every node holds node 1's active blocks, up to
+#                   the per-peer envelope (--peer-max-active, 16384, ADR-0007). Amended after the
+#                   first 30000-signal run: as registered it ignored the envelope, and every peer
+#                   stopping at exactly 16384 was the envelope, not a repair failure;
+#                L4 then no node has blocks waiting for the kernel map;
+#                L5 no node exits.
+#              If no broadcast was dropped the repair path was not exercised: the run reports
+#              NOT EXERCISED and fails, whatever L1-L5 say.
 #
 # netem args are applied to every node's link, e.g. `delay 100ms 20ms loss 10%`.
 set -euo pipefail
@@ -278,6 +293,73 @@ soak)
               for (n in first) { g = (last[n] - first[n]) * 100 / first[n]; if (g > max) max = g; if (min == "" || g < min) min = g }
               printf "RSS growth after the first 5 min: min %.1f%%, max %.1f%% (per node)\n", min, max }' "$CSV"
     echo "samples: $CSV"
+    exit $fail
+    ;;
+recover)
+    SIGNALS=$ARG; [ "$SIGNALS" = 20 ] && SIGNALS=30000   # ARG defaults to 20 for the other modes
+    RATE=${RECOVER_RATE:-8mbit}
+    in_ns 1 tc qdisc replace dev skv1 root tbf rate "$RATE" burst 32kbit latency 400ms
+    ctl_ms() {   # ctl_ms <node> <command>: answer time of the control socket in ms, 99999 if none
+        # Timed inside one process from connect to the first reply line: nc -q1 would add its
+        # own second after end of input.
+        in_ns "$1" python3 - "$WORK/n$1/ctl.sock" "$2" <<'PY'
+import socket, sys, time
+t0 = time.monotonic()
+try:
+    s = socket.socket(socket.AF_UNIX); s.settimeout(5); s.connect(sys.argv[1])
+    s.sendall(sys.argv[2].encode() + b"\n")
+    reply = s.makefile().readline()
+    print(int((time.monotonic() - t0) * 1000) if reply.startswith("OK") else 99999)
+except OSError:
+    print(99999)
+PY
+    }
+    echo "# recover: $SIGNALS signals at node 1, its link held to $RATE"
+    t0=$SECONDS
+    senders=()
+    for half in 0 1; do
+        awk -v n="$SIGNALS" -v h="$half" 'BEGIN { for (i = h; i < n; i += 2)
+            printf "SIGNAL#rec-%d:recover|100.%d.%d.%d|-|recovery flood\n", i, 64 + int(i / 65536) % 64, int(i / 256) % 256, i % 256 }' \
+            | in_ns 1 nc -U -q1 "$WORK/n1/ipc.sock" >/dev/null &
+        senders+=($!)
+    done
+    ctl_max=0; ctl_n=0
+    # Probe until node 1 has taken every signal (the senders finish long before: the socket
+    # buffers what the node's IPC pacing has not read yet), at most 5 minutes.
+    while [ "$(metric 1 'sokol_blocks_active{family="ipv4"}')" != "$SIGNALS" ] && [ $((SECONDS - t0)) -lt 300 ]; do
+        ms=$(ctl_ms 1 LIST_BANS); ctl_n=$((ctl_n + 1)); [ "$ms" -gt "$ctl_max" ] && ctl_max=$ms
+        sleep 0.5
+    done
+    flood_s=$((SECONDS - t0))
+    wait "${senders[@]}"
+    dropped=$(metric 1 'sokol_mesh_broadcasts_dropped_total{class="urgent"}')
+    echo "# flood done in ${flood_s} s; node 1 dropped ${dropped:-0} urgent broadcasts; control answered $ctl_n times, max ${ctl_max} ms"
+    fail=0
+    [ "${dropped:-0}" -gt 0 ] || { echo "NOT EXERCISED no broadcast was dropped: raise the signals or lower RECOVER_RATE"; fail=1; }
+    if [ "$ctl_n" -gt 0 ] && [ "$ctl_max" -le 1000 ]; then echo "PASS L1 control socket answered within 1000 ms during the flood (max $ctl_max ms)"; else echo "FAIL L1 control socket: max $ctl_max ms over $ctl_n probes"; fail=1; fi
+    # L3: every node reaches node 1's count; polled once a second.
+    t_end=$SECONDS; converged=""
+    while [ $((SECONDS - t_end)) -le 120 ]; do
+        want=$(metric 1 'sokol_blocks_active{family="ipv4"}'); behind=0
+        [ -n "$want" ] && [ "$want" -gt 16384 ] && want=16384   # ADR-0007 envelope, default
+        for i in $(seq 2 "$N"); do [ "$(metric "$i" 'sokol_blocks_active{family="ipv4"}')" = "$want" ] || behind=$((behind + 1)); done
+        [ "$behind" = 0 ] && [ -n "$want" ] && { converged=$((SECONDS - t_end)); break; }
+        sleep 1
+    done
+    if [ -n "$converged" ]; then echo "PASS L3 all $N nodes hold node 1's blocks (${want}, envelope 16384) ${converged} s after the flood"; else echo "FAIL L3 after 120 s $behind node(s) still differ from node 1 ($want blocks): $(for i in $(seq 2 "$N"); do printf '%s ' "$(metric "$i" 'sokol_blocks_active{family="ipv4"}')"; done)"; fail=1; fi
+    tick=0; pending=0
+    for i in $(seq 1 "$N"); do
+        t=$(metric "$i" sokol_tick_seconds_max); awk -v t="${t:-9}" 'BEGIN { exit !(t > 0.5) }' && { echo "     node $i tick max ${t}s"; tick=1; }
+        [ "$(metric "$i" sokol_blocks_pending)" = 0 ] || pending=$((pending + 1))
+    done
+    if [ $tick = 0 ]; then echo "PASS L2 no maintenance tick over 500 ms"; else echo "FAIL L2 maintenance tick over 500 ms"; fail=1; fi
+    if [ $pending = 0 ]; then echo "PASS L4 no node has blocks waiting for the kernel map"; else echo "FAIL L4 $pending node(s) have pending blocks"; fail=1; fi
+    dead=0
+    for i in $(seq 1 "$N"); do
+        pid=${NODE_PID[$i]}
+        { [ -e "/proc/$pid" ] && [ "$(awk '{print $3}' "/proc/$pid/stat")" != Z ]; } || { echo "     node $i exited"; dead=1; }
+    done
+    if [ $dead = 0 ]; then echo "PASS L5 no node exited"; else echo "FAIL L5 a node exited"; fail=1; fi
     exit $fail
     ;;
 *) echo "unknown mode $MODE"; exit 2 ;;
