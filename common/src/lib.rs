@@ -82,6 +82,45 @@ pub struct DropEvent {
     pub payload: [u8; MAX_PAYLOAD],
 }
 
+/// The XDP program writes `DropEvent` into the ring buffer and `PacketStats` into a per-CPU map;
+/// the orchestrator reads both. These asserts are the contract between the two sides. They are
+/// evaluated when this crate compiles, which happens for the BPF object and for userspace on
+/// every target, so a layout change that would make the two disagree does not build.
+/// (A kernel value once sat at an offset x86 tolerated and arm64 did not: ADR-0014.)
+/// The numbers are the ABI: changing one is a format change and gets an ADR.
+pub mod abi {
+    use super::{DropEvent, PacketStats, DROP_REASON_SLOTS, MAX_PAYLOAD};
+    use core::mem::{align_of, offset_of, size_of};
+
+    pub const DROP_EVENT_SIZE: usize = 300;
+    pub const PACKET_STATS_SIZE: usize = 208;
+
+    const _: () = {
+        assert!(size_of::<DropEvent>() == DROP_EVENT_SIZE);
+        assert!(align_of::<DropEvent>() == 4);
+        assert!(offset_of!(DropEvent, src_ip) == 0);
+        assert!(offset_of!(DropEvent, dst_ip) == 16);
+        assert!(offset_of!(DropEvent, pkt_len) == 32);
+        assert!(offset_of!(DropEvent, reason) == 36);
+        assert!(offset_of!(DropEvent, protocol) == 38);
+        assert!(offset_of!(DropEvent, ip_version) == 39);
+        assert!(offset_of!(DropEvent, payload_len) == 40);
+        assert!(offset_of!(DropEvent, _pad) == 42);
+        assert!(offset_of!(DropEvent, payload) == 44);
+        // No implicit padding: every byte is a declared field (the kernel side sets them all).
+        assert!(44 + MAX_PAYLOAD == DROP_EVENT_SIZE);
+
+        assert!(size_of::<PacketStats>() == PACKET_STATS_SIZE);
+        assert!(align_of::<PacketStats>() == 8);
+        assert!(offset_of!(PacketStats, rx_packets) == 0);
+        assert!(offset_of!(PacketStats, dropped_packets) == 16);
+        assert!(offset_of!(PacketStats, redirected_packets) == 48);
+        assert!(offset_of!(PacketStats, drops_by_reason) == 56);
+        assert!(offset_of!(PacketStats, events_suppressed) == 56 + 8 * DROP_REASON_SLOTS);
+        assert!(offset_of!(PacketStats, events_in_window) == 200);
+    };
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct NodeTelemetry {

@@ -196,13 +196,21 @@ FLOOD_START=$SECONDS
 ip netns exec "$NS" bash -c "for i in \$(seq 1 3000); do (echo > /dev/tcp/$HOST_IP/44333) 2>/dev/null; done; true"
 FLOOD_SECONDS=$((SECONDS - FLOOD_START + 1))
 sleep 1.5
-TRAP_EVENTS=$( (grep -a -o "KERNEL_DROP_NOTIFY|Reason:6|" "$WORK/events.sntl" || true) | wc -l)
+TRAP_EVENTS=$( (grep -a -o "KERNEL_DROP_NOTIFY|IP:[^|]*|Reason:6|" "$WORK/events.sntl" || true) | wc -l)
 CPUS=$(nproc)
 echo "      trap events recorded: $TRAP_EVENTS for 3000 SYNs; suppressed: $(metric sokol_xdp_events_suppressed_total); cpus: $CPUS"
 check "trap SYN flood: excess events are suppressed" test "$(metric sokol_xdp_events_suppressed_total)" -gt 0
 # 64 events per CPU per started second of flood (+1 window for the boundary).
 check "trap SYN flood: recorded events stay within the per-CPU budget" \
     test "$TRAP_EVENTS" -le $((64 * CPUS * (FLOOD_SECONDS + 1)))
+# ABI between the XDP program and userspace (common::abi): every field of an event written by the
+# real kernel program reads back as what was sent — source, protocol, IP version and a SYN's frame
+# length (Ethernet + IPv4 + TCP with options). A shifted field reads as garbage here.
+check "kernel events read back field by field: IP $ALLOWED_IP, TCP, IPv4, SYN-sized frame" bash -c "
+    '$(dirname "$BIN")/monitor' --dump '$WORK/events.sntl' | cut -f3 | grep '^KERNEL_DROP_NOTIFY|IP:[^|]*|Reason:6|' >'$WORK/trap-events' &&
+    test -s '$WORK/trap-events' &&
+    ! grep -v -E '^KERNEL_DROP_NOTIFY\|IP:$ALLOWED_IP\|Reason:6\|Proto:6\|Version:4\|PktLen:([5-9][0-9]|1[01][0-9])\$' '$WORK/trap-events'"
+check "no ring-buffer record of the wrong size" test "$(metric sokol_xdp_events_malformed_total)" = 0
 
 ipc() {
     printf '%s\n' "$1" | nc -U -q1 /run/sokol.sock

@@ -24,6 +24,7 @@ pub mod cluster_state;
 mod control;
 mod defense;
 mod flowspec;
+mod kernel_events;
 mod mesh_sync;
 mod metrics;
 mod p2p;
@@ -47,7 +48,7 @@ use tokio::sync::{mpsc, watch};
 use common::atp::AtpBudgetController;
 use common::audit_log::{AuditLog, Rotation};
 use common::canonical::CanonicalParser;
-use common::{DropEvent, NodeTelemetry};
+use common::NodeTelemetry;
 
 use crate::block_policy::{BlockPolicy, HostView, PolicyHandle};
 use crate::block_table::{
@@ -1341,56 +1342,47 @@ async fn main() -> Result<(), anyhow::Error> {
 
     if let Some(events_map_data) = bpf.take_map("EVENTS") {
         match RingBuf::try_from(events_map_data) {
-            Ok(ring_buf) => {
-                match AsyncFd::new(ring_buf) {
-                    Ok(mut async_fd) => {
-                        let db_events = sntl_db.clone();
-                        let node_id_ev = args.node_id;
-                        tokio::spawn(async move {
-                            log::info!("[eBPF RingBuf] Active consumer loop attached for kernel drop events.");
-                            loop {
-                                match async_fd.readable_mut().await {
-                                    Ok(mut guard) => {
-                                        let rb = guard.get_inner_mut();
+            Ok(ring_buf) => match AsyncFd::new(ring_buf) {
+                Ok(mut async_fd) => {
+                    let db_events = sntl_db.clone();
+                    let node_id_ev = args.node_id;
+                    tokio::spawn(async move {
+                        log::info!(
+                            "[eBPF RingBuf] Active consumer loop attached for kernel drop events."
+                        );
+                        loop {
+                            match async_fd.readable_mut().await {
+                                Ok(mut guard) => {
+                                    let rb = guard.get_inner_mut();
 
-                                        while let Some(item) = rb.next() {
-                                            if item.len() >= std::mem::size_of::<DropEvent>() {
-                                                let event = unsafe {
-                                                    std::ptr::read_unaligned(
-                                                        item.as_ptr() as *const DropEvent
-                                                    )
-                                                };
-                                                let log_msg = format!(
-                                                    "KERNEL_DROP_NOTIFY|Reason:{}|Proto:{}|Version:{}|PktLen:{}",
-                                                    event.reason, event.protocol, event.ip_version, event.pkt_len
-                                                );
-                                                db_events.append(log_msg.clone());
+                                    while let Some(item) = rb.next() {
+                                        if let Some(log_msg) = kernel_events::audit_line(&item) {
+                                            db_events.append(log_msg.clone());
 
-                                                let telemetry_msg = format!("DB_LOG:NODE={}|TIER=Tier1BotTarpit|IP=0.0.0.0|VEC={}\n", node_id_ev, log_msg);
-                                                push_telemetry(&telemetry_msg).await;
-                                            }
+                                            let telemetry_msg = format!("DB_LOG:NODE={}|TIER=Tier1BotTarpit|IP=0.0.0.0|VEC={}\n", node_id_ev, log_msg);
+                                            push_telemetry(&telemetry_msg).await;
                                         }
-                                        guard.clear_ready();
                                     }
-                                    Err(e) => {
-                                        log::error!(
-                                            "[eBPF RingBuf] Failed to get readable guard: {}",
-                                            e
-                                        );
-                                        break;
-                                    }
+                                    guard.clear_ready();
+                                }
+                                Err(e) => {
+                                    log::error!(
+                                        "[eBPF RingBuf] Failed to get readable guard: {}",
+                                        e
+                                    );
+                                    break;
                                 }
                             }
-                        });
-                    }
-                    Err(e) => {
-                        log::error!(
-                            "[eBPF RingBuf] Failed to wrap ring buffer in AsyncFd: {}",
-                            e
-                        );
-                    }
+                        }
+                    });
                 }
-            }
+                Err(e) => {
+                    log::error!(
+                        "[eBPF RingBuf] Failed to wrap ring buffer in AsyncFd: {}",
+                        e
+                    );
+                }
+            },
             Err(e) => {
                 log::error!(
                     "[eBPF RingBuf] Failed to create RingBuf from map data: {}",
@@ -2336,7 +2328,11 @@ async fn main() -> Result<(), anyhow::Error> {
                 let mut total_rx_packets = 0u64;
                 let mut total_rx_bytes = 0u64;
                 let mut total_dropped = 0u64;
-                let mut snapshot = metrics::Snapshot::default();
+                let mut snapshot = metrics::Snapshot {
+                    events_malformed: kernel_events::MALFORMED
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    ..Default::default()
+                };
 
                 if let Ok(per_cpu_stats) = stats_map.get(&0u32, 0) {
                     for cpu_stat in per_cpu_stats.iter() {
