@@ -431,7 +431,9 @@ clock)
         if t=$(wait_for 60 'test "$(active 1)" = 1'); then pass "C7 node 1 got node 3's block ${t} s after the rejoin"
         else flunk "C7 node 1 never got node 3's block"; fi
     else flunk "C6 node 1 sees $(metric 1 sokol_p2p_active_peers) peers 60 s after node 3 came back"; flunk "C7 not reached"; fi
-    # S4 (exploratory)
+    # S4 (exploratory). The block count is per node, so first let node 2's earlier blocks end
+    # (node 3's block from S2 was issued at +60 s and ends later here): then it counts S4's only.
+    wait_for 240 'test "$(active 2)" = 0' >/dev/null || echo "OBS  S4 node 2 still holds $(active 2) earlier blocks"
     signal_at 2 198.18.7.21; sleep 2
     echo "+3600" >"$WORK/n2/clock"; t0=$SECONDS
     t=$(wait_for 90 'test "$(active 2)" = 0' || true)
