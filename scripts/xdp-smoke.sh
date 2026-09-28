@@ -19,7 +19,7 @@ ORCH_PID=""
 OPERATOR_PID=""
 FAILED=0
 # Logged after XDP/TC attach, IPC socket and P2P setup all succeeded.
-READY="Sokol-Core running with SokolEngine"
+READY="Sokol-Core running"
 
 cleanup() {
     [ -n "$ORCH_PID" ] && kill "$ORCH_PID" 2>/dev/null && wait "$ORCH_PID" 2>/dev/null || true
