@@ -895,6 +895,8 @@ pub struct PeerRegistry {
     trust: Arc<std::sync::RwLock<Arc<TrustStore>>>,
     replay: Arc<std::sync::Mutex<ReplayGuard>>,
     pub stats: Arc<MeshStats>,
+    /// Frames per second and burst allowed to one authenticated peer (ADR-0013).
+    frame_limit: (f64, f64),
 }
 
 impl PeerRegistry {
@@ -905,7 +907,15 @@ impl PeerRegistry {
             trust: Arc::new(std::sync::RwLock::new(Arc::new(trust))),
             replay: Arc::new(std::sync::Mutex::new(ReplayGuard::default())),
             stats: Arc::new(MeshStats::default()),
+            frame_limit: (FRAMES_PER_SEC, FRAME_BURST),
         }
+    }
+
+    /// Another per-peer frame rate (tests: reach the pacing path with a few frames).
+    #[cfg(test)]
+    fn with_frame_limit(mut self, per_sec: f64, burst: f64) -> Self {
+        self.frame_limit = (per_sec, burst);
+        self
     }
 
     pub async fn add_peer(&self, addr: SocketAddr, link: PeerLink, node_id: u64, conn_id: u64) {
@@ -1355,7 +1365,7 @@ async fn handle_reader_loop(
     let mut authenticated_peer: Option<u64> = None;
     let handshake_deadline = tokio::time::Instant::now() + HANDSHAKE_TIMEOUT;
     let (mut frames, mut bytes) = (
-        Bucket::new(FRAMES_PER_SEC, FRAME_BURST),
+        Bucket::new(registry.frame_limit.0, registry.frame_limit.1),
         Bucket::new(BYTES_PER_SEC, BYTE_BURST),
     );
 
@@ -2842,9 +2852,21 @@ mod tests {
         mpsc::Receiver<MeshCommand>,
         watch::Sender<bool>,
     ) {
+        listening_node_with(|r| r).await
+    }
+
+    async fn listening_node_with(
+        configure: impl FnOnce(PeerRegistry) -> PeerRegistry,
+    ) -> (
+        SocketAddr,
+        PeerRegistry,
+        NodeCrypto,
+        mpsc::Receiver<MeshCommand>,
+        watch::Sender<bool>,
+    ) {
         let server = Arc::new(NodeCrypto::generate());
         let peer = NodeCrypto::generate();
-        let registry = PeerRegistry::new(trust_with(2, &peer));
+        let registry = configure(PeerRegistry::new(trust_with(2, &peer)));
         let (cmd_tx, cmd_rx) = mpsc::channel(10_000);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2885,29 +2907,30 @@ mod tests {
         assert_eq!(registry.stats.handshake_timeouts.load(Ordering::Relaxed), 2);
     }
 
+    /// Past its burst a peer is paced, not cut off or dropped: every frame arrives, some late.
+    /// Run with a small limit, so the pacing path is reached on any machine (with the real
+    /// 500/s and 5 000 burst, a slow debug build verified frames slower than the refill and
+    /// never paced them; signing thousands of frames also outlasted their freshness window).
     #[tokio::test]
     async fn a_fast_peer_is_paced_not_dropped() {
         use std::sync::atomic::Ordering;
-        let (addr, registry, peer, mut rx, _stop) = listening_node().await;
-        let mut stream = TcpStream::connect(addr).await.unwrap();
-        let n = FRAME_BURST as usize + 500;
-        let mut frames = Vec::with_capacity(n + 1);
-        frames.push(
-            seal(&peer, 2, &NetworkMessage::handshake(2))
-                .unwrap()
-                .encode(),
+        assert_eq!(
+            PeerRegistry::new(TrustStore::default()).frame_limit,
+            (FRAMES_PER_SEC, FRAME_BURST),
+            "production nodes use the ADR-0013 limit"
         );
+        let (per_sec, burst, n) = (20.0, 20.0, 60usize);
+        let (addr, registry, peer, mut rx, _stop) =
+            listening_node_with(|r| r.with_frame_limit(per_sec, burst)).await;
+        let mut frames = vec![seal(&peer, 2, &NetworkMessage::handshake(2))
+            .unwrap()
+            .encode()];
         for i in 0..n {
-            frames.push(
-                seal(
-                    &peer,
-                    2,
-                    &block_cmd(&format!("10.1.{}.{}", i / 250, i % 250)),
-                )
-                .unwrap()
-                .encode(),
-            );
+            let target = format!("10.1.0.{}", i);
+            frames.push(seal(&peer, 2, &block_cmd(&target)).unwrap().encode());
         }
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let started = std::time::Instant::now();
         let writer = tokio::spawn(async move {
             for bytes in frames {
                 let mut frame = (bytes.len() as u32).to_be_bytes().to_vec();
@@ -2923,10 +2946,17 @@ mod tests {
                 _ => panic!("only {} of {} commands arrived", got, n),
             }
         }
+        let took = started.elapsed();
         let _stream = writer.await.unwrap();
         assert!(
             registry.stats.frames_delayed.load(Ordering::Relaxed) > 0,
             "past the burst, frames must be paced"
+        );
+        // 61 frames (with the handshake) against a burst of 20 at 20/s: about 2 s.
+        assert!(
+            took >= Duration::from_millis(1_500),
+            "paced frames take their time ({:?})",
+            took
         );
     }
 

@@ -91,8 +91,9 @@
   `a_peer_gets_one_snapshot_per_cooldown`.
 - Живий TCP-тест `silent_connections_cannot_hold_the_node`: третє мовчазне з'єднання з однієї
   адреси відхилено одразу, мовчазні закрито за 5 с.
-- Живий TCP-тест `a_fast_peer_is_paced_not_dropped`: 5 500 кадрів, усі доставлено, частину
-  притримано.
+- Живий TCP-тест `a_fast_peer_is_paced_not_dropped`: з малим лімітом (20/с, запас 20) усі 60
+  кадрів доставлено, частину притримано, доставка триває ≈ 2 с. Мутант, що рахує, але не
+  чекає, падає. Типовий ліміт перевіряється окремо: це константи вище.
 - `claims_go_first_and_reports_are_dropped_first`, `the_writer_empties_the_urgent_queue_first`,
   `a_repeat_merged_into_the_running_claim_is_not_new`.
 - `strike_memory_is_bounded_by_count`: 65 636 різних цілей → пам'ятаються 65 536, витіснено 100;
