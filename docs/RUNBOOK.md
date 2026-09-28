@@ -4,6 +4,9 @@
 перевіряється в `scripts/xdp-smoke.sh` або береться з `deploy/`. Де поведінку не перевірено, це
 сказано. Шляхи — як у `deploy/sokol-orchestrator.service`.
 
+Весь шлях від встановлення до пакета для підтримки проганяє `scripts/runbook-rehearsal.sh` на
+чистому systemd-хості (див. кінець документа).
+
 Перевірені середовища — у [SUPPORT.md](SUPPORT.md). Чому система поводиться саме так — у
 [ARCHITECTURE.md](../ARCHITECTURE.md) і [ADR](adr/README.md).
 
@@ -25,6 +28,8 @@ sudo groupadd --system sokol-ops     # оператори й дашборд: к�
 sudo install -m 0755 target/release/orchestrator /usr/local/bin/sokol-orchestrator
 sudo install -m 0755 target/release/monitor /usr/local/bin/sokol-monitor
 sudo install -m 0644 deploy/sokol-orchestrator.service /etc/systemd/system/
+sudo install -d -o sokol -g sokol -m 0700 /var/lib/sokol   # як StateDirectory; потрібен уже в §2
+sudo install -d -m 0755 /etc/sokol
 ```
 
 `/etc/default/sokol`:
@@ -48,7 +53,8 @@ sudo -u sokol /usr/local/bin/sokol-orchestrator --key-file /var/lib/sokol/node.k
 ```
 
 Виводить `mldsa65:<hex>`; файл ключа створюється при першому запуску (`0600`). Зберіть ключі
-всіх вузлів у `/etc/sokol/peers.json` на **кожному** вузлі (меш має бути повним):
+всіх вузлів у `/etc/sokol/peers.json` на **кожному** вузлі (меш має бути повним). Файл
+потрібен до старту служби; перший вузол, поки інших немає, стартує з `[]`.
 
 ```json
 [
@@ -232,3 +238,17 @@ sudo CONTROL=/run/sokol/control.sock PEERS=/etc/sokol/peers.json scripts/support
 
 Ключа вузла й сирих файлів стану та аудиту там **немає**; smoke перевіряє, що байтів ключа
 немає в жодному файлі пакета.
+
+## Репетиція
+
+```shell
+sudo scripts/runbook-rehearsal.sh <тека зі збіркою> <тека з іншою збіркою>
+```
+
+Проганяє цей документ на чистому хості з systemd: команди — як написано вище, трафік — через
+veth до мережевого простору імен (бан не відріже оператора). Друга збірка грає оновлення.
+Кожне місце, де документ і програма розходяться, друкується як `RUNBOOK DEVIATION`.
+
+Перевіряє: §1–§3 (зокрема кожен рядок таблиці перевірок, крім дашборда), §5.1, §5.4, §7, §8 і
+пакет для підтримки. Не перевіряє: збірку з джерел, меш і ротацію ключів (§5.5, §6 — потрібні
+інші вузли), адаптери детекторів (§5.6).

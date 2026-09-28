@@ -130,3 +130,13 @@ jobs:
           name: sokol-${{ github.sha }}-${{ matrix.arch }}
           path: dist/
           if-no-files-found: warn
+
+      # Last: it rebuilds the orchestrator with another build id (the "upgrade"), which replaces
+      # the binary the artifacts above were made from.
+      - name: Runbook rehearsal (systemd, docs/RUNBOOK.md as written)
+        run: |
+          mkdir -p /tmp/rh-a /tmp/rh-b
+          cp target/release/orchestrator target/release/monitor /tmp/rh-a/
+          SOKOL_BUILD_ID="${GITHUB_SHA::12}-upgrade" cargo build --release --locked -p orchestrator
+          cp target/release/orchestrator target/release/monitor /tmp/rh-b/
+          sudo scripts/runbook-rehearsal.sh /tmp/rh-a /tmp/rh-b
