@@ -112,6 +112,9 @@ pub struct MeshStats {
     /// Broadcasts not queued because a peer's queue was full, by class.
     pub dropped_urgent: std::sync::atomic::AtomicU64,
     pub dropped_bulk: std::sync::atomic::AtomicU64,
+    /// Envelopes refused, by `EnvelopeError::LABELS`. `stale_timestamp` rising from one peer
+    /// means its clock and this node's disagree by more than the envelope window.
+    pub rejected: [std::sync::atomic::AtomicU64; 5],
 }
 
 /// Admission of connections that have not authenticated yet.
@@ -744,6 +747,27 @@ pub enum EnvelopeError {
     MalformedPayload,
 }
 
+impl EnvelopeError {
+    /// Metric label and counter slot, in `MeshStats::rejected` order.
+    pub const LABELS: [&'static str; 5] = [
+        "unknown_sender",
+        "bad_signature",
+        "stale_timestamp",
+        "replay",
+        "malformed_payload",
+    ];
+
+    fn slot(&self) -> usize {
+        match self {
+            Self::UnknownSender => 0,
+            Self::BadSignature => 1,
+            Self::StaleTimestamp => 2,
+            Self::Replay => 3,
+            Self::MalformedPayload => 4,
+        }
+    }
+}
+
 pub fn seal(
     crypto: &NodeCrypto,
     sender_id: u64,
@@ -993,9 +1017,23 @@ impl PeerRegistry {
     }
 
     pub fn open(&self, envelope: &SecureEnvelope) -> Result<NetworkMessage, EnvelopeError> {
+        self.open_at(envelope, now_ms())
+    }
+
+    fn open_at(
+        &self,
+        envelope: &SecureEnvelope,
+        now: u64,
+    ) -> Result<NetworkMessage, EnvelopeError> {
         let mut replay = self.replay.lock().unwrap_or_else(|p| p.into_inner());
         let trust = self.trust.read().unwrap_or_else(|p| p.into_inner()).clone();
-        open(&trust, &mut replay, envelope, now_ms())
+        let opened = open(&trust, &mut replay, envelope, now);
+        if let Err(e) = &opened {
+            if let Some(counter) = self.stats.rejected.get(e.slot()) {
+                counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        opened
     }
 
     pub async fn broadcast(
@@ -1845,6 +1883,44 @@ mod tests {
             open(&trust, &mut ReplayGuard::default(), &env, later).unwrap_err(),
             EnvelopeError::StaleTimestamp
         );
+    }
+
+    /// Every refusal is counted under its reason: a peer whose clock is out of the window shows
+    /// up as `stale_timestamp`, not only in the log.
+    #[tokio::test]
+    async fn refused_envelopes_are_counted_by_reason() {
+        use std::sync::atomic::Ordering;
+        let peer = NodeCrypto::generate();
+        let registry = PeerRegistry::new(trust_with(7, &peer));
+        let count = |label: &str| {
+            let slot = EnvelopeError::LABELS
+                .iter()
+                .position(|l| *l == label)
+                .unwrap();
+            registry.stats.rejected[slot].load(Ordering::Relaxed)
+        };
+        let env = seal(&peer, 7, &block_cmd("10.0.0.9")).unwrap();
+        let later = env.timestamp_ms + MAX_CLOCK_SKEW_MS + 1;
+        assert_eq!(
+            registry.open_at(&env, later).unwrap_err(),
+            EnvelopeError::StaleTimestamp
+        );
+        assert!(registry.open_at(&env, env.timestamp_ms).is_ok());
+        assert_eq!(
+            registry.open_at(&env, env.timestamp_ms).unwrap_err(),
+            EnvelopeError::Replay
+        );
+        let stranger = seal(&NodeCrypto::generate(), 9, &block_cmd("10.0.0.9")).unwrap();
+        assert!(registry.open(&stranger).is_err());
+        assert_eq!(
+            (
+                count("stale_timestamp"),
+                count("replay"),
+                count("unknown_sender")
+            ),
+            (1, 1, 1)
+        );
+        assert_eq!(count("bad_signature") + count("malformed_payload"), 0);
     }
 
     #[test]
