@@ -647,6 +647,27 @@ impl<B: Blocklist> BlockTable<B> {
         true
     }
 
+    /// Peers' claims that are valid but wait for a slot in their issuer's envelope
+    /// (`max_active`, ADR-0007): known here, not enforced yet.
+    /// The queues are cleaned lazily, so an entry counts only while its claim still waits.
+    pub fn waiting_claims(&self, now_ms: u64) -> usize {
+        self.waiting
+            .values()
+            .flatten()
+            .filter(|id| {
+                self.claims.get(*id).is_some_and(|h| {
+                    !h.in_quota
+                        && h.claim.live_at(now_ms)
+                        && !self.retracted(id, h)
+                        && self
+                            .lease_ends
+                            .get(*id)
+                            .is_none_or(|(end, _)| *end > now_ms)
+                })
+            })
+            .count()
+    }
+
     /// (remembered event ids, ids forgotten early because the memory was full)
     pub fn event_memory(&self) -> (usize, u64) {
         (self.events.len(), self.events_evicted)
@@ -2771,6 +2792,42 @@ mod tests {
         assert!(
             !restarted.is_blocked(ip("203.0.113.71")),
             "b is enforced past its original lease end"
+        );
+    }
+
+    /// Claims over a peer's envelope are counted while they wait, and not once they are enforced.
+    #[test]
+    fn claims_waiting_for_a_slot_are_counted() {
+        let (a, b) = (
+            peer_claim(2, "203.0.113.80", T0),
+            peer_claim(2, "203.0.113.81", T0),
+        );
+        let mut n1 = table(1, 64);
+        one_slot(&mut n1, 2, T0);
+        let a_id = a.id();
+        assert_eq!(n1.adopt(a, true, T0), Adoption::Enforced);
+        assert_eq!(n1.waiting_claims(T0 + S), 0);
+        assert_eq!(n1.adopt(b, true, T0), Adoption::Held("quota"));
+        assert_eq!(
+            n1.waiting_claims(T0 + S),
+            1,
+            "b waits for the peer's only slot"
+        );
+        n1.retract(2, &[a_id], T0 + S);
+        n1.tick(T0 + S);
+        assert!(n1.is_blocked(ip("203.0.113.81")), "b takes the freed slot");
+        assert_eq!(n1.waiting_claims(T0 + S), 0, "b no longer waits");
+        // A waiting claim its issuer retracts stays in the queue until it is reached, but no
+        // longer waits.
+        let c = peer_claim(2, "203.0.113.82", T0 + S);
+        let c_id = c.id();
+        assert_eq!(n1.adopt(c, true, T0 + S), Adoption::Held("quota"));
+        assert_eq!(n1.waiting_claims(T0 + S), 1);
+        n1.retract(2, &[c_id], T0 + 2 * S);
+        assert_eq!(
+            n1.waiting_claims(T0 + 2 * S),
+            0,
+            "a retracted claim does not wait"
         );
     }
 

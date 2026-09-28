@@ -86,6 +86,7 @@ journalctl -u sokol-orchestrator -n 50 --no-pager
 | `sokol_blocks_pending` / `…_oldest_seconds` | > 0 довго | карта ядра не приймає записи (переповнена) |
 | `sokol_blocks_active` vs `sokol_blocks_capacity` | > 80 % | наближається ліміт 65 536 |
 | `sokol_p2p_active_peers` | менше очікуваного | див. §5.5 |
+| `sokol_claims_waiting` | > 0 довго | пір видав більше рішень, ніж дозволяє його конверт (`--peer-max-active`, 16 384, ADR-0007): решта чекає на слот. Через це кількість блоків на вузлах різниться, хоча меш справний |
 | `sokol_mesh_broadcasts_dropped_total{class="urgent"}` | росте | лінк до піра не встигає за заявками |
 | `sokol_mesh_handshake_timeouts_total` | швидко росте | хтось відкриває з'єднання й мовчить |
 | `sokol_tick_seconds_max` | > 0,5 | обслуговування таблиці сповільнюється |
