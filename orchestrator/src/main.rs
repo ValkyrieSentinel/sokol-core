@@ -47,7 +47,6 @@ use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc, watch};
 
-use common::atp::AtpBudgetController;
 use common::audit_log::{AuditLog, Rotation};
 use common::canonical::CanonicalParser;
 use common::NodeTelemetry;
@@ -503,6 +502,11 @@ struct Args {
     /// Drops per second at which this node reports itself under attack to the mesh.
     #[arg(long, default_value = "1000")]
     attack_drops_per_sec: u64,
+
+    /// Received packets per second above which the node logs (once per crossing) that its
+    /// traffic rate is high. A fixed rate threshold, not an anomaly model; it blocks nothing.
+    #[arg(long, default_value = "500")]
+    rx_rate_alert_pps: f64,
 
     /// How long an attack report (ATTACK:, e.g. from FastNetMon) keeps this node "under attack"
     /// if the detector never clears it.
@@ -1267,8 +1271,6 @@ async fn main() -> Result<(), anyhow::Error> {
         args.interface,
         args.node_id
     );
-
-    let atp_controller = AtpBudgetController::new(10_000_000);
 
     let rotation = (args.audit_max_bytes > 0).then_some(Rotation {
         max_bytes: args.audit_max_bytes,
@@ -2158,7 +2160,8 @@ async fn main() -> Result<(), anyhow::Error> {
         }
     });
 
-    let sokol_engine = SokolEngine::new(500.0);
+    let sokol_engine = SokolEngine::new(args.rx_rate_alert_pps);
+    let mut rate_alert = sokol::RateAlert::default();
     let mut prev_packets = 0;
     let mut prev_bytes = 0;
     let mut prev_dropped = 0;
@@ -2195,7 +2198,7 @@ async fn main() -> Result<(), anyhow::Error> {
         });
     }
 
-    log::info!("Sokol-Core running with SokolEngine anomaly detection & sovereign mesh verification loops.");
+    log::info!("Sokol-Core running.");
 
     // The protected set follows the host: addresses and default gateways are re-read every
     // PROTECTED_REFRESH; a change replaces the policy and re-checks every claim, so a target that
@@ -2327,7 +2330,6 @@ async fn main() -> Result<(), anyhow::Error> {
 
             _ = ticker.tick() => {
                 let tick_started = std::time::Instant::now();
-                atp_controller.reset();
                 if let Some(step) = clock_watch.observe(now_ms(), tick_started) {
                     log::warn!(
                         "[Clock] Wall clock stepped {:+.1} s against the monotonic clock; blocks in force keep their length (ADR-0017), peers' envelopes and claims are now judged by the new time",
@@ -2401,10 +2403,6 @@ async fn main() -> Result<(), anyhow::Error> {
                 let hb_msg = format!("HEARTBEAT:ID={}|NAME=Sokol-Node-{}|EP={}|MODE={}|CTL={}\n", node_id_hb, node_id_hb, p2p_bind_hb, mode, control_socket_hb);
                 push_telemetry(&hb_msg).await;
 
-                if !atp_controller.try_consume(250) {
-                    log::warn!("[ATP THROTTLE] Execution budget exceeded for current tick, skipping heavy analytical cycle.");
-                    continue;
-                }
 
                 let mut total_rx_packets = 0u64;
                 let mut total_rx_bytes = 0u64;
@@ -2538,7 +2536,7 @@ async fn main() -> Result<(), anyhow::Error> {
                 // Measured, not assumed: a delayed tick must not inflate the rates.
                 let dt = last_tick.elapsed().as_secs_f64().max(0.001);
                 last_tick = std::time::Instant::now();
-                let is_anomaly = sokol_engine.detect_anomaly(
+                let rate_high = sokol_engine.rate_above(
                     total_rx_packets as f64,
                     prev_packets as f64,
                     dt,
@@ -2552,17 +2550,30 @@ async fn main() -> Result<(), anyhow::Error> {
                 let first_tick = !have_baseline;
                 have_baseline = true;
 
-                if !first_tick && (is_anomaly || delta_dropped > 0) {
+                // A rate threshold (N04): reported when crossed, not on every tick above it.
+                match rate_alert.update(!first_tick && rate_high) {
+                    Some(true) => {
+                        log::warn!(
+                            "[Traffic] RX rate {:.0} pkts/s is above --rx-rate-alert-pps {:.0}",
+                            flow_rate.0, args.rx_rate_alert_pps
+                        );
+                        let telemetry = format!(
+                            "DB_LOG:NODE={}|TIER=Tier3RateAnomaly|IP=0.0.0.0|VEC=RX rate {:.0} pkts/s above {:.0}\n",
+                            node_id_hb, flow_rate.0, args.rx_rate_alert_pps
+                        );
+                        push_telemetry(&telemetry).await;
+                    }
+                    Some(false) => log::info!(
+                        "[Traffic] RX rate {:.0} pkts/s is back below {:.0}",
+                        flow_rate.0, args.rx_rate_alert_pps
+                    ),
+                    None => {}
+                }
+                if !first_tick && delta_dropped > 0 {
                     log::warn!(
-                        "[SOKOL ANOMALY DETECTED] Flow Rate: {:.2} pkts/s | Pkts/s: {} | Bytes/s: {} | Drops/s: {} | Drops total: {}",
-                        flow_rate.0, delta_packets, delta_bytes, delta_dropped, total_dropped
+                        "[Traffic] {} packets dropped in the last {:.1} s ({} total) | RX {:.0} pkts/s, {} bytes",
+                        delta_dropped, dt, total_dropped, flow_rate.0, delta_bytes
                     );
-
-                    let anomaly_telemetry = format!(
-                        "DB_LOG:NODE={}|TIER=Tier3RateAnomaly|IP=0.0.0.0|VEC=Anomaly detected, flow rate {:.2}\n",
-                        node_id_hb, flow_rate.0
-                    );
-                    push_telemetry(&anomaly_telemetry).await;
                 }
 
                 let telemetry_stat = format!(
