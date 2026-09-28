@@ -29,6 +29,10 @@ pub const STRIKE_MEMORY: Duration = Duration::from_secs(24 * 3600);
 /// How long a detector event id is remembered: a replay within it adds no strike. As long as
 /// the strike memory, so a replay can never escalate a block.
 pub const EVENT_MEMORY: Duration = STRIKE_MEMORY;
+/// Targets whose strikes are remembered at once. Every new source a detector reports adds one,
+/// so without a count bound a flood of distinct (spoofed) sources grew the table for as long as
+/// STRIKE_MEMORY; the oldest are forgotten first, and a forgotten target restarts at `base`.
+pub const MAX_STRIKES: usize = common::BLOCKLIST_CAPACITY as usize;
 /// At most this many remembered event ids; the oldest is forgotten first (and counted).
 pub const MAX_EVENTS: usize = common::BLOCKLIST_CAPACITY as usize;
 
@@ -364,6 +368,10 @@ pub struct BlockTable<B = KernelBlocklist> {
     retry: std::collections::VecDeque<IpNet>,
     queued: HashSet<IpNet>,
     strikes: HashMap<IpNet, (u32, u64)>,
+    /// (target, last strike) in the order strikes were taken; an entry whose time no longer
+    /// matches the map is stale and skipped. Compacted when it holds twice MAX_STRIKES.
+    strike_order: std::collections::VecDeque<(IpNet, u64)>,
+    strikes_evicted: u64,
     /// Detector events already acted on, keyed by hash of (source, event id), oldest first.
     events: HashMap<[u8; 16], u64>,
     event_order: std::collections::VecDeque<([u8; 16], u64)>,
@@ -417,6 +425,8 @@ impl<B: Blocklist> BlockTable<B> {
             retry: std::collections::VecDeque::new(),
             queued: HashSet::new(),
             strikes: HashMap::new(),
+            strike_order: std::collections::VecDeque::new(),
+            strikes_evicted: 0,
             events: HashMap::new(),
             event_order: std::collections::VecDeque::new(),
             events_evicted: 0,
@@ -642,6 +652,41 @@ impl<B: Blocklist> BlockTable<B> {
         (self.events.len(), self.events_evicted)
     }
 
+    /// (targets with remembered strikes, targets forgotten early because the memory was full)
+    pub fn strike_memory(&self) -> (usize, u64) {
+        (self.strikes.len(), self.strikes_evicted)
+    }
+
+    /// Records a strike on `net` and returns its count (at least 1). A new target over
+    /// MAX_STRIKES makes room by forgetting the least recently struck ones.
+    fn strike(&mut self, net: IpNet, now_ms: u64) -> u32 {
+        if !self.strikes.contains_key(&net) {
+            while self.strikes.len() >= MAX_STRIKES {
+                let Some((old, seen)) = self.strike_order.pop_front() else {
+                    break;
+                };
+                if self.strikes.get(&old).map(|&(_, last)| last) == Some(seen) {
+                    self.strikes.remove(&old);
+                    self.strikes_evicted += 1;
+                }
+            }
+        }
+        let entry = self.strikes.entry(net).or_insert((0, now_ms));
+        if now_ms.saturating_sub(entry.1) > ms(STRIKE_MEMORY) {
+            entry.0 = 0;
+        }
+        entry.0 = entry.0.saturating_add(1);
+        entry.1 = now_ms;
+        let count = entry.0;
+        self.strike_order.push_back((net, now_ms));
+        if self.strike_order.len() > 2 * MAX_STRIKES {
+            let strikes = &self.strikes;
+            self.strike_order
+                .retain(|(n, seen)| strikes.get(n).map(|&(_, last)| last) == Some(*seen));
+        }
+        count
+    }
+
     /// The earliest claim in force on `net`, as `<who>: <reason>`.
     fn cause(&self, net: &IpNet, now_ms: u64) -> String {
         let first = self
@@ -768,13 +813,8 @@ impl<B: Blocklist> BlockTable<B> {
             ClaimKind::Static | ClaimKind::Operator => None,
             ClaimKind::Detector if self.policy.base.is_zero() => None,
             ClaimKind::Detector => {
-                let entry = self.strikes.entry(net).or_insert((0, now_ms));
-                if now_ms.saturating_sub(entry.1) > ms(STRIKE_MEMORY) {
-                    entry.0 = 0;
-                }
-                entry.0 = entry.0.saturating_add(1);
-                entry.1 = now_ms;
-                let factor = 1u32.checked_shl(entry.0 - 1).unwrap_or(u32::MAX);
+                let strikes = self.strike(net, now_ms);
+                let factor = 1u32.checked_shl(strikes - 1).unwrap_or(u32::MAX);
                 Some(self.policy.base.saturating_mul(factor).min(self.policy.max))
             }
         };
@@ -1248,6 +1288,12 @@ impl<B: Blocklist> BlockTable<B> {
         }
         self.strikes
             .retain(|_, (_, last)| now_ms.saturating_sub(*last) <= ms(STRIKE_MEMORY));
+        while let Some(&(net, seen)) = self.strike_order.front() {
+            if self.strikes.get(&net).map(|&(_, last)| last) == Some(seen) {
+                break;
+            }
+            self.strike_order.pop_front();
+        }
         let mut lifted = self.settle(touched, now_ms);
         // Retries: at most MAX_RETRIES_PER_TICK targets, each once, in queue order.
         let n = self.retry.len().min(MAX_RETRIES_PER_TICK);
@@ -1912,6 +1958,36 @@ mod tests {
             Some(Duration::from_secs(60)),
             "strikes forgotten"
         );
+    }
+
+    /// Every distinct source a detector reports gets a strike. A flood of distinct sources must
+    /// not grow that memory past MAX_STRIKES: the oldest are forgotten and counted.
+    #[test]
+    fn strike_memory_is_bounded_by_count() {
+        let v4 = |i: u32| {
+            IpNet::from(std::net::IpAddr::from(std::net::Ipv4Addr::from(
+                0x0A00_0000 + i,
+            )))
+        };
+        let mut t = table(1, 64);
+        let extra = 100;
+        for i in 0..(MAX_STRIKES + extra) as u32 {
+            let net = v4(i);
+            let _ = t.add_local(net, ClaimKind::Detector, "flood", T0 + u64::from(i));
+        }
+        assert_eq!(t.strike_memory(), (MAX_STRIKES, extra as u64));
+        let after = T0 + (MAX_STRIKES + extra) as u64 + S;
+        let ttl_of = |t: &mut BlockTable<FakeLists>, net| {
+            t.add_local(net, ClaimKind::Detector, "again", after)
+                .unwrap()
+                .ttl
+        };
+        // The newest target still has its strike: a repeat now doubles its block.
+        let newest = v4((MAX_STRIKES + extra - 1) as u32);
+        assert_eq!(ttl_of(&mut t, newest), Some(Duration::from_secs(120)));
+        // The oldest was forgotten: it starts over at base.
+        let oldest = v4(0);
+        assert_eq!(ttl_of(&mut t, oldest), Some(Duration::from_secs(60)));
     }
 
     #[test]

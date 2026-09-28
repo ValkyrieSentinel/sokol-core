@@ -32,6 +32,8 @@ pub struct Snapshot {
     pub blocks_pending: usize,
     pub event_ids_remembered: usize,
     pub event_ids_evicted: u64,
+    pub strikes_remembered: usize,
+    pub strikes_evicted: u64,
     pub p2p_peers: usize,
     pub audit_queue_overflow: u64,
     pub defense_strict: bool,
@@ -191,6 +193,20 @@ pub fn render(s: &Snapshot) -> String {
         "Event ids forgotten early because the memory was full (a resend of one adds a strike).",
     );
     let _ = writeln!(out, "sokol_event_ids_evicted_total {}", s.event_ids_evicted);
+    family(
+        &mut out,
+        "sokol_strikes_remembered",
+        "gauge",
+        "Targets whose detector strikes are remembered (bounded by MAX_STRIKES).",
+    );
+    let _ = writeln!(out, "sokol_strikes_remembered {}", s.strikes_remembered);
+    family(
+        &mut out,
+        "sokol_strikes_evicted_total",
+        "counter",
+        "Targets whose strikes were forgotten early because the memory was full (they restart at the base TTL).",
+    );
+    let _ = writeln!(out, "sokol_strikes_evicted_total {}", s.strikes_evicted);
     family(
         &mut out,
         "sokol_p2p_active_peers",
@@ -460,6 +476,8 @@ mod tests {
             dropped_packets: 3,
             events_suppressed: 7,
             events_malformed: 2,
+            strikes_remembered: 3,
+            strikes_evicted: 4,
             blocks_active_v4: 2,
             blocks_active_v6: 1,
             blocks_capacity: 65536,
@@ -476,6 +494,8 @@ mod tests {
         assert!(text.contains("sokol_xdp_dropped_packets_total{reason=\"fragment_blocked\"} 1\n"));
         assert!(text.contains("sokol_xdp_events_suppressed_total 7\n"));
         assert!(text.contains("sokol_xdp_events_malformed_total 2\n"));
+        assert!(text.contains("sokol_strikes_remembered 3\n"));
+        assert!(text.contains("sokol_strikes_evicted_total 4\n"));
         assert!(text.contains("sokol_blocks_active{family=\"ipv4\"} 2\n"));
         assert!(text.contains("sokol_blocks_capacity 65536\n"));
         assert!(text.contains("sokol_p2p_active_peers 1\n"));
