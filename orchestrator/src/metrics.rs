@@ -34,6 +34,7 @@ pub struct Snapshot {
     pub event_ids_evicted: u64,
     pub strikes_remembered: usize,
     pub strikes_evicted: u64,
+    pub claims_waiting: usize,
     pub p2p_peers: usize,
     pub audit_queue_overflow: u64,
     pub defense_strict: bool,
@@ -207,6 +208,13 @@ pub fn render(s: &Snapshot) -> String {
         "Targets whose strikes were forgotten early because the memory was full (they restart at the base TTL).",
     );
     let _ = writeln!(out, "sokol_strikes_evicted_total {}", s.strikes_evicted);
+    family(
+        &mut out,
+        "sokol_claims_waiting",
+        "gauge",
+        "Peers' claims known here but waiting for a slot in their issuer's envelope (ADR-0007): not enforced yet.",
+    );
+    let _ = writeln!(out, "sokol_claims_waiting {}", s.claims_waiting);
     family(
         &mut out,
         "sokol_p2p_active_peers",
@@ -475,6 +483,7 @@ mod tests {
             rx_bytes: 1000,
             dropped_packets: 3,
             events_suppressed: 7,
+            claims_waiting: 5,
             events_malformed: 2,
             strikes_remembered: 3,
             strikes_evicted: 4,
@@ -493,6 +502,7 @@ mod tests {
         assert!(text.contains("sokol_xdp_dropped_packets_total{reason=\"blocklist\"} 2\n"));
         assert!(text.contains("sokol_xdp_dropped_packets_total{reason=\"fragment_blocked\"} 1\n"));
         assert!(text.contains("sokol_xdp_events_suppressed_total 7\n"));
+        assert!(text.contains("sokol_claims_waiting 5\n"));
         assert!(text.contains("sokol_xdp_events_malformed_total 2\n"));
         assert!(text.contains("sokol_strikes_remembered 3\n"));
         assert!(text.contains("sokol_strikes_evicted_total 4\n"));
