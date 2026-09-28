@@ -662,7 +662,7 @@ async fn execute_control(cmd: control::ControlCommand, ctx: &ControlCtx) -> Stri
             if let Err(why) = policy.check_net(ip) {
                 return format!("ERR {} is protected ({})", shown, why);
             }
-            let at = now_ms();
+            let at = block_table::local_ms();
             let added = match blocks
                 .lock()
                 .await
@@ -690,7 +690,7 @@ async fn execute_control(cmd: control::ControlCommand, ctx: &ControlCtx) -> Stri
         }
         ControlCommand::Unban(ip) => {
             let shown = show(&ip);
-            let at = now_ms();
+            let at = block_table::local_ms();
             let (result, still_blocked) = {
                 let mut table = blocks.lock().await;
                 let result = table.lift(ip, at);
@@ -724,7 +724,7 @@ async fn execute_control(cmd: control::ControlCommand, ctx: &ControlCtx) -> Stri
             }
         }
         ControlCommand::FlushDynamic => {
-            let at = now_ms();
+            let at = block_table::local_ms();
             let (released, lifted) = blocks.lock().await.flush_detector(at);
             broadcast_retraction(ctx, lifted.retracted).await;
             log::warn!(
@@ -739,7 +739,7 @@ async fn execute_control(cmd: control::ControlCommand, ctx: &ControlCtx) -> Stri
             format!("OK released {} dynamic blocks", released.len())
         }
         ControlCommand::FlushAll => {
-            let at = now_ms();
+            let at = block_table::local_ms();
             let (released, lifted) = blocks.lock().await.flush_all(at);
             broadcast_retraction(ctx, lifted.retracted).await;
             log::warn!(
@@ -763,7 +763,10 @@ async fn execute_control(cmd: control::ControlCommand, ctx: &ControlCtx) -> Stri
             }
         }
         ControlCommand::ListBans => {
-            let bans = blocks.lock().await.operator_targets(now_ms());
+            let bans = blocks
+                .lock()
+                .await
+                .operator_targets(block_table::local_ms());
             let shown: Vec<String> = bans.iter().take(LIST_BANS_MAX).map(show).collect();
             // "OK <total> <target>..."; at most LIST_BANS_MAX targets on the line.
             format!("OK {} {}", bans.len(), shown.join(" "))
@@ -785,10 +788,10 @@ async fn execute_control(cmd: control::ControlCommand, ctx: &ControlCtx) -> Stri
                             ctx.peer_limits.default,
                             per_peer,
                             ctx.peer_limits.quorum,
-                            now_ms(),
+                            block_table::local_ms(),
                         );
                         // A revoked node's claims stop counting here at once.
-                        table.set_pinned(trust.node_ids(), now_ms());
+                        table.set_pinned(trust.node_ids(), block_table::local_ms());
                     }
                     let pinned = ctx.registry.reload(trust);
                     log::warn!(
@@ -837,7 +840,7 @@ async fn send_snapshot(
     node_id: u64,
     crypto: &Arc<NodeCrypto>,
 ) {
-    let (claims, retracted) = blocks.lock().await.snapshot(now_ms());
+    let (claims, retracted) = blocks.lock().await.snapshot(block_table::local_ms());
     let total = claims.len();
     for cmd in mesh_sync::pack_snapshot(node_id, claims, retracted) {
         if let Err(e) = registry.send_to(addr, &cmd, node_id, crypto).await {
@@ -855,7 +858,9 @@ use state_store::{Restore, StateStore};
 async fn submit_state(store: &StateStore, blocks: &SharedBlockTable) -> Option<u64> {
     let state = {
         let mut table = blocks.lock().await;
-        table.dirty().then(|| table.take_persisted(now_ms()))
+        table
+            .dirty()
+            .then(|| table.take_persisted(block_table::local_ms()))
     }?;
     Some(store.submit(state, now_ms()))
 }
@@ -1109,7 +1114,7 @@ async fn enforce_block_local(
         ));
         return Enforcement::Refused;
     }
-    let now = now_ms();
+    let now = block_table::local_ms();
     // Replay context (ADR-0016): the exact decision time and the event id go into every
     // decision record; the audit record's own timestamp is when it was written.
     let context = format!(
@@ -1383,9 +1388,9 @@ async fn main() -> Result<(), anyhow::Error> {
             peer_limits.default,
             peer_limits.per_peer(&trust_store),
             peer_limits.quorum,
-            now_ms(),
+            block_table::local_ms(),
         );
-        table.set_pinned(trust_store.node_ids(), now_ms());
+        table.set_pinned(trust_store.node_ids(), block_table::local_ms());
     }
     let state_file = args
         .state_file
@@ -1459,7 +1464,7 @@ async fn main() -> Result<(), anyhow::Error> {
             blocks
                 .lock()
                 .await
-                .add_local(ip, ClaimKind::Static, "--block", now_ms())
+                .add_local(ip, ClaimKind::Static, "--block", block_table::local_ms())
                 .map_err(|why| anyhow::anyhow!("--block {}: {}", show(&ip), why))?
                 .applied?;
             sntl_db.append(format!(
@@ -1487,7 +1492,7 @@ async fn main() -> Result<(), anyhow::Error> {
             let (restored, refused) = blocks.lock().await.restore(
                 state,
                 |net| block_policy.current().check_net(net).is_ok(),
-                now_ms(),
+                block_table::local_ms(),
             );
             log::warn!(
                 "[State] Restored {} of this node's blocks from {} ({} refused)",
@@ -1611,7 +1616,7 @@ async fn main() -> Result<(), anyhow::Error> {
                     let refusal = claim
                         .net()
                         .and_then(|n| policy_mesh.current().check_net(n).err());
-                    let now = now_ms();
+                    let (now, wall) = (block_table::local_ms(), now_ms());
                     let result = blocks_mesh
                         .lock()
                         .await
@@ -1619,7 +1624,7 @@ async fn main() -> Result<(), anyhow::Error> {
                     match (result, refusal) {
                         (Adoption::Enforced, _) => {
                             let left =
-                                expires.map(|e| Duration::from_millis(e.saturating_sub(now)));
+                                expires.map(|e| Duration::from_millis(e.saturating_sub(wall)));
                             log::warn!(
                                 "[Mesh] Synchronized block for {} from node {} ({}): {}",
                                 shown,
@@ -1678,7 +1683,11 @@ async fn main() -> Result<(), anyhow::Error> {
                     }
                 }
                 MeshCommand::Retract { issuer, claims } => {
-                    let lifted = blocks_mesh.lock().await.retract(issuer, &claims, now_ms());
+                    let lifted =
+                        blocks_mesh
+                            .lock()
+                            .await
+                            .retract(issuer, &claims, block_table::local_ms());
                     for net in lifted {
                         log::info!(
                             "[Mesh] Unblocked {}: node {} took back its block",
@@ -1697,7 +1706,7 @@ async fn main() -> Result<(), anyhow::Error> {
                     claims,
                     retracted,
                 } => {
-                    let now = now_ms();
+                    let (now, wall) = (block_table::local_ms(), now_ms());
                     let mut adopted = 0;
                     for claim in claims {
                         let refusal = claim
@@ -1705,7 +1714,7 @@ async fn main() -> Result<(), anyhow::Error> {
                             .and_then(|n| policy_mesh.current().check_net(n).err());
                         let (shown, secs) = (
                             claim.target.clone(),
-                            claim.expires_ms.map(|e| e.saturating_sub(now) / 1000),
+                            claim.expires_ms.map(|e| e.saturating_sub(wall) / 1000),
                         );
                         let tag = parse_target(&shown).map(ip_tag).unwrap_or("V4");
                         if blocks_mesh
@@ -1743,7 +1752,10 @@ async fn main() -> Result<(), anyhow::Error> {
                 }
                 MeshCommand::Digest { issuer, digest } => {
                     // Our view of the sender's own claims differs: ask the sender for them.
-                    let ours = blocks_mesh.lock().await.digest_of(issuer, now_ms());
+                    let ours = blocks_mesh
+                        .lock()
+                        .await
+                        .digest_of(issuer, block_table::local_ms());
                     if ours != digest {
                         if let Some(addr) = registry_mesh.addr_of(issuer).await {
                             log::info!(
@@ -2233,10 +2245,10 @@ async fn main() -> Result<(), anyhow::Error> {
                     added, removed
                 ));
                 let current = policy.current();
-                let released = blocks
-                    .lock()
-                    .await
-                    .recheck(|net| current.check_net(net).is_ok(), now_ms());
+                let released = blocks.lock().await.recheck(
+                    |net| current.check_net(net).is_ok(),
+                    block_table::local_ms(),
+                );
                 for net in released {
                     log::warn!(
                         "[BlockPolicy] Block of {} released: it is protected now",
@@ -2318,16 +2330,18 @@ async fn main() -> Result<(), anyhow::Error> {
                 atp_controller.reset();
                 if let Some(step) = clock_watch.observe(now_ms(), tick_started) {
                     log::warn!(
-                        "[Clock] Wall clock stepped {:+.1} s against the monotonic clock: every block's end moved with it{}",
-                        step as f64 / 1000.0,
-                        if step > 0 { " (blocks may have ended early)" } else { " (blocks last longer)" }
+                        "[Clock] Wall clock stepped {:+.1} s against the monotonic clock; blocks in force keep their length (ADR-0017), peers' envelopes and claims are now judged by the new time",
+                        step as f64 / 1000.0
                     );
                     sntl_db.append(format!("CLOCK_STEP|By:{}ms|At:{}", step, now_ms()));
                 }
 
                 let (released, (outcomes, outcomes_dropped)) = {
                     let mut table = blocks.lock().await;
-                    let released = table.tick(now_ms());
+                    // ADR-0017: held blocks keep their length in real time across wall-clock steps;
+                    // the offset only converts what enters or leaves the table from now on.
+                    table.set_clock_offset(block_table::wall_offset_ms());
+                    let released = table.tick(block_table::local_ms());
                     (released, table.take_outcomes())
                 };
                 for ip in released {
@@ -2371,7 +2385,7 @@ async fn main() -> Result<(), anyhow::Error> {
                 // ADR-3 anti-entropy: a peer whose digest differs answers with its state.
                 if last_digest.elapsed() >= mesh_sync::DIGEST_INTERVAL {
                     last_digest = std::time::Instant::now();
-                    let digest = blocks.lock().await.digest(now_ms());
+                    let digest = blocks.lock().await.digest(block_table::local_ms());
                     let cmd = MeshCommand::Digest { issuer: node_id_tick, digest };
                     let _ = registry_tick.broadcast(&cmd, node_id_tick, &crypto_tick).await;
                 }
@@ -2423,12 +2437,12 @@ async fn main() -> Result<(), anyhow::Error> {
                     let table = blocks.lock().await;
                     snapshot.blocks_pending = table.pending();
                     snapshot.blocks_pending_oldest_secs =
-                        table.oldest_pending(now_ms()).as_secs_f64();
+                        table.oldest_pending(block_table::local_ms()).as_secs_f64();
                     (snapshot.event_ids_remembered, snapshot.event_ids_evicted) =
                         table.event_memory();
                     (snapshot.strikes_remembered, snapshot.strikes_evicted) =
                         table.strike_memory();
-                    snapshot.claims_waiting = table.waiting_claims(now_ms());
+                    snapshot.claims_waiting = table.waiting_claims(block_table::local_ms());
                 }
                 for message in watermark.update((v4_active, v6_active), common::BLOCKLIST_CAPACITY as usize) {
                     log::warn!("[BlockTable] {}", message);

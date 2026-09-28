@@ -399,14 +399,14 @@ pub fn render(s: &Snapshot) -> String {
         &mut out,
         "sokol_clock_steps_total",
         "counter",
-        "Wall-clock steps of 5 s or more against the monotonic clock; every block's end moved with them (ADR-0003).",
+        "Wall-clock steps of 5 s or more against the monotonic clock (ADR-0017); blocks in force keep their length.",
     );
     let _ = writeln!(out, "sokol_clock_steps_total {}", s.clock_steps);
     family(
         &mut out,
         "sokol_clock_last_step_seconds",
         "gauge",
-        "Size of the last wall-clock step: positive forward (blocks ended early), negative back (blocks last longer).",
+        "Size of the last wall-clock step: positive forward, negative back.",
     );
     let _ = writeln!(
         out,

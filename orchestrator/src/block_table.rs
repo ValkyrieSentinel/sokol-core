@@ -241,6 +241,9 @@ struct Held {
     net: IpNet,
     /// Local enforcement end: a peer's claim is capped at the local `max`.
     until_ms: Option<u64>,
+    /// The claim's own end on this table's clock (ADR-0017): its signed `expires_ms` moved by
+    /// the wall-clock offset when the claim entered, so a later wall-clock step leaves it alone.
+    end_local: Option<u64>,
     /// Passed the local never-block policy.
     allowed: bool,
     /// Holds one of its issuer's enforcement slots (always true for this node's claims).
@@ -258,6 +261,12 @@ struct Retraction {
     by_nodes: Vec<u64>,
     /// When the record may be forgotten (the claim cannot be live after it).
     forget_ms: Option<u64>,
+}
+
+impl Held {
+    fn live(&self, now_ms: u64) -> bool {
+        self.end_local.is_none_or(|e| e > now_ms)
+    }
 }
 
 /// What an operator lift did.
@@ -384,9 +393,28 @@ pub struct BlockTable<B = KernelBlocklist> {
     waiting: HashMap<u64, std::collections::VecDeque<ClaimId>>,
     /// Local ends of peers' claims cut short here, remembered across restarts (R26-07).
     lease_ends: HashMap<ClaimId, (u64, Option<u64>)>,
+    /// Wall clock minus this table's clock (ADR-0017); converts signed and persisted times.
+    wall_offset_ms: i64,
     /// Nodes whose claims may count here (the pinned peers). `None` until configured: no
     /// restriction (tests). A peer removed from the peers file loses its claims' effect.
     pinned: Option<HashSet<u64>>,
+}
+
+/// This table's clock (ADR-0017): monotonic, anchored to the wall clock at its first use. A
+/// wall-clock step does not move it, so a block keeps its length in real time. Signed claim
+/// times, the mesh and the state file stay on the wall clock; the table converts at those edges
+/// with the offset its owner keeps current ([`BlockTable::set_clock_offset`]).
+pub fn local_ms() -> u64 {
+    static ANCHOR: std::sync::OnceLock<(u64, std::time::Instant)> = std::sync::OnceLock::new();
+    let (wall, mono) = *ANCHOR.get_or_init(|| (crate::p2p::now_ms(), std::time::Instant::now()));
+    wall.saturating_add(mono.elapsed().as_millis().min(u128::from(u64::MAX)) as u64)
+}
+
+/// Wall clock minus [`local_ms`]: zero until the wall clock steps.
+pub fn wall_offset_ms() -> i64 {
+    let local = local_ms();
+    let wall = crate::p2p::now_ms();
+    i64::try_from(i128::from(wall) - i128::from(local)).unwrap_or(0)
 }
 
 fn ms(d: Duration) -> u64 {
@@ -437,12 +465,40 @@ impl<B: Blocklist> BlockTable<B> {
             active_by_issuer: HashMap::new(),
             waiting: HashMap::new(),
             pinned: None,
+            wall_offset_ms: 0,
             lease_ends: HashMap::new(),
         }
     }
 
     /// Sets the nodes whose claims may count here (R26-01: an unknown or revoked origin's
     /// claims are known but never enforced).
+    /// Keeps the wall-clock offset current (ADR-0017); the owner calls it every tick with
+    /// [`wall_offset_ms`]. Held claims keep the end they were given on entry.
+    pub fn set_clock_offset(&mut self, wall_minus_local_ms: i64) {
+        self.wall_offset_ms = wall_minus_local_ms;
+    }
+
+    /// A wall-clock time (signed or persisted) on this table's clock.
+    fn to_local(&self, wall_ms: u64) -> u64 {
+        let v = i128::from(wall_ms) - i128::from(self.wall_offset_ms);
+        v.clamp(0, i128::from(u64::MAX)) as u64
+    }
+
+    /// A time on this table's clock as wall-clock time (for claims, the mesh and the state file).
+    fn to_wall(&self, local_ms: u64) -> u64 {
+        let v = i128::from(local_ms) + i128::from(self.wall_offset_ms);
+        v.clamp(0, i128::from(u64::MAX)) as u64
+    }
+
+    /// A claim's own end on this table's clock.
+    fn end_of(&self, claim: &Claim) -> Option<u64> {
+        claim.expires_ms.map(|e| self.to_local(e))
+    }
+
+    fn claim_live(&self, claim: &Claim, now_ms: u64) -> bool {
+        self.end_of(claim).is_none_or(|e| e > now_ms)
+    }
+
     pub fn set_pinned(&mut self, pinned: HashSet<u64>, now_ms: u64) {
         self.pinned = Some(pinned);
         let nets: Vec<IpNet> = self.by_target.keys().copied().collect();
@@ -657,7 +713,7 @@ impl<B: Blocklist> BlockTable<B> {
             .filter(|id| {
                 self.claims.get(*id).is_some_and(|h| {
                     !h.in_quota
-                        && h.claim.live_at(now_ms)
+                        && h.live(now_ms)
                         && !self.retracted(id, h)
                         && self
                             .lease_ends
@@ -768,7 +824,7 @@ impl<B: Blocklist> BlockTable<B> {
                 let queue = self.claims.get(id).and_then(|h| {
                     let waits = h.claim.issuer != self.node_id
                         && !h.in_quota
-                        && h.claim.live_at(now_ms)
+                        && h.live(now_ms)
                         && !self.retracted(id, h)
                         && self.lease_ends.get(id).is_none_or(|(end, _)| *end > now_ms);
                     waits.then_some(h.claim.issuer)
@@ -851,7 +907,7 @@ impl<B: Blocklist> BlockTable<B> {
                 (h.claim.issuer == self.node_id
                     && h.claim.kind == kind
                     && self.effective(id, h, now_ms))
-                .then(|| (id.clone(), h.claim.expires_ms))
+                .then(|| (id.clone(), h.end_local))
             })
             .collect();
         let longest = own.iter().map(|(_, e)| *e).max_by(|a, b| match (a, b) {
@@ -872,12 +928,10 @@ impl<B: Blocklist> BlockTable<B> {
                 .iter()
                 .find(|(_, e)| *e == longest)
                 .and_then(|(id, _)| self.claims.get(id))
-                .map(|h| h.claim.clone());
-            if let Some(claim) = running.filter(|_| enough) {
+                .map(|h| (h.claim.clone(), h.end_local));
+            if let Some((claim, end)) = running.filter(|_| enough) {
                 let applied = self.reconcile(net, now_ms);
-                let left = claim
-                    .expires_ms
-                    .map(|e| Duration::from_millis(e.saturating_sub(now_ms)));
+                let left = end.map(|e| Duration::from_millis(e.saturating_sub(now_ms)));
                 return Ok(Added {
                     claim,
                     ttl: left,
@@ -893,15 +947,16 @@ impl<B: Blocklist> BlockTable<B> {
             issuer: self.node_id,
             kind,
             target: show(&net),
-            issued_ms: now_ms,
-            expires_ms: new_end,
+            issued_ms: self.to_wall(now_ms),
+            expires_ms: new_end.map(|e| self.to_wall(e)),
             reason: bounded_reason(reason),
         };
         let id = claim.id();
         self.insert_held(
             id,
             Held {
-                until_ms: claim.expires_ms,
+                until_ms: new_end,
+                end_local: new_end,
                 claim: claim.clone(),
                 net,
                 allowed: true,
@@ -954,7 +1009,7 @@ impl<B: Blocklist> BlockTable<B> {
         if self.claims.contains_key(&id) {
             return Adoption::Known;
         }
-        if !claim.live_at(now_ms) {
+        if !self.claim_live(&claim, now_ms) {
             return Adoption::Refused("expired");
         }
         if self.claims.len() >= MAX_KNOWN_CLAIMS {
@@ -968,7 +1023,8 @@ impl<B: Blocklist> BlockTable<B> {
             Some((end, _)) => cap.min(*end),
             None => cap,
         };
-        let until_ms = Some(claim.expires_ms.map_or(cap, |e| e.min(cap)));
+        let end_local = self.end_of(&claim);
+        let until_ms = Some(end_local.map_or(cap, |e| e.min(cap)));
         // Only a claim that could count takes a slot or waits for one: not one whose lease ran
         // out (before a restart), one the local policy refuses, or one already retracted (a
         // lifted claim resent by its issuer must not use up the issuer's quota).
@@ -984,7 +1040,7 @@ impl<B: Blocklist> BlockTable<B> {
         if in_quota {
             *active += 1;
             // The lease starts with enforcement; a waiting claim records it when it gets a slot.
-            self.record_lease(&id, cap, claim.expires_ms);
+            self.record_lease(&id, cap, end_local);
         } else if could_count {
             self.waiting
                 .entry(issuer)
@@ -997,6 +1053,7 @@ impl<B: Blocklist> BlockTable<B> {
                 claim,
                 net,
                 until_ms,
+                end_local,
                 allowed,
                 in_quota,
                 ended: lease_over,
@@ -1026,7 +1083,7 @@ impl<B: Blocklist> BlockTable<B> {
                 Some(h) if h.claim.issuer != issuer => continue,
                 Some(h) => {
                     touched.push(h.net);
-                    h.claim.expires_ms
+                    h.end_local
                 }
                 None => Some(now_ms.saturating_add(ms(self.policy.max))),
             };
@@ -1098,7 +1155,7 @@ impl<B: Blocklist> BlockTable<B> {
             // Kept as long as the claim can live anywhere (not just its local lease: a claim
             // that never had one, e.g. one waiting for a slot, would get a fresh lease when it
             // is resent after the record is gone). A claim that never expires keeps it for good.
-            let forget_ms = h.claim.expires_ms;
+            let forget_ms = h.end_local;
             let r = self.retractions.entry(id.clone()).or_default();
             if !r.operator {
                 out.claims += 1;
@@ -1219,7 +1276,7 @@ impl<B: Blocklist> BlockTable<B> {
         let dead: Vec<ClaimId> = self
             .claims
             .iter()
-            .filter(|(_, h)| !h.claim.live_at(now_ms))
+            .filter(|(_, h)| !h.live(now_ms))
             .map(|(id, _)| id.clone())
             .collect();
         // A peer's claim that ended here frees its slot, even while it lives elsewhere.
@@ -1275,13 +1332,13 @@ impl<B: Blocklist> BlockTable<B> {
                     continue;
                 }
                 if let Some(h) = self.claims.get_mut(&id) {
-                    if !h.in_quota && h.claim.live_at(now_ms) {
+                    if !h.in_quota && h.live(now_ms) {
                         h.in_quota = true;
-                        h.until_ms = Some(h.claim.expires_ms.map_or(cap, |e| e.min(cap)));
+                        h.until_ms = Some(h.end_local.map_or(cap, |e| e.min(cap)));
                         h.ended = false;
                         *self.active_by_issuer.entry(issuer).or_insert(0) += 1;
                         touched.push(h.net);
-                        let expires = h.claim.expires_ms;
+                        let expires = h.end_local;
                         self.record_lease(&id, cap, expires);
                     }
                 }
@@ -1391,7 +1448,7 @@ impl<B: Blocklist> BlockTable<B> {
 
     fn shared(&self, id: &ClaimId, h: &Held, now_ms: u64) -> bool {
         h.claim.kind == ClaimKind::Detector
-            && h.claim.live_at(now_ms)
+            && h.live(now_ms)
             && !self
                 .retractions
                 .get(id)
@@ -1439,7 +1496,7 @@ impl<B: Blocklist> BlockTable<B> {
             .filter(|(_, h)| {
                 h.claim.issuer == self.node_id
                     && h.claim.kind != ClaimKind::Static
-                    && h.claim.live_at(now_ms)
+                    && h.live(now_ms)
             })
             .map(|(id, h)| (id, &h.claim))
             .collect();
@@ -1448,11 +1505,12 @@ impl<B: Blocklist> BlockTable<B> {
         let mut operator_lifts = Vec::new();
         let mut retracted = Vec::new();
         for (id, r) in &self.retractions {
+            let forget = r.forget_ms.map(|f| self.to_wall(f));
             if r.operator {
-                operator_lifts.push((id.clone(), r.forget_ms));
+                operator_lifts.push((id.clone(), forget));
             }
             if r.by_nodes.contains(&self.node_id) {
-                retracted.push((id.clone(), r.forget_ms));
+                retracted.push((id.clone(), forget));
             }
         }
         operator_lifts.sort();
@@ -1461,7 +1519,13 @@ impl<B: Blocklist> BlockTable<B> {
             .lease_ends
             .iter()
             .filter(|(_, (_, expires))| expires.is_none_or(|e| e > now_ms))
-            .map(|(id, (end, expires))| (id.clone(), *end, *expires))
+            .map(|(id, (end, expires))| {
+                (
+                    id.clone(),
+                    self.to_wall(*end),
+                    expires.map(|e| self.to_wall(e)),
+                )
+            })
             .collect();
         peer_ends.sort();
         let events = self
@@ -1469,7 +1533,7 @@ impl<B: Blocklist> BlockTable<B> {
             .iter()
             .filter(|(key, seen)| self.events.get(key) == Some(seen))
             .filter(|(_, seen)| now_ms.saturating_sub(*seen) <= ms(EVENT_MEMORY))
-            .map(|(key, seen)| (crate::p2p::to_hex(key), *seen))
+            .map(|(key, seen)| (crate::p2p::to_hex(key), self.to_wall(*seen)))
             .collect();
         Persisted {
             schema: STATE_SCHEMA,
@@ -1492,10 +1556,13 @@ impl<B: Blocklist> BlockTable<B> {
         let mut events: Vec<([u8; 16], u64)> = state
             .events
             .iter()
-            .filter(|(_, seen)| now_ms.saturating_sub(*seen) <= ms(EVENT_MEMORY))
+            .filter(|(_, seen)| now_ms.saturating_sub(self.to_local(*seen)) <= ms(EVENT_MEMORY))
             .filter_map(|(hex, seen)| {
                 let bytes = crate::p2p::from_hex(hex).ok()?;
-                Some((<[u8; 16]>::try_from(bytes.as_slice()).ok()?, *seen))
+                Some((
+                    <[u8; 16]>::try_from(bytes.as_slice()).ok()?,
+                    self.to_local(*seen),
+                ))
             })
             .collect();
         events.sort_by_key(|(_, seen)| *seen);
@@ -1505,16 +1572,19 @@ impl<B: Blocklist> BlockTable<B> {
             self.event_order.push_back((key, seen));
         }
         for (id, end, expires) in state.peer_ends {
+            let (end, expires) = (self.to_local(end), expires.map(|e| self.to_local(e)));
             if expires.is_none_or(|e| e > now_ms) && self.lease_ends.len() < MAX_KNOWN_CLAIMS {
                 self.lease_ends.insert(id, (end, expires));
             }
         }
         for (id, forget_ms) in state.operator_lifts {
+            let forget_ms = forget_ms.map(|f| self.to_local(f));
             let r = self.retractions.entry(id).or_default();
             r.operator = true;
             r.forget_ms = forget_ms;
         }
         for (id, forget_ms) in state.retracted {
+            let forget_ms = forget_ms.map(|f| self.to_local(f));
             let r = self.retractions.entry(id).or_default();
             r.by_nodes.push(self.node_id);
             r.forget_ms = forget_ms;
@@ -1528,7 +1598,7 @@ impl<B: Blocklist> BlockTable<B> {
             };
             if claim.issuer != self.node_id
                 || claim.kind == ClaimKind::Static
-                || !claim.live_at(now_ms)
+                || !self.claim_live(&claim, now_ms)
             {
                 refused += 1;
                 continue;
@@ -1543,7 +1613,8 @@ impl<B: Blocklist> BlockTable<B> {
             self.insert_held(
                 id,
                 Held {
-                    until_ms: claim.expires_ms,
+                    until_ms: self.end_of(&claim),
+                    end_local: self.end_of(&claim),
                     claim,
                     net,
                     allowed: ok,
@@ -2634,6 +2705,86 @@ mod tests {
         assert!(own_retracted.len() + 1 >= t.claims.len());
     }
 
+    /// ADR-0017: a wall-clock step moves neither a block the node holds nor the lease of a
+    /// peer's block it enforces; they end after their length in real (table) time.
+    #[test]
+    fn a_wall_clock_step_does_not_move_held_blocks() {
+        let hour = 3600 * S;
+        for step in [hour as i64, -(hour as i64)] {
+            let mut t = table(1, 64);
+            let own = ip("203.0.113.120");
+            let peer = ip("203.0.113.121");
+            t.add_local(own, ClaimKind::Detector, "x", T0).unwrap();
+            let mut c = peer_claim(2, "203.0.113.121", T0);
+            c.expires_ms = Some(T0 + 60 * S);
+            assert_eq!(t.adopt(c, true, T0), Adoption::Enforced);
+            t.set_clock_offset(step);
+            t.tick(T0 + 59 * S);
+            assert!(
+                t.is_blocked(own) && t.is_blocked(peer),
+                "step {step}: still in force"
+            );
+            t.tick(T0 + 61 * S);
+            assert!(
+                !t.is_blocked(own) && !t.is_blocked(peer),
+                "step {step}: ended on time"
+            );
+        }
+    }
+
+    /// After a step, times entering the table are converted: a peer's claim ending 60 s from
+    /// the (new) wall clock lasts 60 s here, and this node's new claims carry wall-clock times.
+    #[test]
+    fn after_a_step_claims_are_converted_at_the_edges() {
+        let d = 3600 * S;
+        let mut t = table(1, 64);
+        t.set_clock_offset(d as i64);
+        let mut c = peer_claim(2, "203.0.113.122", T0 + d);
+        c.expires_ms = Some(T0 + d + 60 * S);
+        assert_eq!(t.adopt(c, true, T0), Adoption::Enforced);
+        let added = t
+            .add_local(ip("203.0.113.123"), ClaimKind::Detector, "x", T0)
+            .unwrap();
+        assert_eq!(added.claim.issued_ms, T0 + d);
+        assert_eq!(added.claim.expires_ms, Some(T0 + d + 60 * S));
+        assert_eq!(added.ttl, Some(Duration::from_secs(60)));
+        t.tick(T0 + 59 * S);
+        assert!(t.is_blocked(ip("203.0.113.122")) && t.is_blocked(ip("203.0.113.123")));
+        t.tick(T0 + 61 * S);
+        assert!(!t.is_blocked(ip("203.0.113.122")) && !t.is_blocked(ip("203.0.113.123")));
+    }
+
+    /// The state file is on the wall clock: saved under one offset and restored under the same
+    /// wall time, a lift and a remembered event keep their meaning.
+    #[test]
+    fn persisted_times_are_wall_clock() {
+        let d = 3600 * S;
+        let mut t = table(1, 64);
+        t.set_clock_offset(d as i64);
+        assert!(t.first_sighting("ids", "e1", T0));
+        t.add_local(ip("203.0.113.124"), ClaimKind::Detector, "x", T0)
+            .unwrap();
+        t.lift(ip("203.0.113.124"), T0 + S).unwrap();
+        let state = t.take_persisted(T0 + S);
+        assert_eq!(
+            state.events.first().map(|(_, seen)| *seen),
+            Some(T0 + d),
+            "event time saved as wall clock"
+        );
+        assert!(state
+            .operator_lifts
+            .iter()
+            .all(|(_, f)| *f == Some(T0 + d + 60 * S)));
+        // A restart: the table clock is anchored to the wall clock again (offset 0).
+        let mut r = table(1, 64);
+        r.restore(state, |_| true, T0 + d + 2 * S);
+        assert!(
+            !r.first_sighting("ids", "e1", T0 + d + 2 * S),
+            "still a duplicate"
+        );
+        assert!(!r.is_blocked(ip("203.0.113.124")), "the lift holds");
+    }
+
     #[test]
     fn local_claims_respect_the_known_claims_cap() {
         let mut t = table(1, 64);
@@ -2652,6 +2803,7 @@ mod tests {
                     },
                     net: ip(&target),
                     until_ms: Some(T0 + 60 * S),
+                    end_local: Some(T0 + 60 * S),
                     allowed: true,
                     in_quota: true,
                     ended: false,
