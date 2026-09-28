@@ -36,6 +36,12 @@ cleanup() {
     for p in "${PIDS[@]:-}"; do kill "$p" 2>/dev/null || true; done
     for p in "${PIDS[@]:-}"; do wait "$p" 2>/dev/null || true; done
     remove_topology
+    # Node logs outlive the run when there is somewhere to keep them: a node that died is only
+    # explained by its own log (panic=abort writes nothing to the kernel log).
+    if [ -n "${BENCH_OUT:-}" ]; then
+        mkdir -p "$BENCH_OUT/logs"
+        for d in "$WORK"/n*; do [ -f "$d/node.log" ] && cp "$d/node.log" "$BENCH_OUT/logs/$(basename "$d").log"; done
+    fi
     rm -rf "$WORK"
 }
 remove_topology() {
@@ -197,9 +203,18 @@ soak)
     sample() {
         local t=$1
         for i in $(seq 1 "$N"); do
-            local pid=${NODE_PID[$i]} rss fds audit state
+            local pid=${NODE_PID[$i]} rss fds audit state status
+            # A node that exited stays a zombie until waited for, so check the state, not kill -0.
+            if [ -z "$pid" ] || [ "$(awk '{print $3}' "/proc/$pid/stat" 2>/dev/null)" = Z ] || [ ! -e "/proc/$pid" ]; then
+                if [ -n "$pid" ]; then
+                    status=0; wait "$pid" 2>/dev/null || status=$?
+                    echo "# t=$t s: FAIL node $i exited on its own (status $status)"
+                    DIED+=("$i@$t:$status"); NODE_PID[$i]=""
+                fi
+                continue
+            fi
             rss=$(awk '/VmRSS/ {print $2}' "/proc/$pid/status" 2>/dev/null || echo 0)
-            fds=$(ls "/proc/$pid/fd" 2>/dev/null | wc -l)
+            fds=$(ls "/proc/$pid/fd" 2>/dev/null | wc -l || echo 0)
             audit=$(du -cb "$WORK/n$i"/audit.log* 2>/dev/null | tail -1 | cut -f1)
             state=$(stat -c %s "$WORK/n$i/audit.log.blocks.json" 2>/dev/null || echo 0)
             echo "$t,$i,${rss:-0},$fds,${audit:-0},$state,$(metric "$i" 'sokol_blocks_active{family="ipv4"}'),$(metric "$i" sokol_blocks_pending),$(metric "$i" sokol_tick_seconds_max),$(metric "$i" sokol_p2p_active_peers)" >>"$CSV"
@@ -208,7 +223,7 @@ soak)
     start=$SECONDS; end=$((start + MINUTES * 60))
     next_sample=$start; RESTART_EVERY=${RESTART_EVERY:-600}; CUT_EVERY=${CUT_EVERY:-900}
     next_restart=$((start + RESTART_EVERY)); next_cut=$((start + CUT_EVERY))
-    k=0; restarts=0; cuts=0; cutters=()
+    k=0; restarts=0; cuts=0; cutters=(); DIED=()
     echo "# soak ${MINUTES} min, TTL ${TTL:-3600} s"
     while [ $SECONDS -lt $end ]; do
         for _ in 1 2 3 4 5; do
@@ -219,7 +234,10 @@ soak)
                 | in_ns "$i" nc -U -q0 "$WORK/n$i/ipc.sock" >/dev/null 2>&1 || true
         done
         if [ $SECONDS -ge $next_restart ]; then
-            i=$((RANDOM % N + 1)); kill -INT "${NODE_PID[$i]}" 2>/dev/null || true
+            i=$((RANDOM % N + 1))
+            # A node that died stays down: restarting it would hide the failure.
+            if [ -z "${NODE_PID[$i]}" ]; then next_restart=$((next_restart + RESTART_EVERY)); continue; fi
+            kill -INT "${NODE_PID[$i]}" 2>/dev/null || true
             wait "${NODE_PID[$i]}" 2>/dev/null || true; start_node "$i"
             echo "# t=$((SECONDS - start)) s: node $i restarted"
             restarts=$((restarts + 1)); next_restart=$((next_restart + RESTART_EVERY))
@@ -237,12 +255,15 @@ soak)
     sleep 90
     sample $((SECONDS - start))
     fail=0
+    if [ ${#DIED[@]} -gt 0 ]; then echo "FAIL nodes exited on their own (node@t:status): ${DIED[*]}"; fail=1; fi
     # Blocks keep expiring (TTL), and a sweep of N nodes takes a while, so one sweep can straddle
     # an expiry. Agreement is a sweep in which every node reports the same count, within 30 s.
     agreed=""
     for _ in $(seq 1 30); do
-        actives=$(for i in $(seq 1 "$N"); do metric "$i" 'sokol_blocks_active{family="ipv4"}'; done | sort -u | tr '\n' ' ')
-        [ "$(echo "$actives" | wc -w)" = 1 ] && { agreed=1; break; }
+        # Every node must answer: a node that is down has no value, and must not drop out of the vote.
+        actives=$(for i in $(seq 1 "$N"); do v=$(metric "$i" 'sokol_blocks_active{family="ipv4"}'); echo "${v:-down}"; done | sort -u | tr '\n' ' ')
+        read -ra distinct <<<"$actives"
+        [ ${#distinct[@]} = 1 ] && [ "${distinct[0]}" != down ] && { agreed=1; break; }
         sleep 1
     done
     if [ -n "$agreed" ]; then echo "PASS all $N nodes agree on the active blocks ($actives)"; else echo "FAIL active blocks still differ between nodes after 30 s: $actives"; fail=1; fi
@@ -251,8 +272,8 @@ soak)
         grep -q "panicked" "$WORK/n$i/node.log" && { echo "FAIL node $i panicked"; fail=1; }
     done
     [ $fail = 0 ] && echo "PASS every audit chain verifies; no node panicked"
-    awk -F, 'NR > 1 && $1 >= 300 { if (!($2 in first)) first[$2] = $3; last[$2] = $3; seen[$2]++ }
-        END { if (!length(seen)) seen[""] = 0
+    awk -F, 'NR > 1 && $1 >= 300 { if (!($2 in first)) first[$2] = $3; last[$2] = $3; seen[$2]++; rows++ }
+        END { if (!rows) { print "RSS growth: no samples after the first 5 min"; exit }
               for (n in seen) if (seen[n] < 2) { print "RSS growth: under two samples after the first 5 min"; exit }
               for (n in first) { g = (last[n] - first[n]) * 100 / first[n]; if (g > max) max = g; if (min == "" || g < min) min = g }
               printf "RSS growth after the first 5 min: min %.1f%%, max %.1f%% (per node)\n", min, max }' "$CSV"
