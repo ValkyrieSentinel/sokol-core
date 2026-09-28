@@ -1,0 +1,57 @@
+# nodes=10 netem='none' host=aarch64 cpus=10 kernel=6.8.0-142-generic
+# full mesh after 3s: 10/10 nodes see 9 peers
+# soak 300 min, TTL 300 s
+# t=600 s: node 8 restarted
+# t=900 s: node 3 cut off for 30 s
+# t=1200 s: node 10 restarted
+# t=1800 s: node 2 restarted
+# t=1800 s: node 6 cut off for 30 s
+# t=2400 s: node 4 restarted
+# t=2700 s: node 6 cut off for 30 s
+# t=3000 s: node 6 restarted
+# t=3600 s: node 8 restarted
+# t=3600 s: node 1 cut off for 30 s
+# t=4200 s: node 2 restarted
+# t=4500 s: node 4 cut off for 30 s
+# t=4800 s: node 1 restarted
+# t=5400 s: node 9 restarted
+# t=5400 s: node 5 cut off for 30 s
+# t=6000 s: node 9 restarted
+# t=6300 s: node 4 cut off for 30 s
+# t=6600 s: node 6 restarted
+# t=7200 s: node 5 restarted
+# t=7200 s: node 3 cut off for 30 s
+# t=7800 s: node 6 restarted
+# t=8100 s: node 10 cut off for 30 s
+# t=8400 s: node 2 restarted
+# t=9000 s: node 2 restarted
+# t=9000 s: node 1 cut off for 30 s
+# t=9600 s: node 3 restarted
+# t=9900 s: node 10 cut off for 30 s
+# t=10200 s: node 3 restarted
+# t=10800 s: node 4 restarted
+# t=10800 s: node 10 cut off for 30 s
+# t=11400 s: node 3 restarted
+# t=11700 s: node 1 cut off for 30 s
+# t=12000 s: node 3 restarted
+# t=12600 s: node 2 restarted
+# t=12600 s: node 8 cut off for 30 s
+# t=13200 s: node 5 restarted
+# t=13500 s: node 2 cut off for 30 s
+# t=13800 s: node 6 restarted
+# t=14400 s: node 3 restarted
+# t=14400 s: node 6 cut off for 30 s
+# t=15000 s: node 8 restarted
+# t=15300 s: node 8 cut off for 30 s
+# t=15600 s: node 9 restarted
+# t=16200 s: node 3 restarted
+# t=16200 s: node 10 cut off for 30 s
+# t=16800 s: node 10 restarted
+# t=17100 s: node 4 cut off for 30 s
+# t=17400 s: node 4 restarted
+# load done: 79013 events, 29 restarts, 19 cuts; settling 90 s
+PASS all 10 nodes agree on the active blocks (916 )
+PASS every audit chain verifies; no node panicked
+RSS growth after the first 5 min: min 10.1%, max 42.1% (per node)
+samples: /tmp/soak-5h-b/soak.csv
+exit=0
