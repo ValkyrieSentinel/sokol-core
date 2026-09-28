@@ -87,7 +87,7 @@ journalctl -u sokol-orchestrator -n 50 --no-pager
 | `sokol_blocks_active` vs `sokol_blocks_capacity` | > 80 % | наближається ліміт 65 536 |
 | `sokol_p2p_active_peers` | менше очікуваного | див. §5.5 |
 | `sokol_mesh_envelopes_rejected_total{reason="stale_timestamp"}` | росте | годинник піра й цього вузла розійшлися понад 30 с (NTP) |
-| `sokol_clock_steps_total` | зросла | годинник вузла крокував; `sokol_clock_last_step_seconds` > 0 — блоки скінчились раніше, < 0 — тримаються довше (ADR-0017) |
+| `sokol_clock_steps_total` | зросла | годинник вузла крокував на `sokol_clock_last_step_seconds`. Чинні блоки зберігають тривалість (ADR-0017), але якщо годинник тепер розходиться з пірами понад 30 с, вузол випадає з мешу (див. `stale_timestamp`) |
 | `sokol_claims_waiting` | > 0 довго | пір видав більше рішень, ніж дозволяє його конверт (`--peer-max-active`, 16 384, ADR-0007): решта чекає на слот. Через це кількість блоків на вузлах різниться, хоча меш справний |
 | `sokol_mesh_broadcasts_dropped_total{class="urgent"}` | росте | лінк до піра не встигає за заявками |
 | `sokol_mesh_handshake_timeouts_total` | швидко росте | хтось відкриває з'єднання й мовчить |
