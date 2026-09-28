@@ -53,7 +53,9 @@ const KEY_FILE_MAGIC: &[u8; 4] = b"SKK2";
 /// A pre-v2 key file: raw Dilithium3 public key (1952 bytes) and secret key (4000 bytes).
 const LEGACY_KEY_FILE_LEN: usize = 1952 + 4000;
 pub const MAX_CLOCK_SKEW_MS: u64 = 30_000;
-const MAX_REPLAY_ENTRIES: usize = 100_000;
+/// How long a nonce is remembered after it arrived: a timestamp accepted then is at most
+/// MAX_CLOCK_SKEW_MS ahead, so it is stale this long after arrival.
+const REPLAY_WINDOW_MS: u64 = 2 * MAX_CLOCK_SKEW_MS;
 pub const MAX_FRAME_BYTES: usize = 128 * 1024;
 
 // ---- Resource limits of the mesh transport (see ARCHITECTURE, ADR-0013) ----
@@ -543,34 +545,62 @@ impl TrustStore {
     }
 }
 
+/// Nonces one sender can bring within the window: its frame limit (ADR-0013) over the window,
+/// for the two connections a pair of nodes holds when each lists the other as a seed.
+const REPLAY_PER_SENDER: usize =
+    2 * (FRAME_BURST as usize + FRAMES_PER_SEC as usize * (REPLAY_WINDOW_MS / 1000) as usize);
+
+/// One sender's remembered nonces, in arrival order.
+#[derive(Default)]
+struct SenderWindow {
+    order: std::collections::VecDeque<(u64, u64)>,
+    seen: std::collections::HashSet<u64>,
+}
+
 /// Remembers `(sender, nonce)` pairs for as long as their timestamp could still be accepted.
+///
+/// Kept per sender and bounded per sender (N02, 2026-09-28): one peer at its full frame rate
+/// fills only its own window, never another's. Only authenticated senders reach it (the
+/// signature is checked first), so the number of windows is bounded by the trust store.
+/// Expiry pops the oldest arrivals, so a frame costs O(1) amortized, not a scan of the cache.
+/// Arrival is wall-clock time, like the acceptance check: after a backward step an entry is
+/// kept longer (the safe side), after a forward step what it guards is stale anyway.
 #[derive(Default)]
 pub struct ReplayGuard {
-    seen: HashMap<(u64, u64), u64>,
+    senders: HashMap<u64, SenderWindow>,
 }
 
 impl ReplayGuard {
+    #[cfg(test)]
+    fn remembered(&self) -> usize {
+        self.senders.values().map(|w| w.seen.len()).sum()
+    }
+
     fn check_and_record(
         &mut self,
         sender_id: u64,
         nonce: u64,
-        timestamp_ms: u64,
+        _timestamp_ms: u64,
         now: u64,
     ) -> bool {
-        if self.seen.len() >= MAX_REPLAY_ENTRIES / 2 {
-            let horizon = now.saturating_sub(2 * MAX_CLOCK_SKEW_MS);
-            self.seen.retain(|_, ts| *ts >= horizon);
+        let w = self.senders.entry(sender_id).or_default();
+        while let Some(&(arrived, old)) = w.order.front() {
+            if arrived.saturating_add(REPLAY_WINDOW_MS) > now {
+                break;
+            }
+            w.order.pop_front();
+            w.seen.remove(&old);
         }
-        if self.seen.len() >= MAX_REPLAY_ENTRIES {
+        if w.seen.contains(&nonce) {
             return false;
         }
-        match self.seen.entry((sender_id, nonce)) {
-            std::collections::hash_map::Entry::Occupied(_) => false,
-            std::collections::hash_map::Entry::Vacant(v) => {
-                v.insert(timestamp_ms);
-                true
-            }
+        // Over its own budget a sender is refused (fail-closed), others are not affected.
+        if w.seen.len() >= REPLAY_PER_SENDER {
+            return false;
         }
+        w.seen.insert(nonce);
+        w.order.push_back((now, nonce));
+        true
     }
 }
 
@@ -2221,6 +2251,55 @@ mod tests {
             delivered += 1;
         }
         assert_eq!(delivered, 3, "the healthy peer still gets every message");
+    }
+
+    /// One pinned peer sending as fast as its frame limit allows must not fill the replay memory
+    /// for everyone: before, one shared 100 000-entry cache refused every sender once full.
+    #[test]
+    fn one_sender_cannot_crowd_out_another_in_the_replay_memory() {
+        let mut guard = ReplayGuard::default();
+        let now = 1_000_000_000;
+        let mut accepted = 0usize;
+        for nonce in 0..100_000u64 {
+            if guard.check_and_record(7, nonce, now, now) {
+                accepted += 1;
+            }
+        }
+        assert!(
+            guard.check_and_record(8, 1, now, now),
+            "another sender is still accepted"
+        );
+        assert!(
+            accepted < 100_000,
+            "a single sender is bounded ({accepted} accepted)"
+        );
+        assert!(
+            !guard.check_and_record(8, 1, now, now),
+            "a resend is still refused"
+        );
+    }
+
+    /// Entries leave the window oldest first, a resend inside the window is refused, and memory
+    /// empties once the window has passed.
+    #[test]
+    fn replay_memory_expires_by_arrival_and_keeps_its_window() {
+        let mut guard = ReplayGuard::default();
+        let t = 1_000_000_000;
+        assert!(guard.check_and_record(7, 1, t, t));
+        assert!(
+            !guard.check_and_record(7, 1, t, t + 59_000),
+            "a resend within the window"
+        );
+        assert!(guard.check_and_record(7, 2, t + 30_000, t + 30_000));
+        // 60 s after its arrival the first entry is gone; the second is not yet.
+        assert!(guard.check_and_record(7, 1, t + 60_000, t + 60_000));
+        assert!(!guard.check_and_record(7, 2, t + 60_000, t + 60_000));
+        assert!(guard.check_and_record(7, 9, t + 200_000, t + 200_000));
+        assert_eq!(
+            guard.remembered(),
+            1,
+            "only the last one is still remembered"
+        );
     }
 
     #[tokio::test]
