@@ -2359,6 +2359,8 @@ async fn main() -> Result<(), anyhow::Error> {
                         table.oldest_pending(now_ms()).as_secs_f64();
                     (snapshot.event_ids_remembered, snapshot.event_ids_evicted) =
                         table.event_memory();
+                    (snapshot.strikes_remembered, snapshot.strikes_evicted) =
+                        table.strike_memory();
                 }
                 for message in watermark.update((v4_active, v6_active), common::BLOCKLIST_CAPACITY as usize) {
                     log::warn!("[BlockTable] {}", message);
