@@ -1,0 +1,33 @@
+== 3 10
+# nodes=3 netem='none' host=aarch64 cpus=10 kernel=6.8.0-142-generic
+# full mesh after 2s: 3/3 nodes see 2 peers
+signal -> node 1 stops the attacker: n=10 min=10 median=10 p95=11 max=12 (ms)
+signal -> a node stops the attacker: n=30 min=10 median=10 p95=12 max=12 (ms)
+unban  -> a node answers it again:   n=30 min=5 median=9 p95=15 max=16 (ms)
+legitimate pings: 50126 of 50126 answered; round x node without a clean stop or restore: 0
+PASS R1 node 1 stops within 500 ms
+PASS R2 every node stops within 3000 ms
+PASS R3 every node restored within 3000 ms
+PASS R4 legitimate loss <= 0.5 %
+== 10 10
+# nodes=10 netem='none' host=aarch64 cpus=10 kernel=6.8.0-142-generic
+# full mesh after 3s: 10/10 nodes see 9 peers
+signal -> node 1 stops the attacker: n=10 min=10 median=10 p95=10 max=12 (ms)
+signal -> a node stops the attacker: n=100 min=10 median=10 p95=11 max=12 (ms)
+unban  -> a node answers it again:   n=100 min=4 median=10 p95=16 max=18 (ms)
+legitimate pings: 182975 of 182975 answered; round x node without a clean stop or restore: 0
+PASS R1 node 1 stops within 500 ms
+PASS R2 every node stops within 3000 ms
+PASS R3 every node restored within 3000 ms
+PASS R4 legitimate loss <= 0.5 %
+== 5 10 delay 50ms 10ms
+# nodes=5 netem='delay 50ms 10ms' host=aarch64 cpus=10 kernel=6.8.0-142-generic
+# full mesh after 2s: 5/5 nodes see 4 peers
+signal -> node 1 stops the attacker: n=10 min=43 median=56 p95=64 max=65 (ms)
+signal -> a node stops the attacker: n=50 min=43 median=107 p95=121 max=125 (ms)
+unban  -> a node answers it again:   n=50 min=50 median=109 p95=125 max=132 (ms)
+legitimate pings: 77841 of 77860 answered; round x node without a clean stop or restore: 0
+PASS R1 node 1 stops within 500 ms
+PASS R2 every node stops within 3000 ms
+PASS R3 every node restored within 3000 ms
+PASS R4 legitimate loss <= 0.5 %

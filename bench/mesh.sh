@@ -9,6 +9,7 @@
 #   sudo bench/mesh.sh recover     <orchestrator> <monitor> <N> [signals] [netem args...]
 #   sudo bench/mesh.sh clock       <orchestrator> <monitor> 3        (needs libfaketime)
 #   sudo bench/mesh.sh observe     <orchestrator> <monitor> 3
+#   sudo bench/mesh.sh reaction    <orchestrator> <monitor> <N> [rounds]
 #
 # propagation: a block is issued on node 1 `rounds` times; for every other node the delay
 #              until its MESH_BLOCK record is reported (min / median / p95 / max, and the
@@ -59,6 +60,18 @@
 #                   observing node's decisions cause no drop anywhere;
 #                O3 a signal at node 2 still reaches nodes 1 and 3 within 5 s (the mesh works).
 #
+# reaction:    what the traffic sees, not what the audit log says. An attacker namespace
+#              (10.240.0.200) and a legitimate one (10.240.0.201) on the same bridge ping every
+#              node every 10 ms. Each round: a detector signal about the attacker at node 1,
+#              $REACT_HOLD s (10) of block, UNBAN_IP on node 1's control socket, $REACT_HOLD s
+#              lifted. Times come from the replies (ping -D, one host clock): stop = the last
+#              attacker reply a node sent after the signal, restore = its first reply after the
+#              unban; both within one ping interval. Limits, fixed before the first run:
+#                R1 node 1 stops answering the attacker within 500 ms of the signal, every round;
+#                R2 every node stops within 3000 ms;
+#                R3 every node answers the attacker again within 3000 ms of the unban;
+#                R4 the legitimate source loses at most 0.5 % of its pings over the run.
+#
 # netem args are applied to every node's link, e.g. `delay 100ms 20ms loss 10%`.
 set -euo pipefail
 
@@ -89,6 +102,8 @@ cleanup() {
     rm -rf "$WORK"
 }
 remove_topology() {
+    ip netns del sk-atk 2>/dev/null || true; ip netns del sk-leg 2>/dev/null || true
+    ip link del skva-h 2>/dev/null || true; ip link del skvl-h 2>/dev/null || true
     for i in $(seq 1 "$N"); do
         ip link del "skv$i-h" 2>/dev/null || true
         ip netns del "sk-n$i" 2>/dev/null || true
@@ -151,6 +166,7 @@ start_node() {   # start_node <i> [last seed]: (re)starts node i with its key, s
     PIDS+=($!)
 }
 declare -A NODE_PID
+declare -A LEG
 
 for i in $(seq 1 "$N"); do
     {
@@ -478,6 +494,79 @@ observe)
     printf 'SIGNAL:obs|198.18.9.2|-|enforced\n' | in_ns 2 nc -U -q1 "$WORK/n2/ipc.sock" >/dev/null
     ok=""; for _ in $(seq 1 25); do [ "$(active 3)" = 1 ] && [ "$(active 1)" = 2 ] && { ok=1; break; }; sleep 0.2; done
     if [ -n "$ok" ]; then echo "PASS O3 node 2's decision reached nodes 1 and 3"; else echo "FAIL O3 node 1 holds $(active 1), node 3 holds $(active 3)"; fail=1; fi
+    exit $fail
+    ;;
+reaction)
+    ROUNDS=$ARG; HOLD=${REACT_HOLD:-10}; fail=0
+    for side in atk:skva:200 leg:skvl:201; do
+        IFS=: read -r name dev addr <<<"$side"
+        ip netns add "sk-$name"
+        ip link add "$dev-h" type veth peer name "$dev"
+        ip link set "$dev-h" master "$BR" up
+        ip link set "$dev" netns "sk-$name"
+        ip netns exec "sk-$name" ip addr add "10.240.0.$addr/24" dev "$dev"
+        ip netns exec "sk-$name" ip link set "$dev" up
+    done
+    for k in $(seq 1 "$N"); do
+        ip netns exec sk-atk ping -D -n -i 0.01 "10.240.0.$k" >"$WORK/atk$k" 2>&1 &
+        PIDS+=($!)
+        ip netns exec sk-leg ping -D -n -i 0.01 "10.240.0.$k" >"$WORK/leg$k" 2>&1 &
+        LEG[$k]=$!; PIDS+=($!)
+    done
+    sleep 2
+    now_ms() { date +%s%3N; }
+    # The first or last reply time (ms) in ping output $2 within [$3, $4). One awk, no
+    # `| head`: an early close would be SIGPIPE, which pipefail turns into an exit.
+    reply() { awk -v w="$1" -v a="$3" -v b="$4" -F'[][]' '/bytes from/ { t = int($2 * 1000)
+        if (t >= a && t < b) { if (w == "first") { print t; exit } last = t } }
+        END { if (w == "last" && last != "") print last }' "$2"; }
+    : >"$WORK/stop1"; : >"$WORK/stop"; : >"$WORK/restore"; missing=0
+    for r in $(seq 1 "$ROUNDS"); do
+        t0=$(now_ms)
+        printf 'SIGNAL#react%s:bench|10.240.0.200|-|reaction round %s\n' "$r" "$r" \
+            | in_ns 1 nc -U -q1 "$WORK/n1/ipc.sock" >/dev/null
+        sleep "$HOLD"
+        t1=$(now_ms)
+        printf 'UNBAN_IP:10.240.0.200\n' | in_ns 1 nc -U -q1 "$WORK/n1/ctl.sock" >/dev/null
+        sleep "$HOLD"
+        t2=$(now_ms)
+        for k in $(seq 1 "$N"); do
+            # In force if the node went quiet for the attacker at least 1 s before the unban.
+            last=$(reply last "$WORK/atk$k" "$t0" "$t1")
+            quiet_from=${last:-$t0}
+            if [ $((t1 - quiet_from)) -lt 1000 ]; then
+                echo "round $r node $k: still answering the attacker at the unban"
+                missing=$((missing + 1)); stop=999999
+            else
+                stop=$((quiet_from + 10 - t0))
+            fi
+            echo "$stop" >>"$WORK/stop"; [ "$k" = 1 ] && echo "$stop" >>"$WORK/stop1"
+            first=$(reply first "$WORK/atk$k" "$t1" "$t2")
+            if [ -z "$first" ]; then
+                echo "round $r node $k: no attacker reply within $HOLD s of the unban"
+                missing=$((missing + 1)); echo 999999 >>"$WORK/restore"
+            else
+                echo $((first - t1)) >>"$WORK/restore"
+            fi
+        done
+    done
+    for k in $(seq 1 "$N"); do kill -INT "${LEG[$k]}" 2>/dev/null || true; done
+    sleep 0.5
+    sent=0; got=0
+    for k in $(seq 1 "$N"); do
+        read -r s g < <(awk '/packets transmitted/ { print $1, $4 }' "$WORK/leg$k")
+        sent=$((sent + ${s:-0})); got=$((got + ${g:-0}))
+    done
+    echo "signal -> node 1 stops the attacker: $(stats <"$WORK/stop1")"
+    echo "signal -> a node stops the attacker: $(stats <"$WORK/stop")"
+    echo "unban  -> a node answers it again:   $(stats <"$WORK/restore")"
+    echo "legitimate pings: $got of $sent answered; round x node without a clean stop or restore: $missing"
+    worst() { sort -n | tail -1; }
+    if [ "$(worst <"$WORK/stop1")" -le 500 ]; then echo "PASS R1 node 1 stops within 500 ms"; else echo "FAIL R1 node 1 over 500 ms"; fail=1; fi
+    if [ "$(worst <"$WORK/stop")" -le 3000 ]; then echo "PASS R2 every node stops within 3000 ms"; else echo "FAIL R2 a node over 3000 ms"; fail=1; fi
+    if [ "$(worst <"$WORK/restore")" -le 3000 ]; then echo "PASS R3 every node restored within 3000 ms"; else echo "FAIL R3 a node not restored within 3000 ms"; fail=1; fi
+    if [ "$sent" -gt 0 ] && [ $(( (sent - got) * 1000 )) -le $(( sent * 5 )) ]; then echo "PASS R4 legitimate loss <= 0.5 %"
+    else echo "FAIL R4 legitimate loss $((sent - got)) of $sent"; fail=1; fi
     exit $fail
     ;;
 *) echo "unknown mode $MODE"; exit 2 ;;

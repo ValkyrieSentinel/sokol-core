@@ -479,6 +479,7 @@ sudo bench/local.sh fill    target/release/orchestrator 65536   # map capacity, 
 sudo bench/mesh.sh propagation target/release/orchestrator target/release/monitor 10 20
 sudo bench/mesh.sh propagation target/release/orchestrator target/release/monitor 5 20 delay 100ms 20ms loss 5%
 sudo bench/mesh.sh partition   target/release/orchestrator target/release/monitor 4 45
+sudo bench/mesh.sh reaction    target/release/orchestrator target/release/monitor 3 10   # traffic stops/returns, per node
 ```
 
 These run on virtual interfaces in one kernel (generic XDP). They measure the control path and
