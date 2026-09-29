@@ -210,7 +210,22 @@ ip -d link show eth0              # prog/xdp зник: трафік іде бе�
 Smoke перевіряє, що зупинка служби (і навіть SIGKILL процесу) знімає XDP-програму з
 інтерфейсу. Бани оператора збережені у файлі стану й повернуться при наступному старті.
 
-## 9. Чи випливає рішення з того, що записано
+## 9. Пілот: фаза 0 — тінь
+
+```shell
+SOKOL_ARGS=… --enforce observe      # у /etc/default/sokol, потім systemctl restart
+```
+
+- Вузол ухвалює всі рішення, пише аудит і ділиться заявками з мешем, але **не відкидає
+  жодного пакета** (ADR-0018).
+- Що він відкинув би, видно тут:
+  - `metric sokol_xdp_observed_packets_total` — за причинами;
+  - `sudo sokol-monitor --outcomes /var/lib/sokol/audit.log` — кожен блок: скільки відкинув
+    би і чиє рішення. У тіні `Dropped:N` означає «відкинув би N».
+- Режим видно в `metric sokol_enforce_mode` і в аудиті (`ENFORCE_MODE|Mode:observe`).
+- Перехід до відкидання: `--enforce drop` і рестарт. Рішення, що діють, зберігаються.
+
+## 10. Чи випливає рішення з того, що записано
 
 ```shell
 sudo sokol-orchestrator --replay /var/lib/sokol/audit.log
@@ -224,7 +239,7 @@ sudo sokol-orchestrator --replay /var/lib/sokol/audit.log
 
 Запускайте той самий бінарник, що ухвалював рішення.
 
-## 10. Пакет для підтримки
+## 11. Пакет для підтримки
 
 ```shell
 sudo CONTROL=/run/sokol/control.sock PEERS=/etc/sokol/peers.json scripts/support-bundle.sh

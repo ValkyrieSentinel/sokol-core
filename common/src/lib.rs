@@ -44,6 +44,10 @@ pub struct PacketStats {
     pub events_in_window: u64,
     /// Events within the rate limit that found the ring buffer full (its consumer behind).
     pub events_lost: u64,
+    /// Observe mode: packets Sokol would have dropped and passed instead, total and per
+    /// `drop_reason` code (the would-be `dropped_packets` / `drops_by_reason`).
+    pub observed_packets: u64,
+    pub observed_by_reason: [u64; DROP_REASON_SLOTS],
 }
 
 pub const DROP_REASON_SLOTS: usize = 16;
@@ -94,6 +98,8 @@ impl PacketStats {
         event_window_start_ns: 0,
         events_in_window: 0,
         events_lost: 0,
+        observed_packets: 0,
+        observed_by_reason: [0; DROP_REASON_SLOTS],
     };
 }
 
@@ -122,7 +128,7 @@ pub mod abi {
     use core::mem::{align_of, offset_of, size_of};
 
     pub const DROP_EVENT_SIZE: usize = 300;
-    pub const PACKET_STATS_SIZE: usize = 216;
+    pub const PACKET_STATS_SIZE: usize = 352;
 
     const _: () = {
         assert!(size_of::<DropEvent>() == DROP_EVENT_SIZE);
@@ -148,6 +154,8 @@ pub mod abi {
         assert!(offset_of!(PacketStats, events_suppressed) == 56 + 8 * DROP_REASON_SLOTS);
         assert!(offset_of!(PacketStats, events_in_window) == 200);
         assert!(offset_of!(PacketStats, events_lost) == 208);
+        assert!(offset_of!(PacketStats, observed_packets) == 216);
+        assert!(offset_of!(PacketStats, observed_by_reason) == 224);
         assert!(super::EVENTS_RING_BYTES.is_power_of_two());
     };
 }
@@ -202,6 +210,9 @@ pub mod config_flags {
     /// Drop packets whose headers do not parse, instead of passing them to the stack
     /// (set while a distributed storm is engaged, ADR-6).
     pub const STRICT_PARSE: u32 = 1 << 1;
+    /// Pilot phase 0: never drop. Every packet Sokol would drop is passed and counted as
+    /// observed (`--enforce observe`).
+    pub const OBSERVE_ONLY: u32 = 1 << 2;
 }
 
 pub mod tcp_flags {

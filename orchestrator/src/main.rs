@@ -476,6 +476,12 @@ struct Args {
     #[arg(long, value_enum, default_value = "auto")]
     xdp_mode: XdpMode,
 
+    /// `drop` enforces decisions. `observe` (pilot phase 0) makes every decision, writes the
+    /// audit and counts what XDP would drop (`sokol_xdp_observed_packets_total`, and each
+    /// block's outcome), but drops nothing.
+    #[arg(long, value_enum, default_value = "drop")]
+    enforce: Enforce,
+
     /// Rotate the audit log when it reaches this size (bytes); 0 disables rotation.
     #[arg(long, default_value = "104857600")]
     audit_max_bytes: u64,
@@ -532,6 +538,12 @@ const TELEMETRY_INTERVAL: Duration = Duration::from_secs(5);
 const SYNC_COOLDOWN: Duration = Duration::from_secs(5);
 /// How often the host's addresses and default gateways are re-read for the never-block policy.
 const PROTECTED_REFRESH: Duration = Duration::from_secs(2);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum Enforce {
+    Drop,
+    Observe,
+}
 
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
 enum XdpMode {
@@ -1325,6 +1337,21 @@ async fn main() -> Result<(), anyhow::Error> {
     if args.drop_ipv4_fragments {
         config_flags |= common::config_flags::DROP_IPV4_FRAGMENTS;
     }
+    if args.enforce == Enforce::Observe {
+        config_flags |= common::config_flags::OBSERVE_ONLY;
+        log::warn!(
+            "[Enforce] OBSERVE mode: decisions are made and recorded, nothing is dropped; \
+             sokol_xdp_observed_packets_total counts what would have been"
+        );
+    }
+    sntl_db.append(format!(
+        "ENFORCE_MODE|Mode:{}",
+        if args.enforce == Enforce::Observe {
+            "observe"
+        } else {
+            "drop"
+        }
+    ));
     let defense = {
         let config_map = bpf
             .take_map("CONFIG")
@@ -2450,6 +2477,9 @@ async fn main() -> Result<(), anyhow::Error> {
                         total_dropped += cpu_stat.0.dropped_packets;
                         snapshot.events_suppressed += cpu_stat.0.events_suppressed;
                         snapshot.events_lost += cpu_stat.0.events_lost;
+                        for (sum, n) in snapshot.observed_by_reason.iter_mut().zip(cpu_stat.0.observed_by_reason) {
+                            *sum += n;
+                        }
                         for (sum, n) in snapshot.drops_by_reason.iter_mut().zip(cpu_stat.0.drops_by_reason) {
                             *sum += n;
                         }
@@ -2513,6 +2543,7 @@ async fn main() -> Result<(), anyhow::Error> {
                 tick_max_secs = tick_max_secs.max(tick_secs);
                 snapshot.tick_secs = tick_secs;
                 snapshot.xdp_native = matches!(xdp_mode, XdpMode::Native);
+                snapshot.observe_only = args.enforce == Enforce::Observe;
                 snapshot.outcomes = outcome_stats;
                 snapshot.tick_max_secs = tick_max_secs;
                 snapshot.protected_refresh_ok =

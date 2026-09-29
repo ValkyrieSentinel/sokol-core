@@ -24,6 +24,9 @@ pub struct Snapshot {
     pub rx_bytes: u64,
     pub dropped_packets: u64,
     pub drops_by_reason: [u64; DROP_REASON_SLOTS],
+    /// Observe mode: packets that would have been dropped, by reason.
+    pub observed_by_reason: [u64; DROP_REASON_SLOTS],
+    pub observe_only: bool,
     pub events_suppressed: u64,
     pub events_lost: u64,
     pub events_malformed: u64,
@@ -89,6 +92,33 @@ pub fn render(s: &Snapshot) -> String {
         "sokol_build_info{{version=\"{}\",build=\"{}\"}} 1",
         env!("CARGO_PKG_VERSION"),
         env!("SOKOL_BUILD_ID")
+    );
+
+    family(
+        &mut out,
+        "sokol_xdp_observed_packets_total",
+        "counter",
+        "Observe mode (--enforce observe): packets XDP would have dropped and passed, by reason.",
+    );
+    for (code, count) in s.observed_by_reason.iter().enumerate() {
+        if let Some(reason) = drop_reason::name(code as u16) {
+            let _ = writeln!(
+                out,
+                "sokol_xdp_observed_packets_total{{reason=\"{}\"}} {}",
+                reason, count
+            );
+        }
+    }
+    family(
+        &mut out,
+        "sokol_enforce_mode",
+        "gauge",
+        "1 for how decisions act: drop (enforced) or observe (recorded and counted, nothing dropped).",
+    );
+    let _ = writeln!(
+        out,
+        "sokol_enforce_mode{{mode=\"{}\"}} 1",
+        if s.observe_only { "observe" } else { "drop" }
     );
 
     family(
@@ -546,11 +576,15 @@ mod tests {
         };
         snap.drops_by_reason[drop_reason::SLOW_PATH_LPM_HIT as usize] = 2;
         snap.drops_by_reason[drop_reason::FRAGMENT_BLOCKED as usize] = 1;
+        snap.observed_by_reason[drop_reason::SLOW_PATH_LPM_HIT as usize] = 4;
+        snap.observe_only = true;
         let text = render(&snap);
 
         assert!(text.contains("sokol_xdp_rx_packets_total 10\n"));
         assert!(text.contains("sokol_xdp_dropped_packets_total{reason=\"blocklist\"} 2\n"));
         assert!(text.contains("sokol_xdp_dropped_packets_total{reason=\"fragment_blocked\"} 1\n"));
+        assert!(text.contains("sokol_xdp_observed_packets_total{reason=\"blocklist\"} 4\n"));
+        assert!(text.contains("sokol_enforce_mode{mode=\"observe\"} 1\n"));
         assert!(text.contains("sokol_xdp_events_suppressed_total 7\n"));
         assert!(text.contains("sokol_xdp_events_lost_total 6\n"));
         assert!(
