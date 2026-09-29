@@ -39,6 +39,18 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# A section whose tool is missing is skipped, which a reader of a green run cannot tell from a
+# pass. SMOKE_REQUIRE (e.g. "suricata crowdsec gobgp wireguard", as CI sets it) makes a skip of
+# a named section fail instead.
+skip() {   # skip <section> <message>
+    if [[ " ${SMOKE_REQUIRE:-} " == *" $1 "* ]]; then
+        echo "FAIL  $2, but SMOKE_REQUIRE names $1"
+        FAILED=1
+    else
+        echo "SKIP  $2"
+    fi
+}
+
 check() {
     local name="$1"; shift
     if "$@"; then
@@ -497,7 +509,7 @@ if command -v suricata >/dev/null; then
     kill "$ADAPTER_PID" "$SURICATA_PID" 2>/dev/null || true
     ADAPTER_PID=""; SURICATA_PID=""
 else
-    echo "SKIP  Suricata checks (suricata not installed)"
+    skip suricata "Suricata checks (suricata not installed)"
 fi
 
 # CrowdSec decision -> sokol-crowdsec -> orchestrator -> XDP.
@@ -575,7 +587,7 @@ if command -v cscli >/dev/null && command -v crowdsec >/dev/null; then
     cscli bouncers delete "$CS_BOUNCER" >/dev/null 2>&1 || true
     CS_ADAPTER_PID=""; CS_BOUNCER=""
 else
-    echo "SKIP  CrowdSec checks (crowdsec not installed)"
+    skip crowdsec "CrowdSec checks (crowdsec not installed)"
 fi
 
 # Decoy trap: a connection that sends nothing is blocked after 5 s, with the trap's reason.
@@ -758,7 +770,7 @@ if command -v gobgpd >/dev/null; then
     FOREIGN_RULE=192.0.2.99/32
     gobgp -p 50051 global rib -a ipv4-flowspec add match source "$FOREIGN_RULE" then discard
 else
-    echo "SKIP  BGP Flowspec checks (gobgpd not installed)"
+    skip gobgp "BGP Flowspec checks (gobgpd not installed)"
 fi
 start_orchestrator --block-ttl 2 --audit-max-bytes 600 --audit-keep 50 "${FLOWSPEC_ARGS[@]}"
 ipc "DROP_IMMEDIATE:$ALLOWED_IP"
@@ -959,7 +971,7 @@ PY
     NODE2_PID=""
     stop_orchestrator
 else
-    echo "SKIP  two-node WireGuard mesh checks (no wireguard support)"
+    skip wireguard "two-node WireGuard mesh checks (no wireguard support)"
 fi
 
 if [ "$FAILED" -ne 0 ]; then
