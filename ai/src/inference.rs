@@ -7,6 +7,8 @@ pub enum InferenceError {
     ShapeMismatch,
     BufferTooSmall,
     Tensor(TensorError),
+    /// A parameter outside its domain (the reason names which).
+    InvalidParameter(&'static str),
 }
 
 impl fmt::Display for InferenceError {
@@ -15,6 +17,7 @@ impl fmt::Display for InferenceError {
             Self::ShapeMismatch => write!(f, "Inference shape mismatch"),
             Self::BufferTooSmall => write!(f, "Export/Import buffer capacity is too small"),
             Self::Tensor(e) => write!(f, "Tensor error: {}", e),
+            Self::InvalidParameter(why) => write!(f, "Invalid parameter: {}", why),
         }
     }
 }
@@ -70,21 +73,71 @@ impl<const IN: usize, const OUT: usize> LinearLayer<IN, OUT> {
     }
 }
 
+/// Exponentially weighted mean and variance per feature, and a distance of a sample from them.
+///
+/// `alpha` is the **gain**: the weight of a new sample, so each update keeps `1 - alpha` of the
+/// old estimate (the retention). Time enters only through the sample interval `Δt`: the time
+/// constant is `-Δt / ln(1 - alpha)` and the half-life `-Δt ln 2 / ln(1 - alpha)`
+/// ([`Self::time_constant`], [`Self::half_life`]; [`Self::from_time_constant`] goes the other way).
+/// Gain 0.1 at Δt = 1 s is a time constant of about 9.5 s.
+///
+/// The variance starts at [`Self::INITIAL_VARIANCE`] (in units of the feature, squared) and is an
+/// EWMA of the squared innovation against the previous mean, not an unbiased population variance.
+/// [`Self::anomaly_score`] is the mean absolute z-score over the features: a distance, not a
+/// probability of attack and not a calibrated control-chart statistic.
 pub struct EwmaAnomalyDetector<const N: usize> {
     pub mean: Tensor<f32, 1>,
     pub variance: Tensor<f32, 1>,
+    /// Gain of a new sample, `0 < alpha <= 1`.
     pub alpha: f32,
     initialized: bool,
 }
 
 impl<const N: usize> EwmaAnomalyDetector<N> {
+    /// Variance given to every feature by the first sample (units of the feature, squared).
+    pub const INITIAL_VARIANCE: f32 = 1.0;
+    /// Smallest standard deviation used in the score (units of the feature).
+    pub const MIN_STD_DEV: f32 = 1e-6;
+
+    /// `alpha` is the gain of a new sample, in `(0, 1]`; at least one feature.
     pub fn new(alpha: f32) -> Result<Self, InferenceError> {
+        if N == 0 {
+            return Err(InferenceError::InvalidParameter("no features (N = 0)"));
+        }
+        if !(alpha > 0.0 && alpha <= 1.0) {
+            return Err(InferenceError::InvalidParameter("gain must be in (0, 1]"));
+        }
         Ok(Self {
             mean: Tensor::new([N])?,
             variance: Tensor::new([N])?,
             alpha,
             initialized: false,
         })
+    }
+
+    /// The gain that gives time constant `tau_secs` at a sample every `dt_secs`:
+    /// `1 - exp(-dt / tau)`.
+    pub fn from_time_constant(tau_secs: f32, dt_secs: f32) -> Result<Self, InferenceError> {
+        if !(tau_secs > 0.0 && dt_secs > 0.0 && tau_secs.is_finite() && dt_secs.is_finite()) {
+            return Err(InferenceError::InvalidParameter(
+                "time constant and sample interval must be positive and finite",
+            ));
+        }
+        Self::new(1.0 - (-dt_secs / tau_secs).exp())
+    }
+
+    /// Time constant in seconds at a sample every `dt_secs`; zero for gain 1 (no memory).
+    pub fn time_constant(&self, dt_secs: f32) -> f32 {
+        let retention = 1.0 - self.alpha;
+        if retention <= 0.0 {
+            return 0.0;
+        }
+        -dt_secs / retention.ln()
+    }
+
+    /// Time for the weight of a sample to halve, in seconds at a sample every `dt_secs`.
+    pub fn half_life(&self, dt_secs: f32) -> f32 {
+        self.time_constant(dt_secs) * core::f32::consts::LN_2
     }
 
     pub fn update(&mut self, sample: &Tensor<f32, 1>) -> Result<(), InferenceError> {
@@ -98,7 +151,7 @@ impl<const N: usize> EwmaAnomalyDetector<N> {
 
         if !self.initialized {
             m_data.copy_from_slice(s_data);
-            v_data.fill(1.0);
+            v_data.fill(Self::INITIAL_VARIANCE);
             self.initialized = true;
             return Ok(());
         }
@@ -133,7 +186,7 @@ impl<const N: usize> EwmaAnomalyDetector<N> {
             .zip(m_data.iter())
             .zip(v_data.iter())
             .map(|((&s, &m), &v)| {
-                let std_dev = v.sqrt().max(1e-6);
+                let std_dev = v.sqrt().max(Self::MIN_STD_DEV);
                 (s - m).abs() / std_dev
             })
             .sum();
@@ -238,4 +291,61 @@ pub fn mse_loss<const N: usize>(
         .sum();
 
     Ok(sum_sq / (N as f32))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample(values: [f32; 2]) -> Tensor<f32, 1> {
+        let mut t = Tensor::new([2]).unwrap();
+        t.data_mut().copy_from_slice(&values);
+        t
+    }
+
+    #[test]
+    fn the_gain_is_checked() {
+        for bad in [0.0, -0.1, 1.5, f32::NAN] {
+            assert!(EwmaAnomalyDetector::<2>::new(bad).is_err(), "gain {bad}");
+        }
+        assert!(EwmaAnomalyDetector::<2>::new(1.0).is_ok());
+        assert!(matches!(
+            EwmaAnomalyDetector::<0>::new(0.5),
+            Err(InferenceError::InvalidParameter(_))
+        ));
+    }
+
+    /// alpha weighs the new sample: gain 0.1 moves the mean a tenth of the way, 0.9 most of it
+    /// (a test at 0.5 cannot tell gain from retention).
+    #[test]
+    fn alpha_is_the_gain_of_a_new_sample() {
+        for (gain, expected) in [(0.1f32, 1.0f32), (0.9, 9.0)] {
+            let mut d = EwmaAnomalyDetector::<2>::new(gain).unwrap();
+            d.update(&sample([0.0, 0.0])).unwrap();
+            d.update(&sample([10.0, 10.0])).unwrap();
+            assert!((d.mean.data()[0] - expected).abs() < 1e-5, "gain {gain}");
+        }
+    }
+
+    /// Gain 0.1 at 1 s is a time constant of about 9.49 s (the review's figure), and the
+    /// conversion goes both ways; seconds scale with the sample interval.
+    #[test]
+    fn time_constant_needs_the_sample_interval() {
+        let d = EwmaAnomalyDetector::<2>::new(0.1).unwrap();
+        assert!((d.time_constant(1.0) - 9.491).abs() < 1e-3);
+        assert!((d.time_constant(5.0) - 5.0 * 9.491).abs() < 5e-3);
+        assert!((d.half_life(1.0) - 6.579).abs() < 1e-3);
+        let back = EwmaAnomalyDetector::<2>::from_time_constant(9.491, 1.0).unwrap();
+        assert!((back.alpha - 0.1).abs() < 1e-4);
+        assert!(EwmaAnomalyDetector::<2>::from_time_constant(0.0, 1.0).is_err());
+    }
+
+    #[test]
+    fn the_score_is_a_distance_in_standard_deviations() {
+        let mut d = EwmaAnomalyDetector::<2>::new(0.5).unwrap();
+        d.update(&sample([0.0, 0.0])).unwrap();
+        // Variance starts at 1: a sample 3 away in both features is 3 standard deviations.
+        assert!((d.anomaly_score(&sample([3.0, -3.0])).unwrap() - 3.0).abs() < 1e-6);
+        assert_eq!(d.anomaly_score(&sample([0.0, 0.0])).unwrap(), 0.0);
+    }
 }
