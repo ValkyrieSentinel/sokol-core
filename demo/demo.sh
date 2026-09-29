@@ -35,6 +35,10 @@ cleanup() {
     rm -rf "$WORK"
 }
 trap cleanup EXIT
+# A missing tool would otherwise show up as "node 1 does not drop the attacker".
+for tool in ip ping nc curl suricata; do
+    command -v "$tool" >/dev/null || { echo "demo needs $tool (see the header)"; exit 2; }
+done
 cleanup_quiet() { cleanup 2>/dev/null; WORK="$(mktemp -d)"; }
 cleanup_quiet
 
@@ -75,7 +79,9 @@ printf '[{"node_id": 1, "public_key": "%s"}]' "$(cat "$WORK/n1/pub")" >"$WORK/ro
 
 start_node() {   # start_node <name> <id> [extra args...]
     local n=$1 id=$2; shift 2
-    in_ns "$n" "$ORCH" --interface "sd-$n" --node-id "$id" --xdp-mode generic \
+    # ip netns exec, not in_ns: $! of a backgrounded function is its subshell, and cleanup
+    # killed only that, leaving the node running (and heartbeating) after the demo.
+    ip netns exec "sd-$n" "$ORCH" --interface "sd-$n" --node-id "$id" --xdp-mode generic \
         --db-path "$WORK/$n/audit.log" --key-file "$WORK/$n/node.key" \
         --ipc-socket "$WORK/$n/ipc.sock" --control-socket "$WORK/$n/ctl.sock" \
         --p2p-bind "${ADDR[$n]}:7946" --peers-file "$WORK/$n/peers.json" \
@@ -102,7 +108,7 @@ say "Operator dashboard: http://127.0.0.1:3000  (token: $OP_TOKEN)"
 
 printf 'alert tcp any any -> any 23 (msg:"DEMO telnet scan"; flags:S; classtype:attempted-recon; sid:1000001; rev:1;)\n' >"$WORK/demo.rules"
 mkdir -p "$WORK/suricata"
-in_ns n1 suricata -c /etc/suricata/suricata.yaml -S "$WORK/demo.rules" -i sd-n1 -l "$WORK/suricata" -k none \
+ip netns exec sd-n1 suricata -c /etc/suricata/suricata.yaml -S "$WORK/demo.rules" -i sd-n1 -l "$WORK/suricata" -k none \
     --set outputs.1.eve-log.enabled=yes >"$WORK/suricata.out" 2>&1 </dev/null &
 PIDS+=($!)
 for _ in $(seq 1 120); do grep -qi "engine started" "$WORK/suricata/suricata.log" 2>/dev/null && break; sleep 0.5; done

@@ -111,7 +111,10 @@ jobs:
           sudo scripts/xdp-smoke.sh target/release/orchestrator
 
       - name: Demo scenario (3 nodes, attacker, rogue node, Suricata)
-        run: sudo DEMO_AUTO=1 demo/demo.sh target/release
+        run: |
+          sudo DEMO_AUTO=1 demo/demo.sh target/release
+          # The demo leaves nothing behind (its nodes once kept running and heartbeating).
+          if pgrep -af '[o]rchestrator --interface sd-'; then echo "demo left nodes running"; exit 1; fi
 
       - name: Build manifest and checksums
         if: always()
