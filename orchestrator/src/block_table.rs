@@ -2082,6 +2082,26 @@ mod tests {
         assert_eq!(ttl_of(&mut t, oldest), Some(Duration::from_secs(60)));
     }
 
+    /// Ended claims are forgotten, not only unenforced: memory returns to empty. (A mutant that
+    /// skipped this in tick kept every dead claim and was caught only by the model fuzzer.)
+    #[test]
+    fn expired_claims_are_forgotten() {
+        let mut t = table(1, 64);
+        for i in 0..20u32 {
+            let net = IpNet::from(std::net::IpAddr::from(std::net::Ipv4Addr::from(
+                0x0A00_0000 + i,
+            )));
+            t.add_local(net, ClaimKind::Detector, "x", T0).unwrap();
+        }
+        let mut c = peer_claim(2, "203.0.113.130", T0);
+        c.expires_ms = Some(T0 + 60 * S);
+        assert_eq!(t.adopt(c, true, T0), Adoption::Enforced);
+        assert_eq!(t.claims.len(), 21);
+        t.tick(T0 + 61 * S);
+        assert_eq!(t.claims.len(), 0, "ended claims are dropped from memory");
+        assert!(t.by_target.is_empty());
+    }
+
     #[test]
     fn expiry_unblocks_once_and_a_shorter_repeat_does_not_cut_a_longer_block() {
         let mut t = table(1, 64);
