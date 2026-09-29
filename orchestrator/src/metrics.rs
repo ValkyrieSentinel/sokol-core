@@ -36,6 +36,8 @@ pub struct Snapshot {
     pub blocks_pending: usize,
     pub event_ids_remembered: usize,
     pub event_ids_evicted: u64,
+    /// Detector retractions by result (ADR-0019), in `block_table::RETRACTION_RESULTS` order.
+    pub detector_retractions: [u64; crate::block_table::RETRACTION_RESULTS.len()],
     pub strikes_remembered: usize,
     pub strikes_evicted: u64,
     pub claims_waiting: usize,
@@ -236,6 +238,22 @@ pub fn render(s: &Snapshot) -> String {
         "Event ids forgotten early because the memory was full (a resend of one adds a strike).",
     );
     let _ = writeln!(out, "sokol_event_ids_evicted_total {}", s.event_ids_evicted);
+    family(
+        &mut out,
+        "sokol_detector_retractions_total",
+        "counter",
+        "Detector retractions (RETRACT, ADR-0019) by result: lifted, shortened, still_held (another reason holds), not_holding, before_signal, duplicate.",
+    );
+    for (label, n) in crate::block_table::RETRACTION_RESULTS
+        .iter()
+        .zip(s.detector_retractions)
+    {
+        let _ = writeln!(
+            out,
+            "sokol_detector_retractions_total{{result=\"{}\"}} {}",
+            label, n
+        );
+    }
     family(
         &mut out,
         "sokol_strikes_remembered",

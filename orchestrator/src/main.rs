@@ -938,7 +938,7 @@ async fn handle_ipc_line(content: &str, c: &IpcCtx) -> String {
                         c.node_id,
                         &c.crypto,
                         &c.policy.current(),
-                        None,
+                        Detection::default(),
                     )
                     .await,
                 )
@@ -982,12 +982,21 @@ async fn handle_ipc_line(content: &str, c: &IpcCtx) -> String {
                 format!("ERR {}", e)
             }
         }
-    } else if let Some((event_id, payload)) = signal::split_verb(content) {
-        let event_id = match event_id.map(signal::event_id).transpose() {
+    } else if let Some(retract) = signal::parse_retract(content) {
+        match retract {
+            Ok(r) => retract_detection(&r, c).await,
+            Err(e) => format!("ERR {}", e),
+        }
+    } else if let Some(verb) = signal::split_verb(content) {
+        let verb = match verb {
+            Ok(v) => v,
+            Err(e) => return format!("ERR {}", e),
+        };
+        let event_id = match verb.id.map(signal::event_id).transpose() {
             Ok(id) => id,
             Err(e) => return format!("ERR {}", e),
         };
-        match signal::parse(payload) {
+        match signal::parse(verb.payload) {
             Ok(sig) => match signal::target(&sig, &c.policy.current()) {
                 Ok(ip) => {
                     c.db.append(format!(
@@ -1010,7 +1019,10 @@ async fn handle_ipc_line(content: &str, c: &IpcCtx) -> String {
                             c.node_id,
                             &c.crypto,
                             &c.policy.current(),
-                            event,
+                            Detection {
+                                event,
+                                requested: verb.ttl,
+                            },
                         )
                         .await,
                     )
@@ -1117,6 +1129,75 @@ fn log_inbound_budget(peers: usize) {
     );
 }
 
+/// A detector takes back one of its events (ADR-0019). The block ends, or gets shorter, only as
+/// far as no other reason holds it; this node's own claims are retracted mesh-wide.
+async fn retract_detection(r: &signal::Retract, c: &IpcCtx) -> String {
+    let shown = show(&r.target);
+    let now = block_table::local_ms();
+    let (out, shares_own) = {
+        let mut table = c.blocks.lock().await;
+        (
+            table.retract_detection(&r.source, &r.id, r.target, now),
+            table.shares_own(),
+        )
+    };
+    let label = out.label();
+    let claims = match &out {
+        block_table::DetectorRetraction::Lifted { retracted, .. } => retracted.len(),
+        _ => 0,
+    };
+    c.db.append(format!(
+        "DETECTOR_RETRACT|IP:{}|Result:{}|Claims:{}|At:{}|Event:{}/{}",
+        shown, label, claims, now, r.source, r.id
+    ));
+    if let block_table::DetectorRetraction::Lifted {
+        retracted,
+        reissued,
+        unblocked,
+    } = out
+    {
+        log::warn!(
+            "[Local Security] {} took back event {} for {}: {} own claims retracted{}",
+            r.source,
+            r.id,
+            shown,
+            retracted.len(),
+            if unblocked.is_empty() {
+                ""
+            } else {
+                ", unblocked"
+            }
+        );
+        if let Some(claim) = reissued.filter(|_| shares_own) {
+            let _ = c
+                .registry
+                .broadcast(&MeshCommand::Claim { claim }, c.node_id, &c.crypto)
+                .await;
+        }
+        let cmd = MeshCommand::Retract {
+            issuer: c.node_id,
+            claims: retracted,
+        };
+        let _ = c.registry.broadcast(&cmd, c.node_id, &c.crypto).await;
+    }
+    match label {
+        "duplicate" => "OK duplicate".into(),
+        "before_signal" => "OK recorded before its signal".into(),
+        "not_holding" => "OK nothing held".into(),
+        "still_held" => "OK still held by other reasons".into(),
+        other => format!("OK {}", other),
+    }
+}
+
+/// What a detector said about its decision, beyond the target (ADR-0009, ADR-0019).
+#[derive(Clone, Copy, Default)]
+struct Detection<'a> {
+    /// (source, event id): acted on once; the source can take it back.
+    event: Option<(&'a str, &'a str)>,
+    /// The source's own duration (`;ttl=`).
+    requested: Option<Duration>,
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn enforce_block_local(
     target: IpNet,
@@ -1127,8 +1208,9 @@ async fn enforce_block_local(
     node_id: u64,
     node_crypto: &Arc<NodeCrypto>,
     policy: &BlockPolicy,
-    event: Option<(&str, &str)>,
+    detection: Detection<'_>,
 ) -> Enforcement {
+    let Detection { event, requested } = detection;
     let ip = block_table::canonical(target);
     let shown = show(&ip);
     if let Err(why) = policy.check_net(ip) {
@@ -1147,13 +1229,16 @@ async fn enforce_block_local(
     let now = block_table::local_ms();
     // Replay context (ADR-0016): the exact decision time and the event id go into every
     // decision record; the audit record's own timestamp is when it was written.
-    let context = format!(
+    let mut context = format!(
         "At:{}|Event:{}",
         now,
         event
             .map(|(source, id)| format!("{}/{}", source, id))
             .unwrap_or_else(|| "-".into())
     );
+    if let Some(r) = requested {
+        context.push_str(&format!("|Ttl:{}", r.as_secs()));
+    }
     let added = {
         let mut table = blocks.lock().await;
         // Checked and recorded under the same lock as the strike, so no state save sees one
@@ -1171,8 +1256,9 @@ async fn enforce_block_local(
                 return Enforcement::Duplicate;
             }
         }
+        let key = event.map(|(source, id)| block_table::event_key(source, id));
         (
-            table.add_local(ip, ClaimKind::Detector, reason, now),
+            table.add_detection(ip, reason, now, key, requested),
             table.shares_own(),
         )
     };
@@ -1869,7 +1955,7 @@ async fn main() -> Result<(), anyhow::Error> {
                             node_id_mesh,
                             &crypto_mesh,
                             &policy_mesh.current(),
-                            None,
+                            Detection::default(),
                         )
                         .await;
                     }
@@ -1968,7 +2054,7 @@ async fn main() -> Result<(), anyhow::Error> {
                                     node_id_trap,
                                     &crypto_trap,
                                     &policy_trap.current(),
-                                    None,
+                                    Detection::default(),
                                 )
                                 .await;
                                 db_trap.append(format!(
@@ -2515,6 +2601,7 @@ async fn main() -> Result<(), anyhow::Error> {
                         table.oldest_pending(block_table::local_ms()).as_secs_f64();
                     (snapshot.event_ids_remembered, snapshot.event_ids_evicted) =
                         table.event_memory();
+                    snapshot.detector_retractions = table.detector_retractions();
                     (snapshot.strikes_remembered, snapshot.strikes_evicted) =
                         table.strike_memory();
                     snapshot.claims_waiting = table.waiting_claims(block_table::local_ms());

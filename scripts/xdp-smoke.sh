@@ -532,7 +532,9 @@ if command -v cscli >/dev/null && command -v crowdsec >/dev/null; then
         grep -q "Dynamic block enforced in XDP: $CS_IP" "$LOG" && break
         sleep 0.2
     done
-    check "CrowdSec ban decision is forwarded as a signal with its decision id" grep -Eq "SIGNAL#[0-9]+:crowdsec\|$CS_IP\|-\|sokol smoke ban \(origin cscli" "$WORK/crowdsec-adapter.log"
+    check "CrowdSec ban decision is forwarded as a signal with its decision id and duration" grep -Eq "SIGNAL#[0-9]+;ttl=(299|300):crowdsec\|$CS_IP\|-\|sokol smoke ban \(origin cscli" "$WORK/crowdsec-adapter.log"
+    check "the block lasts CrowdSec's 5 minutes, not the node's escalation (ADR-0019 T2)" \
+        grep -Eq "Dynamic block enforced in XDP: $CS_IP for (299|300)s" "$LOG"
     check "CrowdSec ban blocks the address in XDP" \
         bash -c "! ip netns exec $NS ping -c 2 -W 1 -I $CS_IP $HOST_IP >/dev/null 2>&1"
     check "the block reason names CrowdSec and the scenario" grep -q "Dynamic block enforced in XDP: $CS_IP.*crowdsec: sokol smoke ban" "$LOG"
@@ -581,8 +583,31 @@ if command -v cscli >/dev/null && command -v crowdsec >/dev/null; then
     done
     check "after a node restart a replayed decision is still a duplicate" \
         grep -q "crowdsec event [0-9]* for $CS_IP2 already handled" "$LOG"
-    cscli decisions delete --ip "$CS_IP2" >/dev/null 2>&1 || true
+    # ADR-0019 B: a decision deleted in CrowdSec is taken back on the node.
     cscli decisions delete --ip "$CS_IP" >/dev/null 2>&1 || true
+    for _ in $(seq 1 50); do
+        grep -q "crowdsec took back event [0-9]* for $CS_IP" "$LOG" && break
+        sleep 0.2
+    done
+    check "a decision deleted in CrowdSec is sent as a retraction" \
+        grep -Eq "RETRACT#[0-9]+:crowdsec\|$CS_IP" "$WORK/crowdsec-adapter.log"
+    check "the retraction lifts the block it alone held" \
+        ip netns exec "$NS" ping -c 1 -W 1 -I "$CS_IP" "$HOST_IP"
+    check "the lift is in the audit log with its result" \
+        bash -c "'$(dirname "$BIN")/monitor' --dump '$WORK/events.sntl' | grep -q 'DETECTOR_RETRACT|IP:$CS_IP|Result:lifted|Claims:'"
+    # Deleted while the adapter is down: its first (startup=true) poll reports the deletion, so
+    # the adapter needs no state of its own (ADR-0019; seen on CrowdSec 1.4.6).
+    kill "$CS_ADAPTER_PID" 2>/dev/null || true
+    wait "$CS_ADAPTER_PID" 2>/dev/null || true
+    cscli decisions delete --ip "$CS_IP2" >/dev/null 2>&1 || true
+    SOKOL_CROWDSEC_KEY="$CS_KEY" "$(dirname "$BIN")/sokol-crowdsec" --poll-secs 1 >>"$WORK/crowdsec-adapter.log" 2>&1 </dev/null &
+    CS_ADAPTER_PID=$!
+    for _ in $(seq 1 25); do
+        grep -Eq "RETRACT#[0-9]+:crowdsec\|$CS_IP2" "$WORK/crowdsec-adapter.log" && break
+        sleep 0.2
+    done
+    check "a decision deleted while the adapter was down is retracted by its startup poll" \
+        grep -Eq "RETRACT#[0-9]+:crowdsec\|$CS_IP2" "$WORK/crowdsec-adapter.log"
     kill "$CS_ADAPTER_PID" 2>/dev/null || true
     cscli bouncers delete "$CS_BOUNCER" >/dev/null 2>&1 || true
     CS_ADAPTER_PID=""; CS_BOUNCER=""
