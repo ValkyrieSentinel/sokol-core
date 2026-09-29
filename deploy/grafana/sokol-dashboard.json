@@ -1,0 +1,760 @@
+{
+  "title": "Sokol-Core",
+  "uid": "sokol-core",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "tags": [
+    "sokol"
+  ],
+  "time": {
+    "from": "now-24h",
+    "to": "now"
+  },
+  "refresh": "1m",
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "type": "datasource",
+        "query": "prometheus",
+        "label": "Prometheus"
+      },
+      {
+        "name": "instance",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "query": {
+          "query": "label_values(sokol_build_info, instance)",
+          "refId": "i"
+        },
+        "definition": "label_values(sokol_build_info, instance)",
+        "includeAll": true,
+        "multi": true,
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        },
+        "refresh": 2,
+        "label": "Вузол"
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "row",
+      "title": "Стан вузлів",
+      "collapsed": false,
+      "gridPos": {
+        "w": 24,
+        "h": 1,
+        "x": 0,
+        "y": 0
+      },
+      "panels": []
+    },
+    {
+      "id": 2,
+      "type": "table",
+      "title": "Вузли",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "up{job=\"sokol\",instance=~\"$instance\"}",
+          "legendFormat": "up",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "format": "table",
+          "instant": true
+        },
+        {
+          "refId": "B",
+          "expr": "sokol_enforce_mode{instance=~\"$instance\"} == 1",
+          "legendFormat": "enforce",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "format": "table",
+          "instant": true
+        },
+        {
+          "refId": "C",
+          "expr": "sokol_xdp_mode{instance=~\"$instance\"} == 1",
+          "legendFormat": "xdp",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "format": "table",
+          "instant": true
+        },
+        {
+          "refId": "D",
+          "expr": "sokol_p2p_active_peers{instance=~\"$instance\"}",
+          "legendFormat": "peers",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "format": "table",
+          "instant": true
+        },
+        {
+          "refId": "E",
+          "expr": "min without (__name__) ({__name__=~\"sokol_(audit_healthy|state_healthy|state_restore_ok|protected_refresh_ok)\",instance=~\"$instance\"})",
+          "legendFormat": "healthy",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "format": "table",
+          "instant": true
+        }
+      ],
+      "gridPos": {
+        "w": 24,
+        "h": 7,
+        "x": 0,
+        "y": 1
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "options": {},
+      "description": "Один рядок на вузол: чи доступний, режим дії (drop / observe), режим XDP, піри, здоров'я (1 = усе гаразд; 0 = DEGRADED, RUNBOOK §5.3)."
+    },
+    {
+      "id": 3,
+      "type": "row",
+      "title": "Фаза 0: що відкинув би вузол (--enforce observe)",
+      "collapsed": false,
+      "gridPos": {
+        "w": 24,
+        "h": 1,
+        "x": 0,
+        "y": 8
+      },
+      "panels": []
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Відкинув би, пакетів/с за причиною",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (instance, reason) (rate(sokol_xdp_observed_packets_total{instance=~\"$instance\"}[5m])) > 0",
+          "legendFormat": "{{instance}} {{reason}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "gridPos": {
+        "w": 12,
+        "h": 8,
+        "x": 0,
+        "y": 9
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "pps"
+        },
+        "overrides": []
+      },
+      "options": {},
+      "description": "Пакети, які XDP відкинув би в тіньовому режимі й пропустив (ADR-0018). У режимі drop — нуль."
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "Відкинув би за добу",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (instance) (increase(sokol_xdp_observed_packets_total{instance=~\"$instance\"}[24h]))",
+          "legendFormat": "{{instance}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "gridPos": {
+        "w": 6,
+        "h": 8,
+        "x": 12,
+        "y": 9
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "auto"
+      }
+    },
+    {
+      "id": 6,
+      "type": "stat",
+      "title": "Відкинуто за добу",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (instance) (increase(sokol_xdp_dropped_packets_total{instance=~\"$instance\"}[24h]))",
+          "legendFormat": "{{instance}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "gridPos": {
+        "w": 6,
+        "h": 8,
+        "x": 18,
+        "y": 9
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "auto"
+      }
+    },
+    {
+      "id": 7,
+      "type": "row",
+      "title": "Рішення й наслідки",
+      "collapsed": false,
+      "gridPos": {
+        "w": 24,
+        "h": 1,
+        "x": 0,
+        "y": 17
+      },
+      "panels": []
+    },
+    {
+      "id": 8,
+      "type": "stat",
+      "title": "Частка блоків, що нічого не відкинули (за добу)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (instance) (increase(sokol_block_outcomes_total{effect=\"none\",instance=~\"$instance\"}[24h])) / sum by (instance) (increase(sokol_block_outcomes_total{instance=~\"$instance\"}[24h]))",
+          "legendFormat": "{{instance}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "gridPos": {
+        "w": 8,
+        "h": 8,
+        "x": 0,
+        "y": 18
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "auto"
+      },
+      "description": "Знятий блок, що за весь час не відкинув (у тіні — не відкинув би) жодного пакета: зайвий, запізнілий або помилковий. Хто вирішував — sokol-monitor --outcomes (RUNBOOK §9)."
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "Наслідки блоків за ефектом",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (instance, effect) (rate(sokol_block_outcomes_total{instance=~\"$instance\"}[15m]))",
+          "legendFormat": "{{instance}} {{effect}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "gridPos": {
+        "w": 16,
+        "h": 8,
+        "x": 8,
+        "y": 18
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "Активні блоки від місткості",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sokol_blocks_active{instance=~\"$instance\"} / on (instance) group_left sokol_blocks_capacity",
+          "legendFormat": "{{instance}} {{family}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "gridPos": {
+        "w": 8,
+        "h": 8,
+        "x": 0,
+        "y": 26
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "Блоки, що чекають карту ядра",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sokol_blocks_pending{instance=~\"$instance\"}",
+          "legendFormat": "{{instance}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "gridPos": {
+        "w": 8,
+        "h": 8,
+        "x": 8,
+        "y": 26
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "Заявки пірів понад конверт",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sokol_claims_waiting{instance=~\"$instance\"}",
+          "legendFormat": "{{instance}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "gridPos": {
+        "w": 8,
+        "h": 8,
+        "x": 16,
+        "y": 26
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "options": {},
+      "description": "Відомі, але ще не застосовані заявки піра понад --peer-max-active (ADR-0007)."
+    },
+    {
+      "id": 13,
+      "type": "row",
+      "title": "Меш",
+      "collapsed": false,
+      "gridPos": {
+        "w": 24,
+        "h": 1,
+        "x": 0,
+        "y": 34
+      },
+      "panels": []
+    },
+    {
+      "id": 14,
+      "type": "timeseries",
+      "title": "Піри",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sokol_p2p_active_peers{instance=~\"$instance\"}",
+          "legendFormat": "{{instance}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "gridPos": {
+        "w": 8,
+        "h": 8,
+        "x": 0,
+        "y": 35
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "id": 15,
+      "type": "timeseries",
+      "title": "Відхилені конверти за причиною",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (instance, reason) (rate(sokol_mesh_envelopes_rejected_total{instance=~\"$instance\"}[5m])) > 0",
+          "legendFormat": "{{instance}} {{reason}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "gridPos": {
+        "w": 8,
+        "h": 8,
+        "x": 8,
+        "y": 35
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "options": {},
+      "description": "stale_timestamp — годинник піра розійшовся понад 30 с."
+    },
+    {
+      "id": 16,
+      "type": "timeseries",
+      "title": "Нерозіслані рішення (черга піра повна)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (instance, class) (rate(sokol_mesh_broadcasts_dropped_total{instance=~\"$instance\"}[5m]))",
+          "legendFormat": "{{instance}} {{class}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "gridPos": {
+        "w": 8,
+        "h": 8,
+        "x": 16,
+        "y": 35
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "id": 17,
+      "type": "timeseries",
+      "title": "Кроки годинника",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "increase(sokol_clock_steps_total{instance=~\"$instance\"}[1h])",
+          "legendFormat": "{{instance}} кроків/год",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "sokol_clock_last_step_seconds{instance=~\"$instance\"}",
+          "legendFormat": "{{instance}} останній, с",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "gridPos": {
+        "w": 12,
+        "h": 8,
+        "x": 0,
+        "y": 43
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "id": 18,
+      "type": "timeseries",
+      "title": "Шторм",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sokol_cluster_storm_engaged{instance=~\"$instance\"}",
+          "legendFormat": "{{instance}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "gridPos": {
+        "w": 12,
+        "h": 8,
+        "x": 12,
+        "y": 43
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "id": 19,
+      "type": "row",
+      "title": "Ресурси",
+      "collapsed": false,
+      "gridPos": {
+        "w": 24,
+        "h": 1,
+        "x": 0,
+        "y": 51
+      },
+      "panels": []
+    },
+    {
+      "id": 20,
+      "type": "timeseries",
+      "title": "Тривалість тіку",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sokol_tick_seconds{instance=~\"$instance\"}",
+          "legendFormat": "{{instance}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "gridPos": {
+        "w": 8,
+        "h": 8,
+        "x": 0,
+        "y": 52
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "id": 21,
+      "type": "timeseries",
+      "title": "RX, пакетів/с",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "rate(sokol_xdp_rx_packets_total{instance=~\"$instance\"}[5m])",
+          "legendFormat": "{{instance}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "gridPos": {
+        "w": 8,
+        "h": 8,
+        "x": 8,
+        "y": 52
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "pps"
+        },
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "id": 22,
+      "type": "timeseries",
+      "title": "Події ядра: притримано / втрачено",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "rate(sokol_xdp_events_suppressed_total{instance=~\"$instance\"}[5m])",
+          "legendFormat": "{{instance}} притримано",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "rate(sokol_xdp_events_lost_total{instance=~\"$instance\"}[5m])",
+          "legendFormat": "{{instance}} втрачено",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "gridPos": {
+        "w": 8,
+        "h": 8,
+        "x": 16,
+        "y": 52
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "options": {}
+    }
+  ]
+}
