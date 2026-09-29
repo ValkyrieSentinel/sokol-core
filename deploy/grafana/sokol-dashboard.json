@@ -68,58 +68,58 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "up{job=\"sokol\",instance=~\"$instance\"}",
-          "legendFormat": "up",
+          "expr": "max by (instance) (up{job=\"sokol\",instance=~\"$instance\"})",
           "datasource": {
             "type": "prometheus",
             "uid": "${datasource}"
           },
           "format": "table",
-          "instant": true
+          "instant": true,
+          "legendFormat": ""
         },
         {
           "refId": "B",
-          "expr": "sokol_enforce_mode{instance=~\"$instance\"} == 1",
-          "legendFormat": "enforce",
+          "expr": "max by (instance, enforce) (label_replace(sokol_enforce_mode{instance=~\"$instance\"} == 1, \"enforce\", \"$1\", \"mode\", \"(.*)\"))",
           "datasource": {
             "type": "prometheus",
             "uid": "${datasource}"
           },
           "format": "table",
-          "instant": true
+          "instant": true,
+          "legendFormat": ""
         },
         {
           "refId": "C",
-          "expr": "sokol_xdp_mode{instance=~\"$instance\"} == 1",
-          "legendFormat": "xdp",
+          "expr": "max by (instance, xdp) (label_replace(sokol_xdp_mode{instance=~\"$instance\"} == 1, \"xdp\", \"$1\", \"mode\", \"(.*)\"))",
           "datasource": {
             "type": "prometheus",
             "uid": "${datasource}"
           },
           "format": "table",
-          "instant": true
+          "instant": true,
+          "legendFormat": ""
         },
         {
           "refId": "D",
-          "expr": "sokol_p2p_active_peers{instance=~\"$instance\"}",
-          "legendFormat": "peers",
+          "expr": "max by (instance) (sokol_p2p_active_peers{instance=~\"$instance\"})",
           "datasource": {
             "type": "prometheus",
             "uid": "${datasource}"
           },
           "format": "table",
-          "instant": true
+          "instant": true,
+          "legendFormat": ""
         },
         {
           "refId": "E",
-          "expr": "min without (__name__) ({__name__=~\"sokol_(audit_healthy|state_healthy|state_restore_ok|protected_refresh_ok)\",instance=~\"$instance\"})",
-          "legendFormat": "healthy",
+          "expr": "min by (instance) ({__name__=~\"sokol_(audit_healthy|state_healthy|state_restore_ok|protected_refresh_ok)\",instance=~\"$instance\"})",
           "datasource": {
             "type": "prometheus",
             "uid": "${datasource}"
           },
           "format": "table",
-          "instant": true
+          "instant": true,
+          "legendFormat": ""
         }
       ],
       "gridPos": {
@@ -133,7 +133,39 @@
         "overrides": []
       },
       "options": {},
-      "description": "Один рядок на вузол: чи доступний, режим дії (drop / observe), режим XDP, піри, здоров'я (1 = усе гаразд; 0 = DEGRADED, RUNBOOK §5.3)."
+      "description": "Один рядок на вузол: доступний (1), дія (drop / observe), режим XDP, піри, здоров'я (1 — гаразд; 0 — DEGRADED, RUNBOOK §5.3).",
+      "transformations": [
+        {
+          "id": "merge",
+          "options": {}
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "Value #B": true,
+              "Value #C": true
+            },
+            "indexByName": {
+              "instance": 0,
+              "Value #A": 1,
+              "enforce": 2,
+              "xdp": 3,
+              "Value #D": 4,
+              "Value #E": 5
+            },
+            "renameByName": {
+              "instance": "вузол",
+              "Value #A": "доступний",
+              "enforce": "дія",
+              "xdp": "XDP",
+              "Value #D": "піри",
+              "Value #E": "здоров'я"
+            }
+          }
+        }
+      ]
     },
     {
       "id": 3,
@@ -208,7 +240,21 @@
         "y": 9
       },
       "fieldConfig": {
-        "defaults": {},
+        "defaults": {
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "text"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          }
+        },
         "overrides": []
       },
       "options": {
@@ -219,7 +265,7 @@
           "fields": "",
           "values": false
         },
-        "colorMode": "value",
+        "colorMode": "none",
         "graphMode": "none",
         "textMode": "auto"
       }
@@ -250,7 +296,21 @@
         "y": 9
       },
       "fieldConfig": {
-        "defaults": {},
+        "defaults": {
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "text"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          }
+        },
         "overrides": []
       },
       "options": {
@@ -261,7 +321,7 @@
           "fields": "",
           "values": false
         },
-        "colorMode": "value",
+        "colorMode": "none",
         "graphMode": "none",
         "textMode": "auto"
       }
@@ -306,7 +366,20 @@
       },
       "fieldConfig": {
         "defaults": {
-          "unit": "percentunit"
+          "unit": "percentunit",
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "text"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          }
         },
         "overrides": []
       },
@@ -318,7 +391,7 @@
           "fields": "",
           "values": false
         },
-        "colorMode": "value",
+        "colorMode": "none",
         "graphMode": "none",
         "textMode": "auto"
       },
@@ -384,7 +457,9 @@
       },
       "fieldConfig": {
         "defaults": {
-          "unit": "percentunit"
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1
         },
         "overrides": []
       },
@@ -508,7 +583,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (instance, reason) (rate(sokol_mesh_envelopes_rejected_total{instance=~\"$instance\"}[5m])) > 0",
+          "expr": "sum by (instance, reason) (rate(sokol_mesh_envelopes_rejected_total{instance=~\"$instance\"}[5m]))",
           "legendFormat": "{{instance}} {{reason}}",
           "datasource": {
             "type": "prometheus",
