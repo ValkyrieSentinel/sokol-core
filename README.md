@@ -229,8 +229,14 @@ SOKOL_CROWDSEC_KEY=<key> sokol-crowdsec --lapi-url http://127.0.0.1:8080 --ipc-s
 
 Only local decisions (origins `crowdsec` and `cscli`) are forwarded by default; community lists
 (`CAPI`, `lists`) can hold tens of thousands of addresses and are added with `--origins` only if the
-mesh should carry them. Range decisions are forwarded as prefixes. Decisions deleted in
-CrowdSec end on Sokol's own TTL; lift one early with `UNBAN_IP` on the control socket.
+mesh should carry them. Range decisions are forwarded as prefixes.
+
+A decision's CrowdSec `duration` is the block's TTL, capped by `--block-ttl-max`; the node does
+not escalate it again (CrowdSec already did). A decision deleted in CrowdSec
+(`cscli decisions delete`) is taken back on the node and, through the mesh, on its peers. The
+block ends only if nothing else holds it: an alert from Suricata on the same address keeps it
+for as long as that alert justifies (ADR-0019). `UNBAN_IP` on the control socket still lifts
+everything about an address at once.
 
 ### FastNetMon
 
@@ -252,6 +258,20 @@ Other detectors can use the same line protocol on the IPC socket:
 acts on each (source, id) once within 24 h and answers a resend with `OK duplicate`, so a retry
 after a lost reply or an adapter restart adds no strike. `sokol-crowdsec` sends the LAPI decision
 id, `sokol-suricata` a hash of the EVE line.
+
+A detector with its own decision lifecycle can also send (ADR-0019):
+- `SIGNAL#<id>;ttl=<seconds>:...` — the block lasts that long, within `--block-ttl-max`, instead
+  of the node's escalation;
+- `RETRACT#<id>:<source>|<target>` — takes the event back. The reply says what it did:
+  - `OK lifted`: nothing else held the block;
+  - `OK shortened`: the block now ends when the remaining reasons do;
+  - `OK still held by other reasons`;
+  - `OK nothing held`;
+  - `OK recorded before its signal`: the late signal then adds nothing;
+  - `OK duplicate`.
+
+  Events without an id, such as `DROP_IMMEDIATE` or the trap, cannot be taken back.
+  `sokol_detector_retractions_total{result}` counts the answers.
 
 ## Local control socket and protected addresses
 

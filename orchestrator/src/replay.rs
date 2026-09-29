@@ -150,6 +150,7 @@ fn is_decision(tag: &str) -> bool {
         || tag == "BLOCK_PENDING"
         || tag == "BLOCK_REFUSED"
         || tag == "SIGNAL_DUPLICATE"
+        || tag == "DETECTOR_RETRACT"
 }
 
 /// Replays records (seq, payload) in order. `this_build` is the replaying binary's build: a
@@ -225,6 +226,24 @@ pub fn replay_records<'a>(
                 }
             }
             "BLOCK_REFUSED" if f.contains_key("Protected") => report.policy_refusals += 1,
+            "DETECTOR_RETRACT" => {
+                let event = f.get("Event").and_then(|e| e.split_once('/'));
+                let (Some(net), Some(at), Some((source, id))) = (net, at(&f), event) else {
+                    report.insufficient("retraction record without its context");
+                    continue;
+                };
+                table.tick(at);
+                let recorded = f.get("Result").copied().unwrap_or_default().to_string();
+                let replayed = table
+                    .retract_detection(source, id, net, at)
+                    .label()
+                    .to_string();
+                if recorded == replayed {
+                    report.reproduced += 1;
+                } else {
+                    report.mismatched.push((seq, recorded, replayed));
+                }
+            }
             t if is_decision(t) => {
                 let (Some(net), Some(at)) = (net, at(&f)) else {
                     report.insufficient("decision record without its time (older format)");
@@ -232,7 +251,11 @@ pub fn replay_records<'a>(
                 };
                 let recorded = recorded_outcome(tag, &f);
                 let reason = f.get("Reason").copied().unwrap_or_default();
-                let replayed = decide(table, net, reason, f.get("Event").copied(), at);
+                let requested = f
+                    .get("Ttl")
+                    .and_then(|t| t.parse().ok())
+                    .map(Duration::from_secs);
+                let replayed = decide(table, net, reason, f.get("Event").copied(), requested, at);
                 if recorded == replayed {
                     report.reproduced += 1;
                 } else {
@@ -268,15 +291,18 @@ fn decide(
     net: IpNet,
     reason: &str,
     event: Option<&str>,
+    requested: Option<Duration>,
     at: u64,
 ) -> String {
     table.tick(at);
-    if let Some((source, id)) = event.and_then(|e| e.split_once('/')) {
+    let event = event.and_then(|e| e.split_once('/'));
+    if let Some((source, id)) = event {
         if !table.first_sighting(source, id, at) {
             return "duplicate".into();
         }
     }
-    match table.add_local(net, ClaimKind::Detector, reason, at) {
+    let key = event.map(|(source, id)| crate::block_table::event_key(source, id));
+    match table.add_detection(net, reason, at, key, requested) {
         Ok(added) => format!(
             "{} {}",
             ttl_label(added.ttl),

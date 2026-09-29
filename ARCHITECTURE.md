@@ -717,7 +717,7 @@ IPC: пастка розбирає трафік атакера і не пови�
 | Адаптер | Джерело | Що надсилає |
 |---|---|---|
 | `sokol-suricata` | `eve.json` (стежить за ротацією й обірваними рядками) | `SIGNAL:suricata\|src\|dst\|sid:<id> <сигнатура>` з фільтром за важкістю, дедуплікацією й лімітом частоти |
-| `sokol-crowdsec` | потік рішень LAPI | `SIGNAL:crowdsec\|…` лише для локальних походжень (`crowdsec`, `cscli`); діапазони йдуть як префікси |
+| `sokol-crowdsec` | потік рішень LAPI | `SIGNAL#<id>;ttl=<с>:crowdsec\|…` лише для локальних походжень (`crowdsec`, `cscli`); діапазони йдуть як префікси; видалене рішення — `RETRACT#<id>:crowdsec\|<ціль>` (ADR-0019) |
 | `sokol-fastnetmon-notify` | notify-скрипт FastNetMon | `ATTACK:fastnetmon\|жертва\|…`: вузол «під атакою», **без блоку** |
 | `trident_trap` | порти-приманки (22, 80, 443, 3306, 6379, 8443) | `SIGNAL:trident\|…` |
 
@@ -760,6 +760,42 @@ IPC: пастка розбирає трафік атакера і не пови�
 - Тести: `a_replayed_event_is_seen_once`, `event_memory_is_bounded` (`block_table.rs`),
   `splits_the_verb_and_the_event_id` (`signal.rs`); smoke «an event id is acted on once, a resend
   is a duplicate».
+
+**Детектор забирає своє рішення (ADR-0019).** Власна заявка вузла на ціль одна, а причин
+може бути кілька: події різних джерел зводяться в неї (R26-05). Тому таблиця пам'ятає **опори**
+блоку. Опора — це ключ події (джерело, id) і кінець, який вона виправдовує; подія без id
+(пастка, `DROP_IMMEDIATE`) стає анонімною опорою.
+
+`RETRACT#<id>:<source>|<ціль>` прибирає опору цієї події:
+- інших опор немає → власні заявки детектора на ціль відкликаються на весь меш;
+- решта закінчується раніше → видається коротша заявка до їхнього кінця, а старі
+  відкликаються. Нова видається першою, тож ціль не розблоковується між ними;
+- решта тримає щонайменше так само довго → нічого не змінюється.
+
+Властивість: відкликання від джерела S ніколи не знімає блоку, який тримає подія іншого джерела,
+інша подія S або причина без id.
+
+Межі:
+- опор на ціль — до `MAX_SUPPORT_PER_TARGET` (8). Понад це найраніші стають анонімними: вони
+  тримають блок, але відкликати їх уже не можна;
+- цілей з опорами — до `MAX_SUPPORT_TARGETS`. Ціль понад межу тримає блок до свого TTL.
+
+Опори зберігаються в знімку стану поруч із заявками. Відкликання, що прийшло раніше за сигнал,
+запам'ятовується, і пізній сигнал стає дублікатом. `UNBAN_IP` і `FLUSH_*` прибирають опори
+разом із блоками. Тривалість джерела (`;ttl=`) стає TTL в межах `--block-ttl-max`, без
+ескалації й без удару.
+
+Тести:
+- `a_retraction_lifts_a_block_its_event_alone_holds`;
+- `a_retraction_never_lifts_a_block_another_reason_holds`;
+- `a_block_shortens_to_what_the_remaining_reasons_justify`;
+- `a_retraction_before_its_signal_keeps_the_signal_from_blocking`;
+- `a_retraction_works_after_a_restart`;
+- `reasons_past_the_per_target_bound_hold_but_cannot_be_retracted`;
+- `a_source_duration_is_the_ttl_within_the_ceiling_and_adds_no_strike`.
+
+Smoke: «the retraction lifts the block it alone held». Replay (ADR-0016) відтворює
+`DETECTOR_RETRACT` за його результатом.
 
 ## 12. BGP Flowspec
 

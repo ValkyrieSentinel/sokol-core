@@ -16,6 +16,12 @@
 //!
 //! The source may also be a CIDR prefix (e.g. a CrowdSec range decision); a prefix is blocked
 //! as given, never swapped for the destination.
+//!
+//! ADR-0019:
+//! - `SIGNAL[#<event id>];ttl=<seconds>:...` carries the source's own duration: the block lasts
+//!   that long, within `--block-ttl-max`, instead of this node's escalation.
+//! - `RETRACT#<event id>:<source>|<target>` takes the event back. The block ends only when no
+//!   other reason holds it (another event of any source, or a line without an id).
 use std::net::IpAddr;
 
 use ipnet::IpNet;
@@ -31,14 +37,84 @@ pub struct Signal {
     pub reason: String,
 }
 
-/// Splits `SIGNAL:<payload>` and `SIGNAL#<event id>:<payload>`; `None` for any other line.
-pub fn split_verb(line: &str) -> Option<(Option<&str>, &str)> {
+/// The head of a `SIGNAL` line.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Verb<'a> {
+    pub id: Option<&'a str>,
+    /// The source's duration (`;ttl=<seconds>`, 1 s or more).
+    pub ttl: Option<std::time::Duration>,
+    pub payload: &'a str,
+}
+
+/// Splits `SIGNAL[#<event id>][;ttl=<seconds>]:<payload>`. `None` for any other line;
+/// `Some(Err)` for a SIGNAL line whose head is malformed.
+pub fn split_verb(line: &str) -> Option<Result<Verb<'_>, String>> {
     let rest = line.strip_prefix("SIGNAL")?;
-    if let Some(payload) = rest.strip_prefix(':') {
-        return Some((None, payload));
+    if !(rest.starts_with(':') || rest.starts_with('#') || rest.starts_with(';')) {
+        return None;
     }
-    let (id, payload) = rest.strip_prefix('#')?.split_once(':')?;
-    Some((Some(id), payload))
+    let (head, payload) = rest.split_once(':')?;
+    let (id, options) = match head.split_once(';') {
+        Some((id, options)) => (id, Some(options)),
+        None => (head, None),
+    };
+    let id = match id.strip_prefix('#') {
+        Some(id) => Some(id),
+        None if id.is_empty() => None,
+        None => return Some(Err(format!("malformed signal head '{}'", head))),
+    };
+    let ttl = match options {
+        None => None,
+        Some(o) => match o.strip_prefix("ttl=").and_then(|v| v.parse::<u64>().ok()) {
+            Some(secs) if secs > 0 => Some(std::time::Duration::from_secs(secs)),
+            _ => {
+                return Some(Err(format!(
+                    "bad signal option '{}' (ttl=<seconds>, 1 or more)",
+                    o
+                )))
+            }
+        },
+    };
+    Some(Ok(Verb { id, ttl, payload }))
+}
+
+/// A detector taking back one of its events.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Retract {
+    pub id: String,
+    pub source: String,
+    pub target: IpNet,
+}
+
+/// Parses `RETRACT#<event id>:<source>|<target>`; `None` for any other line.
+pub fn parse_retract(line: &str) -> Option<Result<Retract, String>> {
+    let rest = line.strip_prefix("RETRACT")?;
+    Some((|| {
+        let (id, payload) = rest
+            .strip_prefix('#')
+            .and_then(|r| r.split_once(':'))
+            .ok_or("RETRACT needs an event id: RETRACT#<id>:<source>|<target>")?;
+        let id = event_id(id)?.to_string();
+        let (source, target) = payload
+            .trim()
+            .split_once('|')
+            .ok_or("RETRACT needs <source>|<target>")?;
+        let source = source.trim();
+        if source.is_empty()
+            || !source
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
+            return Err(format!("invalid signal source '{}'", source));
+        }
+        let target = parse_target(target.trim())
+            .ok_or_else(|| format!("invalid target '{}'", target.trim()))?;
+        Ok(Retract {
+            id,
+            source: source.to_string(),
+            target,
+        })
+    })())
 }
 
 /// Checks an event id.
@@ -132,17 +208,64 @@ mod tests {
 
     #[test]
     fn splits_the_verb_and_the_event_id() {
-        assert_eq!(split_verb("SIGNAL:a|b"), Some((None, "a|b")));
-        assert_eq!(split_verb("SIGNAL#cs-17:a|b"), Some((Some("cs-17"), "a|b")));
-        assert_eq!(split_verb("SIGNAL#:a"), Some((Some(""), "a")));
+        let v = |id, ttl: Option<u64>, payload| {
+            Some(Ok(Verb {
+                id,
+                ttl: ttl.map(std::time::Duration::from_secs),
+                payload,
+            }))
+        };
+        assert_eq!(split_verb("SIGNAL:a|b"), v(None, None, "a|b"));
+        assert_eq!(
+            split_verb("SIGNAL#cs-17:a|b"),
+            v(Some("cs-17"), None, "a|b")
+        );
+        assert_eq!(split_verb("SIGNAL#:a"), v(Some(""), None, "a"));
         assert_eq!(split_verb("SIGNALS:a"), None);
         assert_eq!(split_verb("SIGNAL#17"), None);
         assert_eq!(split_verb("DROP_IMMEDIATE:1.2.3.4"), None);
+        // ADR-0019 T2: the source's duration.
+        assert_eq!(
+            split_verb("SIGNAL#cs-17;ttl=300:a|b"),
+            v(Some("cs-17"), Some(300), "a|b")
+        );
+        assert_eq!(split_verb("SIGNAL;ttl=60:a|b"), v(None, Some(60), "a|b"));
+        assert!(matches!(split_verb("SIGNAL#1;ttl=0:a"), Some(Err(_))));
+        assert!(matches!(split_verb("SIGNAL#1;ttl=x:a"), Some(Err(_))));
+        assert!(matches!(split_verb("SIGNAL#1;prio=1:a"), Some(Err(_))));
         assert!(event_id("crowdsec.17_a-B").is_ok());
         assert!(event_id("").is_err());
         assert!(event_id(&"x".repeat(65)).is_err());
         assert!(event_id("a b").is_err());
         assert!(event_id("a|b").is_err());
+    }
+
+    #[test]
+    fn parses_retractions() {
+        let r = parse_retract("RETRACT#cs-17:crowdsec|203.0.113.9")
+            .unwrap()
+            .unwrap();
+        assert_eq!(r.id, "cs-17");
+        assert_eq!(r.source, "crowdsec");
+        assert_eq!(r.target, ip("203.0.113.9"));
+        assert_eq!(
+            parse_retract("RETRACT#1:crowdsec|198.51.100.0/24")
+                .unwrap()
+                .unwrap()
+                .target,
+            ip("198.51.100.0/24")
+        );
+        assert!(parse_retract("RETRACT:crowdsec|203.0.113.9")
+            .unwrap()
+            .is_err());
+        assert!(parse_retract("RETRACT#1:crowd sec|203.0.113.9")
+            .unwrap()
+            .is_err());
+        assert!(parse_retract("RETRACT#1:crowdsec|nope").unwrap().is_err());
+        assert!(parse_retract("RETRACT#a b:crowdsec|203.0.113.9")
+            .unwrap()
+            .is_err());
+        assert_eq!(parse_retract("SIGNAL:x"), None);
     }
 
     #[test]
