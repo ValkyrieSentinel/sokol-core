@@ -53,6 +53,24 @@ const KEY_FILE_MAGIC: &[u8; 4] = b"SKK2";
 /// A pre-v2 key file: raw Dilithium3 public key (1952 bytes) and secret key (4000 bytes).
 const LEGACY_KEY_FILE_LEN: usize = 1952 + 4000;
 pub const MAX_CLOCK_SKEW_MS: u64 = 30_000;
+/// Measured cost of verifying a small envelope (ADR-0013, `measure_resource_costs`, aarch64).
+pub const VERIFY_SMALL_MICROS: f64 = 25.0;
+
+/// Worst case the mesh can bring in when every pinned peer sends at its full limit over the
+/// two connections a pair can hold: (frames/s, bytes/s, share of one core spent verifying).
+/// The limits are per connection; nothing caps their sum for the node, so this grows with the
+/// peers file (numerical review N02/N03). Small frames are the CPU worst case; the byte limit
+/// bounds large ones to ~1 % of a core per connection.
+pub fn inbound_worst_case(peers: usize) -> (f64, f64, f64) {
+    let connections = 2.0 * peers as f64;
+    let frames = connections * FRAMES_PER_SEC;
+    (
+        frames,
+        connections * BYTES_PER_SEC,
+        frames * VERIFY_SMALL_MICROS / 1_000_000.0,
+    )
+}
+
 /// How long a nonce is remembered after it arrived: a timestamp accepted then is at most
 /// MAX_CLOCK_SKEW_MS ahead, so it is stale this long after arrival.
 const REPLAY_WINDOW_MS: u64 = 2 * MAX_CLOCK_SKEW_MS;
@@ -2221,6 +2239,81 @@ mod tests {
             0,
             "not counted as dropped"
         );
+    }
+
+    /// N02 under load: 30 senders, each at its per-sender bound (2.1 M nonces remembered), then
+    /// a steady mix of fresh frames and resends. Reports the cost per check; asserts that no
+    /// resend inside the window is accepted and that a full sender does not refuse the others.
+    /// Run with: cargo test --release -- --ignored --nocapture measure_replay_guard_under_load
+    #[test]
+    #[ignore]
+    fn measure_replay_guard_under_load() {
+        let (senders, t) = (30u64, 1_000_000_000u64);
+        let mut guard = ReplayGuard::default();
+        let started = std::time::Instant::now();
+        for s in 0..senders {
+            for n in 0..REPLAY_PER_SENDER as u64 {
+                assert!(guard.check_and_record(s, n, t, t));
+            }
+        }
+        let fill = started.elapsed();
+        assert_eq!(guard.remembered(), senders as usize * REPLAY_PER_SENDER);
+        let ops = 1_000_000u64;
+        let (mut resends_accepted, mut full_refused) = (0u64, 0u64);
+        let started = std::time::Instant::now();
+        for i in 0..ops {
+            let s = i % senders;
+            // Every sender is at its bound: a fresh nonce is refused (its own budget), a resend
+            // of a remembered one must be refused as a replay.
+            if guard.check_and_record(s, i % REPLAY_PER_SENDER as u64, t, t + 1) {
+                resends_accepted += 1;
+            }
+            if !guard.check_and_record(s, u64::MAX - i, t, t + 1) {
+                full_refused += 1;
+            }
+        }
+        let steady = started.elapsed();
+        // A new sender is not affected by thirty full ones.
+        assert!(guard.check_and_record(senders + 1, 1, t, t + 1));
+        assert_eq!(
+            resends_accepted, 0,
+            "no resend inside the window is accepted"
+        );
+        assert_eq!(full_refused, ops, "a sender at its bound is refused");
+        println!(
+            "replay guard: {} entries filled in {:?} ({:.0} ns/insert); steady {:.0} ns per check",
+            guard.remembered(),
+            fill,
+            fill.as_nanos() as f64 / (senders as f64 * REPLAY_PER_SENDER as f64),
+            steady.as_nanos() as f64 / (2 * ops) as f64
+        );
+        // Expiry after the window: one pass frees everything, a check stays cheap.
+        let started = std::time::Instant::now();
+        for s in 0..senders {
+            assert!(guard.check_and_record(
+                s,
+                u64::MAX,
+                t + REPLAY_WINDOW_MS,
+                t + REPLAY_WINDOW_MS
+            ));
+        }
+        println!(
+            "expiry of {} entries on the next frame of each sender: {:?}",
+            senders as usize * REPLAY_PER_SENDER,
+            started.elapsed()
+        );
+        assert_eq!(guard.remembered(), senders as usize + 1);
+    }
+
+    /// The node-wide envelope: 30 pinned peers at their full limit are 30 000 frames/s and 240
+    /// MiB/s over 60 connections, and 0.75 of a core verifying small frames.
+    #[test]
+    fn the_inbound_worst_case_grows_with_the_peers() {
+        let (frames, bytes, cpu) = inbound_worst_case(30);
+        assert_eq!(frames, 30_000.0);
+        assert_eq!(bytes, 240.0 * 1024.0 * 1024.0);
+        assert!((cpu - 0.75).abs() < 1e-9);
+        assert_eq!(inbound_worst_case(0), (0.0, 0.0, 0.0));
     }
 
     /// A peer whose queue is full must not block a broadcast to everyone else.
