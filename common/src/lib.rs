@@ -31,10 +31,6 @@ pub struct PacketStats {
     pub rx_packets: u64,
     pub rx_bytes: u64,
     pub dropped_packets: u64,
-    pub vfr_anomalies: u64,
-    pub fast_path_hits: u64,
-    pub slow_path_hits: u64,
-    pub redirected_packets: u64,
     /// Drops per `drop_reason` code (index = code, masked to `DROP_REASON_SLOTS`).
     pub drops_by_reason: [u64; DROP_REASON_SLOTS],
     /// Ring-buffer events withheld by the per-CPU rate limit.
@@ -89,10 +85,6 @@ impl PacketStats {
         rx_packets: 0,
         rx_bytes: 0,
         dropped_packets: 0,
-        vfr_anomalies: 0,
-        fast_path_hits: 0,
-        slow_path_hits: 0,
-        redirected_packets: 0,
         drops_by_reason: [0; DROP_REASON_SLOTS],
         events_suppressed: 0,
         event_window_start_ns: 0,
@@ -128,7 +120,7 @@ pub mod abi {
     use core::mem::{align_of, offset_of, size_of};
 
     pub const DROP_EVENT_SIZE: usize = 300;
-    pub const PACKET_STATS_SIZE: usize = 352;
+    pub const PACKET_STATS_SIZE: usize = 320;
 
     const _: () = {
         assert!(size_of::<DropEvent>() == DROP_EVENT_SIZE);
@@ -147,15 +139,18 @@ pub mod abi {
 
         assert!(size_of::<PacketStats>() == PACKET_STATS_SIZE);
         assert!(align_of::<PacketStats>() == 8);
+        // Every field, so a field added or removed anywhere moves a number here.
         assert!(offset_of!(PacketStats, rx_packets) == 0);
+        assert!(offset_of!(PacketStats, rx_bytes) == 8);
         assert!(offset_of!(PacketStats, dropped_packets) == 16);
-        assert!(offset_of!(PacketStats, redirected_packets) == 48);
-        assert!(offset_of!(PacketStats, drops_by_reason) == 56);
-        assert!(offset_of!(PacketStats, events_suppressed) == 56 + 8 * DROP_REASON_SLOTS);
-        assert!(offset_of!(PacketStats, events_in_window) == 200);
-        assert!(offset_of!(PacketStats, events_lost) == 208);
-        assert!(offset_of!(PacketStats, observed_packets) == 216);
-        assert!(offset_of!(PacketStats, observed_by_reason) == 224);
+        assert!(offset_of!(PacketStats, drops_by_reason) == 24);
+        assert!(offset_of!(PacketStats, events_suppressed) == 24 + 8 * DROP_REASON_SLOTS);
+        assert!(offset_of!(PacketStats, event_window_start_ns) == 160);
+        assert!(offset_of!(PacketStats, events_in_window) == 168);
+        assert!(offset_of!(PacketStats, events_lost) == 176);
+        assert!(offset_of!(PacketStats, observed_packets) == 184);
+        assert!(offset_of!(PacketStats, observed_by_reason) == 192);
+        assert!(192 + 8 * DROP_REASON_SLOTS == PACKET_STATS_SIZE);
         assert!(super::EVENTS_RING_BYTES.is_power_of_two());
     };
 }

@@ -547,9 +547,6 @@ fn drop_verdict(packet_len: u64, reason: u16) -> u32 {
                 (*stats_ptr).dropped_packets += 1;
                 (*stats_ptr).drops_by_reason[slot] += 1;
             }
-            if reason == drop_reason::SLOW_PATH_LPM_HIT || reason == drop_reason::STATIC_BLOCK {
-                (*stats_ptr).slow_path_hits += 1;
-            }
         }
     }
     if observe {

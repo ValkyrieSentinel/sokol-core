@@ -28,7 +28,8 @@
 - **Видимість:** `sokol_enforce_mode{mode}`, `sokol_xdp_observed_packets_total{reason}`,
   запис аудиту `ENFORCE_MODE|Mode:observe|drop` на кожному старті.
 - **ABI:** `PacketStats` 216 → 352 байти (`observed_packets` зі зсувом 216,
-  `observed_by_reason` зі зсувом 224), див. ADR-0015.
+  `observed_by_reason` зі зсувом 224), див. ADR-0015. Після прибирання полів без запису —
+  320 байт, зсуви 184 і 192.
 
 ## Межі
 
