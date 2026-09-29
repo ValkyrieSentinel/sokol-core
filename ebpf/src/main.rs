@@ -167,7 +167,9 @@ fn emit_drop_event_sampled(
     let stats = unsafe { &mut *stats_ptr };
 
     // Trap hits are always interesting; other drops are sampled 1 in 256.
-    if reason != drop_reason::TRAP_INTERCEPTED && (stats.dropped_packets & 0xFF) != 0 {
+    if reason != drop_reason::TRAP_INTERCEPTED
+        && ((stats.dropped_packets + stats.observed_packets) & 0xFF) != 0
+    {
         return;
     }
 
@@ -209,11 +211,11 @@ pub fn sentinel_vfr_filter(ctx: XdpContext) -> u32 {
         Ok(ret) => ret,
         // Headers that do not parse: passed to the stack normally, dropped in strict mode.
         Err(_) if config_enabled(config_flags::STRICT_PARSE) => {
-            record_drop(
+            let verdict = drop_verdict(
                 (ctx.data_end() - ctx.data()) as u64,
                 drop_reason::MALFORMED_HEADER,
             );
-            xdp_action::XDP_DROP
+            verdict
         }
         Err(_) => xdp_action::XDP_PASS,
     }
@@ -303,7 +305,7 @@ fn try_sentinel_vfr_filter(ctx: &XdpContext) -> Result<u32, ()> {
             let ip_ptr = match ptr_at::<IpHdr>(ctx, ip_offset) {
                 Ok(ptr) => ptr,
                 Err(_) => {
-                    record_drop(packet_len, drop_reason::MALFORMED_HEADER);
+                    let verdict = drop_verdict(packet_len, drop_reason::MALFORMED_HEADER);
                     emit_drop_event_sampled(
                         ctx,
                         &[0u8; 16],
@@ -313,7 +315,7 @@ fn try_sentinel_vfr_filter(ctx: &XdpContext) -> Result<u32, ()> {
                         0,
                         4,
                     );
-                    return Ok(xdp_action::XDP_DROP);
+                    return Ok(verdict);
                 }
             };
 
@@ -327,7 +329,7 @@ fn try_sentinel_vfr_filter(ctx: &XdpContext) -> Result<u32, ()> {
                 || ihl_bytes > 60
                 || ctx.data() as usize + ip_offset + ihl_bytes > ctx.data_end() as usize
             {
-                record_drop(packet_len, drop_reason::MALFORMED_HEADER);
+                let verdict = drop_verdict(packet_len, drop_reason::MALFORMED_HEADER);
                 emit_drop_event_sampled(
                     ctx,
                     &[0u8; 16],
@@ -337,7 +339,7 @@ fn try_sentinel_vfr_filter(ctx: &XdpContext) -> Result<u32, ()> {
                     0,
                     4,
                 );
-                return Ok(xdp_action::XDP_DROP);
+                return Ok(verdict);
             }
 
             let frag_off_raw =
@@ -366,7 +368,7 @@ fn try_sentinel_vfr_filter(ctx: &XdpContext) -> Result<u32, ()> {
             dst_ip_16[..4].copy_from_slice(&dst_bytes);
 
             if is_fragment && !is_blocked && config_enabled(config_flags::DROP_IPV4_FRAGMENTS) {
-                record_drop(packet_len, drop_reason::FRAGMENT_BLOCKED);
+                let verdict = drop_verdict(packet_len, drop_reason::FRAGMENT_BLOCKED);
                 emit_drop_event_sampled(
                     ctx,
                     &src_ip_16,
@@ -376,14 +378,14 @@ fn try_sentinel_vfr_filter(ctx: &XdpContext) -> Result<u32, ()> {
                     protocol,
                     ip_version,
                 );
-                return Ok(xdp_action::XDP_DROP);
+                return Ok(verdict);
             }
         }
         ETH_P_IPV6 => {
             let ip6_ptr = match ptr_at::<Ip6Hdr>(ctx, ip_offset) {
                 Ok(ptr) => ptr,
                 Err(_) => {
-                    record_drop(packet_len, drop_reason::MALFORMED_HEADER);
+                    let verdict = drop_verdict(packet_len, drop_reason::MALFORMED_HEADER);
                     emit_drop_event_sampled(
                         ctx,
                         &[0u8; 16],
@@ -393,7 +395,7 @@ fn try_sentinel_vfr_filter(ctx: &XdpContext) -> Result<u32, ()> {
                         0,
                         6,
                     );
-                    return Ok(xdp_action::XDP_DROP);
+                    return Ok(verdict);
                 }
             };
 
@@ -402,7 +404,7 @@ fn try_sentinel_vfr_filter(ctx: &XdpContext) -> Result<u32, ()> {
             let version = (u32::from_be(raw_ver) >> 28) as u8;
 
             if version != 6 {
-                record_drop(packet_len, drop_reason::MALFORMED_HEADER);
+                let verdict = drop_verdict(packet_len, drop_reason::MALFORMED_HEADER);
                 emit_drop_event_sampled(
                     ctx,
                     &[0u8; 16],
@@ -412,7 +414,7 @@ fn try_sentinel_vfr_filter(ctx: &XdpContext) -> Result<u32, ()> {
                     0,
                     6,
                 );
-                return Ok(xdp_action::XDP_DROP);
+                return Ok(verdict);
             }
 
             src_ip_16 =
@@ -446,7 +448,7 @@ fn try_sentinel_vfr_filter(ctx: &XdpContext) -> Result<u32, ()> {
     };
 
     if is_blocked {
-        record_drop(packet_len, drop_reason::SLOW_PATH_LPM_HIT);
+        let verdict = drop_verdict(packet_len, drop_reason::SLOW_PATH_LPM_HIT);
         emit_drop_event_sampled(
             ctx,
             &src_ip_16,
@@ -456,7 +458,7 @@ fn try_sentinel_vfr_filter(ctx: &XdpContext) -> Result<u32, ()> {
             protocol,
             ip_version,
         );
-        return Ok(xdp_action::XDP_DROP);
+        return Ok(verdict);
     }
 
     if protocol == IPPROTO_TCP && !non_first_fragment {
@@ -467,7 +469,7 @@ fn try_sentinel_vfr_filter(ctx: &XdpContext) -> Result<u32, ()> {
 
             let flags = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*tcp_ptr).flags)) };
             if common::tcp_flags::is_invalid(flags) {
-                record_drop(packet_len, drop_reason::INVALID_TCP_FLAGS);
+                let verdict = drop_verdict(packet_len, drop_reason::INVALID_TCP_FLAGS);
                 emit_drop_event_sampled(
                     ctx,
                     &src_ip_16,
@@ -477,7 +479,7 @@ fn try_sentinel_vfr_filter(ctx: &XdpContext) -> Result<u32, ()> {
                     protocol,
                     ip_version,
                 );
-                return Ok(xdp_action::XDP_DROP);
+                return Ok(verdict);
             }
 
             if port == 80 || port == 443 || port == common::ADMIN_SSH_PORT {
@@ -528,17 +530,32 @@ fn record_rx(packet_len: u64) {
 }
 
 #[inline(always)]
-fn record_drop(packet_len: u64, reason: u16) {
+/// The verdict for a packet Sokol would drop: dropped, or in observe mode (`OBSERVE_ONLY`,
+/// pilot phase 0) passed and counted as observed, so no packet is dropped while every decision
+/// and its would-be effect are still measured.
+fn drop_verdict(packet_len: u64, reason: u16) -> u32 {
+    let observe = config_enabled(config_flags::OBSERVE_ONLY);
     if let Some(stats_ptr) = STATS.get_ptr_mut(0) {
+        let slot = (reason as usize) & (DROP_REASON_SLOTS - 1);
         unsafe {
             (*stats_ptr).rx_packets += 1;
             (*stats_ptr).rx_bytes += packet_len;
-            (*stats_ptr).dropped_packets += 1;
-            (*stats_ptr).drops_by_reason[(reason as usize) & (DROP_REASON_SLOTS - 1)] += 1;
+            if observe {
+                (*stats_ptr).observed_packets += 1;
+                (*stats_ptr).observed_by_reason[slot] += 1;
+            } else {
+                (*stats_ptr).dropped_packets += 1;
+                (*stats_ptr).drops_by_reason[slot] += 1;
+            }
             if reason == drop_reason::SLOW_PATH_LPM_HIT || reason == drop_reason::STATIC_BLOCK {
                 (*stats_ptr).slow_path_hits += 1;
             }
         }
+    }
+    if observe {
+        xdp_action::XDP_PASS
+    } else {
+        xdp_action::XDP_DROP
     }
 }
 

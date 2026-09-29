@@ -709,6 +709,21 @@ stop_orchestrator
 start_orchestrator --xdp-mode native
 check "--xdp-mode native attaches in driver mode (veth supports it)" bash -c "ip -d link show $HOST_IF | grep -qw xdp && ! ip -d link show $HOST_IF | grep -q xdpgeneric"
 check "native mode: blocked source is dropped" bash -c "! ip netns exec $NS ping -c 1 -W 1 -I $BLOCKED_IP $HOST_IP >/dev/null 2>&1"
+# Pilot phase 0 (--enforce observe): every decision is made and counted, nothing is dropped.
+stop_orchestrator
+start_orchestrator --xdp-mode native --enforce observe --drop-ipv4-fragments
+check "observe mode is reported" test "$(metric 'sokol_enforce_mode{mode="observe"}')" = 1
+check "observe mode is recorded in the audit" grep -aq 'ENFORCE_MODE|Mode:observe' "$WORK/events.sntl"
+check "observe mode: the --block address $BLOCKED_IP is not dropped" ping_from "$BLOCKED_IP"
+check "observe mode: fragmented IPv4 passes although fragments are to be dropped" \
+    bash -c "ip netns exec $NS ping -c 2 -W 1 -s 3000 -I $ALLOWED_IP $HOST_IP >/dev/null 2>&1"
+sleep 1.2
+check "observe mode: what would have been dropped is counted, nothing is dropped" bash -c "
+    obs=\$(curl -s http://127.0.0.1:9469/metrics | awk '\$1 ~ /^sokol_xdp_observed_packets_total/ {s += \$2} END {print s + 0}')
+    drop=\$(curl -s http://127.0.0.1:9469/metrics | awk '\$1 ~ /^sokol_xdp_dropped_packets_total/ {s += \$2} END {print s + 0}')
+    echo \"      observed \$obs, dropped \$drop\"; test \"\$obs\" -ge 2 && test \"\$drop\" = 0"
+stop_orchestrator
+start_orchestrator --xdp-mode native
 
 # BGP Flowspec: this node's gobgpd (AS 65001) peers with an "upstream" gobgpd (AS 65002).
 gobgp_config() {
