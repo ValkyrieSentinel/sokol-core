@@ -395,6 +395,9 @@ pub struct BlockTable<B = KernelBlocklist> {
     lease_ends: HashMap<ClaimId, (u64, Option<u64>)>,
     /// Wall clock minus this table's clock (ADR-0017); converts signed and persisted times.
     wall_offset_ms: i64,
+    /// Whether this node's own claims go to the mesh (snapshots, digests). Off in observe mode
+    /// (ADR-0018): an observing node must not make peers drop what it would only observe.
+    share_own: bool,
     /// Nodes whose claims may count here (the pinned peers). `None` until configured: no
     /// restriction (tests). A peer removed from the peers file loses its claims' effect.
     pinned: Option<HashSet<u64>>,
@@ -466,12 +469,24 @@ impl<B: Blocklist> BlockTable<B> {
             waiting: HashMap::new(),
             pinned: None,
             wall_offset_ms: 0,
+            share_own: true,
             lease_ends: HashMap::new(),
         }
     }
 
     /// Sets the nodes whose claims may count here (R26-01: an unknown or revoked origin's
     /// claims are known but never enforced).
+    /// Stops (or resumes) offering this node's own claims to the mesh: its snapshots and
+    /// digests then leave them out, and peers that hold them drop them at the next repair.
+    pub fn set_share_own(&mut self, share: bool) {
+        self.share_own = share;
+    }
+
+    /// Whether this node's own claims are offered to the mesh.
+    pub fn shares_own(&self) -> bool {
+        self.share_own
+    }
+
     /// Keeps the wall-clock offset current (ADR-0017); the owner calls it every tick with
     /// [`wall_offset_ms`]. Held claims keep the end they were given on entry.
     pub fn set_clock_offset(&mut self, wall_minus_local_ms: i64) {
@@ -1447,7 +1462,8 @@ impl<B: Blocklist> BlockTable<B> {
     }
 
     fn shared(&self, id: &ClaimId, h: &Held, now_ms: u64) -> bool {
-        h.claim.kind == ClaimKind::Detector
+        (self.share_own || h.claim.issuer != self.node_id)
+            && h.claim.kind == ClaimKind::Detector
             && h.live(now_ms)
             && !self
                 .retractions
@@ -2803,6 +2819,34 @@ mod tests {
             "still a duplicate"
         );
         assert!(!r.is_blocked(ip("203.0.113.124")), "the lift holds");
+    }
+
+    /// Observe mode (ADR-0018): the node's own claims leave its snapshot and its digest, so no
+    /// peer gets them and a peer that has them drops them at the next repair; peers' claims
+    /// are still reported as known.
+    #[test]
+    fn a_node_that_does_not_share_offers_none_of_its_claims() {
+        let mut t = table(1, 64);
+        let empty = t.digest(T0);
+        t.add_local(ip("203.0.113.140"), ClaimKind::Detector, "x", T0)
+            .unwrap();
+        let mut c = peer_claim(2, "203.0.113.141", T0);
+        c.expires_ms = Some(T0 + 600 * S);
+        t.adopt(c, true, T0);
+        assert_eq!(t.snapshot(T0).0.len(), 1);
+        let peers_view = t.digest_of(2, T0);
+        t.set_share_own(false);
+        assert!(t.snapshot(T0).0.is_empty(), "no own claim in the snapshot");
+        assert_eq!(t.digest(T0), empty, "the digest is that of no claims");
+        assert_eq!(
+            t.digest_of(2, T0),
+            peers_view,
+            "peers' claims are unaffected"
+        );
+        assert!(
+            t.is_blocked(ip("203.0.113.140")),
+            "the local decision stands"
+        );
     }
 
     #[test]
