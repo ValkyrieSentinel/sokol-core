@@ -6,10 +6,10 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 LEDGER=docs/RETIRED.md
 TAG=archive/2026-09-29
-RETIRED_PATHS='docs/reviews/2026-09-2[467]|docs/vision/|experiments/chromatic-boundaries'
+RETIRED_PATHS='docs/reviews/|docs/vision/|experiments/chromatic-boundaries'
 fail=0
 
-cited=$(git grep -hoEw 'F(0[1-9]|1[0-2])|R2[67]-0[1-9]' -- . ":!$LEDGER" ':!docs/reviews' | sort -u)
+cited=$(git grep -hoEw 'F(0[1-9]|1[0-2])|R2[67]-0[1-9]|N0[1-6]|T[1-5]' -- . ":!$LEDGER" | sort -u)
 [ -n "$cited" ] || { echo "FAIL no finding ID found: the check has nothing to check"; exit 1; }
 for id in $cited; do
     grep -q "^| $id |" "$LEDGER" || { echo "FAIL $id is cited but not decoded in $LEDGER"; fail=1; }

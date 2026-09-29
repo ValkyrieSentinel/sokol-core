@@ -23,7 +23,7 @@
 #              agree on the active blocks, every audit chain must verify, no node may have
 #              panicked; memory growth after the first 5 minutes is reported. Block TTL: $TTL, default 300 s.
 #
-# recover:     recovery contract (docs/reviews/2026-09-28-transfer, T2). Node 1's link is held to
+# recover:     recovery contract (T2, docs/RETIRED.md). Node 1's link is held to
 #              $RECOVER_RATE (8mbit) and it gets <signals> (30000) detector events at the IPC rate,
 #              so its per-peer queues overflow. Limits, fixed before the first run:
 #                L1 node 1's control socket answers within 1000 ms throughout the flood;
