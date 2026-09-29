@@ -67,7 +67,7 @@ dut)
     grep -o 'XDP program successfully.*' "$W/node.log"
     prev=0; read -r t0 s0 b0 < <(cpu_sample)
     while sleep 1; do
-        d=$(curl -s 127.0.0.1:9469/metrics | awk '$1 == "sokol_xdp_dropped_packets_total{reason=\"static_block\"}" || $1 == "sokol_xdp_dropped_packets_total{reason=\"blocklist\"}" {s += $2} END {print s + 0}')
+        d=$(curl -s 127.0.0.1:9469/metrics | awk '$1 == "sokol_xdp_dropped_packets_total{reason=\"blocklist\"}" {s += $2} END {print s + 0}')
         read -r t1 s1 b1 < <(cpu_sample); dt=$((t1 - t0)); [ "$dt" -gt 0 ] || dt=1
         echo "dropped/s $((d - prev))  total $d  softirq $(awk -v a=$((s1 - s0)) -v t=$dt 'BEGIN {printf "%.1f", 100 * a / t}')%  busy $(awk -v a=$((b1 - b0)) -v t=$dt 'BEGIN {printf "%.1f", 100 * a / t}')%"
         prev=$d; t0=$t1; s0=$s1; b0=$b1
@@ -94,7 +94,7 @@ local)
     # A node that did not start measures nothing: refuse to print a table of zeros.
     ip netns exec dut ip -d link show nicd0 | grep -q 'prog/xdp' \
         || { echo "FAIL the node is not running with XDP on nicd0:"; tail -5 "$W/node.log"; exit 1; }
-    dropped() { ip netns exec dut curl -s 127.0.0.1:9469/metrics | awk '$1 == "sokol_xdp_dropped_packets_total{reason=\"static_block\"}" || $1 == "sokol_xdp_dropped_packets_total{reason=\"blocklist\"}" {s += $2} END {print s + 0}'; }
+    dropped() { ip netns exec dut curl -s 127.0.0.1:9469/metrics | awk '$1 == "sokol_xdp_dropped_packets_total{reason=\"blocklist\"}" {s += $2} END {print s + 0}'; }
     DMAC=$(ip netns exec dut cat /sys/class/net/nicd0/address)
     echo "# $(grep -o 'XDP program successfully.*' "$W/node.log") | host=$(uname -m) cpus=$(nproc) kernel=$(uname -r) step=${STEP}s"
     printf '%-10s %12s %12s %8s %9s %9s %8s %9s %9s\n' target_pps sent_pps dropped_pps drop_% softirq_% busy_% ping_loss p50_ms p99_ms

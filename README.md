@@ -441,7 +441,7 @@ instances.
 
 `--metrics-bind 127.0.0.1:9469` serves Prometheus metrics at `/metrics`:
 `sokol_xdp_rx_packets_total`, `sokol_xdp_rx_bytes_total`,
-`sokol_xdp_dropped_packets_total{reason=...}` (e.g. `blocklist`, `invalid_tcp_flags`, `fragment_blocked`), `sokol_xdp_events_suppressed_total`,
+`sokol_xdp_dropped_packets_total{reason=...}` (`blocklist` for every blocked source, `malformed_header`, `invalid_tcp_flags`, `fragment_blocked`), `sokol_xdp_events_suppressed_total`,
 `sokol_blocks_active`, `sokol_p2p_active_peers`, `sokol_audit_queue_overflow_total`,
 `sokol_flowspec_announced`, `sokol_cluster_status`, `sokol_cluster_nodes`,
 `sokol_cluster_nodes_under_attack`, `sokol_cluster_storm_engaged`.
