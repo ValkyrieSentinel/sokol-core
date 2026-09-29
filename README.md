@@ -2,9 +2,9 @@
 
 > **Status:** Pilot / Active Testing
 
-A high-performance network security and traffic filtering system running at the Linux kernel level. Built entirely in **Rust** (eBPF/XDP kernel program and user-space daemon).
+A network traffic filter running at the Linux kernel level (XDP). Built entirely in **Rust** (eBPF/XDP kernel program and user-space daemon).
 
-The program intercepts and drops garbage (attacks, malicious traffic) right at the network interface card before it even reaches the OS. Blocks, trap hits and kernel drop events are recorded in an append-only, hash-chained audit log.
+It drops traffic from addresses that a detector (Suricata, CrowdSec, FastNetMon), the operator, a static list or a trusted mesh peer has blocked, before the kernel network stack sees it. It does not decide by itself what an attack is. Besides those blocks the filter drops only by fixed packet rules: malformed headers, invalid TCP flag combinations and, if enabled, IPv4 fragments. A SYN to the trap port is passed and reported as an event, which a detector can turn into a block. Blocks, trap hits and kernel drop events are recorded in an append-only, hash-chained audit log.
 
 Design and its reasons: [ARCHITECTURE.md](ARCHITECTURE.md) (Ukrainian). Normative decisions
 (authority, leases, persistence, degraded modes, protocol versioning, ...):
@@ -68,10 +68,11 @@ sudo ./target/release/orchestrator
 
 `--xdp-mode` chooses how the filter attaches:
 
-- `native` — runs in the NIC driver before any socket buffer is allocated. This is the mode that
-  sustains line-rate drops. Attach fails if the driver has no XDP support.
-- `generic` — runs after the kernel built an skb. Works on any interface but costs roughly as
-  much per packet as iptables; use it for testing or unsupported NICs.
+- `native` — runs in the NIC driver before any socket buffer is allocated. This is the fast
+  path. Its rate on a physical NIC has not been measured yet (`bench/nic.sh` is the method; see
+  docs/SUPPORT.md). Attach fails if the driver has no XDP support.
+- `generic` — runs after the kernel built an skb. Works on any interface but pays for the skb on
+  every packet, dropped or not; use it for testing or unsupported NICs.
 - `auto` (default) — the kernel uses native if the driver supports it, otherwise generic.
 
 Check what you got:
@@ -81,9 +82,11 @@ ip -d link show dev eth0 | grep -o 'xdp[a-z]*'   # "xdp" = native, "xdpgeneric" 
 ethtool -i eth0 | grep driver                    # driver name
 ```
 
-Drivers with native XDP include `mlx5_core`, `mlx4_en`, `i40e`, `ice`, `ixgbe`, `igb`/`igc`
+Drivers with native XDP in the upstream kernel (a list from the kernel, not from our tests; only
+`veth` is tested here) include `mlx5_core`, `mlx4_en`, `i40e`, `ice`, `ixgbe`, `igb`/`igc`
 (recent kernels), `bnxt_en`, `nfp`, `ena`, `virtio_net`, `veth`, `tun`. Some need a driver-specific
-setting: `virtio_net` needs enough queues (`ethtool -L eth0 combined <n>`), `ena` needs an MTU
+setting: `virtio_net` needs enough queues (`ethtool -L eth0 combined <n>`) and refuses XDP when
+the host offloads GRO (Apple Virtualization does), `ena` needs an MTU
 at or below its XDP limit, and several drivers refuse XDP with jumbo frames or LRO enabled
 (`ethtool -K eth0 lro off`). Start the service with `--xdp-mode native` in production so a
 driver problem fails loudly instead of silently falling back to generic mode.
