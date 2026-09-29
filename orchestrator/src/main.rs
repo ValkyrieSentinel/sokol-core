@@ -1171,8 +1171,12 @@ async fn enforce_block_local(
                 return Enforcement::Duplicate;
             }
         }
-        table.add_local(ip, ClaimKind::Detector, reason, now)
+        (
+            table.add_local(ip, ClaimKind::Detector, reason, now),
+            table.shares_own(),
+        )
     };
+    let (added, shares_own) = added;
     let added = match added {
         Ok(added) => added,
         Err(why) => {
@@ -1188,7 +1192,8 @@ async fn enforce_block_local(
     let claim = if added.new { "new" } else { "merged" };
     // A new claim is shared either way: peers can enforce it even if this node's map is full.
     // A repeat merged into the running claim is not signed and sent again (peers have it).
-    if added.new {
+    // Observe mode keeps own claims off the mesh (ADR-0018): peers in drop mode would enforce.
+    if added.new && shares_own {
         let broadcast_cmd = MeshCommand::Claim { claim: added.claim };
         let _ = registry
             .broadcast(&broadcast_cmd, node_id, node_crypto)
@@ -1450,6 +1455,8 @@ async fn main() -> Result<(), anyhow::Error> {
             block_table::local_ms(),
         );
         table.set_pinned(trust_store.node_ids(), block_table::local_ms());
+        // ADR-0018: an observing node keeps its own decisions off the mesh.
+        table.set_share_own(args.enforce == Enforce::Drop);
     }
     let state_file = args
         .state_file
@@ -2337,7 +2344,16 @@ async fn main() -> Result<(), anyhow::Error> {
     let mut window_dropped = 0u64;
     let flowspec_announced = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let (flowspec_tx, flowspec_rx) = watch::channel(std::collections::HashSet::<IpNet>::new());
-    let flowspec_worker = match args.flowspec_gobgp.clone() {
+    let flowspec_gobgp = match (args.flowspec_gobgp.clone(), args.enforce) {
+        (Some(_), Enforce::Observe) => {
+            // Upstream rules would drop traffic elsewhere: not in observe mode (ADR-0018).
+            log::warn!("[Flowspec] OBSERVE mode: --flowspec-gobgp given, no rule is announced");
+            sntl_db.append("FLOWSPEC_DISABLED|Why:observe".to_string());
+            None
+        }
+        (bin, _) => bin,
+    };
+    let flowspec_worker = match flowspec_gobgp {
         Some(bin) => {
             let community = match &args.flowspec_community {
                 Some(raw) => {
@@ -2564,7 +2580,10 @@ async fn main() -> Result<(), anyhow::Error> {
                         node_id: node_id_hb,
                         rx_pps,
                         drops_per_sec,
-                        under_attack: drops_per_sec >= args.attack_drops_per_sec || reported_attacks > 0,
+                        // An observing node drops nothing and claims no attack: peers' storm latch
+                        // (strict parsing, fragment drops) must not engage on its account (ADR-0018).
+                        under_attack: args.enforce == Enforce::Drop
+                            && (drops_per_sec >= args.attack_drops_per_sec || reported_attacks > 0),
                         blocks_active: (v4_active + v6_active) as u64,
                     };
                     if let Some(record) = report.telemetry_record() {

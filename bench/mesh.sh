@@ -8,6 +8,7 @@
 #   sudo bench/mesh.sh soak        <orchestrator> <monitor> <N> <minutes> [netem args...]
 #   sudo bench/mesh.sh recover     <orchestrator> <monitor> <N> [signals] [netem args...]
 #   sudo bench/mesh.sh clock       <orchestrator> <monitor> 3        (needs libfaketime)
+#   sudo bench/mesh.sh observe     <orchestrator> <monitor> 3
 #
 # propagation: a block is issued on node 1 `rounds` times; for every other node the delay
 #              until its MESH_BLOCK record is reported (min / median / p95 / max, and the
@@ -50,6 +51,13 @@
 #                S4 exploratory, observations only: node 2 steps +3600 s and then -3600 s while
 #                   holding its own block; how long each block lasts in real time is printed.
 #              C8 no node exits; C9 no tick over 500 ms.
+#
+# observe:     a mixed mesh (ADR-0018): node 1 runs --enforce observe, nodes 2 and 3 drop.
+#              Limits, fixed before the first run:
+#                O1 a signal at node 1 is a local decision there (node 1 holds 1 block);
+#                O2 40 s later (over two digest periods) nodes 2 and 3 hold none of it: an
+#                   observing node's decisions cause no drop anywhere;
+#                O3 a signal at node 2 still reaches nodes 1 and 3 within 5 s (the mesh works).
 #
 # netem args are applied to every node's link, e.g. `delay 100ms 20ms loss 10%`.
 set -euo pipefail
@@ -118,6 +126,10 @@ for i in $(seq 1 "$N"); do
     "$BIN" --key-file "$WORK/n$i/node.key" --print-public-key >"$WORK/n$i/pub"
 done
 
+node_args() {   # extra arguments for node i in some modes
+    [ "$MODE" = observe ] && [ "$1" = 1 ] && echo "--enforce observe"
+    return 0
+}
 start_node() {   # start_node <i> [last seed]: (re)starts node i with its key, state and audit log
     local i=$1 seeds=()
     for j in $(seq 1 "${2:-$N}"); do [ "$j" != "$i" ] && seeds+=(--seed-peer "10.240.0.$j:7946"); done
@@ -133,7 +145,7 @@ start_node() {   # start_node <i> [last seed]: (re)starts node i with its key, s
         --db-path "$WORK/n$i/audit.log" --key-file "$WORK/n$i/node.key" \
         --ipc-socket "$WORK/n$i/ipc.sock" --control-socket "$WORK/n$i/ctl.sock" \
         --p2p-bind "10.240.0.$i:7946" --peers-file "$WORK/n$i/peers.json" \
-        --metrics-bind 127.0.0.1:9470 --block-ttl "${TTL:-3600}" "${seeds[@]}" \
+        --metrics-bind 127.0.0.1:9470 --block-ttl "${TTL:-3600}" "${seeds[@]}" $(node_args "$i") \
         >>"$WORK/n$i/node.log" 2>&1 </dev/null &
     NODE_PID[$i]=$!
     PIDS+=($!)
@@ -450,6 +462,22 @@ clock)
     [ $dead = 0 ] && pass "C8 no node exited" || flunk "C8 a node exited"
     tick=0; for i in $(seq 1 "$N"); do awk -v t="$(metric "$i" sokol_tick_seconds_max)" 'BEGIN { exit !(t == "" || t > 0.5) }' && tick=1; done
     [ $tick = 0 ] && pass "C9 no tick over 500 ms" || flunk "C9 a tick over 500 ms"
+    exit $fail
+    ;;
+observe)
+    [ "$N" = 3 ] || { echo "observe mode runs on 3 nodes"; exit 2; }
+    fail=0
+    active() { local v; v=$(metric "$1" 'sokol_blocks_active{family="ipv4"}'); echo "${v:-down}"; }
+    [ "$(metric 1 'sokol_enforce_mode{mode="observe"}')" = 1 ] || { echo "FAIL node 1 is not in observe mode"; exit 1; }
+    printf 'SIGNAL:obs|198.18.9.1|-|observed only\n' | in_ns 1 nc -U -q1 "$WORK/n1/ipc.sock" >/dev/null
+    sleep 2
+    if [ "$(active 1)" = 1 ]; then echo "PASS O1 node 1 decided locally (1 block)"; else echo "FAIL O1 node 1 holds $(active 1)"; fail=1; fi
+    sleep 40
+    if [ "$(active 2)" = 0 ] && [ "$(active 3)" = 0 ]; then echo "PASS O2 after 40 s nodes 2 and 3 hold none of node 1's decisions"
+    else echo "FAIL O2 nodes 2 and 3 hold $(active 2) and $(active 3) of the observing node's blocks"; fail=1; fi
+    printf 'SIGNAL:obs|198.18.9.2|-|enforced\n' | in_ns 2 nc -U -q1 "$WORK/n2/ipc.sock" >/dev/null
+    ok=""; for _ in $(seq 1 25); do [ "$(active 3)" = 1 ] && [ "$(active 1)" = 2 ] && { ok=1; break; }; sleep 0.2; done
+    if [ -n "$ok" ]; then echo "PASS O3 node 2's decision reached nodes 1 and 3"; else echo "FAIL O3 node 1 holds $(active 1), node 3 holds $(active 3)"; fail=1; fi
     exit $fail
     ;;
 *) echo "unknown mode $MODE"; exit 2 ;;

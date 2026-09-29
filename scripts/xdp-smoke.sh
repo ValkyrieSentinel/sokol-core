@@ -783,7 +783,8 @@ check "audit log rotated into segments" bash -c "ls '$WORK'/events.sntl.0* >/dev
 check "monitor --verify accepts the chain across rotated segments" bash -c "'$MONITOR_BIN' --verify '$WORK/events.sntl' | grep -q '^OK'"
 FIRST_SEGMENT=$(ls "$WORK"/events.sntl.0* | head -1)
 cp "$FIRST_SEGMENT" "$WORK/segment.bak"
-printf 'X' | dd of="$FIRST_SEGMENT" bs=1 seek=40 conv=notrunc 2>/dev/null
+# Flip a bit (a fixed byte could already be there, and the "edit" would change nothing).
+python3 -c "import sys; f = open(sys.argv[1], 'r+b'); f.seek(40); b = f.read(1)[0]; f.seek(40); f.write(bytes([b ^ 1]))" "$FIRST_SEGMENT"
 check "monitor --verify detects an edited segment" bash -c "! '$MONITOR_BIN' --verify '$WORK/events.sntl' >/dev/null"
 cp "$WORK/segment.bak" "$FIRST_SEGMENT"
 if [ ${#FLOWSPEC_ARGS[@]} -gt 0 ]; then
@@ -792,6 +793,18 @@ fi
 check "TTL: static --block stays in force" bash -c "! ip netns exec $NS ping -c 1 -W 1 -I $BLOCKED_IP $HOST_IP >/dev/null 2>&1"
 
 stop_orchestrator
+if [ ${#FLOWSPEC_ARGS[@]} -gt 0 ]; then
+    # ADR-0018: an observing node announces nothing upstream, even with --flowspec-gobgp.
+    start_orchestrator --enforce observe "${FLOWSPEC_ARGS[@]}"
+    ipc "DROP_IMMEDIATE:$ALLOWED_IP"
+    sleep 2.5
+    check "observe mode: no Flowspec rule reaches upstream for a new block" bash -c \
+        "! gobgp -p 50052 global rib -a ipv4-flowspec | grep -q 'source: $ALLOWED_IP/32'"
+    check "observe mode: the audit says Flowspec is disabled" grep -aq 'FLOWSPEC_DISABLED|Why:observe' "$WORK/events.sntl"
+    check "observe mode: another system's upstream rule is untouched" bash -c \
+        "gobgp -p 50052 global rib -a ipv4-flowspec | grep -q 'source: $FOREIGN_RULE'"
+    stop_orchestrator
+fi
 if [ ${#FLOWSPEC_ARGS[@]} -gt 0 ]; then
     sleep 1
     check "Flowspec: shutdown withdraws the node's rules upstream" bash -c "! gobgp -p 50052 global rib -a ipv4-flowspec | grep -q 'source: $BLOCKED_IP/32'"
