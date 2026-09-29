@@ -29,9 +29,6 @@ const IP_MF: u16 = 0x2000;
 const IP_OFFSET_MASK: u16 = 0x1FFF;
 
 const TRAP_PORT: u16 = 44333;
-const TCP_SYN: u8 = 0x02;
-const TCP_ACK: u8 = 0x10;
-const ADMIN_SSH_PORT: u16 = 2222;
 
 #[repr(C, packed)]
 #[derive(Clone, Copy)]
@@ -200,6 +197,9 @@ fn emit_drop_event_sampled(
             (*entry_ptr).payload_len = 0;
         }
         entry.submit(0);
+    } else {
+        // Counted, not silent: the consumer is behind and the ring is full.
+        stats.events_lost += 1;
     }
 }
 
@@ -480,13 +480,16 @@ fn try_sentinel_vfr_filter(ctx: &XdpContext) -> Result<u32, ()> {
                 return Ok(xdp_action::XDP_DROP);
             }
 
-            if port == 80 || port == 443 || port == ADMIN_SSH_PORT {
+            if port == 80 || port == 443 || port == common::ADMIN_SSH_PORT {
                 record_rx(packet_len);
                 return Ok(xdp_action::XDP_PASS);
             }
 
             // Only connection attempts (SYN without ACK) count as trap hits, not every segment.
-            if port == TRAP_PORT && flags & TCP_SYN != 0 && flags & TCP_ACK == 0 {
+            if port == TRAP_PORT
+                && flags & common::tcp_flags::SYN != 0
+                && flags & common::tcp_flags::ACK == 0
+            {
                 emit_drop_event_sampled(
                     ctx,
                     &src_ip_16,

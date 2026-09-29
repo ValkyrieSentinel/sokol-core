@@ -25,6 +25,7 @@ pub struct Snapshot {
     pub dropped_packets: u64,
     pub drops_by_reason: [u64; DROP_REASON_SLOTS],
     pub events_suppressed: u64,
+    pub events_lost: u64,
     pub events_malformed: u64,
     pub blocks_active_v4: usize,
     pub blocks_active_v6: usize,
@@ -143,6 +144,13 @@ pub fn render(s: &Snapshot) -> String {
         "sokol_xdp_events_suppressed_total {}",
         s.events_suppressed
     );
+    family(
+        &mut out,
+        "sokol_xdp_events_lost_total",
+        "counter",
+        "Kernel events within the rate limit that found the ring buffer full (the reader was behind).",
+    );
+    let _ = writeln!(out, "sokol_xdp_events_lost_total {}", s.events_lost);
     family(
         &mut out,
         "sokol_xdp_events_malformed_total",
@@ -521,6 +529,7 @@ mod tests {
             rx_bytes: 1000,
             dropped_packets: 3,
             events_suppressed: 7,
+            events_lost: 6,
             mesh_rejected: [0, 0, 3, 0, 0],
             clock_steps: 2,
             clock_last_step_ms: -3_600_000,
@@ -543,6 +552,7 @@ mod tests {
         assert!(text.contains("sokol_xdp_dropped_packets_total{reason=\"blocklist\"} 2\n"));
         assert!(text.contains("sokol_xdp_dropped_packets_total{reason=\"fragment_blocked\"} 1\n"));
         assert!(text.contains("sokol_xdp_events_suppressed_total 7\n"));
+        assert!(text.contains("sokol_xdp_events_lost_total 6\n"));
         assert!(
             text.contains("sokol_mesh_envelopes_rejected_total{reason=\"stale_timestamp\"} 3\n")
         );

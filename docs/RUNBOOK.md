@@ -98,6 +98,7 @@ journalctl -u sokol-orchestrator -n 50 --no-pager
 | `sokol_mesh_broadcasts_dropped_total{class="urgent"}` | росте | лінк до піра не встигає за заявками |
 | `sokol_mesh_handshake_timeouts_total` | швидко росте | хтось відкриває з'єднання й мовчить |
 | `sokol_tick_seconds_max` | > 0,5 | обслуговування таблиці сповільнюється |
+| `sokol_xdp_events_lost_total` | росте | orchestrator не встигає читати події ядра: кільце повне, події (не блоки) губляться |
 | `sokol_xdp_events_malformed_total` | > 0 | XDP-програма й orchestrator розходяться в розкладці подій (ADR-0015): бінарник зібрано неправильно |
 | `sokol_block_outcomes_total{effect="none"}` | частка велика | блоки нічого не відкидають: `sudo sokol-monitor --outcomes /var/lib/sokol/audit.log` покаже, які детектори й правила (ADR-0014) |
 

@@ -31,8 +31,8 @@ fn ipc_socket_path() -> String {
 /// Ports that decoy services listen on. 8080 is left out: local services such as the CrowdSec
 /// Local API use it, and a trap there would ban their clients.
 const DEFAULT_TRAP_PORTS: [u16; 6] = [22, 80, 443, 3306, 6379, 8443];
-/// The XDP program always passes this port as the operator's real SSH (ADMIN_SSH_PORT).
-const ADMIN_SSH_PORT: u16 = 2222;
+// The XDP program always passes this port as the operator's real SSH (common::ADMIN_SSH_PORT).
+use common::ADMIN_SSH_PORT;
 const MAX_CONCURRENT_CONNECTIONS: usize = 256;
 
 pub struct TrapConfig {

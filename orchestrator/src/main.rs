@@ -2434,6 +2434,7 @@ async fn main() -> Result<(), anyhow::Error> {
                         total_rx_bytes += cpu_stat.0.rx_bytes;
                         total_dropped += cpu_stat.0.dropped_packets;
                         snapshot.events_suppressed += cpu_stat.0.events_suppressed;
+                        snapshot.events_lost += cpu_stat.0.events_lost;
                         for (sum, n) in snapshot.drops_by_reason.iter_mut().zip(cpu_stat.0.drops_by_reason) {
                             *sum += n;
                         }

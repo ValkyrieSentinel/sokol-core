@@ -212,6 +212,42 @@ check "kernel events read back field by field: IP $ALLOWED_IP, TCP, IPv4, SYN-si
     ! grep -v -E '^KERNEL_DROP_NOTIFY\|IP:$ALLOWED_IP\|Reason:6\|Proto:6\|Version:4\|PktLen:([5-9][0-9]|1[01][0-9])\$' '$WORK/trap-events'"
 check "no ring-buffer record of the wrong size" test "$(metric sokol_xdp_events_malformed_total)" = 0
 
+# N03: an event the ring buffer cannot take is counted, not lost silently. With the reader
+# stopped (SIGSTOP; the XDP program keeps running in the kernel) exactly N trap SYNs are sent
+# over ~20 s, so the per-CPU budget admits more events than the ring holds. Then every one of
+# them must be accounted for: recorded in the audit, suppressed by the rate limit, or lost.
+trap_recorded() { (grep -a -o "KERNEL_DROP_NOTIFY|IP:[^|]*|Reason:6|" "$WORK/events.sntl" || true) | wc -l; }
+LOSS_N=20000
+R0=$(trap_recorded); S0=$(metric sokol_xdp_events_suppressed_total); L0=$(metric sokol_xdp_events_lost_total)
+kill -STOP "$ORCH_PID"
+ip netns exec "$NS" python3 - "$ALLOWED_IP" "$HOST_IP" "$LOSS_N" <<'PY'
+import socket, struct, sys, time
+src, dst, n = sys.argv[1], sys.argv[2], int(sys.argv[3])
+def csum(data):
+    s = sum(struct.unpack("!%dH" % (len(data) // 2), data))
+    s = (s >> 16) + (s & 0xFFFF)
+    return ~(s + (s >> 16)) & 0xFFFF
+sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_TCP)
+sock.bind((src, 0))
+start = time.monotonic()
+for i in range(n):
+    hdr = struct.pack("!HHIIBBHHH", 20000 + i % 40000, 44333, i, 0, 5 << 4, 0x02, 1024, 0, 0)
+    pseudo = socket.inet_aton(src) + socket.inet_aton(dst) + struct.pack("!BBH", 0, 6, len(hdr))
+    hdr = hdr[:16] + struct.pack("!H", csum(pseudo + hdr)) + hdr[18:]
+    sock.sendto(hdr, (dst, 0))
+    while time.monotonic() - start < i / 1000:   # 1 000 SYNs/s, 20 s
+        time.sleep(0.0005)
+PY
+kill -CONT "$ORCH_PID"
+accounted() {
+    R1=$(trap_recorded); S1=$(metric sokol_xdp_events_suppressed_total); L1=$(metric sokol_xdp_events_lost_total)
+    [ $(( (R1 - R0) + (S1 - S0) + (${L1:-0} - ${L0:-0}) )) = "$LOSS_N" ]
+}
+for _ in $(seq 1 50); do accounted && break; sleep 0.2; done
+echo "      $LOSS_N trap SYNs with the reader stopped: recorded $((R1 - R0)), suppressed $((S1 - S0)), lost $((${L1:-0} - ${L0:-0}))"
+check "a full ring buffer is counted: events were lost while the reader was stopped" test "$(( ${L1:-0} - ${L0:-0} ))" -gt 0
+check "every trap SYN is recorded, suppressed or counted lost ($LOSS_N)" accounted
+
 ipc() {
     printf '%s\n' "$1" | nc -U -q1 /run/sokol.sock
 }

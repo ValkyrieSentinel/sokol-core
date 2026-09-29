@@ -42,6 +42,8 @@ pub struct PacketStats {
     /// Rate-limit window state (per CPU; not a counter).
     pub event_window_start_ns: u64,
     pub events_in_window: u64,
+    /// Events within the rate limit that found the ring buffer full (its consumer behind).
+    pub events_lost: u64,
 }
 
 pub const DROP_REASON_SLOTS: usize = 16;
@@ -52,6 +54,8 @@ pub const BLOCK_HIT_SLOTS: u32 = 2 * BLOCKLIST_CAPACITY;
 /// Ring-buffer events allowed per CPU per second; the rest are only counted. Per CPU: a node
 /// with P busy CPUs can emit 64 × P events/s (numerical review N03).
 pub const MAX_EVENTS_PER_CPU_PER_SEC: u64 = 64;
+/// The operator's real SSH port: the XDP program always passes it, and the trap never takes it.
+pub const ADMIN_SSH_PORT: u16 = 2222;
 /// Size of the shared event ring buffer (a power of two, as the kernel requires).
 pub const EVENTS_RING_BYTES: u32 = 256 * 1024;
 /// Ring space one DropEvent takes: the record plus the kernel's 8-byte header, 8-aligned.
@@ -89,6 +93,7 @@ impl PacketStats {
         events_suppressed: 0,
         event_window_start_ns: 0,
         events_in_window: 0,
+        events_lost: 0,
     };
 }
 
@@ -117,7 +122,7 @@ pub mod abi {
     use core::mem::{align_of, offset_of, size_of};
 
     pub const DROP_EVENT_SIZE: usize = 300;
-    pub const PACKET_STATS_SIZE: usize = 208;
+    pub const PACKET_STATS_SIZE: usize = 216;
 
     const _: () = {
         assert!(size_of::<DropEvent>() == DROP_EVENT_SIZE);
@@ -142,6 +147,7 @@ pub mod abi {
         assert!(offset_of!(PacketStats, drops_by_reason) == 56);
         assert!(offset_of!(PacketStats, events_suppressed) == 56 + 8 * DROP_REASON_SLOTS);
         assert!(offset_of!(PacketStats, events_in_window) == 200);
+        assert!(offset_of!(PacketStats, events_lost) == 208);
         assert!(super::EVENTS_RING_BYTES.is_power_of_two());
     };
 }
