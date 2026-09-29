@@ -70,6 +70,10 @@ jobs:
           cargo fmt --all --check
           (cd ebpf && cargo fmt --check)
 
+      - name: Retired surface (docs/RETIRED.md)
+        if: matrix.policy_checks
+        run: scripts/check-retired.sh
+
       - name: Dependency policy (cargo-deny, deny.toml)
         if: matrix.policy_checks
         run: |
