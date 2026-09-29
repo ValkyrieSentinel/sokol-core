@@ -74,6 +74,14 @@ jobs:
         if: matrix.policy_checks
         run: scripts/check-retired.sh
 
+      - name: Monitoring (alert rules, dashboard)
+        if: matrix.policy_checks
+        run: |
+          scripts/check-monitoring.sh
+          docker run --rm -v "$PWD/deploy/prometheus:/w" -w /w --entrypoint promtool \
+            prom/prometheus@sha256:efd719c99d83b060d9daefdcf00360461adf279f45ef5391f8d111892118753e \
+            test rules sokol-alerts.test.yml
+
       - name: Dependency policy (cargo-deny, deny.toml)
         if: matrix.policy_checks
         run: |

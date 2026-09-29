@@ -104,6 +104,14 @@ journalctl -u sokol-orchestrator -n 50 --no-pager
 
 Будь-яка з перших п'яти причин переводить вузол у `MODE=DEGRADED`. Захист при цьому працює.
 
+**Готові алерти й дашборд:**
+- `deploy/prometheus/sokol-alerts.yml` — 16 правил за цією таблицею, з тестами
+  `promtool test rules sokol-alerts.test.yml`;
+- `deploy/prometheus/prometheus.yml` — приклад збору. Метрики без автентифікації, тож
+  `--metrics-bind` лише на приватну адресу (WireGuard, мережа керування);
+- `deploy/grafana/sokol-dashboard.json` — імпорт у Grafana. Ряди: стан вузлів, фаза 0
+  («відкинув би»), рішення й наслідки, меш, ресурси.
+
 ## 5. Інциденти
 
 ### 5.1 Помилковий блок

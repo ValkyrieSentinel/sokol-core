@@ -1,0 +1,115 @@
+# Alert rules for Sokol-Core nodes (docs/RUNBOOK.md §4). Every expression uses metrics a node
+# exports; thresholds are the runbook's. Checked by `promtool test rules sokol-alerts.test.yml`.
+groups:
+  - name: sokol-health
+    rules:
+      - alert: SokolNodeDown
+        expr: up{job="sokol"} == 0
+        for: 1m
+        labels: { severity: critical }
+        annotations:
+          summary: "{{ $labels.instance }}: metrics unreachable"
+          runbook: "RUNBOOK §3: systemctl status sokol-orchestrator; journalctl -u sokol-orchestrator"
+      - alert: SokolDegraded
+        expr: min without (__name__) ({__name__=~"sokol_(audit_healthy|state_healthy|state_restore_ok|protected_refresh_ok)", job="sokol"}) == 0
+        for: 1m
+        labels: { severity: critical }
+        annotations:
+          summary: "{{ $labels.instance }}: node DEGRADED (audit, state, restore or protected set); protection still runs"
+          runbook: "RUNBOOK §5.3"
+      - alert: SokolAuditRecordsLost
+        expr: increase(sokol_audit_lost_total[10m]) > 0 or increase(sokol_audit_queue_overflow_total[10m]) > 0
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.instance }}: audit records lost (disk, rights or queue overflow)"
+          runbook: "RUNBOOK §5.3"
+      - alert: SokolTickSlow
+        expr: max_over_time(sokol_tick_seconds[5m]) > 0.5
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.instance }}: a maintenance tick took over 0.5 s"
+          runbook: "RUNBOOK §4"
+      - alert: SokolClockStepped
+        expr: increase(sokol_clock_steps_total[15m]) > 0
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.instance }}: wall clock stepped {{ with printf `sokol_clock_last_step_seconds{instance='%s'}` $labels.instance | query }}{{ . | first | value }}{{ end }} s"
+          runbook: "ADR-0017: blocks in force keep their length; check NTP/chrony"
+      - alert: SokolNotDropping
+        expr: sokol_enforce_mode{mode="observe"} == 1
+        labels: { severity: info }
+        annotations:
+          summary: "{{ $labels.instance }}: observe mode, decisions are recorded but nothing is dropped"
+          runbook: "RUNBOOK §9 (pilot phase 0)"
+      - alert: SokolXdpGeneric
+        expr: sokol_xdp_mode{mode="generic"} == 1
+        for: 10m
+        labels: { severity: info }
+        annotations:
+          summary: "{{ $labels.instance }}: XDP runs in generic (slower) mode; the NIC driver refused native"
+          runbook: "SUPPORT.md §2"
+
+  - name: sokol-enforcement
+    rules:
+      - alert: SokolBlocksPending
+        expr: sokol_blocks_pending > 0
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.instance }}: {{ $value }} blocks wait for the kernel map for 5 min"
+          runbook: "RUNBOOK §4: the map refuses entries (full?)"
+      - alert: SokolBlocklistNearCapacity
+        expr: sokol_blocks_active / on (instance) group_left sokol_blocks_capacity > 0.8
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.instance }} {{ $labels.family }}: blocklist over 80 % of 65 536"
+          runbook: "RUNBOOK §4"
+      - alert: SokolKernelEventsLost
+        expr: increase(sokol_xdp_events_lost_total[10m]) > 0
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.instance }}: the ring buffer was full, kernel events (not blocks) were lost"
+          runbook: "RUNBOOK §4"
+      - alert: SokolKernelAbiMismatch
+        expr: sokol_xdp_events_malformed_total > 0
+        labels: { severity: critical }
+        annotations:
+          summary: "{{ $labels.instance }}: XDP program and orchestrator disagree on the event layout: wrong build"
+          runbook: "ADR-0015"
+
+  - name: sokol-mesh
+    rules:
+      - alert: SokolPeersLost
+        expr: sokol_p2p_active_peers < max_over_time(sokol_p2p_active_peers[1h])
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.instance }}: {{ $value }} mesh peers, fewer than in the last hour"
+          runbook: "RUNBOOK §5.5"
+      - alert: SokolPeerClockSkew
+        expr: increase(sokol_mesh_envelopes_rejected_total{reason="stale_timestamp"}[10m]) > 0
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.instance }}: envelopes refused as stale: a peer's clock is over 30 s off"
+          runbook: "RUNBOOK §5.5"
+      - alert: SokolUrgentBroadcastsDropped
+        expr: increase(sokol_mesh_broadcasts_dropped_total{class="urgent"}[10m]) > 0
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.instance }}: block decisions not queued to a peer (its link is behind); repair follows"
+          runbook: "RUNBOOK §4"
+      - alert: SokolClaimsWaiting
+        expr: sokol_claims_waiting > 0
+        for: 30m
+        labels: { severity: info }
+        annotations:
+          summary: "{{ $labels.instance }}: {{ $value }} peer claims wait for a slot in their issuer's envelope"
+          runbook: "RUNBOOK §4 (ADR-0007): the mesh is fine, a peer issued more than --peer-max-active"
+      - alert: SokolStormEngaged
+        expr: sokol_cluster_storm_engaged == 1
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.instance }}: distributed storm engaged (strict parsing and fragment drops)"
+          runbook: "ADR-0006"

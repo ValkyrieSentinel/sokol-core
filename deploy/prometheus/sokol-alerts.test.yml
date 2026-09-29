@@ -1,0 +1,108 @@
+# promtool test rules deploy/prometheus/sokol-alerts.test.yml  (run from deploy/prometheus)
+rule_files: [sokol-alerts.yml]
+evaluation_interval: 30s
+tests:
+  - interval: 30s
+    input_series:
+      - { series: 'up{job="sokol",instance="n1"}', values: '1 1 0 0 0 0' }
+      - { series: 'sokol_state_healthy{job="sokol",instance="n1"}', values: '1 0 0 0 0 0' }
+      - { series: 'sokol_audit_healthy{job="sokol",instance="n1"}', values: '1 1 1 1 1 1' }
+      - { series: 'sokol_enforce_mode{job="sokol",instance="n1",mode="observe"}', values: '1 1 1 1 1 1' }
+      - { series: 'sokol_tick_seconds{job="sokol",instance="n1"}', values: '0.01 0.7 0.01 0.01 0.01 0.01' }
+      - { series: 'sokol_tick_seconds{job="sokol",instance="n2"}', values: '0.01 0.01 0.01 0.01 0.01 0.01' }
+      - { series: 'sokol_xdp_events_malformed_total{job="sokol",instance="n2"}', values: '0 0 0 0 0 0' }
+      - { series: 'sokol_xdp_events_malformed_total{job="sokol",instance="n1"}', values: '0 0 1 1 1 1' }
+    alert_rule_test:
+      - { eval_time: 3m, alertname: SokolNodeDown, exp_alerts: [ { exp_labels: { severity: critical, job: sokol, instance: n1 }, exp_annotations: { summary: "n1: metrics unreachable", runbook: "RUNBOOK §3: systemctl status sokol-orchestrator; journalctl -u sokol-orchestrator" } } ] }
+      - eval_time: 3m
+        alertname: SokolDegraded
+        exp_alerts: [ { exp_labels: { severity: critical, job: sokol, instance: n1 }, exp_annotations: { summary: "n1: node DEGRADED (audit, state, restore or protected set); protection still runs", runbook: "RUNBOOK §5.3" } } ]
+      - eval_time: 2m
+        alertname: SokolNotDropping
+        exp_alerts: [ { exp_labels: { severity: info, job: sokol, instance: n1, mode: observe }, exp_annotations: { summary: "n1: observe mode, decisions are recorded but nothing is dropped", runbook: "RUNBOOK §9 (pilot phase 0)" } } ]
+      - eval_time: 2m
+        alertname: SokolTickSlow
+        exp_alerts: [ { exp_labels: { severity: warning, job: sokol, instance: n1 }, exp_annotations: { summary: "n1: a maintenance tick took over 0.5 s", runbook: "RUNBOOK §4" } } ]
+      - eval_time: 2m
+        alertname: SokolKernelAbiMismatch
+        exp_alerts: [ { exp_labels: { severity: critical, job: sokol, instance: n1 }, exp_annotations: { summary: "n1: XDP program and orchestrator disagree on the event layout: wrong build", runbook: "ADR-0015" } } ]
+
+  # Healthy nodes: nothing fires.
+  - interval: 1m
+    input_series:
+      - { series: 'up{job="sokol",instance="n1"}', values: '1x20' }
+      - { series: 'sokol_state_healthy{job="sokol",instance="n1"}', values: '1x20' }
+      - { series: 'sokol_state_restore_ok{job="sokol",instance="n1"}', values: '1x20' }
+      - { series: 'sokol_tick_seconds{job="sokol",instance="n1"}', values: '0.01x20' }
+      - { series: 'sokol_blocks_pending{job="sokol",instance="n1"}', values: '0x20' }
+      - { series: 'sokol_p2p_active_peers{job="sokol",instance="n1"}', values: '3x20' }
+      - { series: 'sokol_claims_waiting{job="sokol",instance="n1"}', values: '0x20' }
+      - { series: 'sokol_enforce_mode{job="sokol",instance="n1",mode="drop"}', values: '1x20' }
+      - { series: 'sokol_blocks_active{job="sokol",instance="n1",family="ipv4"}', values: '100x20' }
+      - { series: 'sokol_blocks_capacity{job="sokol",instance="n1"}', values: '65536x20' }
+    alert_rule_test:
+      - { eval_time: 15m, alertname: SokolNodeDown, exp_alerts: [] }
+      - { eval_time: 15m, alertname: SokolDegraded, exp_alerts: [] }
+      - { eval_time: 15m, alertname: SokolTickSlow, exp_alerts: [] }
+      - { eval_time: 15m, alertname: SokolBlocksPending, exp_alerts: [] }
+      - { eval_time: 15m, alertname: SokolPeersLost, exp_alerts: [] }
+      - { eval_time: 15m, alertname: SokolNotDropping, exp_alerts: [] }
+      - { eval_time: 15m, alertname: SokolBlocklistNearCapacity, exp_alerts: [] }
+
+  # Enforcement and mesh trouble.
+  - interval: 1m
+    input_series:
+      - { series: 'sokol_blocks_pending{job="sokol",instance="n1"}', values: '0 3x10' }
+      - { series: 'sokol_blocks_active{job="sokol",instance="n1",family="ipv4"}', values: '60000x10' }
+      - { series: 'sokol_blocks_capacity{job="sokol",instance="n1"}', values: '65536x10' }
+      - { series: 'sokol_p2p_active_peers{job="sokol",instance="n1"}', values: '3 3 3 1x8' }
+      - { series: 'sokol_xdp_events_lost_total{job="sokol",instance="n1"}', values: '0 0 573x8' }
+      - { series: 'sokol_mesh_envelopes_rejected_total{job="sokol",instance="n1",reason="stale_timestamp"}', values: '0+5x30' }
+      - { series: 'sokol_clock_steps_total{job="sokol",instance="n1"}', values: '0 0 1x8' }
+      - { series: 'sokol_clock_last_step_seconds{job="sokol",instance="n1"}', values: '0 0 -3600x8' }
+    alert_rule_test:
+      - eval_time: 8m
+        alertname: SokolBlocksPending
+        exp_alerts: [ { exp_labels: { severity: warning, job: sokol, instance: n1 }, exp_annotations: { summary: "n1: 3 blocks wait for the kernel map for 5 min", runbook: "RUNBOOK §4: the map refuses entries (full?)" } } ]
+      - eval_time: 8m
+        alertname: SokolBlocklistNearCapacity
+        exp_alerts: [ { exp_labels: { severity: warning, job: sokol, instance: n1, family: ipv4 }, exp_annotations: { summary: "n1 ipv4: blocklist over 80 % of 65 536", runbook: "RUNBOOK §4" } } ]
+      - eval_time: 9m
+        alertname: SokolPeersLost
+        exp_alerts: [ { exp_labels: { severity: warning, job: sokol, instance: n1 }, exp_annotations: { summary: "n1: 1 mesh peers, fewer than in the last hour", runbook: "RUNBOOK §5.5" } } ]
+      - eval_time: 5m
+        alertname: SokolKernelEventsLost
+        exp_alerts: [ { exp_labels: { severity: warning, job: sokol, instance: n1 }, exp_annotations: { summary: "n1: the ring buffer was full, kernel events (not blocks) were lost", runbook: "RUNBOOK §4" } } ]
+      - eval_time: 25m
+        alertname: SokolPeerClockSkew
+        exp_alerts: [ { exp_labels: { severity: warning, job: sokol, instance: n1, reason: stale_timestamp }, exp_annotations: { summary: "n1: envelopes refused as stale: a peer's clock is over 30 s off", runbook: "RUNBOOK §5.5" } } ]
+      - eval_time: 5m
+        alertname: SokolClockStepped
+        exp_alerts: [ { exp_labels: { severity: warning, job: sokol, instance: n1 }, exp_annotations: { summary: "n1: wall clock stepped -3600 s", runbook: "ADR-0017: blocks in force keep their length; check NTP/chrony" } } ]
+
+  # The rest of the rules.
+  - interval: 1m
+    input_series:
+      - { series: 'sokol_audit_lost_total{job="sokol",instance="n1"}', values: '0 0 4x10' }
+      - { series: 'sokol_audit_queue_overflow_total{job="sokol",instance="n1"}', values: '0x12' }
+      - { series: 'sokol_xdp_mode{job="sokol",instance="n1",mode="generic"}', values: '1x15' }
+      - { series: 'sokol_mesh_broadcasts_dropped_total{job="sokol",instance="n1",class="urgent"}', values: '0 0 250x10' }
+      - { series: 'sokol_claims_waiting{job="sokol",instance="n1"}', values: '13616x40' }
+      - { series: 'sokol_cluster_storm_engaged{job="sokol",instance="n1"}', values: '0 1x5' }
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: SokolAuditRecordsLost
+        exp_alerts: [ { exp_labels: { severity: warning, job: sokol, instance: n1 }, exp_annotations: { summary: "n1: audit records lost (disk, rights or queue overflow)", runbook: "RUNBOOK §5.3" } } ]
+      - eval_time: 12m
+        alertname: SokolXdpGeneric
+        exp_alerts: [ { exp_labels: { severity: info, job: sokol, instance: n1, mode: generic }, exp_annotations: { summary: "n1: XDP runs in generic (slower) mode; the NIC driver refused native", runbook: "SUPPORT.md §2" } } ]
+      - eval_time: 5m
+        alertname: SokolUrgentBroadcastsDropped
+        exp_alerts: [ { exp_labels: { severity: warning, job: sokol, instance: n1, class: urgent }, exp_annotations: { summary: "n1: block decisions not queued to a peer (its link is behind); repair follows", runbook: "RUNBOOK §4" } } ]
+      - eval_time: 35m
+        alertname: SokolClaimsWaiting
+        exp_alerts: [ { exp_labels: { severity: info, job: sokol, instance: n1 }, exp_annotations: { summary: "n1: 13616 peer claims wait for a slot in their issuer's envelope", runbook: "RUNBOOK §4 (ADR-0007): the mesh is fine, a peer issued more than --peer-max-active" } } ]
+      - { eval_time: 20m, alertname: SokolClaimsWaiting, exp_alerts: [] }
+      - eval_time: 3m
+        alertname: SokolStormEngaged
+        exp_alerts: [ { exp_labels: { severity: warning, job: sokol, instance: n1 }, exp_annotations: { summary: "n1: distributed storm engaged (strict parsing and fragment drops)", runbook: "ADR-0006" } } ]
