@@ -74,6 +74,10 @@ jobs:
         if: matrix.policy_checks
         run: scripts/check-retired.sh
 
+      - name: Cited evidence exists (tests, metrics, flags, ADRs, paths)
+        if: matrix.policy_checks
+        run: scripts/check-claims.sh
+
       - name: Monitoring (alert rules, dashboard)
         if: matrix.policy_checks
         run: |
