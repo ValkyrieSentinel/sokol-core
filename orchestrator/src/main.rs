@@ -798,6 +798,7 @@ async fn execute_control(cmd: control::ControlCommand, ctx: &ControlCtx) -> Stri
                         table.set_pinned(trust.node_ids(), block_table::local_ms());
                     }
                     let pinned = ctx.registry.reload(trust);
+                    log_inbound_budget(pinned);
                     log::warn!(
                         "[Control] Reloaded {}: {} pinned peers",
                         path.display(),
@@ -1091,6 +1092,19 @@ impl Enforcement {
     }
 }
 
+/// The node-wide mesh envelope for this peers file (ADR-0013): no limit caps the sum of the
+/// per-connection limits, so the operator sees what the peers file allows.
+fn log_inbound_budget(peers: usize) {
+    let (frames, bytes, cpu) = p2p::inbound_worst_case(peers);
+    log::info!(
+        "[Resources] {} pinned peers at their full limits: {:.0} frames/s, {:.0} MiB/s inbound, {:.2} core verifying",
+        peers,
+        frames,
+        bytes / (1024.0 * 1024.0),
+        cpu
+    );
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn enforce_block_local(
     target: IpNet,
@@ -1239,6 +1253,7 @@ async fn main() -> Result<(), anyhow::Error> {
             TrustStore::default()
         }
     };
+    log_inbound_budget(trust_store.len());
 
     // The static part (built-in ranges, seeds, --never-block) plus the host's own addresses and
     // gateways, which are re-read while the node runs (the protected set follows the host).
