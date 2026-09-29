@@ -1,0 +1,50 @@
+{
+  "date": "2026-09-28",
+  "host": "macOS-27.0-arm64-arm-64bit-Mach-O",
+  "repositories": {
+    "core": {
+      "path": "/Users/s0fractal/Projects/external/sokol-core",
+      "head": "b8e0e232853054d1155191f2ca895097bf0e4014",
+      "remote": "https://github.com/ValkyrieSentinel/sokol-core.git",
+      "status": "?? docs/reviews/2026-09-28-transfer/",
+      "Cargo.lock_sha256": "6bd6a2ca836c549794279bd9dedf98e589b3ed6de336418cce80bd18cc38348f",
+      "Cargo.toml_sha256": "97793c9caa4960040ddded8253d3c4998e623e595e54a4823299de5cc5aa31ee"
+    },
+    "biophoton": {
+      "path": "/Users/s0fractal/Projects/external/sokol-biophoton",
+      "head": "87fecc63ccfd717192de3e67e352416e44cd2ee4",
+      "remote": "https://github.com/ValkyrieSentinel/sokol-biophoton.git",
+      "status": "",
+      "Cargo.lock_sha256": "0fa9e6e21901d17313e2479f13439b14120e1d2309cda967db78694ab3afc0e6",
+      "Cargo.toml_sha256": "60587f238e4e7cf7408683418846ca42c4d667d966507aa6b1e207c44c940690"
+    },
+    "hardware": {
+      "path": "/Users/s0fractal/Projects/external/sokol-hardware-filter",
+      "head": "d1fea045bda0df5b857cb65ed46c0341cc0faf80",
+      "remote": "https://github.com/ValkyrieSentinel/sokol-hardware-filter.git",
+      "status": "",
+      "Cargo.lock_sha256": "5bbcffe3dae5d989779282654ccafc1ba0379529bfeacd4e7a0c30d5a23f9428",
+      "Cargo.toml_sha256": "2257a4777916a7795745b76d906ce30b19729936d71cd041eb8fae0af521dd58"
+    },
+    "omega": {
+      "path": "/Users/s0fractal/trinity/omega",
+      "head": "f557cd578e45de79878d3ca5d12b025f7d92a75b",
+      "remote": "https://github.com/s0fractal/genesis.git",
+      "status": "",
+      "Cargo.lock_sha256": "ed4bfb903b43847fa88f779c458a430700632c47585db8361e87becf890ae5e9",
+      "Cargo.toml_sha256": "8d9aee17f84eea15976f41a017c059d933d61fd9f5ba7783643db4d59af71ad0"
+    }
+  },
+  "omega_command": "cargo +stable test --locked -p omega_v2 --test ffi_layout --test golden_vectors --test hebbian_is_load_bearing --test habitability --target-dir /tmp/sokol-transfer-omega-target",
+  "omega_exit": 0,
+  "omega_toolchain": "rustc 1.98.1 (48a229cea 2026-09-01); cargo 1.98.1 (797e8a9bc 2026-08-05)",
+  "prototype_command": "python3 evidence/reproduce.py",
+  "prototype_exit": 0,
+  "prototype_note": "rustc 1.96.1; standalone exact src/lib.rs plus diagnostic unit tests, not Cargo package integration",
+  "limits": [
+    "No whole Omega audit",
+    "No SP1 proof verification or proving",
+    "No kernel/XDP/NIC benchmark rerun",
+    "FastCffBuffer race determined statically; UB not executed"
+  ]
+}

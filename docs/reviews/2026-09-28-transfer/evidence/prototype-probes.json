@@ -1,0 +1,107 @@
+{
+  "biophoton": "87fecc63ccfd717192de3e67e352416e44cd2ee4",
+  "hardware": "d1fea045bda0df5b857cb65ed46c0341cc0faf80",
+  "results": [
+    {
+      "command": [
+        "rustc",
+        "+stable",
+        "--version",
+        "--verbose"
+      ],
+      "exit": 0,
+      "expected_exit": 0,
+      "matched": true,
+      "stdout": "rustc 1.96.1 (31fca3adb 2026-06-26)\nbinary: rustc\ncommit-hash: 31fca3adb283cc9dfd56b49cdee9a96eb9c96ffd\ncommit-date: 2026-06-26\nhost: aarch64-apple-darwin\nrelease: 1.96.1\nLLVM version: 22.1.2\n",
+      "stderr": ""
+    },
+    {
+      "command": [
+        "rustc",
+        "+stable",
+        "--edition=2021",
+        "--test",
+        "/var/folders/3j/t95dsnsj7wlc35dpwlwpdy8r0000gn/T/sokol-transfer-eg_inj1f/sokol-biophoton.rs",
+        "-o",
+        "/var/folders/3j/t95dsnsj7wlc35dpwlwpdy8r0000gn/T/sokol-transfer-eg_inj1f/sokol-biophoton"
+      ],
+      "exit": 0,
+      "expected_exit": 0,
+      "matched": true,
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "command": [
+        "/var/folders/3j/t95dsnsj7wlc35dpwlwpdy8r0000gn/T/sokol-transfer-eg_inj1f/sokol-biophoton",
+        "--test-threads=1"
+      ],
+      "exit": 0,
+      "expected_exit": 0,
+      "matched": true,
+      "stdout": "\nrunning 6 tests\ntest transfer_probes::content_hash_does_not_affect_reception ... ok\ntest transfer_probes::identical_replay_amplifies_energy ... ok\ntest transfer_probes::polynomial_sine_has_large_pi_error ... ok\ntest transfer_probes::quiet_ticks_do_not_restore_stress ... ok\ntest transfer_probes::unsigned_neutralization_blacklists_a_named_emitter ... ok\ntest transfer_probes::zero_distance_produces_nonfinite_state ... ok\n\ntest result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n",
+      "stderr": ""
+    },
+    {
+      "command": [
+        "rustc",
+        "+stable",
+        "--edition=2021",
+        "--test",
+        "/var/folders/3j/t95dsnsj7wlc35dpwlwpdy8r0000gn/T/sokol-transfer-eg_inj1f/sokol-hardware-filter.rs",
+        "-o",
+        "/var/folders/3j/t95dsnsj7wlc35dpwlwpdy8r0000gn/T/sokol-transfer-eg_inj1f/sokol-hardware-filter"
+      ],
+      "exit": 0,
+      "expected_exit": 0,
+      "matched": true,
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "command": [
+        "/var/folders/3j/t95dsnsj7wlc35dpwlwpdy8r0000gn/T/sokol-transfer-eg_inj1f/sokol-hardware-filter",
+        "--test-threads=1"
+      ],
+      "exit": 0,
+      "expected_exit": 0,
+      "matched": true,
+      "stdout": "\nrunning 2 tests\ntest transfer_probes::empty_and_bit_zero_select_the_same_decision ... ok\ntest transfer_probes::lowest_bit_wins_regardless_of_semantic_priority ... ok\n\ntest result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n",
+      "stderr": ""
+    },
+    {
+      "command": [
+        "rustc",
+        "+stable",
+        "--edition=2021",
+        "--crate-name=hardware",
+        "--crate-type=rlib",
+        "/var/folders/3j/t95dsnsj7wlc35dpwlwpdy8r0000gn/T/sokol-transfer-eg_inj1f/sokol-hardware-filter.rs",
+        "-o",
+        "/var/folders/3j/t95dsnsj7wlc35dpwlwpdy8r0000gn/T/sokol-transfer-eg_inj1f/libhardware.rlib"
+      ],
+      "exit": 0,
+      "expected_exit": 0,
+      "matched": true,
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "command": [
+        "rustc",
+        "+stable",
+        "--edition=2021",
+        "/var/folders/3j/t95dsnsj7wlc35dpwlwpdy8r0000gn/T/sokol-transfer-eg_inj1f/consumer.rs",
+        "--extern",
+        "hardware=/var/folders/3j/t95dsnsj7wlc35dpwlwpdy8r0000gn/T/sokol-transfer-eg_inj1f/libhardware.rlib",
+        "-o",
+        "/var/folders/3j/t95dsnsj7wlc35dpwlwpdy8r0000gn/T/sokol-transfer-eg_inj1f/consumer"
+      ],
+      "exit": 1,
+      "expected_exit": 1,
+      "matched": true,
+      "stdout": "",
+      "stderr": "error[E0152]: duplicate lang item in crate `hardware` (which `consumer` depends on): `panic_impl`\n  |\n  = note: the lang item is first defined in crate `std` (which `consumer` depends on)\n  = note: first definition in `std` loaded from /Users/s0fractal/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/lib/libstd-17ed52d55cdc389f.dylib, /Users/s0fractal/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/lib/libstd-17ed52d55cdc389f.rlib, /Users/s0fractal/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/lib/libstd-17ed52d55cdc389f.rmeta\n  = note: second definition in `hardware` loaded from /private/var/folders/3j/t95dsnsj7wlc35dpwlwpdy8r0000gn/T/sokol-transfer-eg_inj1f/libhardware.rlib\n\nerror: aborting due to 1 previous error\n\nFor more information about this error, try `rustc --explain E0152`.\n"
+    }
+  ]
+}
