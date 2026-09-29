@@ -1,0 +1,20 @@
+{
+  "sha": "aeaf88bdbcb105c199347254a1a55e4cf25e56bc",
+  "scope": "exact ATP, SokolEngine and ReplayGuard fragments, plus existing unit tests; not full node",
+  "build_stderr": "warning: struct `PhaseGradient` is never constructed\n   --> /var/folders/3j/t95dsnsj7wlc35dpwlwpdy8r0000gn/T/sokol-numeric-48d5icfg/probe.rs:159:12\n    |\n159 | pub struct PhaseGradient(pub f64);\n    |            ^^^^^^^^^^^^^\n    |\n    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default\n\nwarning: struct `FieldVector` is never constructed\n   --> /var/folders/3j/t95dsnsj7wlc35dpwlwpdy8r0000gn/T/sokol-numeric-48d5icfg/probe.rs:163:12\n    |\n163 | pub struct FieldVector {\n    |            ^^^^^^^^^^^\n\nwarning: 2 warnings emitted\n\n",
+  "test_stdout": "\nrunning 7 tests\ntest numerical_engine::tests::test_chronoflux_math ... ok\ntest numerical_engine::tests::test_sokol_temporal_spike ... ok\ntest probe_constant_rate_is_named_anomaly ... ok\ntest probe_entropy_accepts_nonprobability_mass ... ok\ntest probe_full_replay_retains_expired_entries ... ok\ntest probe_relaxation_uses_retention_not_ewma_gain ... ok\ntest probe_tick_budget_cannot_throttle_single_charge ... ok\n\ntest result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s\n\n",
+  "exit": 0,
+  "derived": {
+    "block_hit_bytes_per_possible_cpu": 1048576,
+    "event_payload_bytes_per_sec_per_cpu": 19200,
+    "event_ring_records_ideal_with_8_byte_header": 840,
+    "event_retention_seconds_at_2000_per_sec": 32.768,
+    "frame_burst_seconds": 10.0,
+    "byte_burst_seconds": 8.0,
+    "ipc_burst_seconds": 5.0,
+    "total_ipc_burst_seconds": 10.0,
+    "envelope_header": 32,
+    "snapshot_slack_bytes": 13043,
+    "ttl_first_capped_strike": 8
+  }
+}
