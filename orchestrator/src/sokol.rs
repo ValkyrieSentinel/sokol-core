@@ -1,24 +1,6 @@
 #[derive(Clone, Copy, Debug, PartialEq, PartialOrd)]
 pub struct FlowRate(pub f64);
 
-#[derive(Clone, Copy, Debug, PartialEq, PartialOrd)]
-pub struct EntropyValue(pub f64);
-
-#[derive(Clone, Copy, Debug, PartialEq, PartialOrd)]
-pub struct RelaxationSec(pub f64);
-
-#[derive(Clone, Copy, Debug, PartialEq, PartialOrd)]
-pub struct PhaseGradient(pub f64);
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-pub struct FieldVector {
-    pub q: FlowRate,
-    pub h: EntropyValue,
-    pub tau: RelaxationSec,
-    pub phi: PhaseGradient,
-}
-
 #[derive(Debug, PartialEq)]
 pub enum EngineError {
     InvalidFloat,
@@ -73,28 +55,6 @@ impl SokolEngine {
         }
         FlowRate(delta_n as f64 / delta_t)
     }
-
-    /// Shannon entropy in bits, `-Σ p log₂ p`, of a probability distribution. The input is not
-    /// validated: it must be normalized (`p ≥ 0`, `Σ p = 1`); entries that are not finite and
-    /// positive are skipped. Not used by the node (numerical review N04).
-    pub fn compute_shannon_entropy(probabilities: &[f64]) -> EntropyValue {
-        let h = probabilities
-            .iter()
-            .filter(|&&p| p > 0.0 && !p.is_nan() && !p.is_infinite())
-            .map(|&p| -p * p.log2())
-            .sum();
-        EntropyValue(h)
-    }
-
-    /// Time constant, in **samples**, of a decay that keeps the fraction `alpha` per sample:
-    /// `-1 / ln(alpha)`. `alpha` is the retention factor, not an EWMA gain `g` (that retains
-    /// `1 - g`); seconds are samples × the sample interval. Not used by the node (N04).
-    pub fn compute_relaxation_time(alpha: f64) -> RelaxationSec {
-        if alpha <= 0.0 || alpha >= 1.0 || alpha.is_nan() {
-            return RelaxationSec(0.0);
-        }
-        RelaxationSec(-1.0 / alpha.ln())
-    }
 }
 
 #[cfg(test)]
@@ -139,14 +99,12 @@ mod tests {
     }
 
     #[test]
-    fn test_chronoflux_math() {
-        let flow = SokolEngine::compute_flow_rate(10000, 2.0);
-        assert_eq!(flow, FlowRate(5000.0));
-
-        let entropy = SokolEngine::compute_shannon_entropy(&[0.5, 0.5, f64::NAN]);
-        assert_eq!(entropy, EntropyValue(1.0));
-
-        let tau = SokolEngine::compute_relaxation_time(0.5);
-        assert!(tau.0 > 1.44 && tau.0 < 1.45);
+    fn a_flow_rate_is_packets_per_second_and_zero_for_no_time() {
+        assert_eq!(SokolEngine::compute_flow_rate(10000, 2.0), FlowRate(5000.0));
+        assert_eq!(SokolEngine::compute_flow_rate(10000, 0.0), FlowRate(0.0));
+        assert_eq!(
+            SokolEngine::compute_flow_rate(10000, f64::NAN),
+            FlowRate(0.0)
+        );
     }
 }
