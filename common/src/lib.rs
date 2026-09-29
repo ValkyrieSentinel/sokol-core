@@ -185,20 +185,72 @@ pub mod drop_reason {
     pub const FRAGMENT_BLOCKED: u16 = 9;
     pub const INVALID_TCP_FLAGS: u16 = 10;
 
-    /// Label for metrics; `None` for codes that are never recorded as drops.
+    /// Label for metrics; `None` for codes that are never recorded as drops. A label is a
+    /// claim that the counter can move: only codes the XDP program passes to `drop_verdict`
+    /// get one (checked against its source below). Static, operator and mesh blocks all drop
+    /// as `blocklist`; a trap hit passes and is only an event; the other codes are unused.
     pub const fn name(code: u16) -> Option<&'static str> {
         match code {
-            STATIC_BLOCK => Some("static_block"),
-            FAST_PATH_HIT => Some("fast_path_hit"),
             SLOW_PATH_LPM_HIT => Some("blocklist"),
-            VFR_ANOMALY => Some("vfr_anomaly"),
             MALFORMED_HEADER => Some("malformed_header"),
-            TRAP_INTERCEPTED => Some("trap_intercepted"),
-            SOCK_REDIRECTED => Some("sock_redirected"),
-            MANUAL_BLOCK => Some("manual_block"),
             FRAGMENT_BLOCKED => Some("fragment_blocked"),
             INVALID_TCP_FLAGS => Some("invalid_tcp_flags"),
             _ => None,
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        extern crate std;
+        use std::{collections::BTreeSet, string::String, vec::Vec};
+
+        const CODES: [(&str, u16); 10] = [
+            ("STATIC_BLOCK", super::STATIC_BLOCK),
+            ("FAST_PATH_HIT", super::FAST_PATH_HIT),
+            ("SLOW_PATH_LPM_HIT", super::SLOW_PATH_LPM_HIT),
+            ("VFR_ANOMALY", super::VFR_ANOMALY),
+            ("MALFORMED_HEADER", super::MALFORMED_HEADER),
+            ("TRAP_INTERCEPTED", super::TRAP_INTERCEPTED),
+            ("SOCK_REDIRECTED", super::SOCK_REDIRECTED),
+            ("MANUAL_BLOCK", super::MANUAL_BLOCK),
+            ("FRAGMENT_BLOCKED", super::FRAGMENT_BLOCKED),
+            ("INVALID_TCP_FLAGS", super::INVALID_TCP_FLAGS),
+        ];
+
+        #[test]
+        fn a_drop_reason_has_a_metric_label_exactly_when_the_xdp_program_drops_with_it() {
+            let src = include_str!("../../ebpf/src/main.rs");
+            // Every `drop_verdict(<len>, drop_reason::X)` call, however it is wrapped.
+            let flat: String = src.split_whitespace().collect();
+            let dropped: BTreeSet<&str> = flat
+                .match_indices("drop_verdict(")
+                .filter_map(|(i, _)| {
+                    let call = &flat[i..flat[i..].find(')').map(|e| i + e)?];
+                    let name = call.split("drop_reason::").nth(1)?;
+                    Some(name.trim_end_matches(','))
+                })
+                .collect();
+            assert!(
+                !dropped.is_empty(),
+                "no drop_verdict call found: the scan is broken"
+            );
+            let labelled: Vec<&str> = CODES
+                .iter()
+                .filter(|(_, c)| super::name(*c).is_some())
+                .map(|(n, _)| *n)
+                .collect();
+            for n in &dropped {
+                assert!(
+                    labelled.contains(n),
+                    "the XDP program drops with {n}, which has no label"
+                );
+            }
+            for n in &labelled {
+                assert!(
+                    dropped.contains(n),
+                    "{n} has a label but the XDP program never drops with it"
+                );
+            }
         }
     }
 }
