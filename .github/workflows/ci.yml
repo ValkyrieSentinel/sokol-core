@@ -108,6 +108,9 @@ jobs:
       - name: Clippy
         run: cargo clippy --release --locked --all-targets -- -D warnings
 
+      - name: CrowdSec TTL smoke oracle regression
+        run: python3 scripts/test_crowdsec_ttl.py
+
       - name: XDP smoke test (veth + netns)
         run: |
           sudo apt-get update -qq
