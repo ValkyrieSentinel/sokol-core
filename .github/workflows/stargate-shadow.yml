@@ -20,7 +20,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           repository: s0fractal/stargate
-          ref: 0ff25b17aad3a921da3d0fcad70dc5a50aab0728
+          ref: f898003d16707fbeceee0cb7c2559bdaa6a4e076
           path: .stargate-checker
           persist-credentials: false
       - name: Install the pinned shadow checker
@@ -31,3 +31,5 @@ jobs:
         run: python .stargate-checker/integration/sokol_delivery.py --sokol-root "$GITHUB_WORKSPACE"
       - name: Retry and reconnect traces versus the certified model
         run: python .stargate-checker/integration/sokol_traces.py --sokol-root "$GITHUB_WORKSPACE"
+      - name: Bounded FIFO, flush limits and overflow accounting
+        run: python .stargate-checker/integration/sokol_queue.py --sokol-root "$GITHUB_WORKSPACE"
