@@ -1,0 +1,31 @@
+name: Stargate shadow contract
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  delivery:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.13.15'
+      - name: Pinned Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: Native outbox regressions and socket traces
+        run: scripts/check-delivery.sh
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: s0fractal/stargate
+          ref: 1ae672f830979e2848e3ae426a2cdddc3c0b28b3
+          path: .stargate-checker
+          persist-credentials: false
+      - name: Install the pinned shadow checker
+        run: python -m pip install ./.stargate-checker
+      - name: Actual checkout versus the certified model and semantic mutants
+        # No --expect-results: this checks this PR's actual source and reports its digest.
+        # Frozen results-v2.json bytes are compared manually from an authorized Sokol checkout.
+        run: python .stargate-checker/integration/sokol_delivery.py --sokol-root "$GITHUB_WORKSPACE"

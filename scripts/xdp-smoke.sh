@@ -532,6 +532,11 @@ if command -v cscli >/dev/null && command -v crowdsec >/dev/null; then
         grep -q "Dynamic block enforced in XDP: $CS_IP" "$LOG" && break
         sleep 0.2
     done
+    # Preserve the observed TTL before later scenarios reset the orchestrator log.
+    # CrowdSec reports remaining duration, so polling delay matters when diagnosing failures.
+    echo "--- CrowdSec initial decision delivery ---"
+    grep -F "$CS_IP" "$WORK/crowdsec-adapter.log" || true
+    grep -F "Dynamic block enforced in XDP: $CS_IP " "$LOG" || true
     check "CrowdSec ban decision is forwarded as a signal with its decision id and duration" grep -Eq "SIGNAL#[0-9]+;ttl=(299|300):crowdsec\|$CS_IP\|-\|sokol smoke ban \(origin cscli" "$WORK/crowdsec-adapter.log"
     check "the block lasts CrowdSec's 5 minutes, not the node's escalation (ADR-0019 T2)" \
         grep -Eq "Dynamic block enforced in XDP: $CS_IP for (299|300)s" "$LOG"
