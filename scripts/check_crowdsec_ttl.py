@@ -33,7 +33,7 @@ def verify(adapter, node, address):
     duration = r'(?P<duration>[^)]+)'
     sent = list(re.finditer(
         r'SIGNAL#[0-9]+;ttl=(?P<ttl>[0-9]+):crowdsec\|' + ip +
-        r'\|-\|sokol smoke ban \(origin cscli, crowdsec duration ' + duration + r'\) \(Applied\)', adapter))
+        r'\|-\|sokol smoke ban \(origin cscli, crowdsec duration ' + duration + r'\)', adapter))
     enforced = list(re.finditer(
         r'Dynamic block enforced in XDP: ' + ip + r' for (?P<ttl>[0-9]+)s \| Reason: '
         r'crowdsec: sokol smoke ban \(origin cscli, crowdsec duration ' + duration + r'\)', node))

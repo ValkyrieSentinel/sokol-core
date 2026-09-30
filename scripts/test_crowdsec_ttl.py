@@ -14,6 +14,8 @@ NODE = ('Dynamic block enforced in XDP: 10.231.0.6 for 298s | Reason: '
 class CrowdSecTTL(unittest.TestCase):
     def test_actual_delayed_decision_is_correct(self):
         self.assertEqual(verify(ADAPTER, NODE, IP), 298)
+        # Delivery may be acknowledged as a duplicate after an earlier ACK was lost.
+        self.assertEqual(verify(ADAPTER.replace('(Applied)', '(Duplicate)'), NODE, IP), 298)
 
     def test_rounding_and_units(self):
         for raw, expected in [('5m', 300), ('4m58.398547965s', 299),
