@@ -6,6 +6,8 @@
 //! or a malformed line would not change the answer). A node that is down, restarting or not
 //! answering leaves the signal queued; delivery is retried with a growing pause. The queue is
 //! bounded: when it is full the oldest signal is dropped and counted.
+//! Unknown or incomplete reply lines retain the signal and reconnect with backoff; only a
+//! complete recognized acknowledgement is final. This does not establish durable storage.
 use std::collections::VecDeque;
 use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -31,23 +33,32 @@ pub enum Outcome {
 }
 
 impl Outcome {
-    fn parse(reply: &str) -> Outcome {
+    fn parse(reply: &str) -> io::Result<Outcome> {
         let reply = reply.trim();
-        match reply {
+        Ok(match reply {
             "OK applied" => Outcome::Applied,
             "OK pending" => Outcome::Pending,
             "OK recorded" => Outcome::Recorded,
             "OK duplicate" => Outcome::Duplicate,
             _ => {
-                if let Some(why) = reply.strip_prefix("OK refused") {
+                if let Some(why) = reply
+                    .strip_prefix("OK refused ")
+                    .filter(|why| !why.trim().is_empty())
+                {
                     Outcome::Refused(why.trim().to_string())
-                } else if let Some(why) = reply.strip_prefix("ERR") {
+                } else if let Some(why) = reply
+                    .strip_prefix("ERR ")
+                    .filter(|why| !why.trim().is_empty())
+                {
                     Outcome::Rejected(why.trim().to_string())
                 } else {
-                    Outcome::Rejected(format!("unexpected reply '{}'", reply))
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("unrecognized acknowledgement: {:?}", reply),
+                    ));
                 }
             }
-        }
+        })
     }
 }
 
@@ -80,7 +91,7 @@ impl Conn {
             .write_all(format!("{}\n", line.trim_end()).as_bytes())?;
         self.stream.flush()?;
         let mut reply = String::new();
-        if self.reader.read_line(&mut reply)? == 0 {
+        if self.reader.read_line(&mut reply)? == 0 || !reply.ends_with('\n') {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "node closed the connection without answering",
@@ -149,13 +160,13 @@ impl Outbox {
                     r
                 }),
             };
-            match reply {
-                Ok(reply) => {
+            match reply.and_then(|text| Outcome::parse(&text)) {
+                Ok(outcome) => {
                     self.queue.pop_front();
                     self.failing = false;
                     self.backoff = BACKOFF_MIN;
                     self.retry_at = None;
-                    done.push((line, Outcome::parse(&reply)));
+                    done.push((line, outcome));
                 }
                 Err(e) => {
                     // The line may or may not have reached the node; it is sent again later.
@@ -287,13 +298,64 @@ mod tests {
 
     #[test]
     fn replies_map_to_outcomes() {
-        assert_eq!(Outcome::parse("OK applied\n"), Outcome::Applied);
-        assert_eq!(Outcome::parse("OK pending"), Outcome::Pending);
-        assert_eq!(Outcome::parse("OK recorded"), Outcome::Recorded);
-        assert_eq!(Outcome::parse("OK duplicate"), Outcome::Duplicate);
-        assert_eq!(
-            Outcome::parse("OK something else"),
-            Outcome::Rejected("unexpected reply 'OK something else'".into())
-        );
+        assert_eq!(Outcome::parse("OK applied\n").unwrap(), Outcome::Applied);
+        assert_eq!(Outcome::parse("OK pending").unwrap(), Outcome::Pending);
+        assert_eq!(Outcome::parse("OK recorded").unwrap(), Outcome::Recorded);
+        assert_eq!(Outcome::parse("OK duplicate").unwrap(), Outcome::Duplicate);
+        for reply in [
+            "OK something else",
+            "",
+            "ERRatic",
+            "OK refusedly",
+            "ERR",
+            "OK refused",
+        ] {
+            assert!(
+                Outcome::parse(reply).is_err(),
+                "{reply:?} must not consume a signal"
+            );
+        }
+    }
+    #[test]
+    fn unknown_reply_keeps_the_obligation_and_a_later_ack_retires_it() {
+        let path = temp_socket("unknown-retry");
+        let node = fake_node(&path, |_| Some("OK something else"));
+        let mut out = Outbox::new(&path, 2);
+        out.push("SIGNAL:test|203.0.113.1|-|x");
+        let (done, err) = out.flush(1);
+        assert!(done.is_empty() && err.is_some());
+        assert_eq!((out.pending(), out.lost, out.failing), (1, 0, true));
+        node.join().unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let node = fake_node(&path, |_| Some("OK duplicate"));
+        out.retry_now();
+        let (done, err) = out.flush(1);
+        assert!(err.is_none());
+        assert_eq!(done[0].1, Outcome::Duplicate);
+        assert_eq!((out.pending(), out.lost, out.failing), (0, 0, false));
+        drop(out);
+        node.join().unwrap();
+    }
+
+    #[test]
+    fn an_unterminated_ack_does_not_retire_the_signal() {
+        let path = temp_socket("partial");
+        let listener = UnixListener::bind(&path).unwrap();
+        let node = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            stream.write_all(b"OK ack\n").unwrap();
+            line.clear();
+            reader.read_line(&mut line).unwrap();
+            stream.write_all(b"OK applied").unwrap(); // EOF before the delimiter
+        });
+        let mut out = Outbox::new(&path, 1);
+        out.push("signal");
+        let (done, err) = out.flush(1);
+        assert!(done.is_empty() && err.is_some());
+        assert_eq!((out.pending(), out.lost), (1, 0));
+        node.join().unwrap();
     }
 }
