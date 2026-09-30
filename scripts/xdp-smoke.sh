@@ -529,7 +529,10 @@ if command -v cscli >/dev/null && command -v crowdsec >/dev/null; then
     CS_ADAPTER_PID=$!
     cscli decisions add --ip "$CS_IP" --reason "sokol smoke ban" --duration 5m >/dev/null 2>&1
     for _ in $(seq 1 50); do
-        grep -q "Dynamic block enforced in XDP: $CS_IP" "$LOG" && break
+        if grep -q "Dynamic block enforced in XDP: $CS_IP" "$LOG" &&
+            grep -Fq "|$CS_IP|-|sokol smoke ban " "$WORK/crowdsec-adapter.log"; then
+            break
+        fi
         sleep 0.2
     done
     # Preserve the observed TTL before later scenarios reset the orchestrator log.
@@ -537,9 +540,8 @@ if command -v cscli >/dev/null && command -v crowdsec >/dev/null; then
     echo "--- CrowdSec initial decision delivery ---"
     grep -F "$CS_IP" "$WORK/crowdsec-adapter.log" || true
     grep -F "Dynamic block enforced in XDP: $CS_IP " "$LOG" || true
-    check "CrowdSec ban decision is forwarded as a signal with its decision id and duration" grep -Eq "SIGNAL#[0-9]+;ttl=(299|300):crowdsec\|$CS_IP\|-\|sokol smoke ban \(origin cscli" "$WORK/crowdsec-adapter.log"
-    check "the block lasts CrowdSec's 5 minutes, not the node's escalation (ADR-0019 T2)" \
-        grep -Eq "Dynamic block enforced in XDP: $CS_IP for (299|300)s" "$LOG"
+    check "CrowdSec remaining duration is forwarded and enforced exactly" \
+        python3 "$(dirname "$0")/check_crowdsec_ttl.py" "$WORK/crowdsec-adapter.log" "$LOG" "$CS_IP"
     check "CrowdSec ban blocks the address in XDP" \
         bash -c "! ip netns exec $NS ping -c 2 -W 1 -I $CS_IP $HOST_IP >/dev/null 2>&1"
     check "the block reason names CrowdSec and the scenario" grep -q "Dynamic block enforced in XDP: $CS_IP.*crowdsec: sokol smoke ban" "$LOG"
