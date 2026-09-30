@@ -7,7 +7,8 @@
 //! answering leaves the signal queued; delivery is retried with a growing pause. The queue is
 //! bounded: when it is full the oldest signal is dropped and counted.
 //! Unknown or incomplete reply lines retain the signal and reconnect with backoff; only a
-//! complete recognized acknowledgement is final. This does not establish durable storage.
+//! complete recognized acknowledgement is final. ADR-0019 retraction acknowledgements
+//! are Recorded outcomes too. This does not establish durable storage.
 use std::collections::VecDeque;
 use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -38,7 +39,12 @@ impl Outcome {
         Ok(match reply {
             "OK applied" => Outcome::Applied,
             "OK pending" => Outcome::Pending,
-            "OK recorded" => Outcome::Recorded,
+            "OK recorded"
+            | "OK recorded before its signal"
+            | "OK nothing held"
+            | "OK still held by other reasons"
+            | "OK lifted"
+            | "OK shortened" => Outcome::Recorded,
             "OK duplicate" => Outcome::Duplicate,
             _ => {
                 if let Some(why) = reply
@@ -357,5 +363,41 @@ mod tests {
         assert!(done.is_empty() && err.is_some());
         assert_eq!((out.pending(), out.lost), (1, 0));
         node.join().unwrap();
+    }
+    #[test]
+    fn all_current_retraction_acknowledgements_are_final() {
+        for (index, reply) in [
+            "OK recorded before its signal",
+            "OK nothing held",
+            "OK still held by other reasons",
+            "OK lifted",
+            "OK shortened",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            // Exercise the public Outbox path, not only the parser's match arms.
+            let path = temp_socket(&format!("retract-{index}"));
+            let listener = UnixListener::bind(&path).unwrap();
+            let node = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                stream.write_all(b"OK ack\n").unwrap();
+                line.clear();
+                reader.read_line(&mut line).unwrap();
+                assert!(line.starts_with("RETRACT#"));
+                writeln!(stream, "{reply}").unwrap();
+            });
+            let mut out = Outbox::new(&path, 1);
+            out.push("RETRACT#7:crowdsec|203.0.113.1");
+            let (done, err) = out.flush(1);
+            assert!(err.is_none(), "{reply}");
+            assert_eq!(done[0].1, Outcome::Recorded);
+            assert_eq!(out.pending(), 0);
+            drop(out);
+            node.join().unwrap();
+        }
     }
 }
