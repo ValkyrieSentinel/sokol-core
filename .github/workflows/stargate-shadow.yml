@@ -20,7 +20,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           repository: s0fractal/stargate
-          ref: 1ae672f830979e2848e3ae426a2cdddc3c0b28b3
+          ref: 0ff25b17aad3a921da3d0fcad70dc5a50aab0728
           path: .stargate-checker
           persist-credentials: false
       - name: Install the pinned shadow checker
@@ -29,3 +29,5 @@ jobs:
         # No --expect-results: this checks this PR's actual source and reports its digest.
         # Frozen results-v2.json bytes are compared manually from an authorized Sokol checkout.
         run: python .stargate-checker/integration/sokol_delivery.py --sokol-root "$GITHUB_WORKSPACE"
+      - name: Retry and reconnect traces versus the certified model
+        run: python .stargate-checker/integration/sokol_traces.py --sokol-root "$GITHUB_WORKSPACE"
