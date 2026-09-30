@@ -27,5 +27,5 @@ jobs:
         run: python -m pip install ./.stargate-checker
       - name: Actual checkout versus the certified model and semantic mutants
         # No --expect-results: this checks this PR's actual source and reports its digest.
-        # The frozen experiment's byte comparison remains in Stargate's own workflow.
+        # Frozen results-v2.json bytes are compared manually from an authorized Sokol checkout.
         run: python .stargate-checker/integration/sokol_delivery.py --sokol-root "$GITHUB_WORKSPACE"
