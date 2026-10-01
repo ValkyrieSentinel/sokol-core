@@ -20,7 +20,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           repository: s0fractal/stargate
-          ref: 0c295e73b015034128b2ce27fb860c14bebed438
+          ref: d512620994fd1f063b2a2c68f8ce137bf9fe714f
           path: .stargate-checker
           persist-credentials: false
       - name: Install the pinned shadow checker
@@ -36,6 +36,8 @@ jobs:
       - name: Actual outbox against checked local effects and recovery receipts
         # Toy SQLite receiver, actual Rust transport; six scenarios and two semantic mutants.
         run: python .stargate-checker/integration/sokol_receipts.py --sokol-root "$GITHUB_WORKSPACE"
+      - name: Retained sender budgets and recovery across actual process exits
+        run: python .stargate-checker/integration/sokol_intents.py --sokol-root "$GITHUB_WORKSPACE"
       - name: Exact source for the frozen experiments
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
@@ -53,3 +55,4 @@ jobs:
           python .stargate-checker/integration/sokol_delivery.py --sokol-root .stargate-frozen-sokol --expect-results .stargate-checker/examples/sokol-delivery/results-v2.json
           python .stargate-checker/integration/sokol_traces.py --sokol-root .stargate-frozen-sokol --expect-results .stargate-checker/examples/sokol-delivery/trace-results.json
           python .stargate-checker/integration/sokol_queue.py --sokol-root .stargate-frozen-sokol --expect-results .stargate-checker/examples/sokol-queue/results.json
+          python .stargate-checker/integration/sokol_intents.py --sokol-root .stargate-frozen-sokol --expect-results .stargate-checker/examples/sokol-intents/results.json
