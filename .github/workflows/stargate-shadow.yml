@@ -20,7 +20,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           repository: s0fractal/stargate
-          ref: f898003d16707fbeceee0cb7c2559bdaa6a4e076
+          ref: 0c295e73b015034128b2ce27fb860c14bebed438
           path: .stargate-checker
           persist-credentials: false
       - name: Install the pinned shadow checker
@@ -33,6 +33,9 @@ jobs:
         run: python .stargate-checker/integration/sokol_traces.py --sokol-root "$GITHUB_WORKSPACE"
       - name: Bounded FIFO, flush limits and overflow accounting
         run: python .stargate-checker/integration/sokol_queue.py --sokol-root "$GITHUB_WORKSPACE"
+      - name: Actual outbox against checked local effects and recovery receipts
+        # Toy SQLite receiver, actual Rust transport; six scenarios and two semantic mutants.
+        run: python .stargate-checker/integration/sokol_receipts.py --sokol-root "$GITHUB_WORKSPACE"
       - name: Exact source for the frozen experiments
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
