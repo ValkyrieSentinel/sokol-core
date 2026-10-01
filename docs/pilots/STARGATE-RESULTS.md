@@ -59,4 +59,23 @@ The first Linux CI stopped before XDP smoke when apt fetched a removed libevent 
 (HTTP 404 on both architectures). The workflow now refreshes its package indexes before
 installing smoke dependencies; no failed infrastructure run is counted as validation.
 
-Shadow harness pinned to Stargate `1ae672f830979e2848e3ae426a2cdddc3c0b28b3`.
+Historical pin for the run above: Stargate `1ae672f830979e2848e3ae426a2cdddc3c0b28b3`.
+
+## Current CI integration — 2026-10-01
+
+`.github/workflows/stargate-shadow.yml` pins the harness to Stargate
+`d512620994fd1f063b2a2c68f8ce137bf9fe714f`. In addition to the delivery, trace,
+queue and local receipt checks, it runs `sokol_intents.py` against the candidate's
+actual delivery source. Six local socket/process-exit cases cover retained budgets,
+receipt-first recovery, incomplete verification, a false ACK and cancellation.
+This uses a toy SQLite receiver; production node admission and distributed restart
+durability remain outside the claim.
+
+Frozen reproduction uses Sokol `5ffaf0854158f4674a470378279a4dd4d237f9fb`.
+Its `orchestrator/src/delivery.rs` SHA-256 is
+`4becf82d8db9194d48be14d14684e3ea9ffd8ff598bc68205553a1327d4b7f0f`, matching
+the retained-intent report. The new harness reads only that file from the Sokol
+checkout; its other dependencies come from the pinned Stargate checkout. CI compares
+all bytes of `examples/sokol-intents/results.json`, including component digests,
+alongside the three existing frozen reports. The older receipt report remains a
+historical observation and is not added to this frozen comparison.
