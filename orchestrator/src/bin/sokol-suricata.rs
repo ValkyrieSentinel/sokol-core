@@ -211,7 +211,7 @@ struct Follower {
     reader: Option<BufReader<File>>,
     inode: u64,
     position: u64,
-    partial: String,
+    partial: Vec<u8>,
     /// Where the line being assembled in `partial` starts.
     line_start: u64,
 }
@@ -243,7 +243,7 @@ impl Follower {
             reader: None,
             inode: 0,
             position: 0,
-            partial: String::new(),
+            partial: Vec::new(),
             line_start: 0,
         };
         let _ = f.open(!from_start);
@@ -344,19 +344,21 @@ impl Follower {
         };
         let mut lines = Vec::new();
         loop {
-            let mut chunk = String::new();
-            let n = reader.read_line(&mut chunk)?;
+            // UTF-8 may be split across appends. Decode only a complete framed line.
+            let n = reader.read_until(b'\n', &mut self.partial)?;
             if n == 0 {
                 break;
             }
             self.position += n as u64;
-            if chunk.ends_with('\n') {
-                self.partial.push_str(&chunk);
-                lines.push((self.line_start, std::mem::take(&mut self.partial)));
+            if self.partial.ends_with(b"\n") {
+                match String::from_utf8(std::mem::take(&mut self.partial)) {
+                    Ok(line) => lines.push((self.line_start, line)),
+                    Err(_) => log::warn!(
+                        "[sokol-suricata] invalid UTF-8 EVE line at byte {} skipped",
+                        self.line_start
+                    ),
+                }
                 self.line_start = self.position;
-            } else {
-                // Suricata is mid-write; keep the fragment until the newline arrives.
-                self.partial.push_str(&chunk);
             }
         }
         Ok(lines)
@@ -771,6 +773,63 @@ mod tests {
             follower.checkpoint(None),
             follower.cursor(),
             "empty queue may checkpoint the read end"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn invalid_utf8_does_not_discard_valid_lines_or_shift_the_cursor() {
+        let dir = std::env::temp_dir().join(format!(
+            "sokol-suricata-utf8-invalid-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("eve.json");
+        std::fs::write(&path, b"first\n\xff\nlast\n").unwrap();
+        let mut follower = Follower::new(&path, true);
+        let batch = follower.poll();
+        assert!(
+            batch.is_ok(),
+            "one malformed line must not discard the batch: {batch:?}"
+        );
+        assert_eq!(
+            batch.unwrap(),
+            vec![(0, "first\n".into()), (8, "last\n".into())]
+        );
+        assert_eq!(follower.cursor().position, 13);
+        let (mut resumed, _) = Follower::resume(&path, follower.cursor(), false);
+        assert!(lines(&mut resumed).is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_partial_utf8_character_waits_for_the_rest_of_the_line() {
+        let dir = std::env::temp_dir().join(format!(
+            "sokol-suricata-utf8-partial-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("eve.json");
+        std::fs::write(&path, b"first\n\xc3").unwrap();
+        let mut follower = Follower::new(&path, true);
+        let batch = follower.poll();
+        assert!(
+            batch.is_ok(),
+            "an unfinished character is not a malformed line: {batch:?}"
+        );
+        assert_eq!(batch.unwrap(), vec![(0, "first\n".into())]);
+        assert_eq!(follower.cursor().position, 6);
+        assert!(lines(&mut follower).is_empty());
+        let mut writer = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writer.write_all(b"\xa9\n").unwrap();
+        assert_eq!(follower.poll().unwrap(), vec![(6, "é\n".into())]);
+        assert_eq!(
+            follower.cursor().position,
+            9,
+            "positions count bytes, not characters"
         );
         std::fs::remove_dir_all(dir).unwrap();
     }
