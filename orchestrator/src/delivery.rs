@@ -9,6 +9,10 @@
 //! Unknown or incomplete reply lines retain the signal and reconnect with backoff; only a
 //! complete recognized acknowledgement is final. ADR-0019 retraction acknowledgements
 //! are Recorded outcomes too. This does not establish durable storage.
+//! Each answer (including the ACK handshake) is limited to 4096 bytes including newline
+//! and ANSWER_TIMEOUT total reading time, not a fresh timeout for every fragment.
+//! Oversized/late answers keep the signal queued and trigger the existing reconnect/backoff.
+//! This bounds answer reads, not connect/write time or a whole multi-signal flush.
 use std::collections::VecDeque;
 use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -16,6 +20,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 pub const ANSWER_TIMEOUT: Duration = Duration::from_secs(2);
+/// Maximum wire bytes in one acknowledgement, including its terminating newline.
+pub const MAX_ANSWER_BYTES: usize = 4096;
 const BACKOFF_MIN: Duration = Duration::from_millis(500);
 const BACKOFF_MAX: Duration = Duration::from_secs(10);
 
@@ -96,8 +102,53 @@ impl Conn {
         self.stream
             .write_all(format!("{}\n", line.trim_end()).as_bytes())?;
         self.stream.flush()?;
-        let mut reply = String::new();
-        if self.reader.read_line(&mut reply)? == 0 || !reply.ends_with('\n') {
+        let deadline = Instant::now() + ANSWER_TIMEOUT;
+        let mut reply = Vec::new();
+        loop {
+            if reply.len() == MAX_ANSWER_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "answer exceeds byte limit",
+                ));
+            }
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .filter(|time| !time.is_zero())
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::TimedOut, "answer deadline exceeded")
+                })?;
+            self.reader.get_ref().set_read_timeout(Some(remaining))?;
+            let bytes = match self.reader.fill_buf() {
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                result => result?,
+            };
+            // A readable fragment must not renew the total answer deadline.
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "answer deadline exceeded",
+                ));
+            }
+            if bytes.is_empty() {
+                break;
+            }
+            let newline = bytes.iter().position(|byte| *byte == b'\n');
+            let count = newline.map_or(bytes.len(), |index| index + 1);
+            if count > MAX_ANSWER_BYTES - reply.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "answer exceeds byte limit",
+                ));
+            }
+            reply.extend_from_slice(&bytes[..count]);
+            self.reader.consume(count);
+            if newline.is_some() {
+                break;
+            }
+        }
+        let reply = String::from_utf8(reply)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        if reply.is_empty() || !reply.ends_with('\n') {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "node closed the connection without answering",
@@ -399,5 +450,137 @@ mod tests {
             drop(out);
             node.join().unwrap();
         }
+    }
+    // Real socket controls: oversized/trickled lines used to be accepted after
+    // unbounded read_line accumulation. Keep the final newline significant.
+    fn sized_reply_node(path: &Path, size: usize, handshake: bool) -> std::thread::JoinHandle<()> {
+        let listener = UnixListener::bind(path).unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(ANSWER_TIMEOUT)).unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            if !handshake {
+                stream.write_all(b"OK ack\n").unwrap();
+                line.clear();
+                reader.read_line(&mut line).unwrap();
+            }
+            let mut reply = if handshake { "OK ack" } else { "OK applied" }.to_string();
+            reply.extend(std::iter::repeat_n(' ', size - reply.len() - 1));
+            reply.push('\n');
+            let _ = stream.write_all(reply.as_bytes());
+            if handshake {
+                line.clear();
+                if reader.read_line(&mut line).unwrap_or(0) > 0 {
+                    let _ = stream.write_all(b"OK applied\n");
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn oversized_handshake_and_signal_answers_keep_the_signal_for_retry() {
+        for handshake in [true, false] {
+            let path = temp_socket(&format!("oversized-{handshake}"));
+            let node = sized_reply_node(&path, 4097, handshake);
+            let mut out = Outbox::new(&path, 1);
+            out.push("signal");
+            let (done, err) = out.flush(1);
+            node.join().unwrap();
+            assert!(
+                done.is_empty() && err.is_some(),
+                "oversized answer was accepted"
+            );
+            assert_eq!((out.pending(), out.lost, out.failing), (1, 0, true));
+            assert!(out.conn.is_none() && out.retry_at.is_some());
+            std::fs::remove_file(&path).unwrap();
+            let node = fake_node(&path, |_| Some("OK duplicate"));
+            out.retry_now();
+            let (done, err) = out.flush(1);
+            assert!(err.is_none());
+            assert_eq!(done[0].1, Outcome::Duplicate);
+            assert_eq!((out.pending(), out.lost, out.failing), (0, 0, false));
+            drop(out);
+            node.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn an_answer_exactly_at_the_byte_limit_is_accepted() {
+        for handshake in [true, false] {
+            let path = temp_socket(&format!("answer-boundary-{handshake}"));
+            let node = sized_reply_node(&path, 4096, handshake);
+            let mut out = Outbox::new(&path, 1);
+            out.push("signal");
+            let (done, err) = out.flush(1);
+            assert!(err.is_none());
+            assert_eq!(done[0].1, Outcome::Applied);
+            assert_eq!(out.pending(), 0);
+            drop(out);
+            node.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn continuously_arriving_bytes_do_not_extend_the_answer_deadline() {
+        let path = temp_socket("trickle-deadline");
+        let listener = UnixListener::bind(&path).unwrap();
+        let node = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(ANSWER_TIMEOUT)).unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            stream.write_all(b"OK ack\n").unwrap();
+            line.clear();
+            reader.read_line(&mut line).unwrap();
+            stream.write_all(b"OK applied").unwrap();
+            // Each gap is below ANSWER_TIMEOUT; the complete line takes >3s.
+            for _ in 0..13 {
+                std::thread::sleep(Duration::from_millis(250));
+                if stream.write_all(b" ").is_err() {
+                    return;
+                }
+            }
+            let _ = stream.write_all(b"\n");
+        });
+        let mut out = Outbox::new(&path, 1);
+        out.push("signal");
+        let (done, err) = out.flush(1);
+        node.join().unwrap();
+        assert!(
+            done.is_empty() && err.is_some(),
+            "trickled answer was accepted"
+        );
+        assert_eq!((out.pending(), out.lost, out.failing), (1, 0, true));
+        assert!(out.conn.is_none() && out.retry_at.is_some());
+    }
+    #[test]
+    fn a_fragmented_utf8_answer_within_the_deadline_is_final() {
+        let path = temp_socket("fragmented-utf8");
+        let listener = UnixListener::bind(&path).unwrap();
+        let node = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(ANSWER_TIMEOUT)).unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            stream.write_all(b"OK ack\n").unwrap();
+            line.clear();
+            reader.read_line(&mut line).unwrap();
+            for fragment in [b"OK refu".as_slice(), b"sed \xc3", b"\xa9", b"\n"] {
+                stream.write_all(fragment).unwrap();
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        });
+        let mut out = Outbox::new(&path, 1);
+        out.push("signal");
+        let (done, err) = out.flush(1);
+        assert!(err.is_none());
+        assert_eq!(done[0].1, Outcome::Refused("é".to_string()));
+        assert_eq!((out.pending(), out.lost, out.failing), (0, 0, false));
+        drop(out);
+        node.join().unwrap();
     }
 }
