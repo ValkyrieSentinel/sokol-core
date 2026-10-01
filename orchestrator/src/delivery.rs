@@ -152,7 +152,7 @@ impl Conn {
                     "answer exceeds byte limit",
                 ));
             }
-            reply.extend_from_slice(&bytes[..count]);
+            reply.extend(bytes.iter().take(count).copied());
             self.reader.consume(count);
             if newline.is_some() {
                 break;
