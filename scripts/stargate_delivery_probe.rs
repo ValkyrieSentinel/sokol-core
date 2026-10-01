@@ -49,7 +49,7 @@ fn main() {
             stream.write_all(&reply).unwrap();
         });
         let mut out = delivery::Outbox::new(&path, 2);
-        out.push(command);
+        out.push(command).unwrap();
         let (done, err) = out.flush(1);
         println!(
             "{}\t{}\t{}\t{}\t{}",

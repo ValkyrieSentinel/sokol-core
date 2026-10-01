@@ -310,7 +310,7 @@ fn main() {
                 }
                 if batch.deleted + batch.deleted_skipped > 0 {
                     log::info!(
-                        "[sokol-crowdsec] {} deleted decisions sent as retractions, {} not forwarded ones skipped",
+                        "[sokol-crowdsec] {} deleted decisions parsed as retractions, {} not forwarded ones skipped",
                         batch.deleted,
                         batch.deleted_skipped
                     );
@@ -319,7 +319,12 @@ fn main() {
                 // batch fetched while the node is down is not lost.
                 let lost = outbox.lost;
                 for line in &batch.signals {
-                    outbox.push(line);
+                    if let Err(error) = outbox.push(line) {
+                        log::warn!(
+                            "[sokol-crowdsec] decision rejected before queueing: {}",
+                            error
+                        );
+                    }
                 }
                 if outbox.lost > lost {
                     log::error!(

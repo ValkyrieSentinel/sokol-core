@@ -6,6 +6,8 @@
 //! or a malformed line would not change the answer). A node that is down, restarting or not
 //! answering leaves the signal queued; delivery is retried with a growing pause. The queue is
 //! bounded: when it is full the oldest signal is dropped and counted.
+//! push() rejects malformed framing or oversized wire lines before changing that queue;
+//! its Result reports local admission only, never delivery. Callers must handle rejection.
 //! Unknown or incomplete reply lines retain the signal and reconnect with backoff; only a
 //! complete recognized acknowledgement is final. ADR-0019 retraction acknowledgements
 //! are Recorded outcomes too. This does not establish durable storage.
@@ -19,6 +21,10 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+
+/// Maximum outgoing wire bytes, including the newline appended by exchange().
+/// Matches the node's main.rs MAX_IPC_LINE. Check bytes, not Unicode characters.
+pub const MAX_SIGNAL_BYTES: usize = 4096;
 
 pub const ANSWER_TIMEOUT: Duration = Duration::from_secs(2);
 /// Maximum wire bytes in one acknowledgement, including its terminating newline.
@@ -199,12 +205,40 @@ impl Outbox {
         }
     }
 
-    pub fn push(&mut self, line: &str) {
+    /// Queue one IPC line. An optional final LF or CRLF is accepted; embedded
+    /// line breaks, empty payloads and over-limit wire lengths are rejected before
+    /// any queue mutation. The caller must report rejection; it is not delivery
+    /// or overflow loss. This validates framing, not command meaning or authority.
+    pub fn push(&mut self, line: &str) -> io::Result<()> {
+        let payload = line
+            .strip_suffix("\r\n")
+            .or_else(|| line.strip_suffix('\n'))
+            .unwrap_or(line);
+        if payload.contains('\n') || payload.contains('\r') {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "signal contains a line break",
+            ));
+        }
+        let payload = payload.trim_end(); // preserve the existing wire normalization
+        if payload.trim().is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "signal is empty",
+            ));
+        }
+        if payload.len() >= MAX_SIGNAL_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "signal exceeds IPC limit of 4096 bytes including newline",
+            ));
+        }
         if self.queue.len() >= self.cap {
             self.queue.pop_front();
             self.lost += 1;
         }
         self.queue.push_back(line.trim_end().to_string());
+        Ok(())
     }
 
     pub fn pending(&self) -> usize {
@@ -302,7 +336,7 @@ mod tests {
     fn a_signal_waits_while_the_node_is_down_and_is_delivered_after() {
         let path = temp_socket("down");
         let mut out = Outbox::new(&path, 16);
-        out.push("SIGNAL:test|203.0.113.1|-|x\n");
+        out.push("SIGNAL:test|203.0.113.1|-|x\n").unwrap();
         let (done, err) = out.flush(8);
         assert!(done.is_empty() && err.is_some());
         assert_eq!(out.pending(), 1, "kept for later, not lost");
@@ -330,8 +364,8 @@ mod tests {
             })
         });
         let mut out = Outbox::new(&path, 16);
-        out.push("SIGNAL:test|10.0.0.1|-|protected");
-        out.push("garbage");
+        out.push("SIGNAL:test|10.0.0.1|-|protected").unwrap();
+        out.push("garbage").unwrap();
         let (done, _) = out.flush(8);
         assert_eq!(
             done[0].1,
@@ -348,7 +382,7 @@ mod tests {
         let path = temp_socket("silent");
         let node = fake_node(&path, |_| None); // closes after the handshake
         let mut out = Outbox::new(&path, 16);
-        out.push("SIGNAL:test|203.0.113.2|-|x");
+        out.push("SIGNAL:test|203.0.113.2|-|x").unwrap();
         let (done, err) = out.flush(8);
         assert!(done.is_empty());
         assert!(err.is_some());
@@ -359,9 +393,9 @@ mod tests {
     #[test]
     fn a_full_queue_drops_the_oldest_and_counts_it() {
         let mut out = Outbox::new(Path::new("/nonexistent/ipc.sock"), 2);
-        out.push("a");
-        out.push("b");
-        out.push("c");
+        out.push("a").unwrap();
+        out.push("b").unwrap();
+        out.push("c").unwrap();
         assert_eq!(out.pending(), 2);
         assert_eq!(out.lost, 1);
         assert_eq!(out.queue.front().map(String::as_str), Some("b"));
@@ -392,7 +426,7 @@ mod tests {
         let path = temp_socket("unknown-retry");
         let node = fake_node(&path, |_| Some("OK something else"));
         let mut out = Outbox::new(&path, 2);
-        out.push("SIGNAL:test|203.0.113.1|-|x");
+        out.push("SIGNAL:test|203.0.113.1|-|x").unwrap();
         let (done, err) = out.flush(1);
         assert!(done.is_empty() && err.is_some());
         assert_eq!((out.pending(), out.lost, out.failing), (1, 0, true));
@@ -423,7 +457,7 @@ mod tests {
             stream.write_all(b"OK applied").unwrap(); // EOF before the delimiter
         });
         let mut out = Outbox::new(&path, 1);
-        out.push("signal");
+        out.push("signal").unwrap();
         let (done, err) = out.flush(1);
         assert!(done.is_empty() && err.is_some());
         assert_eq!((out.pending(), out.lost), (1, 0));
@@ -456,7 +490,7 @@ mod tests {
                 writeln!(stream, "{reply}").unwrap();
             });
             let mut out = Outbox::new(&path, 1);
-            out.push("RETRACT#7:crowdsec|203.0.113.1");
+            out.push("RETRACT#7:crowdsec|203.0.113.1").unwrap();
             let (done, err) = out.flush(1);
             assert!(err.is_none(), "{reply}");
             assert_eq!(done[0].1, Outcome::Recorded);
@@ -499,7 +533,7 @@ mod tests {
             let path = temp_socket(&format!("oversized-{handshake}"));
             let node = sized_reply_node(&path, 8193, handshake);
             let mut out = Outbox::new(&path, 1);
-            out.push("signal");
+            out.push("signal").unwrap();
             let (done, err) = out.flush(1);
             node.join().unwrap();
             assert!(
@@ -527,7 +561,7 @@ mod tests {
             let path = temp_socket(&format!("answer-boundary-{handshake}"));
             let node = sized_reply_node(&path, 8192, handshake);
             let mut out = Outbox::new(&path, 1);
-            out.push("signal");
+            out.push("signal").unwrap();
             let (done, err) = out.flush(1);
             assert!(err.is_none());
             assert_eq!(done[0].1, Outcome::Applied);
@@ -561,7 +595,7 @@ mod tests {
             let _ = stream.write_all(b"\n");
         });
         let mut out = Outbox::new(&path, 1);
-        out.push("signal");
+        out.push("signal").unwrap();
         let started = Instant::now();
         let (done, err) = out.flush(1);
         let elapsed = started.elapsed();
@@ -598,7 +632,7 @@ mod tests {
             }
         });
         let mut out = Outbox::new(&path, 1);
-        out.push("signal");
+        out.push("signal").unwrap();
         let (done, err) = out.flush(1);
         assert!(err.is_none());
         assert_eq!(done[0].1, Outcome::Refused("é".to_string()));
@@ -628,7 +662,7 @@ mod tests {
                 let _ = reader.read_line(&mut line);
             });
             let mut out = Outbox::new(&path, 1);
-            out.push("signal");
+            out.push("signal").unwrap();
             let (done, err) = out.flush(1);
             node.join().unwrap();
             assert!(done.is_empty());
@@ -659,7 +693,7 @@ mod tests {
                 let _ = reader.read_line(&mut line); // stay silent until client closes
             });
             let mut out = Outbox::new(&path, 1);
-            out.push("signal");
+            out.push("signal").unwrap();
             let started = Instant::now();
             let (done, err) = out.flush(1);
             let elapsed = started.elapsed();
@@ -692,12 +726,117 @@ mod tests {
             writeln!(stream, "ERR {reason}").unwrap();
         });
         let mut out = Outbox::new(&path, 1);
-        out.push("signal");
+        out.push("signal").unwrap();
         let (done, err) = out.flush(1);
         assert!(err.is_none());
         assert_eq!(done[0].1, Outcome::Rejected(expected));
         assert_eq!((out.pending(), out.lost, out.failing), (0, 0, false));
         drop(out);
         node.join().unwrap();
+    }
+    fn rejected_input_does_not_reach_the_socket(bad: &str, name: &str) {
+        use std::io::Read;
+        let path = temp_socket(name);
+        let listener = UnixListener::bind(&path).unwrap();
+        let node = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(ANSWER_TIMEOUT)).unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            assert_eq!(line, "ACK\n");
+            stream.write_all(b"OK ack\n").unwrap();
+            let mut commands = Vec::new();
+            loop {
+                line.clear();
+                let read = (&mut reader).take(4096).read_line(&mut line);
+                if !matches!(read, Ok(n) if n > 0) {
+                    break;
+                }
+                if !line.ends_with('\n') && line.len() >= 4096 {
+                    break;
+                }
+                commands.push(line.trim_end().to_string());
+                if stream.write_all(b"OK applied\n").is_err() {
+                    break;
+                }
+            }
+            commands
+        });
+        let mut out = Outbox::new(&path, 2);
+        let rejected = out.push(bad).unwrap_err();
+        assert_eq!(rejected.kind(), io::ErrorKind::InvalidInput);
+        out.push("good").unwrap();
+        let (done, err) = out.flush(2);
+        drop(out);
+        let commands = node.join().unwrap();
+        assert_eq!(
+            commands,
+            vec!["good"],
+            "invalid input reached the wire or blocked the next signal"
+        );
+        assert!(err.is_none());
+        assert_eq!(done, vec![("good".to_string(), Outcome::Applied)]);
+    }
+
+    #[test]
+    fn oversized_input_cannot_block_a_following_valid_signal() {
+        rejected_input_does_not_reach_the_socket(&"x".repeat(4096), "reject-long-input");
+    }
+
+    #[test]
+    fn embedded_newline_cannot_send_an_extra_command() {
+        rejected_input_does_not_reach_the_socket("first\nextra", "reject-newline-input");
+    }
+
+    #[test]
+    fn invalid_input_cannot_evict_a_queued_signal() {
+        let mut out = Outbox::new(Path::new("/unused"), 1);
+        out.push("keep").unwrap();
+        assert!(out.push("first\nextra").is_err());
+        assert_eq!(out.lost, 0);
+        assert_eq!(out.queue.front().map(String::as_str), Some("keep"));
+    }
+    #[test]
+    fn input_framing_accepts_one_terminator_and_rejects_empty_or_multiple_lines() {
+        let mut out = Outbox::new(Path::new("/unused"), 4);
+        for line in ["a", "b\n", "c\r\n", "d \t\n"] {
+            out.push(line).unwrap();
+        }
+        let original = out.queue.clone();
+        assert_eq!(
+            original,
+            VecDeque::from(["a".into(), "b".into(), "c".into(), "d".into()])
+        );
+        for line in [
+            "", "\n", "\r\n", " \t ", "a\rb", "a\n\n", "a\r", "a\r\nb", "a\nb\n",
+        ] {
+            assert_eq!(
+                out.push(line).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput
+            );
+            assert_eq!(out.queue, original);
+            assert_eq!(out.lost, 0);
+        }
+    }
+
+    #[test]
+    fn input_limit_counts_wire_bytes_including_the_appended_newline() {
+        let mut out = Outbox::new(Path::new("/unused"), 2);
+        out.push(&"x".repeat(4095)).unwrap();
+        out.push(&format!("{}x\r\n", "é".repeat(2047))).unwrap();
+        let original = out.queue.clone();
+        for line in [&"x".repeat(4096), &"é".repeat(2048)] {
+            assert_eq!(
+                out.push(line).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput
+            );
+            assert_eq!(out.queue, original);
+            assert_eq!(out.lost, 0);
+        }
+        assert!(out
+            .queue
+            .iter()
+            .all(|line| line.len() + 1 == MAX_SIGNAL_BYTES));
     }
 }

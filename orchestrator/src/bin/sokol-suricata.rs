@@ -435,7 +435,10 @@ fn main() {
                         continue;
                     }
                     let lost = outbox.lost;
-                    outbox.push(&alert.signal_line());
+                    if let Err(error) = outbox.push(&alert.signal_line()) {
+                        log::warn!("[sokol-suricata] alert rejected before queueing: {}", error);
+                        continue; // no queued cursor entry for a rejected alert
+                    }
                     queued_at.push_back(start);
                     if outbox.lost > lost {
                         queued_at.pop_front();
