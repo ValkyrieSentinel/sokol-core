@@ -250,8 +250,9 @@ impl Follower {
     }
 
     /// Resumes at a saved cursor: at its position if the file is the same one and not shorter,
-    /// from the start if it was rotated meanwhile (all of the new file is unread), otherwise as
-    /// `new`. Says what it did.
+    /// from the start if it was rotated or is shorter than the saved position (the remaining
+    /// content is unread), otherwise as `new`. Inode/length cannot detect truncation followed
+    /// by regrowth beyond the saved position. Says what it did.
     fn resume(path: &Path, cursor: Cursor, from_start: bool) -> (Self, &'static str) {
         let mut f = Self::new(path, from_start);
         let Ok(meta) = std::fs::metadata(path) else {
@@ -266,6 +267,8 @@ impl Follower {
                 f,
                 "file rotated while down; reading the new one from its start",
             );
+        } else if meta.len() < cursor.position && f.open(false).is_ok() {
+            return (f, "file truncated while down; reading it from its start");
         }
         (f, "saved position no longer valid; starting as usual")
     }
@@ -653,6 +656,43 @@ mod tests {
         let (mut f, how) = Follower::resume(&path, cursor, false);
         assert!(how.starts_with("file rotated"), "{}", how);
         assert_eq!(lines(&mut f), vec!["four\n"]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_restart_reads_a_truncated_file_from_its_start() {
+        let dir =
+            std::env::temp_dir().join(format!("sokol-suricata-truncated-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("eve.json");
+        std::fs::write(&path, "old acknowledged line\n".repeat(100)).unwrap();
+        let old = Follower::new(&path, false).cursor();
+
+        // copytruncate keeps the inode. New alerts can arrive before the adapter restarts.
+        std::fs::write(&path, format!("{ALERT}\n")).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().ino(), old.inode);
+        assert!(std::fs::metadata(&path).unwrap().len() < old.position);
+        for from_start in [false, true] {
+            let (mut follower, how) = Follower::resume(&path, old, from_start);
+            assert!(how.starts_with("file truncated"), "{how}");
+            let recovered = lines(&mut follower);
+            assert_eq!(
+                recovered,
+                vec![format!("{ALERT}\n")],
+                "from_start={from_start}"
+            );
+            assert!(decide(&recovered[0], &filter()).is_some());
+            assert!(
+                lines(&mut follower).is_empty(),
+                "do not reread on the next poll"
+            );
+            let next = follower.cursor();
+            let (mut resumed, _) = Follower::resume(&path, next, false);
+            assert!(
+                lines(&mut resumed).is_empty(),
+                "the new cursor resumes at the new end"
+            );
+        }
         std::fs::remove_dir_all(dir).unwrap();
     }
 
