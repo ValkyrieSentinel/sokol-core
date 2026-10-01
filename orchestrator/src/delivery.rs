@@ -12,6 +12,7 @@
 //! Each answer (including the ACK handshake) is limited to 4096 bytes including newline
 //! and ANSWER_TIMEOUT total reading time, not a fresh timeout for every fragment.
 //! Oversized/late answers keep the signal queued and trigger the existing reconnect/backoff.
+//! Blocking reads check the deadline at 100ms intervals (plus scheduler/kernel delay).
 //! This bounds answer reads, not connect/write time or a whole multi-signal flush.
 use std::collections::VecDeque;
 use std::io::{self, BufRead, BufReader, Write};
@@ -22,6 +23,9 @@ use std::time::{Duration, Instant};
 pub const ANSWER_TIMEOUT: Duration = Duration::from_secs(2);
 /// Maximum wire bytes in one acknowledgement, including its terminating newline.
 pub const MAX_ANSWER_BYTES: usize = 4096;
+// A fixed short read timeout lets the loop check its total deadline without
+// changing socket options after a peer has closed (EINVAL on macOS).
+const ANSWER_READ_SLICE: Duration = Duration::from_millis(100);
 const BACKOFF_MIN: Duration = Duration::from_millis(500);
 const BACKOFF_MAX: Duration = Duration::from_secs(10);
 
@@ -82,7 +86,7 @@ struct Conn {
 impl Conn {
     fn open(socket: &Path) -> io::Result<Conn> {
         let stream = UnixStream::connect(socket)?;
-        stream.set_read_timeout(Some(ANSWER_TIMEOUT))?;
+        stream.set_read_timeout(Some(ANSWER_READ_SLICE))?;
         stream.set_write_timeout(Some(ANSWER_TIMEOUT))?;
         let mut conn = Conn {
             reader: BufReader::new(stream.try_clone()?),
@@ -111,15 +115,23 @@ impl Conn {
                     "answer exceeds byte limit",
                 ));
             }
-            let remaining = deadline
-                .checked_duration_since(Instant::now())
-                .filter(|time| !time.is_zero())
-                .ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::TimedOut, "answer deadline exceeded")
-                })?;
-            self.reader.get_ref().set_read_timeout(Some(remaining))?;
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "answer deadline exceeded",
+                ));
+            }
             let bytes = match self.reader.fill_buf() {
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::Interrupted
+                            | io::ErrorKind::WouldBlock
+                            | io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    continue
+                }
                 result => result?,
             };
             // A readable fragment must not renew the total answer deadline.
@@ -571,7 +583,8 @@ mod tests {
             reader.read_line(&mut line).unwrap();
             for fragment in [b"OK refu".as_slice(), b"sed \xc3", b"\xa9", b"\n"] {
                 stream.write_all(fragment).unwrap();
-                std::thread::sleep(Duration::from_millis(5));
+                // Longer than the read slice, still within the overall answer deadline.
+                std::thread::sleep(Duration::from_millis(150));
             }
         });
         let mut out = Outbox::new(&path, 1);
