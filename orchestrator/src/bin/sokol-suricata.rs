@@ -71,8 +71,9 @@ struct Args {
     from_start: bool,
 
     /// Remember where reading got to (the oldest alert the node has not answered yet) in this
-    /// file, and resume there after a restart, so alerts written while the adapter was down are
-    /// not lost. Replays are safe: the node recognises an alert it already acted on.
+    /// file, and resume there after a restart. Recovery reads the current EVE path only;
+    /// queued alerts in rotated-away files are not recovered after process loss.
+    /// Replays use the same event IDs so the node can recognise duplicates.
     #[arg(long, value_name = "PATH")]
     cursor_file: Option<PathBuf>,
 
@@ -294,6 +295,22 @@ impl Follower {
         }
     }
 
+    /// Keep queue offsets tied to their source file. While an older file is pending,
+    /// replay the current file from its start after restart rather than transplanting
+    /// an unrelated offset. This does not recover old-file entries after process loss;
+    /// the outbox is in memory and resume only opens the current path.
+    fn checkpoint(&self, oldest: Option<Cursor>) -> Cursor {
+        let mut cursor = self.cursor();
+        if let Some(oldest) = oldest {
+            cursor.position = if oldest.inode == cursor.inode {
+                oldest.position
+            } else {
+                0
+            };
+        }
+        cursor
+    }
+
     fn open(&mut self, at_end: bool) -> io::Result<()> {
         let file = File::open(&self.path)?;
         let meta = file.metadata()?;
@@ -406,9 +423,9 @@ fn main() {
         None => Follower::new(&args.eve, args.from_start),
     };
     let max_age_ms = (args.max_alert_age_secs as i64).saturating_mul(1000);
-    // Where each queued alert's line starts, oldest first (the outbox is FIFO too): the saved
-    // cursor never passes an alert the node has not answered.
-    let mut queued_at: std::collections::VecDeque<u64> = std::collections::VecDeque::new();
+    // File identity and offset for each queued alert, oldest first (the outbox is FIFO too).
+    // A rotation must not transplant an old-file offset into the new file's saved cursor.
+    let mut queued_at: std::collections::VecDeque<Cursor> = std::collections::VecDeque::new();
     let mut saved: Option<Cursor> = None;
     let mut last_save = Instant::now();
     let mut outbox = delivery::Outbox::new(&args.ipc_socket, OUTBOX_CAP);
@@ -422,6 +439,7 @@ fn main() {
     loop {
         match follower.poll() {
             Ok(lines) => {
+                let inode = follower.cursor().inode;
                 let now_ms = chrono::Utc::now().timestamp_millis();
                 for (start, line) in lines {
                     let Some(alert) = decide(&line, &filter) else {
@@ -442,7 +460,10 @@ fn main() {
                         log::warn!("[sokol-suricata] alert rejected before queueing: {}", error);
                         continue; // no queued cursor entry for a rejected alert
                     }
-                    queued_at.push_back(start);
+                    queued_at.push_back(Cursor {
+                        inode,
+                        position: start,
+                    });
                     if outbox.lost > lost {
                         queued_at.pop_front();
                         log::error!(
@@ -461,10 +482,7 @@ fn main() {
         if let Some(path) = args.cursor_file.as_deref() {
             if last_save.elapsed() >= Duration::from_secs(1) {
                 last_save = Instant::now();
-                let mut cursor = follower.cursor();
-                if let Some(oldest) = queued_at.front() {
-                    cursor.position = *oldest;
-                }
+                let cursor = follower.checkpoint(queued_at.front().copied());
                 if saved != Some(cursor) {
                     match cursor.save(path) {
                         Ok(()) => saved = Some(cursor),
@@ -693,6 +711,67 @@ mod tests {
                 "the new cursor resumes at the new end"
             );
         }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_pending_old_file_offset_cannot_skip_the_new_file_after_restart() {
+        let dir = std::env::temp_dir().join(format!(
+            "sokol-suricata-rotation-queue-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("eve.json");
+        std::fs::write(&path, "already read\nold pending\n").unwrap();
+        let mut follower = Follower::new(&path, true);
+        let old_lines = follower.poll().unwrap();
+        let old = Cursor {
+            inode: follower.cursor().inode,
+            position: old_lines[1].0,
+        };
+        assert_eq!(
+            follower.checkpoint(Some(old)),
+            old,
+            "same-file queue position is retained"
+        );
+
+        std::fs::rename(&path, dir.join("eve.json.1")).unwrap();
+        let new_content = "new first\nnew second\nnew third\n";
+        std::fs::write(&path, new_content).unwrap();
+        let new_lines = follower.poll().unwrap();
+        assert_ne!(follower.cursor().inode, old.inode);
+        assert!(
+            new_content.len() as u64 > old.position,
+            "old offset would be accepted in the new file"
+        );
+        let checkpoint = follower.checkpoint(Some(old));
+        let saved = dir.join("cursor");
+        checkpoint.save(&saved).unwrap();
+        let (mut restarted, _) = Follower::resume(&path, Cursor::load(&saved).unwrap(), false);
+        assert_eq!(
+            lines(&mut restarted).concat(),
+            new_content,
+            "no prefix of the new file may be skipped"
+        );
+        assert_eq!(
+            checkpoint,
+            Cursor {
+                inode: follower.cursor().inode,
+                position: 0
+            }
+        );
+
+        // After old-file entries and the first new entry leave the queue, advance within this file.
+        let pending_new = Cursor {
+            inode: follower.cursor().inode,
+            position: new_lines[1].0,
+        };
+        assert_eq!(follower.checkpoint(Some(pending_new)), pending_new);
+        assert_eq!(
+            follower.checkpoint(None),
+            follower.cursor(),
+            "empty queue may checkpoint the read end"
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 
