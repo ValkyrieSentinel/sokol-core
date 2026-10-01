@@ -111,6 +111,10 @@ jobs:
       - name: CrowdSec TTL smoke oracle regression
         run: python3 scripts/test_crowdsec_ttl.py
 
+      - name: Suricata process recovery regression
+        timeout-minutes: 2
+        run: python3 scripts/test_suricata_recovery.py target/release/sokol-suricata
+
       - name: XDP smoke test (veth + netns)
         run: |
           sudo apt-get update -qq
