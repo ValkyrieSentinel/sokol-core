@@ -9,7 +9,7 @@
 //! Unknown or incomplete reply lines retain the signal and reconnect with backoff; only a
 //! complete recognized acknowledgement is final. ADR-0019 retraction acknowledgements
 //! are Recorded outcomes too. This does not establish durable storage.
-//! Each answer (including the ACK handshake) is limited to 4096 bytes including newline
+//! Each answer (including the ACK handshake) is limited to 8192 bytes including newline
 //! and ANSWER_TIMEOUT total reading time, not a fresh timeout for every fragment.
 //! Oversized/late answers keep the signal queued and trigger the existing reconnect/backoff.
 //! Blocking reads check the deadline at 100ms intervals (plus scheduler/kernel delay).
@@ -22,7 +22,9 @@ use std::time::{Duration, Instant};
 
 pub const ANSWER_TIMEOUT: Duration = Duration::from_secs(2);
 /// Maximum wire bytes in one acknowledgement, including its terminating newline.
-pub const MAX_ANSWER_BYTES: usize = 4096;
+/// The node admits at most 4096-byte IPC requests (main.rs MAX_IPC_LINE); allow
+/// room for an echoed invalid field plus the diagnostic prefix in a final ERR.
+pub const MAX_ANSWER_BYTES: usize = 8192;
 // A fixed short read timeout lets the loop check its total deadline without
 // changing socket options after a peer has closed (EINVAL on macOS).
 const ANSWER_READ_SLICE: Duration = Duration::from_millis(100);
@@ -495,7 +497,7 @@ mod tests {
     fn oversized_handshake_and_signal_answers_keep_the_signal_for_retry() {
         for handshake in [true, false] {
             let path = temp_socket(&format!("oversized-{handshake}"));
-            let node = sized_reply_node(&path, 4097, handshake);
+            let node = sized_reply_node(&path, 8193, handshake);
             let mut out = Outbox::new(&path, 1);
             out.push("signal");
             let (done, err) = out.flush(1);
@@ -523,7 +525,7 @@ mod tests {
     fn an_answer_exactly_at_the_byte_limit_is_accepted() {
         for handshake in [true, false] {
             let path = temp_socket(&format!("answer-boundary-{handshake}"));
-            let node = sized_reply_node(&path, 4096, handshake);
+            let node = sized_reply_node(&path, 8192, handshake);
             let mut out = Outbox::new(&path, 1);
             out.push("signal");
             let (done, err) = out.flush(1);
@@ -606,7 +608,7 @@ mod tests {
     }
     #[test]
     fn a_full_unterminated_answer_hits_the_size_limit_before_the_deadline() {
-        for size in [4096, 8192] {
+        for size in [8192, 16384] {
             let path = temp_socket(&format!("no-delimiter-{size}"));
             let listener = UnixListener::bind(&path).unwrap();
             let node = std::thread::spawn(move || {
@@ -671,5 +673,31 @@ mod tests {
             assert_eq!((out.pending(), out.lost, out.failing), (1, 0, true));
             assert!(out.conn.is_none() && out.retry_at.is_some());
         }
+    }
+    #[test]
+    fn an_error_echoing_a_maximum_sized_request_is_still_final() {
+        let path = temp_socket("long-node-error");
+        let listener = UnixListener::bind(&path).unwrap();
+        let reason = format!("invalid signal source '{}'", "x".repeat(4096));
+        let expected = reason.clone();
+        let node = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(ANSWER_TIMEOUT)).unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            stream.write_all(b"OK ack\n").unwrap();
+            line.clear();
+            reader.read_line(&mut line).unwrap();
+            writeln!(stream, "ERR {reason}").unwrap();
+        });
+        let mut out = Outbox::new(&path, 1);
+        out.push("signal");
+        let (done, err) = out.flush(1);
+        assert!(err.is_none());
+        assert_eq!(done[0].1, Outcome::Rejected(expected));
+        assert_eq!((out.pending(), out.lost, out.failing), (0, 0, false));
+        drop(out);
+        node.join().unwrap();
     }
 }
