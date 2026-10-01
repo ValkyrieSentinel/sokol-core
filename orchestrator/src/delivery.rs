@@ -560,8 +560,14 @@ mod tests {
         });
         let mut out = Outbox::new(&path, 1);
         out.push("signal");
+        let started = Instant::now();
         let (done, err) = out.flush(1);
+        let elapsed = started.elapsed();
         node.join().unwrap();
+        assert!(
+            elapsed < ANSWER_TIMEOUT + Duration::from_secs(1),
+            "{elapsed:?}"
+        );
         assert!(
             done.is_empty() && err.is_some(),
             "trickled answer was accepted"
@@ -626,6 +632,44 @@ mod tests {
             assert!(done.is_empty());
             assert_eq!(err.as_deref(), Some("answer exceeds byte limit"));
             assert_eq!((out.pending(), out.lost, out.failing), (1, 0, true));
+        }
+    }
+    #[test]
+    fn a_silent_open_peer_hits_the_deadline_in_handshake_and_signal_reads() {
+        for handshake in [true, false] {
+            let path = temp_socket(&format!("silent-open-{handshake}"));
+            let listener = UnixListener::bind(&path).unwrap();
+            let node = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                // Also bound the test peer so a broken deadline cannot hang the suite.
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(4)))
+                    .unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if !handshake {
+                    stream.write_all(b"OK ack\n").unwrap();
+                    line.clear();
+                    reader.read_line(&mut line).unwrap();
+                }
+                line.clear();
+                let _ = reader.read_line(&mut line); // stay silent until client closes
+            });
+            let mut out = Outbox::new(&path, 1);
+            out.push("signal");
+            let started = Instant::now();
+            let (done, err) = out.flush(1);
+            let elapsed = started.elapsed();
+            node.join().unwrap();
+            assert!(done.is_empty());
+            assert_eq!(err.as_deref(), Some("answer deadline exceeded"));
+            assert!(
+                elapsed < ANSWER_TIMEOUT + Duration::from_secs(1),
+                "{elapsed:?}"
+            );
+            assert_eq!((out.pending(), out.lost, out.failing), (1, 0, true));
+            assert!(out.conn.is_none() && out.retry_at.is_some());
         }
     }
 }
