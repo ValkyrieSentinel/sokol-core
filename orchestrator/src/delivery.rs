@@ -504,6 +504,7 @@ mod tests {
                 done.is_empty() && err.is_some(),
                 "oversized answer was accepted"
             );
+            assert_eq!(err.as_deref(), Some("answer exceeds byte limit"));
             assert_eq!((out.pending(), out.lost, out.failing), (1, 0, true));
             assert!(out.conn.is_none() && out.retry_at.is_some());
             std::fs::remove_file(&path).unwrap();
@@ -565,6 +566,7 @@ mod tests {
             done.is_empty() && err.is_some(),
             "trickled answer was accepted"
         );
+        assert_eq!(err.as_deref(), Some("answer deadline exceeded"));
         assert_eq!((out.pending(), out.lost, out.failing), (1, 0, true));
         assert!(out.conn.is_none() && out.retry_at.is_some());
     }
@@ -595,5 +597,35 @@ mod tests {
         assert_eq!((out.pending(), out.lost, out.failing), (0, 0, false));
         drop(out);
         node.join().unwrap();
+    }
+    #[test]
+    fn a_full_unterminated_answer_hits_the_size_limit_before_the_deadline() {
+        for size in [4096, 8192] {
+            let path = temp_socket(&format!("no-delimiter-{size}"));
+            let listener = UnixListener::bind(&path).unwrap();
+            let node = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(4)))
+                    .unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                stream.write_all(b"OK ack\n").unwrap();
+                line.clear();
+                reader.read_line(&mut line).unwrap();
+                let _ = stream.write_all(&vec![b'x'; size]);
+                // Stay open: EOF must not be the reason the client stops reading.
+                line.clear();
+                let _ = reader.read_line(&mut line);
+            });
+            let mut out = Outbox::new(&path, 1);
+            out.push("signal");
+            let (done, err) = out.flush(1);
+            node.join().unwrap();
+            assert!(done.is_empty());
+            assert_eq!(err.as_deref(), Some("answer exceeds byte limit"));
+            assert_eq!((out.pending(), out.lost, out.failing), (1, 0, true));
+        }
     }
 }
