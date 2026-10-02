@@ -10,6 +10,7 @@ from contextlib import contextmanager
 import datetime
 import json
 import os
+import re
 from pathlib import Path
 import socket
 import subprocess
@@ -42,13 +43,17 @@ def running(args, capture=None):
                 capture.append(log)
             yield proc
         except BaseException:
-            log.seek(0)
-            print(log.read(), file=sys.stderr)
+            print(read_log(log), file=sys.stderr)
             raise
         finally:
             if proc.poll() is None:
                 proc.kill()  # process loss: no graceful checkpoint on shutdown
             proc.wait(timeout=3)
+
+
+def read_log(log):
+    # Unlike seek/read, pread does not move the child's shared output offset.
+    return os.pread(log.fileno(), os.fstat(log.fileno()).st_size, 0).decode()
 
 
 def await_cursor(path, expected, proc):
@@ -69,6 +74,73 @@ def await_cursor(path, expected, proc):
 
 class RecoveryTests(unittest.TestCase):
     binary = None
+
+    def test_invalid_forwarding_age_leaves_cursor_and_ipc_untouched(self):
+        with tempfile.TemporaryDirectory(prefix="sokol-rec-", dir="/tmp") as directory:
+            root = Path(directory)
+            eve, cursor, ipc = root / "eve.json", root / "cursor", root / "ipc.sock"
+            eve.write_text(alert("203.0.113.17"))
+            original = json.dumps({"inode": eve.stat().st_ino, "position": 0}).encode()
+            cursor.write_bytes(original)
+            with socket.socket(socket.AF_UNIX) as server:
+                server.bind(str(ipc))
+                server.listen(1)
+                with running([str(self.binary), "--eve", str(eve),
+                              "--cursor-file", str(cursor), "--ipc-socket", str(ipc),
+                              "--max-alert-age-secs", "18446744073709551615"]) as proc:
+                    try:
+                        code = proc.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        self.fail("invalid forwarding age started a long-running adapter")
+                    self.assertEqual(code, 2, "Clap must reject the configuration")
+                    self.assertEqual(cursor.read_bytes(), original)
+                    server.settimeout(0.1)
+                    with self.assertRaises(socket.timeout):
+                        server.accept()
+
+    def test_cooldown_diagnostics_aggregate_across_batches_and_flush_at_eof(self):
+        with tempfile.TemporaryDirectory(prefix="sokol-rec-", dir="/tmp") as directory:
+            root = Path(directory)
+            eve, cursor, ipc = root / "eve.json", root / "cursor", root / "ipc.sock"
+            repeats = 4096
+            eve.write_text(alert("203.0.113.17") * (repeats + 1))
+            logs = []
+            with socket.socket(socket.AF_UNIX) as server:
+                server.bind(str(ipc))
+                server.listen(1)
+                server.settimeout(WAIT_SECONDS)
+                started = time.monotonic()
+                with running([str(self.binary), "--eve", str(eve), "--from-start",
+                              "--cursor-file", str(cursor), "--ipc-socket", str(ipc)],
+                             capture=logs) as proc:
+                    conn, _ = server.accept()
+                    with conn:
+                        conn.settimeout(WAIT_SECONDS)
+                        with conn.makefile("rb") as reader:
+                            self.assertEqual(reader.readline(4097), b"ACK\n")
+                            conn.sendall(b"OK ack\n")
+                            self.assertIn(b"suricata|203.0.113.17|", reader.readline(4097))
+                            conn.sendall(b"OK applied\n")
+                            await_cursor(cursor, {"inode": eve.stat().st_ino,
+                                                  "position": eve.stat().st_size}, proc)
+                            deadline = time.monotonic() + WAIT_SECONDS
+                            while True:
+                                # pread leaves the child's shared output offset alone.
+                                text = read_log(logs[0])
+                                counts = [int(n) for n in re.findall(
+                                    r"(\d+) alerts skipped: source cooldown active", text)]
+                                if sum(counts) >= repeats:
+                                    break
+                                if time.monotonic() >= deadline:
+                                    self.fail(f"pending diagnostics never flushed at EOF: {counts}")
+                                time.sleep(0.05)
+                            self.assertEqual(sum(counts), repeats)
+                            elapsed = time.monotonic() - started
+                            self.assertLessEqual(len(counts), int(elapsed) + 1,
+                                                 "refusal warnings must be spaced by a second")
+                            conn.settimeout(0.2)
+                            with self.assertRaises(socket.timeout):
+                                reader.readline(4097)
 
     def restart_case(self, rotate):
         # Short path also fits macOS's Unix-socket pathname limit.
@@ -273,8 +345,7 @@ class RecoveryTests(unittest.TestCase):
                             conn.settimeout(0.2)
                             with self.assertRaises(socket.timeout):
                                 reader.readline(4097)
-                            diagnostics[0].seek(0)
-                            logs = diagnostics[0].read()
+                            logs = read_log(diagnostics[0])
                             self.assertIn("1 queued alerts expired before forwarding", logs)
                             self.assertIn("1 alerts skipped: source cooldown active", logs)
 

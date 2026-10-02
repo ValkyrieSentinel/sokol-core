@@ -222,8 +222,10 @@ Timestamped alerts older than `--max-alert-age-secs` (default 600) are skipped. 
 remaining freshness budget, the adapter also keeps a monotonic forwarding deadline,
 checked before connecting and again after the ACK handshake, on initial send and retries.
 The measured age consumes that budget; future timestamps cannot grant more than the
-configured interval from observation. An unrepresentable local deadline is logged and
-skipped. Missing or unparseable timestamps retain the legacy untimed policy.
+configured interval from observation. An age interval that cannot be represented on the
+local monotonic clock is rejected at CLI parsing, before opening EVE, loading the cursor
+or using IPC. Each later deadline addition is still checked; an unrepresentable per-alert
+deadline is logged and skipped. Missing or unparseable timestamps retain the legacy untimed policy.
 Zero age budget or an exactly exhausted budget is skipped before policy admission.
 An expired queued alert is removed as **counted local policy loss**, not a node ACK:
 `queued alerts expired before forwarding` reports it, and its queued cursor is released.
@@ -232,7 +234,12 @@ nor undoes the node's effects. Suricata does not emit an expiry RETRACT because 
 can select the destination instead of the source and the adapter does not know that target.
 Cooldown starts at policy admission and remains active even if the queued alert expires
 without a write. Fresh same-source alerts can therefore be suppressed until cooldown
-ends; refusals are counted and logged per batch as `alerts skipped: source cooldown active`.
+ends; refusals are counted as `alerts skipped: source cooldown active`.
+Cooldown and full-cache warnings aggregate across batches and are spaced at least one
+monotonic second apart (at most one line per category per emission). Pending counts
+are also checked on idle/error polls; slow delivery or scheduling can delay emission.
+Counts saturate at `u64::MAX`, and pending diagnostics do not survive process loss.
+Other log categories are unaffected.
 This preserves the admission throttle during outages; it does not promise delivery of
 an active attack's first alert. Successful acknowledged blocks retain the node's normal TTL/escalation policy; freshness
 is a forwarding limit, not a block TTL. Time after the final check (write, scheduling,
@@ -263,8 +270,8 @@ The same source address is not admitted again within `--cooldown-secs` (60), and
 retries or paced delivery. Adjacent windows can admit a burst across their boundary.
 Cooldown memory retains at most **100,000 distinct addresses**. Expired entries leave in
 admission order; a full cache skips new addresses without evicting an unexpired cooldown.
-Each batch logs its capacity refusals. Those alerts are deliberately skipped, not queued
-for retry, and the source cursor may advance past them. This is a cardinality bound,
+Capacity refusals use the aggregated warnings described above. Those alerts are deliberately
+skipped, not queued for retry, and the source cursor may advance past them. This is a cardinality bound,
 not a process RSS or latency guarantee. Noisy rules can be skipped with `--ignore-sid`.
 The adapter only needs to read the EVE log and write to the IPC socket (group `sokol-ipc`).
 The [detector invariant ledger](docs/DETECTOR_INVARIANTS.md) maps these boundaries and
