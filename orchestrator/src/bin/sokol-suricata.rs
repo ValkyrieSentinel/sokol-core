@@ -174,6 +174,30 @@ fn decide(line: &str, filter: &Filter) -> Option<Alert> {
 /// Maximum distinct source addresses retained by the adapter cooldown policy.
 const COOLDOWN_CAP: usize = 100_000;
 
+/// The first failing policy owns one refusal; this is not a delivery outcome.
+enum AdmissionRefusal {
+    Cooldown,
+    Rate,
+    Capacity,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct RefusalCounts {
+    cooldown: u64,
+    rate: u64,
+    capacity: u64,
+}
+
+impl RefusalCounts {
+    fn since(self, reported: Self) -> Self {
+        Self {
+            cooldown: self.cooldown.saturating_sub(reported.cooldown),
+            rate: self.rate.saturating_sub(reported.rate),
+            capacity: self.capacity.saturating_sub(reported.capacity),
+        }
+    }
+}
+
 /// Suppresses repeats and bounds policy admission, not delivery or ACK rate.
 /// Calls use nondecreasing Instants and one fixed cooldown for this Gate's lifetime.
 struct Gate {
@@ -183,8 +207,7 @@ struct Gate {
     last_sent: HashSet<IpAddr>,
     // One entry per retained address, ordered by successful admission time.
     expires: VecDeque<(IpAddr, Instant)>,
-    capacity_refused: u64,
-    cooldown_refused: u64,
+    refusals: RefusalCounts,
     window_start: Option<Instant>,
     in_window: u32,
 }
@@ -201,11 +224,20 @@ impl Gate {
             capacity,
             last_sent: HashSet::new(),
             expires: VecDeque::new(),
-            capacity_refused: 0,
-            cooldown_refused: 0,
+            refusals: RefusalCounts::default(),
             window_start: None,
             in_window: 0,
         }
+    }
+
+    fn refuse(&mut self, reason: AdmissionRefusal) -> bool {
+        let count = match reason {
+            AdmissionRefusal::Cooldown => &mut self.refusals.cooldown,
+            AdmissionRefusal::Rate => &mut self.refusals.rate,
+            AdmissionRefusal::Capacity => &mut self.refusals.capacity,
+        };
+        *count = count.saturating_add(1);
+        false
     }
 
     fn admit(&mut self, ip: IpAddr, now: Instant) -> bool {
@@ -222,8 +254,7 @@ impl Gate {
             }
         }
         if self.last_sent.contains(&ip) {
-            self.cooldown_refused = self.cooldown_refused.saturating_add(1);
-            return false;
+            return self.refuse(AdmissionRefusal::Cooldown);
         }
         let start = *self.window_start.get_or_insert(now);
         if now.duration_since(start) >= Duration::from_secs(1) {
@@ -231,11 +262,11 @@ impl Gate {
             self.in_window = 0;
         }
         if self.in_window >= self.per_sec {
-            return false;
+            return self.refuse(AdmissionRefusal::Rate);
         }
         if self.last_sent.len() >= self.capacity {
-            self.capacity_refused = self.capacity_refused.saturating_add(1);
-            return false; // never evict a live cooldown to admit a new address
+            // Never evict a live cooldown to admit a new address.
+            return self.refuse(AdmissionRefusal::Capacity);
         }
         self.in_window += 1;
         self.last_sent.insert(ip);
@@ -249,26 +280,21 @@ impl Gate {
 /// No per-address storage and no promise that pending diagnostics survive process loss.
 #[derive(Default)]
 struct AdmissionDiagnostics {
-    reported_cooldown: u64,
-    reported_capacity: u64,
+    reported: RefusalCounts,
     last_emit: Option<Instant>,
 }
 
 impl AdmissionDiagnostics {
-    fn take(&mut self, now: Instant, cooldown: u64, capacity: u64) -> Option<(u64, u64)> {
-        let counts = (
-            cooldown.saturating_sub(self.reported_cooldown),
-            capacity.saturating_sub(self.reported_capacity),
-        );
-        if counts == (0, 0)
+    fn take(&mut self, now: Instant, totals: RefusalCounts) -> Option<RefusalCounts> {
+        let counts = totals.since(self.reported);
+        if counts == RefusalCounts::default()
             || self
                 .last_emit
                 .is_some_and(|at| now.duration_since(at) < Duration::from_secs(1))
         {
             return None;
         }
-        self.reported_cooldown = cooldown;
-        self.reported_capacity = capacity;
+        self.reported = totals;
         self.last_emit = Some(now);
         Some(counts)
     }
@@ -715,16 +741,21 @@ fn main() {
             }
             Err(e) => log::error!("[sokol-suricata] reading {}: {}", args.eve.display(), e),
         }
-        if let Some((cooldown, capacity)) =
-            diagnostics.take(Instant::now(), gate.cooldown_refused, gate.capacity_refused)
-        {
-            if cooldown > 0 {
-                log::warn!("[sokol-suricata] {} alerts skipped: source cooldown active (policy admission, not delivery)", cooldown);
+        if let Some(refused) = diagnostics.take(Instant::now(), gate.refusals) {
+            if refused.cooldown > 0 {
+                log::warn!("[sokol-suricata] {} alerts skipped: source cooldown active (policy admission, not delivery)", refused.cooldown);
             }
-            if capacity > 0 {
+            if refused.rate > 0 {
+                log::warn!(
+                    "[sokol-suricata] {} alerts skipped: policy rate limit reached ({} admissions per fixed one-second window)",
+                    refused.rate,
+                    args.max_signals_per_sec
+                );
+            }
+            if refused.capacity > 0 {
                 log::warn!(
                     "[sokol-suricata] {} alerts skipped: cooldown memory full ({} addresses)",
-                    capacity,
+                    refused.capacity,
                     COOLDOWN_CAP
                 );
             }
@@ -805,42 +836,54 @@ mod tests {
         );
     }
 
+    fn counts(cooldown: u64, rate: u64, capacity: u64) -> RefusalCounts {
+        RefusalCounts {
+            cooldown,
+            rate,
+            capacity,
+        }
+    }
+
     #[test]
     fn refusal_diagnostics_preserve_counts_and_space_emissions_across_batches() {
         let t = Instant::now();
         let mut diagnostics = AdmissionDiagnostics::default();
-        assert_eq!(diagnostics.take(t, 0, 0), None);
-        assert_eq!(diagnostics.take(t, 1, 0), Some((1, 0)));
+        assert_eq!(diagnostics.take(t, counts(0, 0, 0)), None);
+        assert_eq!(diagnostics.take(t, counts(1, 0, 0)), Some(counts(1, 0, 0)));
         for count in 2..=10_001 {
             assert_eq!(
-                diagnostics.take(t + Duration::from_nanos(count), count, count / 2),
+                diagnostics.take(
+                    t + Duration::from_nanos(count),
+                    counts(count, count * 2, count / 2)
+                ),
                 None
             );
         }
+        let totals = counts(10_001, 20_002, 5_000);
         assert_eq!(
-            diagnostics.take(t + Duration::from_millis(999), 10_001, 5_000),
+            diagnostics.take(t + Duration::from_millis(999), totals),
             None
         );
         // No new refusals: a later idle/error poll still flushes accumulated counts.
         assert_eq!(
-            diagnostics.take(t + Duration::from_secs(1), 10_001, 5_000),
-            Some((10_000, 5_000))
+            diagnostics.take(t + Duration::from_secs(1), totals),
+            Some(counts(10_000, 20_002, 5_000))
+        );
+        assert_eq!(diagnostics.take(t + Duration::from_secs(2), totals), None);
+        assert_eq!(
+            diagnostics.take(t + Duration::from_secs(2), counts(10_001, 20_002, 5_007)),
+            Some(counts(0, 0, 7))
         );
         assert_eq!(
-            diagnostics.take(t + Duration::from_secs(2), 10_001, 5_000),
+            diagnostics.take(
+                t + Duration::from_millis(2_999),
+                counts(10_004, 20_008, 5_007)
+            ),
             None
         );
         assert_eq!(
-            diagnostics.take(t + Duration::from_secs(2), 10_001, 5_007),
-            Some((0, 7))
-        );
-        assert_eq!(
-            diagnostics.take(t + Duration::from_millis(2_999), 10_004, 5_007),
-            None
-        );
-        assert_eq!(
-            diagnostics.take(t + Duration::from_secs(3), 10_004, 5_007),
-            Some((3, 0))
+            diagnostics.take(t + Duration::from_secs(3), counts(10_004, 20_008, 5_007)),
+            Some(counts(3, 6, 0))
         );
     }
 
@@ -848,21 +891,57 @@ mod tests {
     fn refusal_diagnostics_do_not_wrap_or_reemit_saturated_totals() {
         let t = Instant::now();
         let mut diagnostics = AdmissionDiagnostics::default();
+        let previous = counts(u64::MAX - 2, u64::MAX - 3, u64::MAX - 1);
+        let saturated = counts(u64::MAX, u64::MAX, u64::MAX);
+        assert_eq!(diagnostics.take(t, previous), Some(previous));
         assert_eq!(
-            diagnostics.take(t, u64::MAX - 2, u64::MAX - 1),
-            Some((u64::MAX - 2, u64::MAX - 1))
-        );
-        assert_eq!(
-            diagnostics.take(t + Duration::from_millis(500), u64::MAX, u64::MAX),
+            diagnostics.take(t + Duration::from_millis(500), saturated),
             None
         );
         assert_eq!(
-            diagnostics.take(t + Duration::from_secs(1), u64::MAX, u64::MAX),
-            Some((2, 1))
+            diagnostics.take(t + Duration::from_secs(1), saturated),
+            Some(counts(2, 3, 1))
         );
         assert_eq!(
-            diagnostics.take(t + Duration::from_secs(2), u64::MAX, u64::MAX),
+            diagnostics.take(t + Duration::from_secs(2), saturated),
             None
+        );
+    }
+
+    #[test]
+    fn rate_only_diagnostics_wait_for_the_shared_interval_and_preserve_pending_counts() {
+        let t = Instant::now();
+        let mut diagnostics = AdmissionDiagnostics::default();
+        assert_eq!(diagnostics.take(t, counts(0, 4, 0)), Some(counts(0, 4, 0)));
+        assert_eq!(
+            diagnostics.take(t + Duration::from_millis(999), counts(0, 513, 0)),
+            None
+        );
+        // Generated counts + pending difference equal the owner's cumulative totals.
+        assert_eq!(
+            diagnostics.reported.rate + counts(0, 513, 0).since(diagnostics.reported).rate,
+            513
+        );
+        assert_eq!(
+            diagnostics.take(t + Duration::from_secs(1), counts(0, 513, 0)),
+            Some(counts(0, 509, 0))
+        );
+        assert_eq!(
+            diagnostics.take(t + Duration::from_secs(2), counts(0, 513, 0)),
+            None
+        );
+        assert_eq!(
+            diagnostics.take(t + Duration::from_secs(2), counts(2, 513, 0)),
+            Some(counts(2, 0, 0))
+        );
+        assert_eq!(
+            diagnostics.take(t + Duration::from_millis(2_999), counts(2, 514, 0)),
+            None,
+            "other categories cannot bypass the shared report interval"
+        );
+        assert_eq!(
+            diagnostics.take(t + Duration::from_secs(3), counts(2, 514, 0)),
+            Some(counts(0, 1, 0))
         );
     }
 
@@ -917,13 +996,88 @@ mod tests {
     }
 
     #[test]
+    fn every_gate_refusal_has_one_counted_policy_reason() {
+        let t = Instant::now();
+        let a = "203.0.113.1".parse().unwrap();
+        let b = "203.0.113.2".parse().unwrap();
+        let mut gate = Gate::with_capacity(Duration::from_secs(5), 1, 1);
+        assert!(gate.admit(a, t));
+        assert_eq!(gate.refusals, counts(0, 0, 0), "admission is not refusal");
+        assert!(
+            !gate.admit(b, t),
+            "rate wins when both rate and capacity are full"
+        );
+        assert_eq!(
+            gate.refusals.cooldown + gate.refusals.rate + gate.refusals.capacity,
+            1,
+            "a policy-refused alert must not disappear from refusal accounting"
+        );
+        assert_eq!(gate.refusals, counts(0, 1, 0));
+        assert!(
+            !gate.admit(a, t),
+            "cooldown wins even at full rate and capacity"
+        );
+        assert_eq!(gate.refusals, counts(1, 1, 0));
+        assert!(
+            !gate.admit(b, t + Duration::from_secs(1)),
+            "capacity wins after rate window resets"
+        );
+        assert_eq!(gate.refusals, counts(1, 1, 1));
+        assert_eq!(gate.in_window, 0, "capacity refusal consumes no rate slot");
+        assert!(
+            gate.admit(b, t + Duration::from_secs(5)),
+            "refused b has no cooldown after a expires"
+        );
+        assert_eq!(gate.refusals, counts(1, 1, 1));
+        let mut zero = Gate::with_capacity(Duration::ZERO, 0, 0);
+        assert!(!zero.admit(a, t));
+        assert!(!zero.admit(a, t + Duration::from_secs(1)));
+        assert_eq!(
+            zero.refusals,
+            counts(0, 2, 0),
+            "zero rate wins even at zero capacity"
+        );
+        assert!(zero.last_sent.is_empty());
+        assert!(zero.expires.is_empty());
+        assert_eq!(zero.in_window, 0);
+    }
+
+    #[test]
+    fn gate_refusal_counters_saturate_independently() {
+        let t = Instant::now();
+        let a = "203.0.113.1".parse().unwrap();
+        let b = "203.0.113.2".parse().unwrap();
+        let mut gate = Gate::with_capacity(Duration::from_secs(60), 1, 1);
+        assert!(gate.admit(a, t));
+        gate.refusals = counts(u64::MAX - 1, u64::MAX - 1, u64::MAX - 1);
+        for _ in 0..2 {
+            assert!(!gate.admit(a, t));
+        }
+        assert_eq!(gate.refusals, counts(u64::MAX, u64::MAX - 1, u64::MAX - 1));
+        for _ in 0..2 {
+            assert!(!gate.admit(b, t));
+        }
+        assert_eq!(gate.refusals, counts(u64::MAX, u64::MAX, u64::MAX - 1));
+        for _ in 0..2 {
+            assert!(!gate.admit(b, t + Duration::from_secs(1)));
+        }
+        assert_eq!(gate.refusals, counts(u64::MAX, u64::MAX, u64::MAX));
+        assert!(gate.admit(b, t + Duration::from_secs(60)));
+        assert_eq!(
+            gate.refusals,
+            counts(u64::MAX, u64::MAX, u64::MAX),
+            "saturation never blocks admission"
+        );
+    }
+
+    #[test]
     fn gate_suppresses_repeats_and_caps_rate() {
         let t0 = Instant::now();
         let mut gate = Gate::new(Duration::from_secs(60), 3);
         let a: IpAddr = "203.0.113.1".parse().unwrap();
         assert!(gate.admit(a, t0));
         assert!(!gate.admit(a, t0 + Duration::from_secs(10)), "cooldown");
-        assert_eq!(gate.cooldown_refused, 1, "repeat refusal is observable");
+        assert_eq!(gate.refusals.cooldown, 1, "repeat refusal is observable");
         assert!(gate.admit(a, t0 + Duration::from_secs(61)), "cooldown over");
 
         let mut gate = Gate::new(Duration::from_secs(60), 3);
@@ -969,7 +1123,7 @@ mod tests {
         assert!(gate.admit(a, t));
         assert!(gate.admit(b, t + Duration::from_secs(1)));
         assert!(!gate.admit(c, t + Duration::from_secs(2)));
-        assert_eq!(gate.capacity_refused, 1);
+        assert_eq!(gate.refusals.capacity, 1);
         assert_eq!(gate.in_window, 0, "capacity refusal reserves no rate slot");
         assert!(!gate.admit(a, t + Duration::from_secs(4)));
         assert!(!gate.admit(b, t + Duration::from_secs(4)));
@@ -989,7 +1143,7 @@ mod tests {
             !gate.admit(c, t + Duration::from_secs(6)),
             "refusals must not renew c early"
         );
-        assert_eq!(gate.capacity_refused, 1);
+        assert_eq!(gate.refusals.capacity, 1);
     }
 
     #[test]
@@ -1022,7 +1176,7 @@ mod tests {
         let mut gate = Gate::with_capacity(Duration::ZERO, 1, 0);
         assert!(!gate.admit(a, t));
         assert_eq!(gate.in_window, 0);
-        assert_eq!(gate.capacity_refused, 1);
+        assert_eq!(gate.refusals.capacity, 1);
     }
 
     #[test]
@@ -1046,6 +1200,14 @@ mod tests {
                 }
                 admissions += 1;
             }
+            let rejected = u128::from(gate.refusals.cooldown)
+                + u128::from(gate.refusals.rate)
+                + u128::from(gate.refusals.capacity);
+            assert_eq!(
+                admissions + rejected,
+                u128::from(step) + 1,
+                "attempts partition into admissions and exactly one refusal category"
+            );
             assert!(gate.last_sent.len() <= 4);
             let queued: HashSet<_> = gate.expires.iter().map(|(ip, _)| *ip).collect();
             assert_eq!(
@@ -1070,7 +1232,7 @@ mod tests {
             admissions > 1_000,
             "history exercises renewal, not just refusals"
         );
-        assert!(gate.capacity_refused > 0, "history reaches capacity");
+        assert!(gate.refusals.capacity > 0, "history reaches capacity");
     }
 
     fn lines(f: &mut Follower) -> Vec<String> {

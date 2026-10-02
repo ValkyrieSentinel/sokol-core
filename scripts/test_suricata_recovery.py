@@ -111,8 +111,8 @@ class RecoveryTests(unittest.TestCase):
                 server.settimeout(WAIT_SECONDS)
                 started = time.monotonic()
                 with running([str(self.binary), "--eve", str(eve), "--from-start",
-                              "--cursor-file", str(cursor), "--ipc-socket", str(ipc)],
-                             capture=logs) as proc:
+                              "--cursor-file", str(cursor), "--ipc-socket", str(ipc),
+                              "--cooldown-secs", "86400"], capture=logs) as proc:
                     conn, _ = server.accept()
                     with conn:
                         conn.settimeout(WAIT_SECONDS)
@@ -141,6 +141,42 @@ class RecoveryTests(unittest.TestCase):
                             conn.settimeout(0.2)
                             with self.assertRaises(socket.timeout):
                                 reader.readline(4097)
+
+    def test_zero_rate_counts_skipped_alerts_without_ipc_or_pending_cursor(self):
+        with tempfile.TemporaryDirectory(prefix="sokol-rec-", dir="/tmp") as directory:
+            root = Path(directory)
+            eve, cursor, ipc = root / "eve.json", root / "cursor", root / "ipc.sock"
+            refused = 513  # crosses three bounded reader batches
+            eve.write_text(alert("203.0.113.17") * refused)
+            logs = []
+            with socket.socket(socket.AF_UNIX) as server:
+                server.bind(str(ipc))
+                server.listen(1)
+                started = time.monotonic()
+                with running([str(self.binary), "--eve", str(eve), "--from-start",
+                              "--cursor-file", str(cursor), "--ipc-socket", str(ipc),
+                              "--max-signals-per-sec", "0"], capture=logs) as proc:
+                    await_cursor(cursor, {"inode": eve.stat().st_ino,
+                                          "position": eve.stat().st_size}, proc)
+                    deadline = time.monotonic() + WAIT_SECONDS
+                    while True:
+                        text = read_log(logs[0])
+                        counts = [int(n) for n in re.findall(
+                            r"(\d+) alerts skipped: policy rate limit reached", text)]
+                        if sum(counts) >= refused:
+                            break
+                        if time.monotonic() >= deadline:
+                            self.fail(f"rate-refused alerts are invisible in diagnostics: {counts}")
+                        self.assertIsNone(proc.poll(), "adapter must stay alive at zero rate")
+                        time.sleep(0.05)
+                    self.assertEqual(sum(counts), refused)
+                    self.assertLessEqual(len(counts), int(time.monotonic() - started) + 1)
+                    self.assertNotIn("alerts skipped: source cooldown active", text)
+                    self.assertNotIn("alerts skipped: cooldown memory full", text)
+                    self.assertNotIn("alerts queued, retrying", text)
+                    server.settimeout(0.1)
+                    with self.assertRaises(socket.timeout):
+                        server.accept()
 
     def restart_case(self, rotate):
         # Short path also fits macOS's Unix-socket pathname limit.

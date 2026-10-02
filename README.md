@@ -235,13 +235,14 @@ can select the destination instead of the source and the adapter does not know t
 Cooldown starts at policy admission and remains active even if the queued alert expires
 without a write. Fresh same-source alerts can therefore be suppressed until cooldown
 ends; refusals are counted as `alerts skipped: source cooldown active`.
-Cooldown and full-cache warnings aggregate across batches. Report decisions are spaced
-at least one monotonic second apart, with at most one line per category per report.
+Cooldown, rate-limit and full-cache warnings aggregate across batches. Report decisions
+are spaced at least one monotonic second apart, with at most one line per category per report.
 Pending counts are also checked on idle/error polls. Slow work can delay reporting;
 slow stderr writes can make visible lines appear closer together. Log-level filters
 may suppress output; reporting baselines advance even when WARN is disabled. Counts
 saturate at `u64::MAX`, and pending diagnostics do not survive process loss. Other log
-categories are unaffected; rate-window refusals remain uncounted and silent.
+categories are unaffected. These counters cover Gate policy refusals only; parsing,
+severity/signature/freshness filtering and outbox losses have their own boundaries.
 This preserves the admission throttle during outages; it does not promise delivery of
 an active attack's first alert. Successful acknowledged blocks retain the node's normal TTL/escalation policy; freshness
 is a forwarding limit, not a block TTL. Time after the final check (write, scheduling,
@@ -270,6 +271,11 @@ outbound traffic, the remote destination is blocked instead; the never-block pol
 The same source address is not admitted again within `--cooldown-secs` (60), and
 `--max-signals-per-sec` (50) caps policy admissions per fixed one-second window, not IPC
 retries or paced delivery. Adjacent windows can admit a burst across their boundary.
+Rate-refused alerts are counted as `alerts skipped: policy rate limit reached`; they
+are skipped without a queued retry, so their source cursor may advance. Zero rate skips
+all alerts that reach this policy. Each refused attempt has one reason, in precedence
+order: cooldown, rate, capacity. The reason identifies the first failing policy,
+not every limit reached and not a node-delivery outcome.
 Cooldown memory retains at most **100,000 distinct addresses**. Expired entries leave in
 admission order; a full cache skips new addresses without evicting an unexpired cooldown.
 Capacity refusals use the aggregated warnings described above. Those alerts are deliberately
