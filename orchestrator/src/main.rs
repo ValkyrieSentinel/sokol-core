@@ -2808,6 +2808,8 @@ async fn main() -> Result<(), anyhow::Error> {
         );
     }
     sntl_db.append("NODE_SHUTDOWN".to_string());
+    // This barrier covers preceding submissions, not a producer stop: IPC/mesh tasks
+    // can still append afterwards. Quiescing all producers is a separate shutdown limit.
     if !sntl_db.flush(Duration::from_secs(2)) {
         log::error!("[Audit] Shutdown without a confirmed final fsync");
     }
@@ -3056,12 +3058,25 @@ mod tests {
         db.append("DROPPED".into());
         assert_eq!(db.overflow_total(), 1);
         let dropped = db.dropped.clone();
+        let observed_dropped = dropped.clone();
+        let health = db.health.clone();
         drop(db);
         let thread = std::thread::spawn(move || writer.run(rx, dropped));
         thread.join().unwrap();
         let mut expected = loss_test_prefix();
         expected.push("AUDIT_QUEUE_OVERFLOW|Dropped:1".into());
         assert_eq!(read_audit(&path), expected);
+        assert_eq!(
+            observed_dropped.load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        assert!(
+            health
+                .last_sync_ok_ms
+                .load(std::sync::atomic::Ordering::Relaxed)
+                > 0,
+            "appending the notice without a successful final sync is not enough"
+        );
     }
 
     #[test]
@@ -3070,7 +3085,10 @@ mod tests {
         let (db, mut writer, _rx, path) = paused_audit("notice-recovery", 1);
         writer.log = None; // Release the real log's exclusive writer lock.
         let saved_path = writer.path.clone();
-        writer.path = saved_path.parent().unwrap().to_path_buf(); // Opening a directory as a log fails.
+        let unavailable = saved_path.parent().unwrap().join("unavailable");
+        std::fs::create_dir(&unavailable).unwrap();
+        writer.path = unavailable.clone(); // Opening a directory as a log fails.
+                                           // Both the failing directory and its .lock sibling stay inside this test's directory.
         db.dropped.store(5, Ordering::Relaxed);
         writer.record("LOST_WHILE_UNAVAILABLE".into(), &db.dropped);
         assert_eq!(db.dropped.load(Ordering::Relaxed), 5);
@@ -3082,6 +3100,8 @@ mod tests {
             "failed sync must not erase notices"
         );
         writer.path = saved_path;
+        std::fs::remove_file(unavailable.with_extension("lock")).unwrap();
+        std::fs::remove_dir(unavailable).unwrap();
         db.dropped.fetch_add(2, Ordering::Relaxed); // New drops join the retained count.
         writer.record("AFTER_RECOVERY".into(), &db.dropped);
         assert!(writer.sync(&db.dropped));

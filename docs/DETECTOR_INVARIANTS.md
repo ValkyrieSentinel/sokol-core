@@ -174,7 +174,7 @@ Owner: [replay_records / print_report](../orchestrator/src/replay.rs),
 | REPLAY-R4 | Signal-socket `DB_LOG` text has a fixed `CLIENT_LOG` outer tag and cannot supply node lifecycle/decision/loss records. | `client_logs_cannot_supply_replay_authority` (real writer/reader/CLI), XDP smoke client ACK/dump/fresh-replay checks |
 | REPLAY-R5 | Explicit loss markers fence dependent replay until a usable start. Any marker prevents CLI 0, including a tail/pre-context gap; known mismatches retain 1. | `explicit_audit_gaps_fence_dependent_decisions`, `a_gap_alone_prevents_a_successful_cli_result` (real chained files) |
 | AUDIT-R1 | Oversized records are known losses, not successful appends. Before following data or sync, `AUDIT_LOST` accounts for them even on a still-writable log. | `oversized_audit_records_are_counted_and_marked_before_following_data_or_flush` (real asynchronous writer, chained file, metrics and CLI) |
-| AUDIT-R2 | Queue loss is emitted before following data and every sync path: explicit Flush, idle timeout, disconnected final sync. A failed notice retains its count; following data cannot bypass it. | `a_flush_records_real_queue_overflow_without_a_following_record`, `idle_sync_records_real_queue_overflow_without_a_following_record`, `disconnected_final_sync_records_real_queue_overflow`, `a_failed_loss_notice_retains_its_count_until_recovery` (actual Full channels, writer loop and unavailable-path recovery) |
+| AUDIT-R2 | Queue loss is emitted before following data and every sync path: explicit Flush, idle timeout, disconnected final sync. A failed notice retains its sampled count; that record cannot bypass the notice. Cross-producer drop publication and send are not atomic. | `a_flush_records_real_queue_overflow_without_a_following_record`, `idle_sync_records_real_queue_overflow_without_a_following_record`, `disconnected_final_sync_records_real_queue_overflow`, `a_failed_loss_notice_retains_its_count_until_recovery` (actual Full channels, writer loop and unavailable-path recovery) |
 
 Baseline regressions: a recorded capacity refusal replayed as `lifted`, then its retry
 as `duplicate`, producing two mismatches on a table changed by speculation. A journal
@@ -274,7 +274,13 @@ Queue-drop counts are sampled before each record and sync. A successfully append
 the count is added back, preserving concurrent new drops. Ordinary records cannot
 bypass a failed notice: they are counted as additional failed records. Retrying a
 notice is not itself counted as another lost user record. When the log recovers,
-failed-record and queue-loss notices precede subsequent data. Since the drop counter
+failed-record and sampled queue-loss notices precede subsequent data. This ordering
+covers drops with a happens-before link to the later send (e.g. the same producer).
+Across independent producers, `try_send(Full)` and publishing its counter are not
+atomic; another record may be sent/written in that window before the notice is known.
+The later marker still prevents CLI 0, but an intervening comparison may become a
+mismatch rather than insufficient. No atomic ordering across producers is claimed.
+Since the drop counter
 has no queue position, a fence may precede records queued before the actual loss;
 it conservatively discards replay context rather than assigning an exact loss time.
 
@@ -283,7 +289,10 @@ and the final sync after sender disconnection. `flush(true)` confirms that the b
 processed preceding queued records, appended sampled pending loss notices and completed
 sync; it does **not** mean all original records survived or replay can return 0.
 Quiesce producers to include all completed submissions: a barrier does not freeze or
-acknowledge concurrent later submissions. If a notice cannot be appended, sync returns
+acknowledge concurrent later submissions. Current production shutdown still leaves
+IPC/mesh producers running across the barrier, so later submissions may be lost on
+process exit without a marker; quiescing them remains a separate implementation task.
+If a notice cannot be appended, sync returns
 false and pending counts remain for retry; the retry interval stays bounded by the
 existing 100 ms receive timeout rather than a zero-wait busy loop. Process termination
 or persistent disk failure can still prevent a notice from being written. Failed sync
@@ -298,5 +307,6 @@ deterministically without production test hooks. The idle test captures evidence
 before disconnection, so final-sync behavior cannot mask a timeout regression.
 Semantic controls must reject silent oversize success, skipping loss on a healthy
 handle, skipping queue accounting in sync, dropping failed notice counts and writing
-ordinary records ahead of pending queue loss. Existing fresh complete replay remains 0;
+ordinary records ahead of sampled pending queue loss or ending after appending a
+notice without successful disconnected final sync. Existing fresh complete replay remains 0;
 real synced loss notices give 2, not a complete-evidence success.
