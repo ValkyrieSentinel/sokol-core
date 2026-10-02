@@ -80,8 +80,18 @@ struct Args {
     /// Forwarding age budget for timestamped alerts, including queueing and retries.
     /// Expiry drops pending forwarding locally, without undoing possibly applied effects.
     /// Missing/unparseable timestamps retain the legacy untimed policy.
-    #[arg(long, default_value = "600")]
+    #[arg(long, default_value = "600", value_parser = forwarding_age_secs)]
     max_alert_age_secs: u64,
+}
+
+/// Reject an impossible interval before opening the source, loading a cursor or using IPC.
+/// This checks the local clock at startup; per-alert checked addition remains necessary.
+fn forwarding_age_secs(raw: &str) -> Result<u64, String> {
+    let seconds = raw.parse::<u64>().map_err(|error| error.to_string())?;
+    Instant::now()
+        .checked_add(Duration::from_secs(seconds))
+        .ok_or_else(|| "forwarding age exceeds local clock range".to_string())?;
+    Ok(seconds)
 }
 
 struct Filter {
@@ -231,6 +241,36 @@ impl Gate {
         self.last_sent.insert(ip);
         self.expires.push_back((ip, now));
         true
+    }
+}
+
+/// Aggregate monotone refusal counters across batches, including later empty/error polls.
+/// Report decisions are at least one second apart; totals saturate, like Gate counters.
+/// No per-address storage and no promise that pending diagnostics survive process loss.
+#[derive(Default)]
+struct AdmissionDiagnostics {
+    reported_cooldown: u64,
+    reported_capacity: u64,
+    last_emit: Option<Instant>,
+}
+
+impl AdmissionDiagnostics {
+    fn take(&mut self, now: Instant, cooldown: u64, capacity: u64) -> Option<(u64, u64)> {
+        let counts = (
+            cooldown.saturating_sub(self.reported_cooldown),
+            capacity.saturating_sub(self.reported_capacity),
+        );
+        if counts == (0, 0)
+            || self
+                .last_emit
+                .is_some_and(|at| now.duration_since(at) < Duration::from_secs(1))
+        {
+            return None;
+        }
+        self.reported_cooldown = cooldown;
+        self.reported_capacity = capacity;
+        self.last_emit = Some(now);
+        Some(counts)
     }
 }
 
@@ -590,6 +630,7 @@ fn main() {
         Duration::from_secs(args.cooldown_secs),
         args.max_signals_per_sec,
     );
+    let mut diagnostics = AdmissionDiagnostics::default();
     let mut follower = match args.cursor_file.as_deref().and_then(Cursor::load) {
         Some(cursor) => {
             let (f, how) = Follower::resume(&args.eve, cursor);
@@ -617,8 +658,6 @@ fn main() {
                 if let Some(error) = batch.error {
                     log::error!("[sokol-suricata] reading {}: {}", args.eve.display(), error);
                 }
-                let capacity_refused = gate.capacity_refused;
-                let cooldown_refused = gate.cooldown_refused;
                 let observed = Instant::now();
                 let now_ms = chrono::Utc::now().timestamp_millis();
                 for (start, line) in batch.lines {
@@ -673,20 +712,22 @@ fn main() {
                         );
                     }
                 }
-                let cooldown_skipped = gate.cooldown_refused.saturating_sub(cooldown_refused);
-                if cooldown_skipped > 0 {
-                    log::warn!("[sokol-suricata] {} alerts skipped: source cooldown active (policy admission, not delivery)", cooldown_skipped);
-                }
-                let skipped = gate.capacity_refused.saturating_sub(capacity_refused);
-                if skipped > 0 {
-                    log::warn!(
-                        "[sokol-suricata] {} alerts skipped: cooldown memory full ({} addresses)",
-                        skipped,
-                        COOLDOWN_CAP
-                    );
-                }
             }
             Err(e) => log::error!("[sokol-suricata] reading {}: {}", args.eve.display(), e),
+        }
+        if let Some((cooldown, capacity)) =
+            diagnostics.take(Instant::now(), gate.cooldown_refused, gate.capacity_refused)
+        {
+            if cooldown > 0 {
+                log::warn!("[sokol-suricata] {} alerts skipped: source cooldown active (policy admission, not delivery)", cooldown);
+            }
+            if capacity > 0 {
+                log::warn!(
+                    "[sokol-suricata] {} alerts skipped: cooldown memory full ({} addresses)",
+                    capacity,
+                    COOLDOWN_CAP
+                );
+            }
         }
         deliver(&mut outbox, &args.ipc_socket);
         while queued_at.len() > outbox.pending() {
@@ -729,6 +770,100 @@ mod tests {
             max_severity: 2,
             ignore_sid: vec![],
         }
+    }
+
+    #[test]
+    fn cli_rejects_unrepresentable_forwarding_age_before_startup() {
+        let result = Args::try_parse_from([
+            "sokol-suricata",
+            "--max-alert-age-secs",
+            "18446744073709551615",
+        ]);
+        assert!(
+            result.is_err(),
+            "an impossible clock interval must not start the adapter"
+        );
+    }
+
+    #[test]
+    fn cli_forwarding_age_accepts_zero_and_normal_intervals_but_rejects_bad_numbers() {
+        for value in ["0", "600", "86400"] {
+            let args =
+                Args::try_parse_from(["sokol-suricata", "--max-alert-age-secs", value]).unwrap();
+            assert_eq!(args.max_alert_age_secs, value.parse::<u64>().unwrap());
+        }
+        for value in ["-1", "no", "18446744073709551616"] {
+            assert!(
+                Args::try_parse_from(["sokol-suricata", "--max-alert-age-secs", value]).is_err()
+            );
+        }
+        assert_eq!(
+            Args::try_parse_from(["sokol-suricata"])
+                .unwrap()
+                .max_alert_age_secs,
+            600
+        );
+    }
+
+    #[test]
+    fn refusal_diagnostics_preserve_counts_and_space_emissions_across_batches() {
+        let t = Instant::now();
+        let mut diagnostics = AdmissionDiagnostics::default();
+        assert_eq!(diagnostics.take(t, 0, 0), None);
+        assert_eq!(diagnostics.take(t, 1, 0), Some((1, 0)));
+        for count in 2..=10_001 {
+            assert_eq!(
+                diagnostics.take(t + Duration::from_nanos(count), count, count / 2),
+                None
+            );
+        }
+        assert_eq!(
+            diagnostics.take(t + Duration::from_millis(999), 10_001, 5_000),
+            None
+        );
+        // No new refusals: a later idle/error poll still flushes accumulated counts.
+        assert_eq!(
+            diagnostics.take(t + Duration::from_secs(1), 10_001, 5_000),
+            Some((10_000, 5_000))
+        );
+        assert_eq!(
+            diagnostics.take(t + Duration::from_secs(2), 10_001, 5_000),
+            None
+        );
+        assert_eq!(
+            diagnostics.take(t + Duration::from_secs(2), 10_001, 5_007),
+            Some((0, 7))
+        );
+        assert_eq!(
+            diagnostics.take(t + Duration::from_millis(2_999), 10_004, 5_007),
+            None
+        );
+        assert_eq!(
+            diagnostics.take(t + Duration::from_secs(3), 10_004, 5_007),
+            Some((3, 0))
+        );
+    }
+
+    #[test]
+    fn refusal_diagnostics_do_not_wrap_or_reemit_saturated_totals() {
+        let t = Instant::now();
+        let mut diagnostics = AdmissionDiagnostics::default();
+        assert_eq!(
+            diagnostics.take(t, u64::MAX - 2, u64::MAX - 1),
+            Some((u64::MAX - 2, u64::MAX - 1))
+        );
+        assert_eq!(
+            diagnostics.take(t + Duration::from_millis(500), u64::MAX, u64::MAX),
+            None
+        );
+        assert_eq!(
+            diagnostics.take(t + Duration::from_secs(1), u64::MAX, u64::MAX),
+            Some((2, 1))
+        );
+        assert_eq!(
+            diagnostics.take(t + Duration::from_secs(2), u64::MAX, u64::MAX),
+            None
+        );
     }
 
     #[test]

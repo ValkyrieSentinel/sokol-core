@@ -22,9 +22,9 @@ an RSS bound. Rate uses fixed one-second windows starting/resetting on eligible 
 its setting is not a sliding-window guarantee or an IPC send/retry ceiling. Zero cooldown
 allows immediate renewal; zero rate admits nothing. Policy admission is before outbox
 framing validation and delivery, so it does not establish that an alert was queued or ACKed.
-Capacity refusal increments a saturating counter and is reported per batch. Such alerts
-are skipped: no retry obligation is created, and checkpointing may advance past them.
-Cooldown-refused attempts also increment a saturating counter and are logged per batch.
+Capacity refusal increments a saturating counter and is reported in aggregated warnings.
+Such alerts are skipped: no retry obligation is created, and checkpointing may advance past them.
+Cooldown-refused attempts also increment a saturating counter and use the same aggregation.
 Cooldown starts at policy admission, so even a later never-written expiry leaves it active.
 This intentionally throttles admission during outages; fresh same-source alerts can be
 suppressed until it ends. That suppression is not ACK evidence or guaranteed delivery.
@@ -34,10 +34,33 @@ and a rate quota above the fixture size, then one more different address. The pr
 implementation accepted the extra address because none had expired. The real-cap test
 failed at that admission assertion before the fix. This does not assert a production outage.
 
+## Admission diagnostics
+
+| ID | Invariant and enforcement point | Executable evidence |
+|---|---|---|
+| SUR-D1 | Decisions to report cooldown and capacity refusals are separated by at least one monotonic second; each report generates at most one line per category. Fixed-size reporting state retains the difference between cumulative and reported counters, including across empty/error polls. Generated report deltas sum to observed refusals before counter saturation. | `refusal_diagnostics_preserve_counts_and_space_emissions_across_batches`, `refusal_diagnostics_do_not_wrap_or_reemit_saturated_totals`; actual process `RecoveryTests.test_cooldown_diagnostics_aggregate_across_batches_without_losing_counts` |
+
+The first nonempty report may be immediate. Reports are checked outside the source-poll
+match, before delivery: idle/error polls can flush earlier pending counts, but blocked
+work and scheduling can delay a check. The bound concerns decision instants, not visible
+line spacing: slow stderr writes can make visible lines appear closer together. Log-level
+filters can suppress output; baselines advance even when WARN is disabled. This is not
+a deadline or a bound on all logging. Rate-window refusals remain uncounted and silent.
+Counters saturate at `u64::MAX`; additional refusals beyond saturation are not observable. Pending reports are in memory
+and may be lost on process death. Neither skipped-alert count establishes delivery.
+
+Regression input: one admitted source followed by 4096 repeats over 17 reader batches.
+Before aggregation the actual process emitted 17 warnings in roughly one second, and
+the emission-count assertion failed. The revised loop preserves all 4096 refusal counts
+by the final check at EOF. On a slow host reports may occur during batch processing;
+the unit test separately demonstrates a pending report with no new refusals at the next
+one-second check.
+
 ## Forwarding freshness
 
 | ID | Invariant and enforcement point | Executable evidence |
 |---|---|---|
+| SUR-T2 | CLI parsing rejects an age interval that cannot be added to the startup local `Instant`, before source/cursor/IPC operations. Zero and normal intervals remain valid configuration; each later per-alert addition is independently checked. This does not promise representability forever for values close to the clock limit. | `cli_rejects_unrepresentable_forwarding_age_before_startup`, `cli_forwarding_age_accepts_zero_and_normal_intervals_but_rejects_bad_numbers`; actual process `RecoveryTests.test_invalid_forwarding_age_leaves_cursor_and_ipc_untouched` |
 | SUR-T1 | A parsed timestamp consumes the configured age budget. Future timestamps grant at most that budget from observation. Integer conversion and local-clock addition are checked; stale/unrepresentable timestamps do not enqueue. Missing/invalid timestamps retain the untimed policy. | `forwarding_budget_ages_exactly_and_future_timestamps_cannot_enlarge_it` |
 | IPC-T1 | An opt-in forwarding deadline is checked before connection/backoff work and after handshake, immediately before preparing a send/retry. Expired FIFO entries are removed in pairs and increment `expired`, never a node-answer result. Each removal spends flush work budget. Source TTL entries still render retractions and require ACK; expired entries behind an unexpired FIFO head wait until they reach the front. | `forwarding_expiry_is_counted_loss_not_an_ack_and_spends_flush_budget`, `invalid_freshness_input_does_not_evict_or_create_a_deadline`, `lost_ack_then_freshness_expiry_does_not_resend_or_undo_the_signal`, `lost_answer_keeps_expiry_and_later_retry_sends_its_retraction` |
 
