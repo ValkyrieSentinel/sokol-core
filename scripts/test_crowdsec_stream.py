@@ -197,6 +197,100 @@ class StreamTests(unittest.TestCase):
                     thread.join(timeout=5)
                 self.assertFalse(thread.is_alive(), "HTTP fixture did not stop")
 
+    def test_polling_continues_before_a_healthy_backlog_is_drained(self):
+        self.check_backlog("1")
+
+    def test_zero_poll_interval_does_not_starve_delivery(self):
+        self.check_backlog("0")
+
+    def check_backlog(self, poll_secs):
+        total = 20
+        commands = []
+        errors = []
+        second_poll = threading.Event()
+        complete = threading.Event()
+        at_second_poll = []
+        count = 0
+        decisions = [{**DECISION, "id": 100 + i} for i in range(total)]
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                nonlocal count
+                count += 1
+                if count == 1:
+                    response = {"new": decisions, "deleted": []}
+                elif count == 2:
+                    at_second_poll.append(len(commands))
+                    response = {"new": [], "deleted": [decisions[0]]}
+                else:
+                    response = {}
+                body = json.dumps(response).encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                self.wfile.flush()
+                if count == 2:
+                    second_poll.set()
+
+            def log_message(self, *args):
+                pass
+
+        with tempfile.TemporaryDirectory(prefix="sokol-cs-sched-", dir="/tmp") as directory:
+            ipc = Path(directory) / "ipc.sock"
+            with LocalAPI(("127.0.0.1", 0), Handler) as api, socket.socket(socket.AF_UNIX) as server:
+                server.bind(str(ipc))
+                server.listen(1)
+                server.settimeout(WAIT_SECONDS)
+
+                def node():
+                    try:
+                        conn, _ = server.accept()
+                        with conn:
+                            conn.settimeout(WAIT_SECONDS)
+                            with conn.makefile("rb") as reader:
+                                if reader.readline(4097) != b"ACK\n":
+                                    raise AssertionError("missing ACK handshake")
+                                conn.sendall(b"OK ack\n")
+                                while len(commands) <= total:
+                                    line = reader.readline(4097)
+                                    if not line:
+                                        break
+                                    commands.append(line)
+                                    conn.sendall(b"OK lifted\n" if line.startswith(b"RETRACT") else b"OK applied\n")
+                                complete.set()
+                    except Exception as error:
+                        errors.append(error)
+                        second_poll.set()
+                        complete.set()
+
+                http_thread = threading.Thread(target=api.serve_forever,
+                    kwargs={"poll_interval": 0.05}, daemon=True)
+                node_thread = threading.Thread(target=node, daemon=True)
+                http_thread.start()
+                node_thread.start()
+                try:
+                    args = [str(self.binary), "--lapi-url", f"http://127.0.0.1:{api.server_port}",
+                            "--api-key", "dummy-regression-key", "--ipc-socket", str(ipc),
+                            "--poll-secs", poll_secs, "--max-signals-per-sec", "5"]
+                    with patch.dict(os.environ, {"NO_PROXY": "127.0.0.1", "no_proxy": "127.0.0.1"}), running(args):
+                        self.assertTrue(second_poll.wait(WAIT_SECONDS), "API polling stalled")
+                        self.assertFalse(errors, str(errors))
+                        self.assertTrue(at_second_poll)
+                        self.assertLess(at_second_poll[0], total,
+                                        "the next poll must precede draining the initial backlog")
+                        self.assertTrue(complete.wait(WAIT_SECONDS), "queued commands did not finish")
+                        self.assertFalse(errors, str(errors))
+                        self.assertEqual(len(commands), total + 1)
+                        self.assertEqual([line.split(b";", 1)[0] for line in commands[:total]],
+                                         [f"SIGNAL#{100 + i}".encode() for i in range(total)])
+                        self.assertEqual(commands[-1], b"RETRACT#100:crowdsec|203.0.113.71\n")
+                finally:
+                    api.shutdown()
+                    http_thread.join(timeout=5)
+                    node_thread.join(timeout=5)
+                self.assertFalse(http_thread.is_alive() or node_thread.is_alive(), "fixture did not stop")
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)

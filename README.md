@@ -243,10 +243,18 @@ Only local decisions (origins `crowdsec` and `cscli`) are forwarded by default; 
 (`CAPI`, `lists`) can hold tens of thousands of addresses and are added with `--origins` only if the
 mesh should carry them. Range decisions are forwarded as prefixes.
 
-While IPC delivery is backing off, the adapter returns to its LAPI polling loop
-instead of waiting inside delivery; queued commands remain pending. Polling is
-still sequential with HTTP requests and active deliveries, not a fixed-period
-scheduler or a bound on draining a large healthy queue.
+API polling and IPC pacing use separate clocks in one sequential loop. Delivery
+yields between commands when the next poll is due, so a healthy backlog does not
+have to drain before new decisions and retractions are fetched. FIFO order and
+ACK retention remain intact; fetched retractions join the existing queue.
+`--poll-secs` measures the wait after a poll and queue insertion finish, while
+`--max-signals-per-sec` still paces each completed delivery. During backoff the
+loop waits up to 50 ms, or until a poll is due, before checking retry readiness. A zero poll
+interval permits one delivery attempt per poll to avoid starving the sender.
+
+This is cooperative scheduling: an in-flight HTTP request, one IPC exchange or
+its pacing sleep can delay the next poll. It does not provide a strict wall-clock
+poll period or prioritize retractions ahead of earlier queued commands.
 
 The adapter validates the decision-stream envelope before queueing any commands. The
 root must be an object; `new` and `deleted`, when present and non-null, must be arrays

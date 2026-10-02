@@ -65,7 +65,7 @@ struct Args {
     #[arg(long, default_value = "crowdsec,cscli", value_delimiter = ',')]
     origins: Vec<String>,
 
-    /// Seconds between polls of the decision stream.
+    /// Seconds after a completed poll before the next poll becomes due.
     #[arg(long, default_value = "5")]
     poll_secs: u64,
 
@@ -285,9 +285,22 @@ const OUTBOX_CAP: usize = 100_000;
 
 /// Sends what is queued at `pause` per signal; a decision leaves the queue only when the node
 /// has answered it. Returns on transport failure or active backoff so the main loop can poll
-/// LAPI again. A pending retry is not a successful delivery.
-fn deliver(outbox: &mut delivery::Outbox, socket: &Path, pause: Duration) {
+/// LAPI again. Yield between commands when the next poll is due. One attempt is
+/// allowed even with a zero poll interval, so polling cannot starve delivery.
+/// A pending retry is not a successful delivery.
+fn deliver(
+    outbox: &mut delivery::Outbox,
+    socket: &Path,
+    pause: Duration,
+    poll_finished: Instant,
+    poll_interval: Duration,
+) {
+    let mut attempted = false;
     while outbox.pending() > 0 {
+        if attempted && poll_finished.elapsed() >= poll_interval {
+            return;
+        }
+        attempted = true;
         let was_failing = outbox.failing;
         let (done, err) = outbox.flush(1);
         // Backoff reports no completion and no new error. Do not wait it out here:
@@ -336,72 +349,93 @@ fn main() {
         args.ipc_socket.display()
     );
 
+    let poll_interval = Duration::from_secs(args.poll_secs);
+    let mut poll_finished = Instant::now();
+    let mut first_poll = true;
     loop {
-        // Conservative local anchor includes the HTTP round-trip and parsing time.
-        let fetched_at = Instant::now();
-        match poll(&args, startup).and_then(|body| batch_from(&body, &args.origins)) {
-            Ok(batch) => {
-                startup = false;
-                if batch.skipped_origin + batch.skipped_not_ban + batch.skipped_scope > 0 {
-                    log::info!(
-                        "[sokol-crowdsec] skipped {} other-origin, {} non-ban, {} non-address decisions",
-                        batch.skipped_origin,
-                        batch.skipped_not_ban,
-                        batch.skipped_scope
-                    );
-                }
-                if batch.deleted + batch.deleted_skipped > 0 {
-                    log::info!(
-                        "[sokol-crowdsec] {} deleted decisions parsed as retractions, {} not forwarded ones skipped",
-                        batch.deleted,
-                        batch.deleted_skipped
-                    );
-                }
-                // Queued, not yet delivered: the outbox keeps them until the node answers, so a
-                // batch fetched while the node is down is not lost.
-                if batch.skipped_duration > 0 {
-                    log::warn!("[sokol-crowdsec] skipped {} invalid/expired or unidentifiable timed decisions", batch.skipped_duration);
-                }
-                let lost = outbox.lost;
-                for (index, line) in batch.signals.iter().enumerate() {
-                    let queued = match batch.deadlines.get(&index) {
-                        Some((seconds, expired)) => fetched_at
-                            .checked_add(Duration::from_secs(*seconds))
-                            .ok_or_else(|| {
-                                std::io::Error::new(
-                                    std::io::ErrorKind::InvalidInput,
-                                    "decision expiry exceeds local clock range",
-                                )
-                            })
-                            .and_then(|until| outbox.push_with_deadline(line, until, expired)),
-                        None => outbox.push(line),
-                    };
-                    if let Err(error) = queued {
-                        log::warn!(
-                            "[sokol-crowdsec] decision rejected before queueing: {}",
-                            error
+        if first_poll || poll_finished.elapsed() >= poll_interval {
+            // Conservative local anchor includes the HTTP round-trip and parsing time.
+            let fetched_at = Instant::now();
+            match poll(&args, startup).and_then(|body| batch_from(&body, &args.origins)) {
+                Ok(batch) => {
+                    startup = false;
+                    if batch.skipped_origin + batch.skipped_not_ban + batch.skipped_scope > 0 {
+                        log::info!(
+                            "[sokol-crowdsec] skipped {} other-origin, {} non-ban, {} non-address decisions",
+                            batch.skipped_origin,
+                            batch.skipped_not_ban,
+                            batch.skipped_scope
+                        );
+                    }
+                    if batch.deleted + batch.deleted_skipped > 0 {
+                        log::info!(
+                            "[sokol-crowdsec] {} deleted decisions parsed as retractions, {} not forwarded ones skipped",
+                            batch.deleted,
+                            batch.deleted_skipped
+                        );
+                    }
+                    // Queued, not yet delivered: the outbox keeps them until the node answers, so a
+                    // batch fetched while the node is down is not lost.
+                    if batch.skipped_duration > 0 {
+                        log::warn!("[sokol-crowdsec] skipped {} invalid/expired or unidentifiable timed decisions", batch.skipped_duration);
+                    }
+                    let lost = outbox.lost;
+                    for (index, line) in batch.signals.iter().enumerate() {
+                        let queued = match batch.deadlines.get(&index) {
+                            Some((seconds, expired)) => fetched_at
+                                .checked_add(Duration::from_secs(*seconds))
+                                .ok_or_else(|| {
+                                    std::io::Error::new(
+                                        std::io::ErrorKind::InvalidInput,
+                                        "decision expiry exceeds local clock range",
+                                    )
+                                })
+                                .and_then(|until| outbox.push_with_deadline(line, until, expired)),
+                            None => outbox.push(line),
+                        };
+                        if let Err(error) = queued {
+                            log::warn!(
+                                "[sokol-crowdsec] decision rejected before queueing: {}",
+                                error
+                            );
+                        }
+                    }
+                    if outbox.lost > lost {
+                        log::error!(
+                            "[sokol-crowdsec] outbox full: {} oldest decisions dropped",
+                            outbox.lost - lost
                         );
                     }
                 }
-                if outbox.lost > lost {
-                    log::error!(
-                        "[sokol-crowdsec] outbox full: {} oldest decisions dropped",
-                        outbox.lost - lost
+                Err(e) => {
+                    // The server may have advanced its cursor even when the client did
+                    // not obtain a usable batch. Ask for retained full state next time.
+                    startup = true;
+                    log::warn!(
+                        "[sokol-crowdsec] LAPI poll failed: {}; requesting full stream on next poll",
+                        e
                     );
                 }
             }
-            Err(e) => {
-                // The server may have advanced its cursor even when the client did
-                // not obtain a usable batch. Ask for retained full state next time.
-                startup = true;
-                log::warn!(
-                    "[sokol-crowdsec] LAPI poll failed: {}; requesting full stream on next poll",
-                    e
-                );
-            }
+            poll_finished = Instant::now();
+            first_poll = false;
         }
-        deliver(&mut outbox, &args.ipc_socket, pause);
-        std::thread::sleep(Duration::from_secs(args.poll_secs));
+        deliver(
+            &mut outbox,
+            &args.ipc_socket,
+            pause,
+            poll_finished,
+            poll_interval,
+        );
+        // Poll and send clocks are independent: a healthy backlog continues to
+        // drain until the poll is due; an empty queue waits for that poll. Retry
+        // readiness is private to Outbox, so check backoff at a bounded cadence.
+        let until_poll = poll_interval.saturating_sub(poll_finished.elapsed());
+        if outbox.pending() == 0 {
+            std::thread::sleep(until_poll);
+        } else if outbox.failing {
+            std::thread::sleep(until_poll.min(Duration::from_millis(50)));
+        }
     }
 }
 
@@ -585,7 +619,13 @@ mod tests {
         let listener = UnixListener::bind(&socket).unwrap();
         listener.set_nonblocking(true).unwrap();
         // No fake peer responds: an erroneous retry can finish via the answer timeout.
-        deliver(&mut outbox, &socket, Duration::ZERO);
+        deliver(
+            &mut outbox,
+            &socket,
+            Duration::ZERO,
+            Instant::now(),
+            Duration::from_secs(60),
+        );
         let attempted = listener.accept();
         drop(listener);
         std::fs::remove_dir_all(directory).unwrap();
