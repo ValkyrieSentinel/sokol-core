@@ -212,8 +212,9 @@ identity: after a detected truncation, even on the same inode, old-content work 
 current file's recovery cursor to zero. Once that work leaves the queue, the cursor advances
 within the current contents. The saved inode/position format is unchanged. This does not
 recover pre-truncation bytes after process loss. Inode and length still cannot detect
-truncation followed by regrowth beyond the saved position between observations. Alerts older than `--max-alert-age-secs`
-(default 600) are skipped; replayed alerts retain their event IDs for duplicate recognition.
+truncation followed by regrowth beyond the saved position between observations.
+Alerts older than `--max-alert-age-secs` (default 600) are skipped; replayed alerts retain
+their event IDs for duplicate recognition.
 
 The reader processes at most **1 MiB of bytes or 256 completed lines per poll**, counting
 invalid lines too, then yields to delivery and the existing once-per-second checkpoint check. It retains at

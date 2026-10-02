@@ -133,9 +133,9 @@ class RecoveryTests(unittest.TestCase):
                 self.assertLess(len(first), len(prefix))
                 eve.write_text(first)
                 self.assertEqual(eve.stat().st_ino, inode)
-                # The adapter retries a missing socket without blocking its reader.
-                # Leave the short file visible for several 50 ms reader iterations.
-                time.sleep(1.2)
+                # Observe the reset before regrowth, rather than racing the reader.
+                # An empty or short intermediate file is acceptable; both reset it.
+                await_cursor(cursor, {"inode": inode, "position": 0}, proc)
                 with eve.open("a") as file:
                     file.write(alert(expected_ips[1]))
                 self.assertGreater(eve.stat().st_size, len(prefix))
