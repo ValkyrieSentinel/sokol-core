@@ -2371,6 +2371,49 @@ mod tests {
         assert_eq!(t.retractions.len(), MAX_KNOWN_CLAIMS);
     }
 
+    fn fill_claim_memory(t: &mut BlockTable<FakeLists>, seed: &Claim) {
+        for i in 0..MAX_KNOWN_CLAIMS - t.claims.len() {
+            t.claims.insert(
+                format!("flood-{i}"),
+                Held {
+                    claim: Claim {
+                        issuer: 2,
+                        ..seed.clone()
+                    },
+                    net: ip("203.0.113.9"),
+                    until_ms: seed.expires_ms,
+                    end_local: seed.expires_ms,
+                    allowed: true,
+                    in_quota: false,
+                    ended: false,
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn a_plain_lift_needs_no_free_claim_slot() {
+        let mut t = table(1, 64);
+        let claim = signal(&mut t, "crowdsec", "17", "203.0.113.9", T0, None)
+            .unwrap()
+            .claim;
+        fill_claim_memory(&mut t, &claim);
+        assert_eq!(t.claims.len(), MAX_KNOWN_CLAIMS);
+        assert!(lifted(&t.retract_detection(
+            "crowdsec",
+            "17",
+            ip("203.0.113.9"),
+            T0 + S
+        )));
+        assert!(!t.is_blocked(ip("203.0.113.9")));
+        assert_eq!(
+            t.claims.len(),
+            MAX_KNOWN_CLAIMS,
+            "no replacement claim needed"
+        );
+        assert_eq!(t.retractions.len(), 1);
+    }
+
     #[test]
     fn a_shortening_capacity_refusal_keeps_both_event_supports() {
         let mut t = table(1, 64);
@@ -2378,23 +2421,7 @@ mod tests {
             .unwrap()
             .claim;
         signal(&mut t, "suricata", "5", "203.0.113.9", T0 + S, None).unwrap();
-        for i in 0..MAX_KNOWN_CLAIMS - 1 {
-            t.claims.insert(
-                format!("flood-{i}"),
-                Held {
-                    claim: Claim {
-                        issuer: 2,
-                        ..long.clone()
-                    },
-                    net: ip("203.0.113.9"),
-                    until_ms: long.expires_ms,
-                    end_local: long.expires_ms,
-                    allowed: true,
-                    in_quota: false,
-                    ended: false,
-                },
-            );
-        }
+        fill_claim_memory(&mut t, &long);
         let before = t.take_persisted(T0 + 2 * S);
         let out = t.retract_detection("crowdsec", "17", ip("203.0.113.9"), T0 + 2 * S);
         assert_eq!(

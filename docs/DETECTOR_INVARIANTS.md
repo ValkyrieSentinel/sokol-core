@@ -144,7 +144,7 @@ Owner: [BlockTable::retract_detection](../orchestrator/src/block_table.rs),
 | ID | Invariant and enforcement point | Executable evidence |
 |---|---|---|
 | NODE-R1 | When an identified event requires lifting/shortening own detector claims, capacity is checked for every missing retraction record, owner entry and replacement claim before support removal or replay-marker insertion. Capacity refusal preserves claims, support and event memory; after capacity is freed the same explicit request remains eligible. | `a_capacity_refusal_preserves_retraction_intent_for_retry`, `a_shortening_capacity_refusal_keeps_both_event_supports`, `retraction_admission_reserves_every_needed_record`, `a_full_retractor_set_preserves_support_until_its_owner_fits` |
-| NODE-R2 | Admission counts missing records, not all claims: a full global record table can update a suitable existing record. A still-held event requires no new claim/tombstone storage. | `an_existing_record_can_accept_its_owner_at_the_global_capacity`, `an_event_still_held_needs_no_new_retraction_storage` |
+| NODE-R2 | Admission counts missing records, not all claims: a full global record table can update a suitable existing record. A still-held event requires no new claim/tombstone storage. | `an_existing_record_can_accept_its_owner_at_the_global_capacity`, `an_event_still_held_needs_no_new_retraction_storage`, `a_plain_lift_needs_no_free_claim_slot` |
 | NODE-R3 | Capacity refusal is reported as `refused` in audit/metrics and `OK refused retraction state capacity` over IPC. The outbox classifies it as a final refusal, not a recorded lift or transport retry. | `a_retraction_capacity_refusal_is_not_an_ipc_success`, `a_retraction_capacity_refusal_is_a_final_refusal_not_a_recorded_effect` |
 
 Baseline regressions: a full retraction map returned `lifted` while the block remained;
@@ -160,3 +160,9 @@ updates diagnostics but creates no removal, broadcast or background retry obliga
 Kernel deletion may still fail and remain pending after an admitted retraction. Bounded
 support/event memory, asynchronous persistence and mesh delivery keep their existing
 limits. These tests do not certify physical NIC behavior or distributed atomic removal.
+
+Audit replay re-runs decisions in a fresh table. A capacity-dependent `refused` result
+needs the same initial claim/retraction occupancy and owner sets to reproduce; an audit
+slice without that state can produce a mismatch. Replay does not currently distinguish
+that missing resource context from other mismatches. The record remains a reported
+refusal; a fresh replay outcome is not evidence that it succeeded in the original node.

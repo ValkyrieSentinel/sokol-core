@@ -2791,6 +2791,8 @@ async fn main() -> Result<(), anyhow::Error> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn a_retraction_capacity_refusal_is_not_an_ipc_success() {
         assert_eq!(
@@ -2798,8 +2800,6 @@ mod tests {
             "OK refused retraction state capacity"
         );
     }
-
-    use super::*;
 
     fn temp_log(name: &str) -> String {
         let dir = std::env::temp_dir().join(format!("sokol-db-{}-{}", name, std::process::id()));
