@@ -116,12 +116,48 @@ class RecoveryTests(unittest.TestCase):
                             with self.assertRaises(socket.timeout):
                                 reader.readline(4097)
 
-    def test_invalid_utf8_does_not_drop_neighbouring_alerts(self):
-        with tempfile.TemporaryDirectory(prefix="sokol-utf8-", dir="/tmp") as directory:
+    def test_bad_records_do_not_drop_neighbouring_alerts(self):
+        oversized = json.loads(alert("203.0.113.99"))
+        oversized["padding"] = "x" * (1024 * 1024)
+        for name, bad_record in [
+            ("invalid UTF-8", b"\xff\n"),
+            ("oversized valid JSON alert", (json.dumps(oversized) + "\n").encode()),
+        ]:
+            with self.subTest(record=name):
+                with tempfile.TemporaryDirectory(prefix="sokol-utf8-", dir="/tmp") as directory:
+                    root = Path(directory)
+                    eve, cursor, ipc = root / "eve.json", root / "cursor", root / "ipc.sock"
+                    ips = ["203.0.113.4", "203.0.113.5"]
+                    eve.write_bytes(alert(ips[0]).encode() + bad_record + alert(ips[1]).encode())
+                    with socket.socket(socket.AF_UNIX) as server:
+                        server.bind(str(ipc))
+                        server.listen(1)
+                        server.settimeout(WAIT_SECONDS)
+                        args = [str(self.binary), "--eve", str(eve), "--cursor-file", str(cursor),
+                                "--ipc-socket", str(ipc), "--from-start"]
+                        with running(args) as proc:
+                            conn, _ = server.accept()
+                            with conn:
+                                conn.settimeout(WAIT_SECONDS)
+                                with conn.makefile("rb") as reader:
+                                    self.assertEqual(reader.readline(4097), b"ACK\n")
+                                    conn.sendall(b"OK ack\n")
+                                    for ip in ips:
+                                        line = reader.readline(4097).decode()
+                                        self.assertTrue(line.startswith("SIGNAL#"), line)
+                                        self.assertEqual(line.partition(":")[2],
+                                                         f"suricata|{ip}|-|sid:123 recovery probe\n")
+                                        conn.sendall(b"OK applied\n")
+                                    await_cursor(cursor, {"inode": eve.stat().st_ino,
+                                                          "position": eve.stat().st_size}, proc)
+
+    def test_backlog_does_not_sleep_between_every_batch(self):
+        # 100,000 records / 256 per batch * 50 ms would delay this alert by >19 s.
+        # The existing 10 s socket deadline detects that artificial delay.
+        with tempfile.TemporaryDirectory(prefix="sokol-backlog-", dir="/tmp") as directory:
             root = Path(directory)
             eve, cursor, ipc = root / "eve.json", root / "cursor", root / "ipc.sock"
-            ips = ["203.0.113.4", "203.0.113.5"]
-            eve.write_bytes(alert(ips[0]).encode() + b"\xff\n" + alert(ips[1]).encode())
+            eve.write_text("{}\n" * 100_000 + alert("203.0.113.6"))
             with socket.socket(socket.AF_UNIX) as server:
                 server.bind(str(ipc))
                 server.listen(1)
@@ -135,12 +171,11 @@ class RecoveryTests(unittest.TestCase):
                         with conn.makefile("rb") as reader:
                             self.assertEqual(reader.readline(4097), b"ACK\n")
                             conn.sendall(b"OK ack\n")
-                            for ip in ips:
-                                line = reader.readline(4097).decode()
-                                self.assertTrue(line.startswith("SIGNAL#"), line)
-                                self.assertEqual(line.partition(":")[2],
-                                                 f"suricata|{ip}|-|sid:123 recovery probe\n")
-                                conn.sendall(b"OK applied\n")
+                            line = reader.readline(4097).decode()
+                            self.assertTrue(line.startswith("SIGNAL#"), line)
+                            self.assertEqual(line.partition(":")[2],
+                                             "suricata|203.0.113.6|-|sid:123 recovery probe\n")
+                            conn.sendall(b"OK applied\n")
                             await_cursor(cursor, {"inode": eve.stat().st_ino,
                                                   "position": eve.stat().st_size}, proc)
 

@@ -204,11 +204,23 @@ sokol-suricata --eve /var/log/suricata/eve.json --ipc-socket /run/sokol/sokol.so
     --cursor-file /var/lib/sokol/suricata.cursor
 ```
 
-With `--cursor-file` the adapter remembers where it got to (the oldest alert the node has not
-answered yet) and resumes there after a restart, so alerts written while it was down are not
-lost; a file rotated meanwhile is read from its start. Alerts older than `--max-alert-age-secs`
-(default 600) are skipped, so catching up after a long outage does not turn old events into new
-blocks. Replays are safe: the node recognises an alert it already acted on.
+With `--cursor-file` the adapter saves the oldest unanswered position for restart.
+Recovery opens only the current EVE path: queued alerts in rotated-away files are not
+recovered after process loss. During live rotation it drains unread bytes from the old
+open file before switching to the new one. Inode and length do not detect truncation
+followed by regrowth beyond the saved position. Alerts older than `--max-alert-age-secs`
+(default 600) are skipped; replayed alerts retain their event IDs for duplicate recognition.
+
+The reader processes at most **1 MiB of bytes or 256 completed lines per poll**, counting
+invalid lines too, then yields to delivery and the existing once-per-second checkpoint check. It retains at
+most **1 MiB of unfinished line data**, including the final LF. A larger record (even valid JSON) is logged and
+skipped through its LF; the next record is read normally. Invalid UTF-8 completed lines
+are also logged and skipped. These are fixed operational quotas, not measured throughput
+or wall-clock deadlines, and the line-data cap is not a whole-process memory limit.
+Delivery and the checkpoint check still run between batches, but a budget-exhausted poll
+is followed immediately by the next iteration. The 50 ms idle pause
+applies only when a poll does not exhaust a budget (or returns an error).
+
 
 The node blocks the offending address in XDP, shares the block with its mesh peers and records the
 rule in the audit log (`suricata: sid:<id> <signature>`). If the alert fired on this node's own
