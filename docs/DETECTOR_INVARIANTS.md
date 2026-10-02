@@ -161,8 +161,25 @@ Kernel deletion may still fail and remain pending after an admitted retraction. 
 support/event memory, asynchronous persistence and mesh delivery keep their existing
 limits. These tests do not certify physical NIC behavior or distributed atomic removal.
 
-Audit replay re-runs decisions in a fresh table. A capacity-dependent `refused` result
-needs the same initial claim/retraction occupancy and owner sets to reproduce; an audit
-slice without that state can produce a mismatch. Replay does not currently distinguish
-that missing resource context from other mismatches. The record remains a reported
-refusal; a fresh replay outcome is not evidence that it succeeded in the original node.
+## Audit replay evidence
+
+Owner: [replay_records / print_report](../orchestrator/src/replay.rs),
+[ADR-0016](adr/0016-decision-replay.md).
+
+| ID | Invariant and enforcement point | Executable evidence |
+|---|---|---|
+| REPLAY-R1 | A recorded retraction capacity refusal that the fresh replay cannot reproduce is unverified. Its speculative table is discarded; dependent decisions are insufficient until a new usable start record. It is neither a verified refusal nor a cascade of mismatches. | `an_unverified_capacity_refusal_fences_dependent_replay_until_a_fresh_start`, `a_wrong_retraction_outcome_remains_a_mismatch` |
+| REPLAY-R2 | Any insufficient decision prevents CLI success even when earlier/later decisions reproduce. Actual mismatches retain exit 1; complete nonempty replay has exit 0; incomplete/empty replay has exit 2. | `a_partially_reproduced_audit_is_not_a_successful_cli_result` (real chained files and `print_report`), XDP smoke requires zero insufficient decisions |
+
+Baseline regressions: a recorded capacity refusal replayed as `lifted`, then its retry
+as `duplicate`, producing two mismatches on a table changed by speculation. A journal
+with a decision before its start record and a later reproduced decision returned 0.
+Both regressions compiled and failed their outcome assertions before the fix.
+
+Claim/retraction occupancy and owner sets can depend on unlogged mesh inputs. This
+classification does not establish that the refusal was correct: a faulty/fabricated
+refusal can also remain unverified and yields exit 2. A new start restores replay context,
+not evidence for earlier decisions. Other missing-input/mismatch handling retains its
+existing scope; there is no complete mesh/resource-state reconstruction. Protected-set
+refusals remain separately counted outside replay scope, even at exit 0. Chain validation
+checks integrity, not authenticity against an actor able to rewrite the chain.

@@ -665,7 +665,7 @@ stop_orchestrator
 "$BIN" --replay "$WORK/events.sntl" >"$WORK/replay.out" 2>&1 && REPLAY_STATUS=0 || REPLAY_STATUS=$?
 echo "      $(tail -1 "$WORK/replay.out")"
 check "the node's detector decisions replay from its audit log: all reproduced, none mismatched" \
-    bash -c "test $REPLAY_STATUS = 0 && grep -Eq ': [1-9][0-9]* reproduced, 0 mismatched' '$WORK/replay.out'"
+    bash -c "test $REPLAY_STATUS = 0 && grep -Eq ': [1-9][0-9]* reproduced, 0 mismatched, 0 without enough context,' '$WORK/replay.out'"
 cp "$WORK/events.sntl" "$WORK/tampered.sntl"
 # Flip a bit (writing a fixed byte could leave it unchanged: that byte may already hold it).
 python3 -c "import sys; f = open(sys.argv[1], 'r+b'); f.seek(200); b = f.read(1)[0]; f.seek(200); f.write(bytes([b ^ 1]))" "$WORK/tampered.sntl"
