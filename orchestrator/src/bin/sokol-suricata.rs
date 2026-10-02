@@ -211,6 +211,14 @@ const MAX_EVE_LINE_BYTES: usize = 1024 * 1024;
 const MAX_POLL_BYTES: usize = 1024 * 1024;
 const MAX_POLL_LINES: usize = 256;
 
+/// Completed records survive a later read error in the same bounded scan.
+/// File metadata/open errors still return Err from poll before scanning starts.
+#[derive(Debug, Default)]
+struct ReadBatch {
+    lines: Vec<(u64, String)>,
+    error: Option<io::Error>,
+}
+
 /// `tail -F` for one file: survives truncation and rotation (rename + new file).
 struct Follower {
     path: PathBuf,
@@ -365,7 +373,7 @@ impl Follower {
     /// One bounded batch of complete lines, each with its starting byte position.
     /// Budgets count consumed bytes and all completed lines (including skipped ones).
     /// BufReader may prefetch; these are work quotas, not a wall-clock deadline.
-    fn poll(&mut self) -> io::Result<Vec<(u64, String)>> {
+    fn poll(&mut self) -> io::Result<ReadBatch> {
         self.budget_exhausted = false; // errors/EOF must not cause a busy retry loop
         match std::fs::metadata(&self.path) {
             Ok(_) if self.reader.is_none() => self.open(false)?,
@@ -384,17 +392,33 @@ impl Follower {
             }
             Ok(meta) if meta.len() < self.position => self.open(false)?,
             Ok(_) => {}
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(ReadBatch::default()),
             Err(e) => return Err(e),
         }
-        let Some(reader) = self.reader.as_mut() else {
-            return Ok(Vec::new());
+        let Some(mut reader) = self.reader.take() else {
+            return Ok(ReadBatch::default());
         };
+        let result = self.read_batch(&mut reader);
+        self.reader = Some(reader);
+        Ok(result)
+    }
+
+    /// Scan a bounded portion of any buffered input. Production uses the open file;
+    /// tests can exercise actual I/O failures without a production failpoint.
+    fn read_batch<R: BufRead>(&mut self, reader: &mut R) -> ReadBatch {
+        self.budget_exhausted = false;
+        let mut error = None;
         let mut lines = Vec::new();
         let mut remaining = MAX_POLL_BYTES;
         let mut completed = 0;
         while remaining > 0 && completed < MAX_POLL_LINES {
-            let bytes = reader.fill_buf()?;
+            let bytes = match reader.fill_buf() {
+                Ok(bytes) => bytes,
+                Err(failure) => {
+                    error = Some(failure);
+                    break; // keep completed lines, partial bytes and the open reader
+                }
+            };
             if bytes.is_empty() {
                 break;
             }
@@ -431,8 +455,8 @@ impl Follower {
                 completed += 1;
             }
         }
-        self.budget_exhausted = remaining == 0 || completed == MAX_POLL_LINES;
-        Ok(lines)
+        self.budget_exhausted = error.is_none() && (remaining == 0 || completed == MAX_POLL_LINES);
+        ReadBatch { lines, error }
     }
 }
 
@@ -511,9 +535,12 @@ fn main() {
 
     loop {
         match follower.poll() {
-            Ok(lines) => {
+            Ok(batch) => {
+                if let Some(error) = batch.error {
+                    log::error!("[sokol-suricata] reading {}: {}", args.eve.display(), error);
+                }
                 let now_ms = chrono::Utc::now().timestamp_millis();
-                for (start, line) in lines {
+                for (start, line) in batch.lines {
                     let Some(alert) = decide(&line, &filter) else {
                         continue;
                     };
@@ -658,7 +685,12 @@ mod tests {
     }
 
     fn lines(f: &mut Follower) -> Vec<String> {
-        f.poll().unwrap().into_iter().map(|(_, l)| l).collect()
+        f.poll()
+            .unwrap()
+            .lines
+            .into_iter()
+            .map(|(_, l)| l)
+            .collect()
     }
 
     #[test]
@@ -701,7 +733,7 @@ mod tests {
         std::fs::write(&path, "aa\nbbb\ncc").unwrap();
         let mut f = Follower::new(&path, true);
         assert_eq!(
-            f.poll().unwrap(),
+            f.poll().unwrap().lines,
             vec![(0, "aa\n".to_string()), (3, "bbb\n".to_string())]
         );
         assert_eq!(
@@ -719,7 +751,7 @@ mod tests {
         let (path, saved) = (dir.join("eve.json"), dir.join("cursor"));
         std::fs::write(&path, "one\ntwo\n").unwrap();
         let mut f = Follower::new(&path, true);
-        let _ = f.poll().unwrap();
+        let _ = f.poll().unwrap().lines;
         let cursor = Cursor {
             position: 4, // "two" was queued but not yet answered when the adapter stopped
             ..f.cursor()
@@ -797,7 +829,7 @@ mod tests {
         let path = dir.join("eve.json");
         std::fs::write(&path, "already read\nold pending\n").unwrap();
         let mut follower = Follower::new(&path, true);
-        let old_lines = follower.poll().unwrap();
+        let old_lines = follower.poll().unwrap().lines;
         let old = follower.queued_at(old_lines[1].0);
         assert_eq!(
             follower.checkpoint(Some(&old)),
@@ -808,7 +840,7 @@ mod tests {
         std::fs::rename(&path, dir.join("eve.json.1")).unwrap();
         let new_content = "new first\nnew second\nnew third\n";
         std::fs::write(&path, new_content).unwrap();
-        let new_lines = follower.poll().unwrap();
+        let new_lines = follower.poll().unwrap().lines;
         assert_ne!(follower.cursor().inode, old.cursor.inode);
         assert!(
             new_content.len() as u64 > old.cursor.position,
@@ -852,21 +884,21 @@ mod tests {
         let path = dir.join("eve.json");
         std::fs::write(&path, "already read\nold pending\n").unwrap();
         let mut follower = Follower::new(&path, true);
-        let old_lines = follower.poll().unwrap();
+        let old_lines = follower.poll().unwrap().lines;
         let old = follower.queued_at(old_lines[1].0);
         assert_eq!(follower.checkpoint(Some(&old)), old.cursor);
 
         // The reader observes shorter contents before they regrow past the old offset.
         std::fs::write(&path, "new first\n").unwrap();
         assert_eq!(std::fs::metadata(&path).unwrap().ino(), old.cursor.inode);
-        let first = follower.poll().unwrap();
+        let first = follower.poll().unwrap().lines;
         assert_eq!(first[0].1, "new first\n");
         let mut writer = std::fs::OpenOptions::new()
             .append(true)
             .open(&path)
             .unwrap();
         writer.write_all(b"new second\nnew third\n").unwrap();
-        let more = follower.poll().unwrap();
+        let more = follower.poll().unwrap().lines;
         assert!(std::fs::metadata(&path).unwrap().len() > old.cursor.position);
         let checkpoint = follower.checkpoint(Some(&old));
         assert_eq!(
@@ -886,6 +918,117 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    struct ReadFault {
+        bytes: std::io::Cursor<Vec<u8>>,
+        fail_at: u64,
+        failed: bool,
+    }
+
+    impl std::io::Read for ReadFault {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if self.bytes.position() == self.fail_at && !self.failed {
+                self.failed = true;
+                return Err(io::Error::other("injected read failure"));
+            }
+            let limit = if self.failed {
+                buf.len()
+            } else {
+                buf.len()
+                    .min((self.fail_at - self.bytes.position()) as usize)
+            };
+            std::io::Read::read(&mut self.bytes, &mut buf[..limit])
+        }
+    }
+
+    #[test]
+    fn a_read_error_preserves_completed_alerts_and_unfinished_bytes() {
+        let dir =
+            std::env::temp_dir().join(format!("sokol-suricata-read-error-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("eve.json");
+        let first = format!("{ALERT}\n");
+        let second = format!("{}\n", ALERT.replace("telnet probe", "é probe"));
+        let split = second.find('é').unwrap() + 1; // between the two UTF-8 bytes
+        let bytes = format!("{first}{second}").into_bytes();
+        std::fs::write(&path, &bytes).unwrap();
+        let mut follower = Follower::new(&path, true);
+        let token = follower.content.clone();
+        let fault = ReadFault {
+            bytes: std::io::Cursor::new(bytes),
+            fail_at: (first.len() + split) as u64,
+            failed: false,
+        };
+        let mut reader = BufReader::with_capacity(7, fault);
+        let result = follower.read_batch(&mut reader);
+        assert_eq!(
+            result.lines.len(),
+            1,
+            "a later I/O error must not erase a completed alert"
+        );
+        assert_eq!(result.error.unwrap().to_string(), "injected read failure");
+        let batch = result.lines;
+        assert_eq!(batch, vec![(0, first.clone())]);
+        assert!(decide(&batch[0].1, &filter()).is_some());
+        assert!(
+            !follower.budget_exhausted,
+            "read errors must yield rather than busy-loop"
+        );
+        assert!(std::rc::Rc::ptr_eq(&token, &follower.content));
+        let pending = follower.queued_at(batch[0].0);
+        assert_eq!(follower.checkpoint(Some(&pending)).position, 0);
+        let resumed = follower.read_batch(&mut reader);
+        assert!(resumed.error.is_none());
+        let resumed = resumed.lines;
+        assert_eq!(resumed, vec![(first.len() as u64, second.clone())]);
+        assert!(decide(&resumed[0].1, &filter()).is_some());
+        assert_eq!(
+            follower.cursor().position,
+            (first.len() + second.len()) as u64
+        );
+        assert!(follower.read_batch(&mut reader).lines.is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn read_errors_before_a_complete_line_preserve_the_cursor_and_retry_bytes() {
+        let dir = std::env::temp_dir().join(format!(
+            "sokol-suricata-incomplete-error-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("eve.json");
+        let line = format!("{}\n", ALERT.replace("telnet probe", "é probe"));
+        std::fs::write(&path, &line).unwrap();
+        for fail_at in [
+            0,
+            (line.find('é').unwrap() + 1) as u64,
+            (line.len() - 1) as u64,
+        ] {
+            let mut follower = Follower::new(&path, true);
+            let fault = ReadFault {
+                bytes: std::io::Cursor::new(line.as_bytes().to_vec()),
+                fail_at,
+                failed: false,
+            };
+            let mut reader = BufReader::with_capacity(7, fault);
+            let failed = follower.read_batch(&mut reader);
+            assert!(failed.error.is_some());
+            assert!(failed.lines.is_empty());
+            assert_eq!(
+                follower.cursor().position,
+                0,
+                "never checkpoint an unfinished record"
+            );
+            assert!(!follower.budget_exhausted);
+            let retried = follower.read_batch(&mut reader);
+            assert!(retried.error.is_none());
+            assert_eq!(retried.lines, vec![(0, line.clone())]);
+            assert!(decide(&retried.lines[0].1, &filter()).is_some());
+            assert_eq!(follower.cursor().position, line.len() as u64);
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn invalid_utf8_does_not_discard_valid_lines_or_shift_the_cursor() {
         let dir = std::env::temp_dir().join(format!(
@@ -902,7 +1045,7 @@ mod tests {
             "one malformed line must not discard the batch: {batch:?}"
         );
         assert_eq!(
-            batch.unwrap(),
+            batch.unwrap().lines,
             vec![(0, "first\n".into()), (8, "last\n".into())]
         );
         assert_eq!(follower.cursor().position, 13);
@@ -926,7 +1069,7 @@ mod tests {
             batch.is_ok(),
             "an unfinished character is not a malformed line: {batch:?}"
         );
-        assert_eq!(batch.unwrap(), vec![(0, "first\n".into())]);
+        assert_eq!(batch.unwrap().lines, vec![(0, "first\n".into())]);
         assert_eq!(follower.cursor().position, 6);
         assert!(lines(&mut follower).is_empty());
         let mut writer = std::fs::OpenOptions::new()
@@ -934,7 +1077,7 @@ mod tests {
             .open(&path)
             .unwrap();
         writer.write_all(b"\xa9\n").unwrap();
-        assert_eq!(follower.poll().unwrap(), vec![(6, "é\n".into())]);
+        assert_eq!(follower.poll().unwrap().lines, vec![(6, "é\n".into())]);
         assert_eq!(
             follower.cursor().position,
             9,
@@ -953,11 +1096,11 @@ mod tests {
         let path = dir.join("eve.json");
         std::fs::write(&path, "x\n".repeat(MAX_POLL_LINES + 1)).unwrap();
         let mut f = Follower::new(&path, true);
-        assert_eq!(f.poll().unwrap().len(), MAX_POLL_LINES);
+        assert_eq!(f.poll().unwrap().lines.len(), MAX_POLL_LINES);
         assert!(f.budget_exhausted);
         assert_eq!(f.cursor().position, (2 * MAX_POLL_LINES) as u64);
         assert_eq!(
-            f.poll().unwrap(),
+            f.poll().unwrap().lines,
             vec![((2 * MAX_POLL_LINES) as u64, "x\n".into())]
         );
         assert!(!f.budget_exhausted);
@@ -977,7 +1120,7 @@ mod tests {
         let mut f = Follower::new(&path, true);
         while f.position < length as u64 {
             let before = f.position;
-            assert!(f.poll().unwrap().is_empty());
+            assert!(f.poll().unwrap().lines.is_empty());
             assert!(f.position > before && f.position - before <= MAX_POLL_BYTES as u64);
             assert!(f.partial.len() <= MAX_EVE_LINE_BYTES);
             assert_eq!(
@@ -992,7 +1135,7 @@ mod tests {
             .unwrap();
         writer.write_all(b"tail\nok\n").unwrap();
         assert_eq!(
-            f.poll().unwrap(),
+            f.poll().unwrap().lines,
             vec![((length + 5) as u64, "ok\n".into())]
         );
         assert_eq!(f.cursor().position, (length + 8) as u64);
@@ -1011,7 +1154,7 @@ mod tests {
         let mut f = Follower::new(&path, true);
         let mut observed = Vec::new();
         while f.position < std::fs::metadata(&path).unwrap().len() {
-            observed.extend(f.poll().unwrap());
+            observed.extend(f.poll().unwrap().lines);
         }
         assert_eq!(
             observed,
@@ -1033,16 +1176,16 @@ mod tests {
         let path = dir.join("eve.json");
         std::fs::write(&path, "x\n".repeat(MAX_POLL_LINES + 1)).unwrap();
         let mut f = Follower::new(&path, true);
-        assert_eq!(f.poll().unwrap().len(), MAX_POLL_LINES);
+        assert_eq!(f.poll().unwrap().lines.len(), MAX_POLL_LINES);
         let old_inode = f.cursor().inode;
         std::fs::rename(&path, dir.join("eve.json.1")).unwrap();
         std::fs::write(&path, "new\n").unwrap();
         assert_eq!(
-            f.poll().unwrap(),
+            f.poll().unwrap().lines,
             vec![((MAX_POLL_LINES * 2) as u64, "x\n".into())]
         );
         assert_eq!(f.cursor().inode, old_inode);
-        assert_eq!(f.poll().unwrap(), vec![(0, "new\n".into())]);
+        assert_eq!(f.poll().unwrap().lines, vec![(0, "new\n".into())]);
         assert_ne!(f.cursor().inode, old_inode);
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -1060,14 +1203,14 @@ mod tests {
             std::fs::write(&path, vec![b'x'; length]).unwrap();
             let mut f = Follower::new(&path, true);
             while f.position < length as u64 {
-                assert!(f.poll().unwrap().is_empty());
+                assert!(f.poll().unwrap().lines.is_empty());
             }
             assert!(f.discarding);
             if rotate {
                 std::fs::rename(&path, dir.join("eve.json.1")).unwrap();
             }
             std::fs::write(&path, "fresh\n").unwrap();
-            assert_eq!(f.poll().unwrap(), vec![(0, "fresh\n".into())]);
+            assert_eq!(f.poll().unwrap().lines, vec![(0, "fresh\n".into())]);
             std::fs::remove_dir_all(dir).unwrap();
         }
     }
@@ -1084,10 +1227,10 @@ mod tests {
         bytes.extend_from_slice(b"ok\n");
         std::fs::write(&path, bytes).unwrap();
         let mut f = Follower::new(&path, true);
-        assert!(f.poll().unwrap().is_empty());
+        assert!(f.poll().unwrap().lines.is_empty());
         assert_eq!(f.position, (2 * MAX_POLL_LINES) as u64);
         assert_eq!(
-            f.poll().unwrap(),
+            f.poll().unwrap().lines,
             vec![((2 * (MAX_POLL_LINES + 1)) as u64, "ok\n".into())]
         );
         std::fs::remove_dir_all(dir).unwrap();

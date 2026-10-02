@@ -225,6 +225,11 @@ or wall-clock deadlines, and the line-data cap is not a whole-process memory lim
 Delivery and the checkpoint check still run between batches, but a budget-exhausted poll
 is followed immediately by the next iteration. The 50 ms idle pause
 applies only when a poll does not exhaust a budget (or returns an error).
+A read error after complete records returns those records together with the error:
+the adapter logs the failure and still processes the completed prefix. Unfinished bytes
+and the open reader remain for the next attempt, and the error yields through the idle
+pause rather than a busy retry. The checkpoint remains at the start of unfinished data
+or the oldest queued alert. Metadata/open errors before scanning still return no records.
 
 
 The node blocks the offending address in XDP, shares the block with its mesh peers and records the
