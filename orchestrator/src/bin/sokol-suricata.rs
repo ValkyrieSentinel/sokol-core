@@ -174,6 +174,7 @@ struct Gate {
     // One entry per retained address, ordered by successful admission time.
     expires: VecDeque<(IpAddr, Instant)>,
     capacity_refused: u64,
+    cooldown_refused: u64,
     window_start: Option<Instant>,
     in_window: u32,
 }
@@ -191,6 +192,7 @@ impl Gate {
             last_sent: HashSet::new(),
             expires: VecDeque::new(),
             capacity_refused: 0,
+            cooldown_refused: 0,
             window_start: None,
             in_window: 0,
         }
@@ -210,6 +212,7 @@ impl Gate {
             }
         }
         if self.last_sent.contains(&ip) {
+            self.cooldown_refused = self.cooldown_refused.saturating_add(1);
             return false;
         }
         let start = *self.window_start.get_or_insert(now);
@@ -244,6 +247,12 @@ fn forwarding_deadline(
     let remaining = Duration::from_secs(max_age_secs)
         .checked_sub(Duration::from_millis(age_ms))
         .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "stale alert"))?;
+    if remaining.is_zero() {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "no alert forwarding budget remains",
+        ));
+    }
     observed.checked_add(remaining).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -609,6 +618,7 @@ fn main() {
                     log::error!("[sokol-suricata] reading {}: {}", args.eve.display(), error);
                 }
                 let capacity_refused = gate.capacity_refused;
+                let cooldown_refused = gate.cooldown_refused;
                 let observed = Instant::now();
                 let now_ms = chrono::Utc::now().timestamp_millis();
                 for (start, line) in batch.lines {
@@ -662,6 +672,10 @@ fn main() {
                             OUTBOX_CAP
                         );
                     }
+                }
+                let cooldown_skipped = gate.cooldown_refused.saturating_sub(cooldown_refused);
+                if cooldown_skipped > 0 {
+                    log::warn!("[sokol-suricata] {} alerts skipped: source cooldown active (policy admission, not delivery)", cooldown_skipped);
                 }
                 let skipped = gate.capacity_refused.saturating_sub(capacity_refused);
                 if skipped > 0 {
@@ -774,6 +788,7 @@ mod tests {
         let a: IpAddr = "203.0.113.1".parse().unwrap();
         assert!(gate.admit(a, t0));
         assert!(!gate.admit(a, t0 + Duration::from_secs(10)), "cooldown");
+        assert_eq!(gate.cooldown_refused, 1, "repeat refusal is observable");
         assert!(gate.admit(a, t0 + Duration::from_secs(61)), "cooldown over");
 
         let mut gate = Gate::new(Duration::from_secs(60), 3);
@@ -1553,7 +1568,10 @@ mod tests {
             forwarding_deadline(0, 1_500, t, 2).unwrap(),
             t + Duration::from_millis(500)
         );
-        assert_eq!(forwarding_deadline(0, 2_000, t, 2).unwrap(), t);
+        assert_eq!(
+            forwarding_deadline(0, 2_000, t, 2).unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
         assert_eq!(
             forwarding_deadline(0, 2_001, t, 2).unwrap_err().kind(),
             io::ErrorKind::TimedOut
@@ -1562,7 +1580,10 @@ mod tests {
             forwarding_deadline(9_000, 0, t, 2).unwrap(),
             t + Duration::from_secs(2)
         );
-        assert_eq!(forwarding_deadline(0, 0, t, 0).unwrap(), t);
+        assert_eq!(
+            forwarding_deadline(0, 0, t, 0).unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
         assert_eq!(
             forwarding_deadline(i64::MIN, i64::MAX, t, 0)
                 .unwrap_err()

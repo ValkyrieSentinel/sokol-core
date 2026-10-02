@@ -24,6 +24,10 @@ allows immediate renewal; zero rate admits nothing. Policy admission is before o
 framing validation and delivery, so it does not establish that an alert was queued or ACKed.
 Capacity refusal increments a saturating counter and is reported per batch. Such alerts
 are skipped: no retry obligation is created, and checkpointing may advance past them.
+Cooldown-refused attempts also increment a saturating counter and are logged per batch.
+Cooldown starts at policy admission, so even a later never-written expiry leaves it active.
+This intentionally throttles admission during outages; fresh same-source alerts can be
+suppressed until it ends. That suppression is not ACK evidence or guaranteed delivery.
 
 Regression input: 100,000 different IPv4 addresses at one `Instant`, 24-hour cooldown,
 and a rate quota above the fixture size, then one more different address. The previous threshold-and-retain
@@ -35,10 +39,11 @@ failed at that admission assertion before the fix. This does not assert a produc
 | ID | Invariant and enforcement point | Executable evidence |
 |---|---|---|
 | SUR-T1 | A parsed timestamp consumes the configured age budget. Future timestamps grant at most that budget from observation. Integer conversion and local-clock addition are checked; stale/unrepresentable timestamps do not enqueue. Missing/invalid timestamps retain the untimed policy. | `forwarding_budget_ages_exactly_and_future_timestamps_cannot_enlarge_it` |
-| IPC-T1 | An opt-in forwarding deadline is checked before connection/backoff work and after handshake, immediately before preparing a send/retry. Expired FIFO entries are removed in pairs and increment `expired`, never a node-answer result. Each removal spends flush work budget. Source TTL entries still render retractions and require ACK. | `forwarding_expiry_is_counted_loss_not_an_ack_and_spends_flush_budget`, `invalid_freshness_input_does_not_evict_or_create_a_deadline`, `lost_ack_then_freshness_expiry_does_not_resend_or_undo_the_signal`, `lost_answer_keeps_expiry_and_later_retry_sends_its_retraction` |
+| IPC-T1 | An opt-in forwarding deadline is checked before connection/backoff work and after handshake, immediately before preparing a send/retry. Expired FIFO entries are removed in pairs and increment `expired`, never a node-answer result. Each removal spends flush work budget. Source TTL entries still render retractions and require ACK; expired entries behind an unexpired FIFO head wait until they reach the front. | `forwarding_expiry_is_counted_loss_not_an_ack_and_spends_flush_budget`, `invalid_freshness_input_does_not_evict_or_create_a_deadline`, `lost_ack_then_freshness_expiry_does_not_resend_or_undo_the_signal`, `lost_answer_keeps_expiry_and_later_retry_sends_its_retraction` |
 
 The actual-process case `RecoveryTests.test_alert_expiring_during_handshake_is_not_forwarded`
-checks both first send and lost-ACK retry: after a delayed handshake, the next wire command
+checks both first send and lost-ACK retry, including a fresh same-source alert suppressed
+by the still-active admission cooldown (verified diagnostic). After a delayed handshake, the next wire command
 is a new fresh alert, never the stale one or a fabricated retraction; checkpointing advances.
 Before the fix both scenarios sent the stale alert. Freshness expiry is intentional forwarding
 loss. Already applied effects remain under node policy, not a local undo. It does not shorten

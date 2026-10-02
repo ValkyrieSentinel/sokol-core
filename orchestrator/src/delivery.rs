@@ -384,6 +384,11 @@ impl Outbox {
             };
             // The ACK handshake may consume the last of the freshness budget.
             if ready.is_ok() && self.expire_front() {
+                // A successful handshake followed by policy expiry proves reachability,
+                // even though no signal acknowledgement will reset outage state.
+                self.failing = false;
+                self.backoff = BACKOFF_MIN;
+                self.retry_at = None;
                 expired += 1;
                 continue;
             }
