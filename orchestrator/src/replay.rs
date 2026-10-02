@@ -182,6 +182,11 @@ pub fn replay_records<'a>(
             };
             continue;
         }
+        // The protected set is not a replay input, regardless of run context.
+        if tag == "BLOCK_REFUSED" && f.contains_key("Protected") {
+            report.policy_refusals += 1;
+            continue;
+        }
         let table = match &mut run {
             Run::Live(table) => table,
             Run::Blind(why) => {
@@ -225,7 +230,6 @@ pub fn replay_records<'a>(
                     let _ = table.flush_all(at);
                 }
             }
-            "BLOCK_REFUSED" if f.contains_key("Protected") => report.policy_refusals += 1,
             "DETECTOR_RETRACT" => {
                 let event = f.get("Event").and_then(|e| e.split_once('/'));
                 let (Some(net), Some(at), Some((source, id))) = (net, at(&f), event) else {
@@ -238,6 +242,7 @@ pub fn replay_records<'a>(
                     .retract_detection(source, id, net, at)
                     .label()
                     .to_string();
+                // DetectorRetraction::Refused currently means capacity admission only.
                 if recorded == "refused" && replayed != "refused" {
                     // Mesh claims/retraction owners are not logged as replay inputs.
                     // Do not certify the recorded refusal, or continue on the state
@@ -458,6 +463,8 @@ mod tests {
             retraction("refused", 1_001_000),
             retraction("lifted", 1_002_000),
             decision("198.51.100.8", "60s", "new", 1_003_000, "ids/2"),
+            "OPERATOR_BAN_V4|IP:198.51.100.7|At:1004000".into(),
+            "STATE_RESTORED|Blocks:3|Refused:0".into(),
             start(60, 600),
             decision("198.51.100.7", "60s", "new", 2_000_000, "ids/1"),
             retraction("lifted", 2_001_000),
@@ -489,6 +496,23 @@ mod tests {
             report.mismatched,
             vec![(2, "duplicate".into(), "lifted".into())]
         );
+    }
+
+    #[test]
+    fn protected_set_refusals_are_separate_even_without_replay_context() {
+        let protected = "BLOCK_REFUSED|IP:198.51.100.7|Protected:host address".to_string();
+        let report = run(&[
+            protected.clone(),
+            start(60, 600),
+            protected.clone(),
+            decision("198.51.100.8", "60s", "new", 1_000_000, "ids/1"),
+            "STATE_RESTORED|Blocks:3|Refused:0".into(),
+            protected,
+        ]);
+        assert_eq!(report.policy_refusals, 3);
+        assert_eq!(report.reproduced, 1);
+        assert_eq!(report.insufficient.len(), 0);
+        assert_eq!(report.mismatched.len(), 0);
     }
 
     #[test]

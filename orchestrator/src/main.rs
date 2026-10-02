@@ -427,7 +427,8 @@ struct Args {
 
     /// Replay this node's detector decisions from an audit log with this build's code, report
     /// what is reproduced, mismatched or lacks context, then exit (ADR-0016). Exit status:
-    /// 0 all replayable decisions reproduced, 1 a mismatch, 2 nothing could be replayed.
+    /// 0 nonempty replay without mismatches or insufficient context, 1 a mismatch,
+    /// 2 incomplete/empty replay or invalid audit chain. Protected-set refusals are excluded.
     #[arg(long, value_name = "AUDIT_LOG")]
     replay: Option<std::path::PathBuf>,
 
