@@ -15,6 +15,7 @@ Owner: [Gate](../orchestrator/src/bin/sokol-suricata.rs). Time inputs are nondec
 | SUR-G1 | Cooldown membership and expiry FIFO describe the same distinct addresses; each has at most `COOLDOWN_CAP` = 100,000 entries. Start empty; remove the expired prefix from both; refuse at capacity before inserting into both. Never evict an unexpired address to admit another. | `gate_cooldown_memory_has_a_hard_bound_without_eviction`, `gate_generated_history_preserves_cooldown_and_bounded_unique_memory` |
 | SUR-G2 | Successful admissions of one source IP are separated by at least cooldown. A capacity or rate refusal creates neither a new cooldown nor an admitted-rate slot. Only successful admission inserts an expiry tuple and increments the quota. | `gate_capacity_refusal_keeps_live_cooldowns_and_releases_only_expired_slots`, `gate_rate_refusal_does_not_start_cooldown_and_zero_policies_are_defined`, generated history above |
 | SUR-G3 | Expiry inspection is an ordered prefix, with no full-set scan on each hot-cache refusal. Each admitted tuple is appended once and popped at most once. Thus total expiry pops cannot exceed prior successful admissions; each attempt adds at most one stopping head inspection. | Code structure plus mixed renewal/refusal history in `gate_generated_history_preserves_cooldown_and_bounded_unique_memory`; this is accounting, not a timing benchmark. |
+| SUR-G4 | Every `Gate::admit` attempt either admits or routes exactly one refusal reason to its saturating counter: cooldown first, then rate, then capacity. Admission increments no refusal counter; refusing creates no new cooldown or rate slot. Before any category saturates, attempted count equals admissions plus the three refusal counts. | `every_gate_refusal_has_one_counted_policy_reason`, `gate_refusal_counters_saturate_independently`; per-step accounting over 10,000 attempts in `gate_generated_history_preserves_cooldown_and_bounded_unique_memory` |
 
 A single call can expire the entire 100,000-entry FIFO. Hash operations and allocations
 have no hard latency bound, allocated capacity may exceed live entries, and this is not
@@ -24,7 +25,9 @@ allows immediate renewal; zero rate admits nothing. Policy admission is before o
 framing validation and delivery, so it does not establish that an alert was queued or ACKed.
 Capacity refusal increments a saturating counter and is reported in aggregated warnings.
 Such alerts are skipped: no retry obligation is created, and checkpointing may advance past them.
-Cooldown-refused attempts also increment a saturating counter and use the same aggregation.
+Cooldown- and rate-refused attempts also increment saturating counters and use the same aggregation.
+These categories identify the first failing policy, not all constraints an attempt violates.
+For example, a new address at full rate and full capacity counts only as rate refusal.
 Cooldown starts at policy admission, so even a later never-written expiry leaves it active.
 This intentionally throttles admission during outages; fresh same-source alerts can be
 suppressed until it ends. That suppression is not ACK evidence or guaranteed delivery.
@@ -38,14 +41,16 @@ failed at that admission assertion before the fix. This does not assert a produc
 
 | ID | Invariant and enforcement point | Executable evidence |
 |---|---|---|
-| SUR-D1 | Decisions to report cooldown and capacity refusals are separated by at least one monotonic second; each report generates at most one line per category. Fixed-size reporting state retains the difference between cumulative and reported counters, including across empty/error polls. Generated report deltas sum to observed refusals before counter saturation. | `refusal_diagnostics_preserve_counts_and_space_emissions_across_batches`, `refusal_diagnostics_do_not_wrap_or_reemit_saturated_totals`; actual process `RecoveryTests.test_cooldown_diagnostics_aggregate_across_batches_without_losing_counts` |
+| SUR-D1 | Decisions to report cooldown, rate and capacity refusals are separated by at least one monotonic second; each report generates at most one line per category. Fixed-size reporting state retains the difference between cumulative and reported counters, including across empty/error polls. For each category, generated report totals plus pending deltas equal its cumulative counter before saturation. A report decision clears pending deltas; filtered or delayed writes do not change accounting. | `refusal_diagnostics_preserve_counts_and_space_emissions_across_batches`, `refusal_diagnostics_do_not_wrap_or_reemit_saturated_totals`, `rate_only_diagnostics_wait_for_the_shared_interval_and_preserve_pending_counts`; actual process count checks `RecoveryTests.test_cooldown_diagnostics_aggregate_across_batches_without_losing_counts` |
 
 The first nonempty report may be immediate. Reports are checked outside the source-poll
 match, before delivery: idle/error polls can flush earlier pending counts, but blocked
 work and scheduling can delay a check. The bound concerns decision instants, not visible
 line spacing: slow stderr writes can make visible lines appear closer together. Log-level
 filters can suppress output; baselines advance even when WARN is disabled. This is not
-a deadline or a bound on all logging. Rate-window refusals remain uncounted and silent.
+a deadline or a bound on all logging. Each report generates at most three warnings, one
+per category. Pre-Gate filters (severity, ignored SID, parsing and freshness) are outside
+these refusal counters. They are not a complete EVE-loss or delivery-loss inventory.
 Counters saturate at `u64::MAX`; additional refusals beyond saturation are not observable. Pending reports are in memory
 and may be lost on process death. Neither skipped-alert count establishes delivery.
 
@@ -54,7 +59,15 @@ Before aggregation the actual process emitted 17 warnings in roughly one second,
 the emission-count assertion failed. The revised loop preserves all 4096 refusal counts
 by the final check at EOF. On a slow host reports may occur during batch processing;
 the unit test separately demonstrates a pending report with no new refusals at the next
-one-second check.
+one-second check. The process suite supports count preservation and a coarse report-count
+bound; synthetic-time tests enforce the exact decision interval and idle flush.
+
+A second actual-process regression sets `--max-signals-per-sec 0` and reads 513 alerts
+across three batches. Before rate accounting, the adapter advanced its cursor to EOF
+without any refusal diagnostic; the regression failed waiting for the missing counts.
+`RecoveryTests.test_zero_rate_counts_skipped_alerts_without_ipc_or_pending_cursor` checks
+all 513 rate refusals, no other refusal category, no IPC connection and a fully advanced
+cursor. Rate refusal is a deliberate skip, not a queued retry or node refusal.
 
 ## Forwarding freshness
 
