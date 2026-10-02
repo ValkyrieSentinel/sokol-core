@@ -261,8 +261,12 @@ Each delivery attempt recalculates the remaining TTL after the ACK handshake;
 expired events send their `RETRACT#id` even if an earlier signal's answer was lost.
 The retraction stays queued until a recognized answer. Positive durations require
 an event id; explicit invalid/non-positive durations are skipped and counted,
-rather than falling back to node escalation. Decisions without a duration retain
-the legacy node policy. This changes the expired-duration fallback in ADR-0019.
+rather than falling back to node escalation. Only a missing `duration` key retains the legacy node policy; an explicit
+`null` is invalid. This changes the expired-duration fallback in ADR-0019.
+
+Retries retain the same event id: while the node remembers it, a repeated SIGNAL
+returns `OK duplicate` and does not shorten the TTL of an already accepted signal.
+Its later expiry RETRACT is the separate request to remove that event's support.
 
 Durations and remaining TTLs are rounded up to whole seconds. The local anchor
 conservatively includes the HTTP round-trip; it is not an authoritative server
