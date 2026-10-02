@@ -16,6 +16,8 @@
 //! Oversized/late answers keep the signal queued and trigger the existing reconnect/backoff.
 //! Blocking reads check the deadline at 100ms intervals (plus scheduler/kernel delay).
 //! This bounds answer reads, not connect/write time or a whole multi-signal flush.
+//! push_with_deadline additionally ages a source TTL before each send and switches
+//! to a caller-provided retraction on expiry; it never retires an expired event locally.
 use std::collections::VecDeque;
 use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -178,9 +180,67 @@ impl Conn {
     }
 }
 
+fn validated_line(line: &str) -> io::Result<&str> {
+    let payload = line
+        .strip_suffix("\r\n")
+        .or_else(|| line.strip_suffix('\n'))
+        .unwrap_or(line);
+    if payload.contains('\n') || payload.contains('\r') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "signal contains a line break",
+        ));
+    }
+    let payload = payload.trim_end(); // preserve the existing wire normalization
+    if payload.trim().is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "signal is empty",
+        ));
+    }
+    if payload.len() >= MAX_SIGNAL_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "signal exceeds IPC limit of 4096 bytes including newline",
+        ));
+    }
+    Ok(payload)
+}
+
+/// A source expiry retained alongside the exact queued request. Rendering happens
+/// after the ACK handshake, immediately before each attempt, including retries.
+struct TimedLine {
+    expires: Instant,
+    head: String,
+    max_seconds: u64,
+    tail: String,
+    expired: String,
+}
+
+impl TimedLine {
+    fn render(&self, now: Instant) -> String {
+        match self.expires.checked_duration_since(now) {
+            Some(left) if !left.is_zero() => {
+                let seconds = left
+                    .as_secs()
+                    .saturating_add(u64::from(left.subsec_nanos() != 0));
+                format!(
+                    "{};ttl={}:{}",
+                    self.head,
+                    seconds.min(self.max_seconds),
+                    self.tail
+                )
+            }
+            _ => self.expired.clone(),
+        }
+    }
+}
+
 pub struct Outbox {
     socket: PathBuf,
     queue: VecDeque<String>,
+    // Exactly one entry per queued line, including ordinary lines without an expiry.
+    deadlines: VecDeque<Option<TimedLine>>,
     cap: usize,
     conn: Option<Conn>,
     backoff: Duration,
@@ -196,6 +256,7 @@ impl Outbox {
         Self {
             socket: socket.to_path_buf(),
             queue: VecDeque::new(),
+            deadlines: VecDeque::new(),
             cap: cap.max(1),
             conn: None,
             backoff: BACKOFF_MIN,
@@ -210,34 +271,53 @@ impl Outbox {
     /// any queue mutation. The caller must report rejection; it is not delivery
     /// or overflow loss. This validates framing, not command meaning or authority.
     pub fn push(&mut self, line: &str) -> io::Result<()> {
-        let payload = line
-            .strip_suffix("\r\n")
-            .or_else(|| line.strip_suffix('\n'))
-            .unwrap_or(line);
-        if payload.contains('\n') || payload.contains('\r') {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "signal contains a line break",
-            ));
-        }
-        let payload = payload.trim_end(); // preserve the existing wire normalization
-        if payload.trim().is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "signal is empty",
-            ));
-        }
-        if payload.len() >= MAX_SIGNAL_BYTES {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "signal exceeds IPC limit of 4096 bytes including newline",
-            ));
-        }
+        validated_line(line)?;
         if self.queue.len() >= self.cap {
             self.queue.pop_front();
+            self.deadlines.pop_front();
             self.lost += 1;
         }
         self.queue.push_back(line.trim_end().to_string());
+        self.deadlines.push_back(None);
+        Ok(())
+    }
+
+    /// Queue a SIGNAL with a source deadline. Its `;ttl=` is recalculated before
+    /// each write; at/after expiry send `expired` instead (normally its RETRACT).
+    /// Both possible wire frames are validated before any queue mutation. The
+    /// caller owns command semantics and the expiry clock; acknowledgement rules,
+    /// overflow, and backoff are the same as push(). This is in-memory state.
+    #[allow(dead_code)] // Suricata includes this module but uses ordinary push().
+    pub fn push_with_deadline(
+        &mut self,
+        line: &str,
+        expires: Instant,
+        expired: &str,
+    ) -> io::Result<()> {
+        let payload = validated_line(line)?;
+        let expired = validated_line(expired)?.to_string();
+        let invalid = || {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "expected SIGNAL#id;ttl=seconds",
+            )
+        };
+        let (head, rest) = payload.split_once(";ttl=").ok_or_else(invalid)?;
+        let (ttl, tail) = rest.split_once(':').ok_or_else(invalid)?;
+        if !head.starts_with("SIGNAL#") || ttl.parse::<u64>().ok().filter(|n| *n > 0).is_none() {
+            return Err(invalid());
+        }
+        let timing = TimedLine {
+            expires,
+            head: head.to_string(),
+            max_seconds: ttl.parse::<u64>().map_err(|_| invalid())?,
+            tail: tail.to_string(),
+            expired,
+        };
+        self.push(line)?;
+        if let Some(last) = self.deadlines.back_mut() {
+            *last = Some(timing);
+        }
         Ok(())
     }
 
@@ -257,10 +337,17 @@ impl Outbox {
             let Some(line) = self.queue.front().cloned() else {
                 break;
             };
+            let timing = self.deadlines.front().and_then(|entry| entry.as_ref());
+            let prepare = || timing.map_or_else(|| line.clone(), |t| t.render(Instant::now()));
+            let mut wire = line.clone();
             let reply = match self.conn.as_mut() {
-                Some(conn) => conn.exchange(&line),
+                Some(conn) => {
+                    wire = prepare();
+                    conn.exchange(&wire)
+                }
                 None => Conn::open(&self.socket).and_then(|mut c| {
-                    let r = c.exchange(&line);
+                    wire = prepare();
+                    let r = c.exchange(&wire);
                     self.conn = Some(c);
                     r
                 }),
@@ -268,10 +355,11 @@ impl Outbox {
             match reply.and_then(|text| Outcome::parse(&text)) {
                 Ok(outcome) => {
                     self.queue.pop_front();
+                    self.deadlines.pop_front();
                     self.failing = false;
                     self.backoff = BACKOFF_MIN;
                     self.retry_at = None;
-                    done.push((line, outcome));
+                    done.push((wire, outcome));
                 }
                 Err(e) => {
                     // The line may or may not have reached the node; it is sent again later.
@@ -330,6 +418,115 @@ mod tests {
                 }
             }
         })
+    }
+
+    #[test]
+    fn timed_wire_ages_rounds_up_and_retracts_at_its_deadline() {
+        let now = Instant::now();
+        let line = TimedLine {
+            expires: now + Duration::from_secs(10),
+            head: "SIGNAL#7".into(),
+            max_seconds: 10,
+            tail: "crowdsec|203.0.113.7|-|test".into(),
+            expired: "RETRACT#7:crowdsec|203.0.113.7".into(),
+        };
+        assert!(line
+            .render(now + Duration::from_millis(2500))
+            .starts_with("SIGNAL#7;ttl=8:"));
+        assert!(line
+            .render(now + Duration::from_millis(9999))
+            .starts_with("SIGNAL#7;ttl=1:"));
+        assert_eq!(line.render(line.expires), line.expired);
+        assert_eq!(
+            line.render(line.expires + Duration::from_secs(1)),
+            line.expired
+        );
+        assert!(
+            line.render(now - Duration::from_secs(1))
+                .starts_with("SIGNAL#7;ttl=10:"),
+            "even a caller-supplied late deadline cannot enlarge the admitted TTL"
+        );
+    }
+
+    #[test]
+    fn lost_answer_keeps_expiry_and_later_retry_sends_its_retraction() {
+        let path = temp_socket("timed-retry");
+        let mut out = Outbox::new(&path, 2);
+        out.push_with_deadline(
+            "SIGNAL#7;ttl=60:crowdsec|203.0.113.7|-|test",
+            Instant::now() + Duration::from_secs(60),
+            "RETRACT#7:crowdsec|203.0.113.7",
+        )
+        .unwrap();
+        let node = fake_node(&path, |line| {
+            assert!(line.starts_with("SIGNAL#7;ttl="));
+            None // request observed, answer lost
+        });
+        let (done, err) = out.flush(1);
+        assert!(done.is_empty() && err.is_some());
+        node.join().unwrap();
+        assert_eq!(out.pending(), 1);
+        out.deadlines.front_mut().unwrap().as_mut().unwrap().expires = Instant::now();
+        std::fs::remove_file(&path).unwrap();
+        let node = fake_node(&path, |line| {
+            assert_eq!(line, "RETRACT#7:crowdsec|203.0.113.7");
+            Some("OK lifted")
+        });
+        out.retry_now();
+        assert_eq!(
+            out.flush(1),
+            (
+                vec![("RETRACT#7:crowdsec|203.0.113.7".into(), Outcome::Recorded)],
+                None
+            )
+        );
+        assert_eq!(out.pending(), 0);
+        assert!(out.deadlines.is_empty());
+        drop(out);
+        node.join().unwrap();
+    }
+
+    #[test]
+    fn timed_metadata_follows_overflow_and_validation_never_evicts() {
+        let path = temp_socket("timed-overflow");
+        let mut out = Outbox::new(&path, 1);
+        out.push_with_deadline(
+            "SIGNAL#7;ttl=1:crowdsec|203.0.113.7|-|test",
+            Instant::now(),
+            "RETRACT#7:crowdsec|203.0.113.7",
+        )
+        .unwrap();
+        for (line, expiry) in [
+            ("SIGNAL#8;ttl=1:crowdsec|203.0.113.8|-|test", "bad\nline"),
+            (
+                "SIGNAL#8;ttl=0:crowdsec|203.0.113.8|-|test",
+                "RETRACT#8:crowdsec|203.0.113.8",
+            ),
+        ] {
+            assert!(out
+                .push_with_deadline(line, Instant::now(), expiry)
+                .is_err());
+            assert_eq!(out.lost, 0);
+            assert_eq!(out.pending(), 1);
+        }
+        out.push("RETRACT#8:crowdsec|203.0.113.8").unwrap();
+        assert_eq!(out.lost, 1);
+        assert!(out.deadlines.front().unwrap().is_none());
+        out.push_with_deadline(
+            "SIGNAL#9;ttl=1:crowdsec|203.0.113.9|-|test",
+            Instant::now(),
+            "RETRACT#9:crowdsec|203.0.113.9",
+        )
+        .unwrap();
+        assert_eq!(out.lost, 2);
+        let node = fake_node(&path, |line| {
+            assert_eq!(line, "RETRACT#9:crowdsec|203.0.113.9");
+            Some("OK nothing held")
+        });
+        assert_eq!(out.flush(1).0[0].0, "RETRACT#9:crowdsec|203.0.113.9");
+        assert!(out.deadlines.is_empty());
+        drop(out);
+        node.join().unwrap();
     }
 
     #[test]

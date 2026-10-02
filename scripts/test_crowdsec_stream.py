@@ -13,6 +13,7 @@ import socket
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from unittest.mock import patch
 
@@ -27,12 +28,12 @@ DECISION = {"id": 71, "origin": "cscli", "type": "ban", "scope": "Ip",
 class StreamTests(unittest.TestCase):
     binary = None
 
-    def test_malformed_batch_does_not_finish_startup_or_send_partial_retractions(self):
+    def check_stream(self, expire_during_handshake=False):
         requests = []
         replies = [
             # Even the valid deletion must not escape this malformed envelope.
             {"new": "not an array", "deleted": [DECISION]},
-            {"new": [DECISION], "deleted": None},
+            {"new": [{**DECISION, "duration": "1s" if expire_during_handshake else "60s"}], "deleted": None},
             {"new": [], "deleted": [DECISION]},
         ]
 
@@ -76,23 +77,35 @@ class StreamTests(unittest.TestCase):
                             conn.settimeout(WAIT_SECONDS)
                             with conn.makefile("rb") as reader:
                                 self.assertEqual(reader.readline(4097), b"ACK\n")
+                                if expire_during_handshake:
+                                    time.sleep(1.2)  # longer than the source TTL, shorter than ACK timeout
                                 conn.sendall(b"OK ack\n")
-                                self.assertEqual(reader.readline(4097).decode(),
-                                                 "SIGNAL#71;ttl=60:crowdsec|203.0.113.71|-|stream probe "
-                                                 "(origin cscli, crowdsec duration 60s)\n")
-                                conn.sendall(b"OK applied\n")
-                                self.assertEqual(reader.readline(4097),
-                                                 b"RETRACT#71:crowdsec|203.0.113.71\n")
-                                conn.sendall(b"OK lifted\n")
-                                self.assertEqual(requests[:3], [
-                                    "/v1/decisions/stream?startup=true",
-                                    "/v1/decisions/stream?startup=true",
-                                    "/v1/decisions/stream?startup=false",
-                                ])
+                                if expire_during_handshake:
+                                    self.assertEqual(reader.readline(4097), b"RETRACT#71:crowdsec|203.0.113.71\n")
+                                    conn.sendall(b"OK lifted\n")
+                                else:
+                                    self.assertEqual(reader.readline(4097).decode(),
+                                                     "SIGNAL#71;ttl=60:crowdsec|203.0.113.71|-|stream probe "
+                                                     "(origin cscli, crowdsec duration 60s)\n")
+                                    conn.sendall(b"OK applied\n")
+                                    self.assertEqual(reader.readline(4097),
+                                                     b"RETRACT#71:crowdsec|203.0.113.71\n")
+                                    conn.sendall(b"OK lifted\n")
+                                    self.assertEqual(requests[:3], [
+                                        "/v1/decisions/stream?startup=true",
+                                        "/v1/decisions/stream?startup=true",
+                                        "/v1/decisions/stream?startup=false",
+                                    ])
                 finally:
                     api.shutdown()
                     thread.join(timeout=5)
                 self.assertFalse(thread.is_alive(), "HTTP fixture did not stop")
+
+    def test_malformed_batch_does_not_finish_startup_or_send_partial_retractions(self):
+        self.check_stream()
+
+    def test_decision_expiring_during_handshake_is_retracted(self):
+        self.check_stream(expire_during_handshake=True)
 
 
 if __name__ == "__main__":
