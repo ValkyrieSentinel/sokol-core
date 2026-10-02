@@ -111,6 +111,10 @@ jobs:
       - name: CrowdSec TTL smoke oracle regression
         run: python3 scripts/test_crowdsec_ttl.py
 
+      - name: CrowdSec stream recovery regression
+        timeout-minutes: 2
+        run: python3 scripts/test_crowdsec_stream.py target/release/sokol-crowdsec
+
       - name: Suricata process recovery regression
         timeout-minutes: 2
         run: python3 scripts/test_suricata_recovery.py target/release/sokol-suricata

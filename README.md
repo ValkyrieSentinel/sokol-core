@@ -243,6 +243,14 @@ Only local decisions (origins `crowdsec` and `cscli`) are forwarded by default; 
 (`CAPI`, `lists`) can hold tens of thousands of addresses and are added with `--origins` only if the
 mesh should carry them. Range decisions are forwarded as prefixes.
 
+The adapter validates the decision-stream envelope before queueing any commands. The
+root must be an object; `new` and `deleted`, when present and non-null, must be arrays
+of objects. Missing/null/empty sections remain valid (the [upstream response model](https://github.com/crowdsecurity/crowdsec/blob/master/pkg/models/decisions_stream_response.go)
+makes these fields optional). A malformed initial response is logged and leaves
+`startup=true` for the next poll. This is shape validation, not complete validation of
+each decision; existing origin/type/scope filters still apply. It does not guarantee
+replay of a rejected delta after the server has advanced its stream position.
+
 A decision's CrowdSec `duration` is the block's TTL, capped by `--block-ttl-max`; the node does
 not escalate it again (CrowdSec already did). A decision deleted in CrowdSec
 (`cscli decisions delete`) is taken back on the node and, through the mesh, on its peers. The
