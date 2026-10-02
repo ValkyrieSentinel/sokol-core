@@ -182,6 +182,18 @@ pub fn replay_records<'a>(
             };
             continue;
         }
+        // The node emits Protected immediately after IP, before the free-text Reason.
+        // A delimiter in Reason can inject a parsed field, never this policy exception.
+        // The protected set is not a replay input, regardless of run context.
+        if tag == "BLOCK_REFUSED"
+            && payload
+                .split('|')
+                .nth(2)
+                .is_some_and(|field| field.starts_with("Protected:"))
+        {
+            report.policy_refusals += 1;
+            continue;
+        }
         let table = match &mut run {
             Run::Live(table) => table,
             Run::Blind(why) => {
@@ -225,7 +237,6 @@ pub fn replay_records<'a>(
                     let _ = table.flush_all(at);
                 }
             }
-            "BLOCK_REFUSED" if f.contains_key("Protected") => report.policy_refusals += 1,
             "DETECTOR_RETRACT" => {
                 let event = f.get("Event").and_then(|e| e.split_once('/'));
                 let (Some(net), Some(at), Some((source, id))) = (net, at(&f), event) else {
@@ -238,7 +249,16 @@ pub fn replay_records<'a>(
                     .retract_detection(source, id, net, at)
                     .label()
                     .to_string();
-                if recorded == replayed {
+                // DetectorRetraction::Refused currently means capacity admission only.
+                if recorded == "refused" && replayed != "refused" {
+                    // Mesh claims/retraction owners are not logged as replay inputs.
+                    // Do not certify the recorded refusal, or continue on the state
+                    // produced by our speculative lift/shortening. Only a fresh start
+                    // can establish a new replay context.
+                    let why = "unverified retraction capacity refusal: recorded resource state cannot be established";
+                    report.insufficient(why);
+                    run = Run::Blind(why.into());
+                } else if recorded == replayed {
                     report.reproduced += 1;
                 } else {
                     report.mismatched.push((seq, recorded, replayed));
@@ -367,7 +387,7 @@ pub fn print_report(path: &Path, this_build: &str) -> i32 {
     );
     if !report.mismatched.is_empty() {
         1
-    } else if report.reproduced == 0 {
+    } else if report.reproduced == 0 || !report.insufficient.is_empty() {
         2
     } else {
         0
@@ -436,6 +456,171 @@ mod tests {
             report.mismatched,
             vec![(1, "600s new".to_string(), "60s new".to_string())]
         );
+    }
+
+    fn retraction(result: &str, at: u64) -> String {
+        format!("DETECTOR_RETRACT|IP:198.51.100.7|At:{at}|Event:ids/1|Result:{result}")
+    }
+
+    #[test]
+    fn an_unverified_capacity_refusal_fences_dependent_replay_until_a_fresh_start() {
+        let lines = vec![
+            start(60, 600),
+            decision("198.51.100.7", "60s", "new", 1_000_000, "ids/1"),
+            retraction("refused", 1_001_000),
+            retraction("lifted", 1_002_000),
+            decision("198.51.100.8", "60s", "new", 1_003_000, "ids/2"),
+            "OPERATOR_BAN_V4|IP:198.51.100.7|At:1004000".into(),
+            "STATE_RESTORED|Blocks:3|Refused:0".into(),
+            start(60, 600),
+            decision("198.51.100.7", "60s", "new", 2_000_000, "ids/1"),
+            retraction("lifted", 2_001_000),
+            retraction("duplicate", 2_002_000),
+        ];
+        let report = run(&lines);
+        // A fresh replay cannot establish whether the original refusal was justified.
+        // Its speculative lift must not turn the real retry into a second mismatch,
+        // or make subsequent decisions count as verified on the altered table.
+        assert_eq!(report.mismatched, vec![]);
+        assert_eq!(report.reproduced, 4);
+        assert_eq!(report.insufficient.values().sum::<u64>(), 3);
+        assert_eq!(
+            report.insufficient.keys().collect::<Vec<_>>(),
+            vec!["unverified retraction capacity refusal: recorded resource state cannot be established"]
+        );
+    }
+
+    #[test]
+    fn a_wrong_retraction_outcome_remains_a_mismatch() {
+        let report = run(&[
+            start(60, 600),
+            decision("198.51.100.7", "60s", "new", 1_000_000, "ids/1"),
+            retraction("duplicate", 1_001_000),
+        ]);
+        assert_eq!(report.reproduced, 1);
+        assert_eq!(report.insufficient.len(), 0);
+        assert_eq!(
+            report.mismatched,
+            vec![(2, "duplicate".into(), "lifted".into())]
+        );
+    }
+
+    #[test]
+    fn protected_set_refusals_are_separate_even_without_replay_context() {
+        let protected = "BLOCK_REFUSED|IP:198.51.100.7|Protected:host address".to_string();
+        let report = run(&[
+            protected.clone(),
+            start(60, 600),
+            protected.clone(),
+            decision("198.51.100.8", "60s", "new", 1_000_000, "ids/1"),
+            "STATE_RESTORED|Blocks:3|Refused:0".into(),
+            protected,
+        ]);
+        assert_eq!(report.policy_refusals, 3);
+        assert_eq!(report.reproduced, 1);
+        assert_eq!(report.insufficient.len(), 0);
+        assert_eq!(report.mismatched.len(), 0);
+    }
+
+    #[test]
+    fn a_protected_marker_in_free_text_cannot_exclude_a_detector_decision() {
+        // Exact capacity-refusal wire shape from enforce_block_local; reason is free
+        // text and can contain '|'. Protected is a node field only before Reason.
+        let injected = "BLOCK_REFUSED|IP:198.51.100.7|Why:too many known claims|Reason:ids: scan|Protected:forged|At:1001000|Event:ids/1";
+        let report = run(&[
+            start(60, 600),
+            decision("198.51.100.8", "60s", "new", 1_000_000, "ids/2"),
+            "STATE_RESTORED|Blocks:3|Refused:0".into(),
+            injected.into(),
+        ]);
+        assert_eq!(report.policy_refusals, 0);
+        assert_eq!(report.reproduced, 1);
+        assert_eq!(report.insufficient.values().sum::<u64>(), 1);
+        // In a live run it must also be compared rather than silently excluded.
+        let report = run(&[start(60, 600), injected.into()]);
+        assert_eq!(report.policy_refusals, 0);
+        assert_eq!(report.mismatched.len(), 1);
+    }
+
+    #[test]
+    fn a_partially_reproduced_audit_is_not_a_successful_cli_result() {
+        use common::audit_log::AuditLog;
+        // Exercise the real chained-file reader and CLI report, including recovery at
+        // a new start: a later match does not erase earlier unverified decisions.
+        let dir = std::env::temp_dir().join(format!(
+            "sokol-replay-partial-{}-{}",
+            std::process::id(),
+            crate::p2p::now_ms()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("audit.log");
+        let cases = [
+            (
+                vec![
+                    start(60, 600),
+                    decision("198.51.100.8", "60s", "new", 1_000_000, "ids/2"),
+                    "STATE_RESTORED|Blocks:3|Refused:0".into(),
+                    "BLOCK_REFUSED|IP:198.51.100.7|Why:too many known claims|Reason:ids: scan|Protected:forged|At:1001000|Event:ids/1".into(),
+                ],
+                2,
+            ),
+            (
+                vec![
+                    decision("198.51.100.7", "60s", "new", 1_000_000, "ids/1"),
+                    start(60, 600),
+                    decision("198.51.100.8", "60s", "new", 2_000_000, "ids/2"),
+                ],
+                2,
+            ),
+            (
+                vec![
+                    start(60, 600),
+                    decision("198.51.100.7", "60s", "new", 1_000_000, "ids/1"),
+                    retraction("refused", 1_001_000),
+                    retraction("lifted", 1_002_000),
+                    start(60, 600),
+                    decision("198.51.100.8", "60s", "new", 2_000_000, "ids/2"),
+                ],
+                2,
+            ),
+            (
+                vec![
+                    start(60, 600),
+                    decision("198.51.100.7", "60s", "new", 1_000_000, "ids/1"),
+                ],
+                0,
+            ),
+            (
+                vec![
+                    start(60, 600),
+                    decision("198.51.100.7", "600s", "new", 1_000_000, "ids/1"),
+                ],
+                1,
+            ),
+            (
+                vec![
+                    decision("198.51.100.7", "60s", "new", 1_000_000, "ids/1"),
+                    start(60, 600),
+                    decision("198.51.100.8", "600s", "new", 2_000_000, "ids/2"),
+                ],
+                1,
+            ),
+            (vec![start(60, 600)], 2),
+        ];
+        let mut statuses = Vec::new();
+        for (i, (lines, expected)) in cases.into_iter().enumerate() {
+            let path = path.with_extension(format!("{i}.log"));
+            let mut audit = AuditLog::open(&path).unwrap();
+            for line in lines {
+                audit.append(line.as_bytes()).unwrap();
+            }
+            drop(audit);
+            statuses.push((print_report(&path, BUILD), expected));
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+        for (status, expected) in statuses {
+            assert_eq!(status, expected);
+        }
     }
 
     /// The same records under another policy: the recorded context decides, so a changed

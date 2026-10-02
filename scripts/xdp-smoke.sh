@@ -563,6 +563,9 @@ if command -v cscli >/dev/null && command -v crowdsec >/dev/null; then
     CS_IP2=10.231.0.13
     ip netns exec "$NS" ip addr add "$CS_IP2/24" dev "$PEER_IF"
     STATE_FILE=$LAST_STATE stop_orchestrator
+    # Preserve the complete fresh run before NODE_START/STATE_RESTORED make later
+    # decisions impossible to reconstruct from this audit alone (ADR-0016).
+    cp "$WORK/events.sntl" "$WORK/replay-fresh.sntl"
     cscli decisions add --ip "$CS_IP2" --reason "made while the node was down" --duration 5m >/dev/null 2>&1
     sleep 3
     check "the adapter reports the node unreachable and keeps the decision" \
@@ -660,12 +663,20 @@ printf 'BAN_IP:%s\n' "$PERSIST_IP" | nc -U -q1 "$WORK/control.sock" >/dev/null
 check "operator cannot lift a --block address" bash -c \
     "printf 'UNBAN_IP:$BLOCKED_IP\\n' | nc -U -q1 '$WORK/control.sock' | grep -q 'blocked by --block'"
 stop_orchestrator
-# ADR-0016: the first run started fresh, so its detector decisions (signals, resends, trap
-# hits, operator bans and lifts in between) replay from the audit log alone, with this build.
-"$BIN" --replay "$WORK/events.sntl" >"$WORK/replay.out" 2>&1 && REPLAY_STATUS=0 || REPLAY_STATUS=$?
+# ADR-0016: use the complete first run, saved before CrowdSec's state-restoring
+# restarts. Without CrowdSec, no restart has occurred yet; this is still the fresh run.
+if [ ! -f "$WORK/replay-fresh.sntl" ]; then
+    cp "$WORK/events.sntl" "$WORK/replay-fresh.sntl"
+else
+    "$BIN" --replay "$WORK/events.sntl" >"$WORK/replay-restored.out" 2>&1 && RESTORED_STATUS=0 || RESTORED_STATUS=$?
+    echo "      $(tail -1 "$WORK/replay-restored.out")"
+    check "decisions after state restoration remain incomplete even when earlier ones reproduce" \
+        bash -c "test $RESTORED_STATUS = 2 && grep -Eq ': [1-9][0-9]* reproduced, 0 mismatched, [1-9][0-9]* without enough context,' '$WORK/replay-restored.out' && grep -q 'state file the log does not hold' '$WORK/replay-restored.out'"
+fi
+"$BIN" --replay "$WORK/replay-fresh.sntl" >"$WORK/replay.out" 2>&1 && REPLAY_STATUS=0 || REPLAY_STATUS=$?
 echo "      $(tail -1 "$WORK/replay.out")"
-check "the node's detector decisions replay from its audit log: all reproduced, none mismatched" \
-    bash -c "test $REPLAY_STATUS = 0 && grep -Eq ': [1-9][0-9]* reproduced, 0 mismatched' '$WORK/replay.out'"
+check "the fresh run's detector decisions replay: all reproduced, none mismatched or insufficient" \
+    bash -c "test $REPLAY_STATUS = 0 && grep -Eq ': [1-9][0-9]* reproduced, 0 mismatched, 0 without enough context,' '$WORK/replay.out'"
 cp "$WORK/events.sntl" "$WORK/tampered.sntl"
 # Flip a bit (writing a fixed byte could leave it unchanged: that byte may already hold it).
 python3 -c "import sys; f = open(sys.argv[1], 'r+b'); f.seek(200); b = f.read(1)[0]; f.seek(200); f.write(bytes([b ^ 1]))" "$WORK/tampered.sntl"
