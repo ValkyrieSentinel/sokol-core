@@ -42,7 +42,7 @@ mod delivery;
 #[derive(Parser, Debug)]
 #[command(about = "Forward Suricata alerts to Sokol-Core as block signals")]
 struct Args {
-    /// Suricata EVE JSON log to follow.
+    /// Suricata EVE JSON log to follow. Records above 1 MiB including LF are skipped.
     #[arg(long, default_value = "/var/log/suricata/eve.json")]
     eve: PathBuf,
 
@@ -205,6 +205,12 @@ impl Gate {
     }
 }
 
+// Operational quotas, not measured capacity: yield to delivery/checkpointing after either
+// budget. Line size includes LF; larger EVE records are deliberately skipped.
+const MAX_EVE_LINE_BYTES: usize = 1024 * 1024;
+const MAX_POLL_BYTES: usize = 1024 * 1024;
+const MAX_POLL_LINES: usize = 256;
+
 /// `tail -F` for one file: survives truncation and rotation (rename + new file).
 struct Follower {
     path: PathBuf,
@@ -212,6 +218,7 @@ struct Follower {
     inode: u64,
     position: u64,
     partial: Vec<u8>,
+    discarding: bool,
     /// Where the line being assembled in `partial` starts.
     line_start: u64,
 }
@@ -244,6 +251,7 @@ impl Follower {
             inode: 0,
             position: 0,
             partial: Vec::new(),
+            discarding: false,
             line_start: 0,
         };
         let _ = f.open(!from_start);
@@ -284,6 +292,7 @@ impl Follower {
         self.inode = meta.ino();
         self.reader = Some(reader);
         self.partial.clear();
+        self.discarding = false;
         Ok(())
     }
 
@@ -321,20 +330,30 @@ impl Follower {
         self.inode = meta.ino();
         self.reader = Some(reader);
         self.partial.clear();
+        self.discarding = false;
         Ok(())
     }
 
-    /// Complete lines appended since the last call, each with the position where it starts.
+    /// One bounded batch of complete lines, each with its starting byte position.
+    /// Budgets count consumed bytes and all completed lines (including skipped ones).
+    /// BufReader may prefetch; these are work quotas, not a wall-clock deadline.
     fn poll(&mut self) -> io::Result<Vec<(u64, String)>> {
         match std::fs::metadata(&self.path) {
-            Ok(meta)
-                if self.reader.is_none()
-                    || meta.ino() != self.inode
-                    || meta.len() < self.position =>
-            {
-                // First appearance, rotation or truncation: read the new file from its start.
-                self.open(false)?;
+            Ok(_) if self.reader.is_none() => self.open(false)?,
+            Ok(meta) if meta.ino() != self.inode => {
+                // Budgeted polls may leave unread old-file bytes. Drain that descriptor
+                // before switching; every returned batch still belongs to one inode.
+                let unread = self
+                    .reader
+                    .as_ref()
+                    .map(|reader| reader.get_ref().metadata().map(|m| m.len() > self.position))
+                    .transpose()?
+                    .unwrap_or(false);
+                if !unread {
+                    self.open(false)?;
+                }
             }
+            Ok(meta) if meta.len() < self.position => self.open(false)?,
             Ok(_) => {}
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(e) => return Err(e),
@@ -343,22 +362,44 @@ impl Follower {
             return Ok(Vec::new());
         };
         let mut lines = Vec::new();
-        loop {
-            // UTF-8 may be split across appends. Decode only a complete framed line.
-            let n = reader.read_until(b'\n', &mut self.partial)?;
-            if n == 0 {
+        let mut remaining = MAX_POLL_BYTES;
+        let mut completed = 0;
+        while remaining > 0 && completed < MAX_POLL_LINES {
+            let bytes = reader.fill_buf()?;
+            if bytes.is_empty() {
                 break;
             }
-            self.position += n as u64;
-            if self.partial.ends_with(b"\n") {
-                match String::from_utf8(std::mem::take(&mut self.partial)) {
-                    Ok(line) => lines.push((self.line_start, line)),
-                    Err(_) => log::warn!(
-                        "[sokol-suricata] invalid UTF-8 EVE line at byte {} skipped",
-                        self.line_start
-                    ),
+            let newline = bytes.iter().take(remaining).position(|byte| *byte == b'\n');
+            let count = newline.map_or(bytes.len().min(remaining), |index| index + 1);
+            if !self.discarding {
+                if count > MAX_EVE_LINE_BYTES - self.partial.len() {
+                    self.partial.clear();
+                    self.discarding = true;
+                    log::warn!(
+                        "[sokol-suricata] EVE line at byte {} exceeds {} bytes; skipping to LF",
+                        self.line_start,
+                        MAX_EVE_LINE_BYTES
+                    );
+                } else {
+                    self.partial.extend(bytes.iter().take(count).copied());
                 }
+            }
+            reader.consume(count);
+            self.position += count as u64;
+            remaining -= count;
+            if newline.is_some() {
+                if !self.discarding {
+                    match String::from_utf8(std::mem::take(&mut self.partial)) {
+                        Ok(line) => lines.push((self.line_start, line)),
+                        Err(_) => log::warn!(
+                            "[sokol-suricata] invalid UTF-8 EVE line at byte {} skipped",
+                            self.line_start
+                        ),
+                    }
+                }
+                self.discarding = false;
                 self.line_start = self.position;
+                completed += 1;
             }
         }
         Ok(lines)
@@ -830,6 +871,154 @@ mod tests {
             follower.cursor().position,
             9,
             "positions count bytes, not characters"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_poll_yields_after_its_line_budget_without_losing_the_next_line() {
+        let dir = std::env::temp_dir().join(format!(
+            "sokol-suricata-lines-budget-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("eve.json");
+        std::fs::write(&path, "x\n".repeat(MAX_POLL_LINES + 1)).unwrap();
+        let mut f = Follower::new(&path, true);
+        assert_eq!(f.poll().unwrap().len(), MAX_POLL_LINES);
+        assert_eq!(f.cursor().position, (2 * MAX_POLL_LINES) as u64);
+        assert_eq!(
+            f.poll().unwrap(),
+            vec![((2 * MAX_POLL_LINES) as u64, "x\n".into())]
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn an_unterminated_oversized_line_has_bounded_work_and_does_not_leak_its_tail() {
+        let dir = std::env::temp_dir().join(format!(
+            "sokol-suricata-bytes-budget-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("eve.json");
+        let length = 3 * MAX_EVE_LINE_BYTES;
+        std::fs::write(&path, vec![b'x'; length]).unwrap();
+        let mut f = Follower::new(&path, true);
+        while f.position < length as u64 {
+            let before = f.position;
+            assert!(f.poll().unwrap().is_empty());
+            assert!(f.position > before && f.position - before <= MAX_POLL_BYTES as u64);
+            assert!(f.partial.len() <= MAX_EVE_LINE_BYTES);
+            assert_eq!(
+                f.cursor().position,
+                0,
+                "unfinished record remains replayable"
+            );
+        }
+        let mut writer = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writer.write_all(b"tail\nok\n").unwrap();
+        assert_eq!(
+            f.poll().unwrap(),
+            vec![((length + 5) as u64, "ok\n".into())]
+        );
+        assert_eq!(f.cursor().position, (length + 8) as u64);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn the_eve_line_limit_includes_the_newline() {
+        let dir =
+            std::env::temp_dir().join(format!("sokol-suricata-line-limit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("eve.json");
+        let accepted = format!("{}\n", "x".repeat(MAX_EVE_LINE_BYTES - 1));
+        let rejected = format!("{}\n", "x".repeat(MAX_EVE_LINE_BYTES));
+        std::fs::write(&path, format!("{accepted}{rejected}ok\n")).unwrap();
+        let mut f = Follower::new(&path, true);
+        let mut observed = Vec::new();
+        while f.position < std::fs::metadata(&path).unwrap().len() {
+            observed.extend(f.poll().unwrap());
+        }
+        assert_eq!(
+            observed,
+            vec![
+                (0, accepted),
+                ((2 * MAX_EVE_LINE_BYTES + 1) as u64, "ok\n".into())
+            ]
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn rotation_drains_the_old_budgeted_backlog_before_switching_inode() {
+        let dir = std::env::temp_dir().join(format!(
+            "sokol-suricata-drain-budget-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("eve.json");
+        std::fs::write(&path, "x\n".repeat(MAX_POLL_LINES + 1)).unwrap();
+        let mut f = Follower::new(&path, true);
+        assert_eq!(f.poll().unwrap().len(), MAX_POLL_LINES);
+        let old_inode = f.cursor().inode;
+        std::fs::rename(&path, dir.join("eve.json.1")).unwrap();
+        std::fs::write(&path, "new\n").unwrap();
+        assert_eq!(
+            f.poll().unwrap(),
+            vec![((MAX_POLL_LINES * 2) as u64, "x\n".into())]
+        );
+        assert_eq!(f.cursor().inode, old_inode);
+        assert_eq!(f.poll().unwrap(), vec![(0, "new\n".into())]);
+        assert_ne!(f.cursor().inode, old_inode);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_reset_clears_oversized_line_discarding() {
+        for rotate in [false, true] {
+            let dir = std::env::temp_dir().join(format!(
+                "sokol-suricata-discard-reset-{}-{rotate}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("eve.json");
+            let length = MAX_EVE_LINE_BYTES + 1;
+            std::fs::write(&path, vec![b'x'; length]).unwrap();
+            let mut f = Follower::new(&path, true);
+            while f.position < length as u64 {
+                assert!(f.poll().unwrap().is_empty());
+            }
+            assert!(f.discarding);
+            if rotate {
+                std::fs::rename(&path, dir.join("eve.json.1")).unwrap();
+            }
+            std::fs::write(&path, "fresh\n").unwrap();
+            assert_eq!(f.poll().unwrap(), vec![(0, "fresh\n".into())]);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn invalid_lines_also_spend_the_poll_line_budget() {
+        let dir = std::env::temp_dir().join(format!(
+            "sokol-suricata-invalid-budget-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("eve.json");
+        let mut bytes = b"\xff\n".repeat(MAX_POLL_LINES + 1);
+        bytes.extend_from_slice(b"ok\n");
+        std::fs::write(&path, bytes).unwrap();
+        let mut f = Follower::new(&path, true);
+        assert!(f.poll().unwrap().is_empty());
+        assert_eq!(f.position, (2 * MAX_POLL_LINES) as u64);
+        assert_eq!(
+            f.poll().unwrap(),
+            vec![((2 * (MAX_POLL_LINES + 1)) as u64, "ok\n".into())]
         );
         std::fs::remove_dir_all(dir).unwrap();
     }
