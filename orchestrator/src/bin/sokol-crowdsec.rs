@@ -159,6 +159,23 @@ fn duration_secs(d: &str) -> Option<u64> {
 fn batch_from(body: &str, origins: &[String]) -> Result<Batch, String> {
     let doc: serde_json::Value =
         serde_json::from_str(body).map_err(|e| format!("bad JSON: {}", e))?;
+    // Validate the whole envelope before producing any command or advancing startup.
+    // Missing/null sections are valid empty lists; present sections must be arrays
+    // of decision objects. Individual decision filters below retain their semantics.
+    if !doc.is_object() {
+        return Err("bad decision stream: expected an object".into());
+    }
+    for name in ["new", "deleted"] {
+        match doc.get(name) {
+            None | Some(serde_json::Value::Null) => {}
+            Some(serde_json::Value::Array(items)) if items.iter().all(|item| item.is_object()) => {}
+            _ => {
+                return Err(format!(
+                    "bad decision stream: {name} must be null or an array of objects"
+                ))
+            }
+        }
+    }
     let mut batch = Batch::default();
     // Deletions first: a decision deleted and re-added between two polls ends up blocked.
     for decision in doc
@@ -437,6 +454,47 @@ mod tests {
         let batch = batch_from(body, &local()).unwrap();
         assert_eq!(batch.signals[0].matches('\n').count(), 1);
         assert!(batch_from("not json", &local()).is_err());
+    }
+
+    #[test]
+    fn stream_shape_errors_are_not_successful_empty_batches() {
+        for body in [
+            "null",
+            "[]",
+            "42",
+            "true",
+            r#""text""#,
+            r#"{"new":{}}"#,
+            r#"{"deleted":"bad"}"#,
+            r#"{"new":[null]}"#,
+            r#"{"deleted":[false]}"#,
+            r#"{"new":[{},42]}"#,
+        ] {
+            assert!(
+                batch_from(body, &local()).is_err(),
+                "accepted invalid stream shape: {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_new_section_cannot_publish_valid_deletions() {
+        let mut response: serde_json::Value = serde_json::from_str(STARTUP).unwrap();
+        response["deleted"] = response["new"].clone();
+        response["new"] = serde_json::json!({"not": "an array"});
+        assert!(batch_from(&response.to_string(), &local()).is_err());
+    }
+
+    #[test]
+    fn optional_null_and_empty_stream_sections_remain_compatible() {
+        for body in [
+            "{}",
+            r#"{"new":null}"#,
+            r#"{"deleted":[]}"#,
+            r#"{"new":[],"deleted":null,"extra":"ignored"}"#,
+        ] {
+            assert_eq!(batch_from(body, &local()).unwrap(), Batch::default());
+        }
     }
 
     #[test]
