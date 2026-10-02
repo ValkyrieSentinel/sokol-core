@@ -357,6 +357,17 @@ for line in ["ACK"] + sys.argv[1:]:
     f.write(line + "\n"); f.flush(); print(f.readline().strip())
 PY
 }
+# Client audit text cannot open a node run, restore state or declare a gap. Later
+# fresh-run --replay must still return 0 after these real socket writes.
+ipc_ack "DB_LOG:NODE_START|Build:client|Node:9|TtlBase:1|TtlMax:1|Digest:fake" \
+    "DB_LOG:STATE_RESTORED|Blocks:100|Refused:0" \
+    "DB_LOG:AUDIT_LOST|Records:1" "DB_LOG:AUDIT_QUEUE_OVERFLOW|Dropped:1" >"$WORK/client-log-replies.txt"
+check "DB_LOG keeps its ACK reply" \
+    test "$(grep -c '^OK recorded$' "$WORK/client-log-replies.txt")" = 4
+sleep 0.3
+"$(dirname "$BIN")/monitor" --dump "$WORK/events.sntl" | cut -f3 >"$WORK/client-log-dump.txt"
+check "socket client records have a fixed non-decision outer tag" \
+    test "$(grep -Ec '^CLIENT_LOG\|Message:(NODE_START\|Build:client|STATE_RESTORED\|Blocks:100|AUDIT_LOST\|Records:1|AUDIT_QUEUE_OVERFLOW\|Dropped:1)' "$WORK/client-log-dump.txt")" = 4
 EV_IP=198.51.100.77
 ipc_ack "SIGNAL#smoke-1:smoke|$EV_IP|-|first" "SIGNAL#smoke-1:smoke|$EV_IP|-|resend" \
     "SIGNAL#smoke-1:other|$EV_IP|-|same id, other source" "SIGNAL#bad id:smoke|$EV_IP|-|x" >"$WORK/event-ids.txt"

@@ -161,6 +161,8 @@ pub struct Report {
     pub insufficient: BTreeMap<String, u64>,
     /// Refusals by the host's protected set, which the log does not record: not replayed.
     pub policy_refusals: u64,
+    /// Explicit loss markers, not a count of lost records or unverified decisions.
+    pub audit_gaps: BTreeMap<String, u64>,
 }
 
 impl Report {
@@ -217,6 +219,15 @@ pub fn replay_records<'a>(
                     ctx.node,
                 ))),
             };
+            continue;
+        }
+        if matches!(tag, "AUDIT_LOST" | "AUDIT_QUEUE_OVERFLOW") {
+            // Even a tail gap or a gap before usable context prevents a complete result.
+            // Treat malformed/zero counters conservatively: the marker declares missing data.
+            *report.audit_gaps.entry(tag.to_string()).or_default() += 1;
+            run = Run::Blind(format!(
+                "audit gap ({tag}): omitted records may have changed decision state"
+            ));
             continue;
         }
         // The protected set is not a replay input, regardless of run context.
@@ -407,17 +418,24 @@ pub fn print_report(path: &Path, this_build: &str) -> i32 {
     for (why, n) in &report.insufficient {
         println!("INSUFFICIENT {} decision(s): {}", n, why);
     }
+    for (tag, n) in &report.audit_gaps {
+        println!("AUDIT GAP {} marker(s): {}", n, tag);
+    }
     println!(
-        "replayed with build {}: {} reproduced, {} mismatched, {} without enough context, {} refused by the protected set (not replayed)",
+        "replayed with build {}: {} reproduced, {} mismatched, {} without enough context, {} refused by the protected set (not replayed), {} audit gap marker(s)",
         this_build,
         report.reproduced,
         report.mismatched.len(),
         report.insufficient.values().sum::<u64>(),
-        report.policy_refusals
+        report.policy_refusals,
+        report.audit_gaps.values().sum::<u64>()
     );
     if !report.mismatched.is_empty() {
         1
-    } else if report.reproduced == 0 || !report.insufficient.is_empty() {
+    } else if report.reproduced == 0
+        || !report.insufficient.is_empty()
+        || !report.audit_gaps.is_empty()
+    {
         2
     } else {
         0
@@ -749,6 +767,104 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
         for (status, expected) in statuses {
             assert_eq!(status, expected);
+        }
+    }
+
+    #[test]
+    fn explicit_audit_gaps_fence_dependent_decisions() {
+        for gap in [
+            "AUDIT_LOST|Records:1",
+            "AUDIT_QUEUE_OVERFLOW|Dropped:2",
+            "AUDIT_LOST|Records:0",
+            "AUDIT_QUEUE_OVERFLOW|Dropped:invalid",
+        ] {
+            let r = run(&[
+                start(60, 600),
+                decision("198.51.100.7", "60s", "new", 1_000_000, "ids/1"),
+                gap.into(),
+                "SIGNAL_DUPLICATE|IP:198.51.100.7|At:1001000|Event:ids/1".into(),
+                decision("198.51.100.8", "60s", "new", 1_002_000, "ids/2"),
+                start(60, 600),
+                decision("198.51.100.9", "60s", "new", 2_000_000, "ids/3"),
+            ]);
+            assert_eq!(r.reproduced, 2, "gap: {gap}");
+            assert_eq!(r.insufficient.values().sum::<u64>(), 2);
+            assert_eq!(r.audit_gaps.values().sum::<u64>(), 1);
+            assert!(r.mismatched.is_empty());
+        }
+    }
+
+    #[test]
+    fn a_gap_alone_prevents_a_successful_cli_result() {
+        use common::audit_log::AuditLog;
+        let dir = std::env::temp_dir().join(format!(
+            "sokol-replay-gaps-{}-{}",
+            std::process::id(),
+            crate::p2p::now_ms()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let mut statuses = Vec::new();
+        for (g, gap) in ["AUDIT_LOST|Records:1", "AUDIT_QUEUE_OVERFLOW|Dropped:2"]
+            .into_iter()
+            .enumerate()
+        {
+            for (case, (lines, expected)) in [
+                (
+                    vec![
+                        start(60, 600),
+                        decision("198.51.100.7", "60s", "new", 1_000_000, "ids/1"),
+                        gap.into(),
+                    ],
+                    2,
+                ),
+                (
+                    vec![
+                        gap.into(),
+                        start(60, 600),
+                        decision("198.51.100.7", "60s", "new", 1_000_000, "ids/1"),
+                    ],
+                    2,
+                ),
+                (
+                    vec![
+                        start(60, 600),
+                        gap.into(),
+                        start(60, 600),
+                        decision("198.51.100.7", "60s", "new", 1_000_000, "ids/1"),
+                    ],
+                    2,
+                ),
+                (
+                    vec![
+                        start(60, 600),
+                        decision("198.51.100.7", "600s", "new", 1_000_000, "ids/1"),
+                        gap.into(),
+                    ],
+                    1,
+                ),
+                (
+                    vec![
+                        start(60, 600),
+                        decision("198.51.100.7", "60s", "new", 1_000_000, "ids/1"),
+                    ],
+                    0,
+                ),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let path = dir.join(format!("{g}-{case}.log"));
+                let mut writer = AuditLog::open(&path).unwrap();
+                for line in lines {
+                    writer.append(line.as_bytes()).unwrap();
+                }
+                drop(writer);
+                statuses.push((print_report(&path, BUILD), expected));
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+        for (actual, expected) in statuses {
+            assert_eq!(actual, expected);
         }
     }
 
