@@ -240,9 +240,17 @@ or the oldest queued alert. Metadata/open errors before scanning still return no
 The node blocks the offending address in XDP, shares the block with its mesh peers and records the
 rule in the audit log (`suricata: sid:<id> <signature>`). If the alert fired on this node's own
 outbound traffic, the remote destination is blocked instead; the never-block policy still applies.
-The same address is not re-sent within `--cooldown-secs` (60), signals are capped at
-`--max-signals-per-sec` (50), and noisy rules can be skipped with `--ignore-sid`. The adapter only
-needs to read the EVE log and write to the IPC socket (group `sokol-ipc`).
+The same source address is not admitted again within `--cooldown-secs` (60), and
+`--max-signals-per-sec` (50) caps policy admissions per fixed one-second window, not IPC
+retries or paced delivery. Adjacent windows can admit a burst across their boundary.
+Cooldown memory retains at most **100,000 distinct addresses**. Expired entries leave in
+admission order; a full cache skips new addresses without evicting an unexpired cooldown.
+Each batch logs its capacity refusals. Those alerts are deliberately skipped, not queued
+for retry, and the source cursor may advance past them. This is a cardinality bound,
+not a process RSS or latency guarantee. Noisy rules can be skipped with `--ignore-sid`.
+The adapter only needs to read the EVE log and write to the IPC socket (group `sokol-ipc`).
+The [detector invariant ledger](docs/DETECTOR_INVARIANTS.md) maps these boundaries and
+source/queue/ACK/cursor properties to code and executable counterexamples.
 
 ### CrowdSec
 
