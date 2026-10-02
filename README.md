@@ -212,12 +212,13 @@ followed by regrowth beyond the saved position. Alerts older than `--max-alert-a
 (default 600) are skipped; replayed alerts retain their event IDs for duplicate recognition.
 
 The reader processes at most **1 MiB of bytes or 256 completed lines per poll**, counting
-invalid lines too, then yields to delivery and checkpointing. It retains at most **1 MiB
-of line data**, including the final LF. A larger record (even valid JSON) is logged and
+invalid lines too, then yields to delivery and the existing once-per-second checkpoint check. It retains at
+most **1 MiB of unfinished line data**, including the final LF. A larger record (even valid JSON) is logged and
 skipped through its LF; the next record is read normally. Invalid UTF-8 completed lines
 are also logged and skipped. These are fixed operational quotas, not measured throughput
-or wall-clock deadlines. Delivery and checkpointing still run between batches, but a
-budget-exhausted poll is followed immediately by the next iteration. The 50 ms idle pause
+or wall-clock deadlines, and the line-data cap is not a whole-process memory limit.
+Delivery and the checkpoint check still run between batches, but a budget-exhausted poll
+is followed immediately by the next iteration. The 50 ms idle pause
 applies only when a poll does not exhaust a budget (or returns an error).
 
 
