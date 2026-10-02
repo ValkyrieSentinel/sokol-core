@@ -216,7 +216,9 @@ invalid lines too, then yields to delivery and checkpointing. It retains at most
 of line data**, including the final LF. A larger record (even valid JSON) is logged and
 skipped through its LF; the next record is read normally. Invalid UTF-8 completed lines
 are also logged and skipped. These are fixed operational quotas, not measured throughput
-or wall-clock deadlines; the adapter still sleeps 50 ms between main-loop iterations.
+or wall-clock deadlines. Delivery and checkpointing still run between batches, but a
+budget-exhausted poll is followed immediately by the next iteration. The 50 ms idle pause
+applies only when a poll does not exhaust a budget (or returns an error).
 
 
 The node blocks the offending address in XDP, shares the block with its mesh peers and records the

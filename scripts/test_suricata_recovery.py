@@ -151,6 +151,34 @@ class RecoveryTests(unittest.TestCase):
                                     await_cursor(cursor, {"inode": eve.stat().st_ino,
                                                           "position": eve.stat().st_size}, proc)
 
+    def test_backlog_does_not_sleep_between_every_batch(self):
+        # 100,000 records / 256 per batch * 50 ms would delay this alert by >19 s.
+        # The existing 10 s socket deadline detects that artificial delay.
+        with tempfile.TemporaryDirectory(prefix="sokol-backlog-", dir="/tmp") as directory:
+            root = Path(directory)
+            eve, cursor, ipc = root / "eve.json", root / "cursor", root / "ipc.sock"
+            eve.write_text("{}\n" * 100_000 + alert("203.0.113.6"))
+            with socket.socket(socket.AF_UNIX) as server:
+                server.bind(str(ipc))
+                server.listen(1)
+                server.settimeout(WAIT_SECONDS)
+                args = [str(self.binary), "--eve", str(eve), "--cursor-file", str(cursor),
+                        "--ipc-socket", str(ipc), "--from-start"]
+                with running(args) as proc:
+                    conn, _ = server.accept()
+                    with conn:
+                        conn.settimeout(WAIT_SECONDS)
+                        with conn.makefile("rb") as reader:
+                            self.assertEqual(reader.readline(4097), b"ACK\n")
+                            conn.sendall(b"OK ack\n")
+                            line = reader.readline(4097).decode()
+                            self.assertTrue(line.startswith("SIGNAL#"), line)
+                            self.assertEqual(line.partition(":")[2],
+                                             "suricata|203.0.113.6|-|sid:123 recovery probe\n")
+                            conn.sendall(b"OK applied\n")
+                            await_cursor(cursor, {"inode": eve.stat().st_ino,
+                                                  "position": eve.stat().st_size}, proc)
+
     def test_pending_same_file_survives_process_loss(self):
         self.restart_case(rotate=False)
 

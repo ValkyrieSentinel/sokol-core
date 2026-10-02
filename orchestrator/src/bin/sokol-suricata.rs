@@ -219,6 +219,7 @@ struct Follower {
     position: u64,
     partial: Vec<u8>,
     discarding: bool,
+    budget_exhausted: bool,
     /// Where the line being assembled in `partial` starts.
     line_start: u64,
 }
@@ -252,6 +253,7 @@ impl Follower {
             position: 0,
             partial: Vec::new(),
             discarding: false,
+            budget_exhausted: false,
             line_start: 0,
         };
         let _ = f.open(!from_start);
@@ -338,6 +340,7 @@ impl Follower {
     /// Budgets count consumed bytes and all completed lines (including skipped ones).
     /// BufReader may prefetch; these are work quotas, not a wall-clock deadline.
     fn poll(&mut self) -> io::Result<Vec<(u64, String)>> {
+        self.budget_exhausted = false; // errors/EOF must not cause a busy retry loop
         match std::fs::metadata(&self.path) {
             Ok(_) if self.reader.is_none() => self.open(false)?,
             Ok(meta) if meta.ino() != self.inode => {
@@ -402,6 +405,7 @@ impl Follower {
                 completed += 1;
             }
         }
+        self.budget_exhausted = remaining == 0 || completed == MAX_POLL_LINES;
         Ok(lines)
     }
 }
@@ -538,7 +542,11 @@ fn main() {
                 }
             }
         }
-        std::thread::sleep(Duration::from_millis(50));
+        // Still deliver/checkpoint between batches, but do not impose 20 batches/s
+        // on a backlog. An exact-boundary EOF costs one extra empty poll.
+        if !follower.budget_exhausted {
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 }
 
@@ -886,11 +894,13 @@ mod tests {
         std::fs::write(&path, "x\n".repeat(MAX_POLL_LINES + 1)).unwrap();
         let mut f = Follower::new(&path, true);
         assert_eq!(f.poll().unwrap().len(), MAX_POLL_LINES);
+        assert!(f.budget_exhausted);
         assert_eq!(f.cursor().position, (2 * MAX_POLL_LINES) as u64);
         assert_eq!(
             f.poll().unwrap(),
             vec![((2 * MAX_POLL_LINES) as u64, "x\n".into())]
         );
+        assert!(!f.budget_exhausted);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
