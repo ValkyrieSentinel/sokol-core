@@ -297,7 +297,7 @@ impl Outbox {
     /// Both possible wire frames are validated before any queue mutation. The
     /// caller owns command semantics and the expiry clock; acknowledgement rules,
     /// overflow, and backoff are the same as push(). This is in-memory state.
-    #[allow(dead_code)] // Suricata includes this module but uses ordinary push().
+    #[allow(dead_code)] // Suricata uses push/push_before; source TTL is CrowdSec policy.
     pub fn push_with_deadline(
         &mut self,
         line: &str,
@@ -365,10 +365,12 @@ impl Outbox {
     /// Returns node answers only; local expiry is reported through the expired counter.
     pub fn flush(&mut self, max: usize) -> (Vec<(String, Outcome)>, Option<String>) {
         let mut done = Vec::new();
-        let mut expired = 0;
-        while done.len() + expired < max {
+        // Preserve the ordinary answer bound; each local loss spends one of its slots.
+        let mut max = max;
+        while done.len() < max {
             if self.expire_front() {
-                expired += 1;
+                // The loop condition proves max > 0 here.
+                max -= 1;
                 continue;
             }
             if self.retry_at.is_some_and(|t| Instant::now() < t) {
@@ -389,7 +391,8 @@ impl Outbox {
                 self.failing = false;
                 self.backoff = BACKOFF_MIN;
                 self.retry_at = None;
-                expired += 1;
+                // The loop condition proves max > 0 here.
+                max -= 1;
                 continue;
             }
             let wire = match self.deadlines.front() {
