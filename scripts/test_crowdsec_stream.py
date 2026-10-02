@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import socket
+import subprocess
 import sys
 import tempfile
 import threading
@@ -34,6 +35,91 @@ class LocalAPI(HTTPServer):
 
 class StreamTests(unittest.TestCase):
     binary = None
+
+    def test_zero_pacing_fails_before_lapi_or_ipc_requests(self):
+        requests, commands, connections, errors = [], [], [], []
+        stop = threading.Event()
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                requests.append(self.path)
+                body = json.dumps({"new": [DECISION], "deleted": []}).encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        class CountingAPI(LocalAPI):
+            def get_request(self):
+                conn, address = super().get_request()
+                connections.append("LAPI")
+                return conn, address
+
+        with tempfile.TemporaryDirectory(prefix="sokol-cs-rate-", dir="/tmp") as directory:
+            ipc = Path(directory) / "ipc.sock"
+            with CountingAPI(("127.0.0.1", 0), Handler) as api, socket.socket(socket.AF_UNIX) as server:
+                server.bind(str(ipc))
+                server.listen(1)
+                server.settimeout(0.1)
+
+                def node():
+                    try:
+                        while not stop.is_set():
+                            try:
+                                conn, _ = server.accept()
+                            except socket.timeout:
+                                continue
+                            connections.append("IPC")
+                            with conn:
+                                conn.settimeout(2)
+                                with conn.makefile("rb") as reader:
+                                    line = reader.readline(4097)
+                                    commands.append(line)
+                                    if line == b"ACK\n":
+                                        conn.sendall(b"OK ack\n")
+                                        commands.append(reader.readline(4097))
+                                        conn.sendall(b"OK applied\n")
+                            return
+                    except Exception as error:
+                        errors.append(error)
+
+                http_thread = threading.Thread(target=api.serve_forever,
+                    kwargs={"poll_interval": 0.05}, daemon=True)
+                node_thread = threading.Thread(target=node, daemon=True)
+                http_thread.start()
+                node_thread.start()
+                try:
+                    args = [str(self.binary), "--lapi-url", f"http://127.0.0.1:{api.server_port}",
+                            "--api-key", "dummy-regression-key", "--ipc-socket", str(ipc),
+                            "--max-signals-per-sec", "0"]
+                    with patch.dict(os.environ, {"NO_PROXY": "127.0.0.1", "no_proxy": "127.0.0.1"}), running(args) as proc:
+                        try:
+                            code = proc.wait(timeout=WAIT_SECONDS)
+                        except subprocess.TimeoutExpired:
+                            self.fail(f"zero pacing started adapter; HTTP={requests}; IPC={commands}")
+                finally:
+                    stop.set()
+                    api.shutdown()
+                    http_thread.join(timeout=3)
+                    node_thread.join(timeout=3)
+                self.assertFalse(http_thread.is_alive() or node_thread.is_alive(), "fixture did not stop")
+                self.assertEqual(code, 2, "invalid CLI configuration must fail before startup")
+                self.assertEqual(requests, [], "configuration refusal must precede LAPI polling")
+                self.assertEqual(commands, [], "configuration refusal must precede IPC handshake")
+                self.assertEqual(connections, [], "configuration refusal must precede network connection")
+                self.assertFalse(errors, str(errors))
+                # Catch connections queued before exit but not yet accepted by the spies.
+                for listener in (api.socket, server):
+                    listener.settimeout(0.1)
+                    try:
+                        conn, _ = listener.accept()
+                    except socket.timeout:
+                        continue
+                    conn.close()
+                    self.fail("invalid configuration left a queued network connection")
 
     def check_stream(self, expire_during_handshake=False):
         requests = []

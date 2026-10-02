@@ -38,6 +38,7 @@
     )
 )]
 use std::net::IpAddr;
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -69,9 +70,9 @@ struct Args {
     #[arg(long, default_value = "5")]
     poll_secs: u64,
 
-    /// Upper bound on signals per second sent to the node.
+    /// Positive nominal IPC pacing rate, in commands/second (not a sliding-window quota).
     #[arg(long, default_value = "200")]
-    max_signals_per_sec: u32,
+    max_signals_per_sec: NonZeroU32,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -334,13 +335,19 @@ fn deliver(
     }
 }
 
+/// Smallest whole-nanosecond interval no shorter than the inverse configured rate.
+/// The typed rate cannot be zero; the result is in 1 ns..=1 s, including large rates.
+fn signal_pause(rate: NonZeroU32) -> Duration {
+    Duration::from_nanos(1_000_000_000u64.div_ceil(u64::from(rate.get())))
+}
+
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let args = Args::parse();
     let mut outbox = delivery::Outbox::new(&args.ipc_socket, OUTBOX_CAP);
     // The first successful poll asks for all current decisions, later ones only for changes.
     let mut startup = true;
-    let pause = Duration::from_secs_f64(1.0 / f64::from(args.max_signals_per_sec.max(1)));
+    let pause = signal_pause(args.max_signals_per_sec);
     log::info!(
         "[sokol-crowdsec] polling {} every {} s (origins: {}), signalling {}",
         args.lapi_url,
@@ -448,6 +455,85 @@ mod tests {
 
     fn local() -> Vec<String> {
         vec!["crowdsec".into(), "cscli".into()]
+    }
+
+    #[test]
+    fn cli_rejects_zero_ipc_pacing_before_startup() {
+        assert!(
+            Args::try_parse_from([
+                "sokol-crowdsec",
+                "--api-key",
+                "dummy-regression-key",
+                "--max-signals-per-sec",
+                "0",
+            ])
+            .is_err(),
+            "zero pacing must not silently authorize one command per second"
+        );
+    }
+
+    #[test]
+    fn ipc_pacing_interval_does_not_round_below_the_configured_budget() {
+        let pause = signal_pause(NonZeroU32::new(3).unwrap());
+        assert!(
+            pause.as_nanos() * 3 >= 1_000_000_000,
+            "three configured pacing intervals must consume at least one second"
+        );
+    }
+
+    #[test]
+    fn cli_pacing_accepts_positive_u32_bounds_and_zero_poll_interval() {
+        for value in ["1", "200", "4294967295"] {
+            let args = Args::try_parse_from([
+                "sokol-crowdsec",
+                "--api-key",
+                "dummy-regression-key",
+                "--max-signals-per-sec",
+                value,
+                "--poll-secs",
+                "0",
+            ])
+            .unwrap();
+            assert_eq!(
+                args.max_signals_per_sec.get(),
+                value.parse::<u32>().unwrap()
+            );
+            assert_eq!(
+                args.poll_secs, 0,
+                "zero poll interval is a separate valid policy"
+            );
+        }
+        let defaults =
+            Args::try_parse_from(["sokol-crowdsec", "--api-key", "dummy-regression-key"]).unwrap();
+        assert_eq!(defaults.max_signals_per_sec.get(), 200);
+        for value in ["0", "00", "-1", "4294967296", "no"] {
+            assert!(Args::try_parse_from([
+                "sokol-crowdsec",
+                "--api-key",
+                "dummy-regression-key",
+                "--max-signals-per-sec",
+                value,
+            ])
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn ipc_pacing_intervals_are_positive_minimal_integer_budgets() {
+        for rate in (1..=10_000u32).chain([500_000_001, 1_000_000_000, 1_000_000_001, u32::MAX]) {
+            let pause = signal_pause(NonZeroU32::new(rate).unwrap());
+            let nanos = pause.as_nanos();
+            let rate = u128::from(rate);
+            assert!((1..=1_000_000_000).contains(&nanos));
+            assert!(
+                nanos * rate >= 1_000_000_000,
+                "interval cannot understate inverse rate"
+            );
+            assert!(
+                (nanos - 1) * rate < 1_000_000_000,
+                "one nanosecond less is insufficient"
+            );
+        }
     }
 
     #[test]
