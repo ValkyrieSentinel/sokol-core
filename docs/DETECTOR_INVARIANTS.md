@@ -214,8 +214,11 @@ unwrapped records or protect against an actor able to rewrite the chain.
 The signal socket's `DB_LOG:<text>` calls `SentinelDb::append_client_log`, which
 writes one length-framed `CLIENT_LOG|Message:<trimmed text>` record. The fixed outer
 tag is ignored by decision replay: embedded `NODE_START`, decisions, `STATE_RESTORED`
-and loss markers remain text. Delimiters, internal newlines, NUL and Unicode are
-retained; existing outer trimming, `OK recorded` and downstream telemetry are unchanged.
+and loss markers remain text. Pipes, NUL and Unicode are retained; direct API callers
+can also supply internal newlines, while socket input is line-based. Existing outer
+trimming, `OK recorded` and downstream telemetry are unchanged. Telemetry still
+forwards client text under `DB_LOG:NODE=...`; this change separates audit records,
+not the operator telemetry consumer.
 The reply still acknowledges queue submission, not durable storage. Internal node
 writers continue using `append` and their original tags. Trap finalisation is now
 client data, still visible in monitor dumps. Existing unwrapped logs are not migrated;
