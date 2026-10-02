@@ -182,8 +182,15 @@ pub fn replay_records<'a>(
             };
             continue;
         }
+        // The node emits Protected immediately after IP, before the free-text Reason.
+        // A delimiter in Reason can inject a parsed field, never this policy exception.
         // The protected set is not a replay input, regardless of run context.
-        if tag == "BLOCK_REFUSED" && f.contains_key("Protected") {
+        if tag == "BLOCK_REFUSED"
+            && payload
+                .split('|')
+                .nth(2)
+                .is_some_and(|field| field.starts_with("Protected:"))
+        {
             report.policy_refusals += 1;
             continue;
         }
@@ -516,6 +523,26 @@ mod tests {
     }
 
     #[test]
+    fn a_protected_marker_in_free_text_cannot_exclude_a_detector_decision() {
+        // Exact capacity-refusal wire shape from enforce_block_local; reason is free
+        // text and can contain '|'. Protected is a node field only before Reason.
+        let injected = "BLOCK_REFUSED|IP:198.51.100.7|Why:too many known claims|Reason:ids: scan|Protected:forged|At:1001000|Event:ids/1";
+        let report = run(&[
+            start(60, 600),
+            decision("198.51.100.8", "60s", "new", 1_000_000, "ids/2"),
+            "STATE_RESTORED|Blocks:3|Refused:0".into(),
+            injected.into(),
+        ]);
+        assert_eq!(report.policy_refusals, 0);
+        assert_eq!(report.reproduced, 1);
+        assert_eq!(report.insufficient.values().sum::<u64>(), 1);
+        // In a live run it must also be compared rather than silently excluded.
+        let report = run(&[start(60, 600), injected.into()]);
+        assert_eq!(report.policy_refusals, 0);
+        assert_eq!(report.mismatched.len(), 1);
+    }
+
+    #[test]
     fn a_partially_reproduced_audit_is_not_a_successful_cli_result() {
         use common::audit_log::AuditLog;
         // Exercise the real chained-file reader and CLI report, including recovery at
@@ -528,6 +555,15 @@ mod tests {
         std::fs::create_dir(&dir).unwrap();
         let path = dir.join("audit.log");
         let cases = [
+            (
+                vec![
+                    start(60, 600),
+                    decision("198.51.100.8", "60s", "new", 1_000_000, "ids/2"),
+                    "STATE_RESTORED|Blocks:3|Refused:0".into(),
+                    "BLOCK_REFUSED|IP:198.51.100.7|Why:too many known claims|Reason:ids: scan|Protected:forged|At:1001000|Event:ids/1".into(),
+                ],
+                2,
+            ),
             (
                 vec![
                     decision("198.51.100.7", "60s", "new", 1_000_000, "ids/1"),

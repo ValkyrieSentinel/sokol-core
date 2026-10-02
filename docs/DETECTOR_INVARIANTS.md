@@ -181,5 +181,8 @@ classification does not establish that the refusal was correct: a faulty/fabrica
 refusal can also remain unverified and yields exit 2. A new start restores replay context,
 not evidence for earlier decisions. Other missing-input/mismatch handling retains its
 existing scope; there is no complete mesh/resource-state reconstruction. Protected-set
-refusals remain separately counted outside replay scope, even at exit 0. Chain validation
+refusals remain separately counted outside replay scope, even at exit 0. Only the node's
+`Protected:` field immediately after `IP:` qualifies; a marker embedded in free-text
+`Reason:` cannot exempt a capacity refusal from checking (`a_protected_marker_in_free_text_cannot_exclude_a_detector_decision`, also tested through the chained-file CLI). This
+is a bound on this policy exception, not a redesign of the legacy delimiter format. Chain validation
 checks integrity, not authenticity against an actor able to rewrite the chain.
