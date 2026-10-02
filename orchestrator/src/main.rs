@@ -71,7 +71,7 @@ use ipnet::IpNet;
 /// reopens the log, which drops a torn tail, until it can write again.
 enum AuditMsg {
     Record(String),
-    /// Acked with whether everything queued before it is written and fsynced.
+    /// Acked after processing preceding records and syncing the log plus pending loss notices.
     Flush(std::sync::mpsc::SyncSender<bool>),
 }
 
@@ -80,7 +80,7 @@ enum AuditMsg {
 pub struct AuditHealth {
     write_errors: std::sync::atomic::AtomicU64,
     sync_errors: std::sync::atomic::AtomicU64,
-    /// Records that could not be written (log unavailable), besides queue overflow.
+    /// Records not written (including oversize rejection), besides queue overflow.
     lost: std::sync::atomic::AtomicU64,
     last_sync_ok_ms: std::sync::atomic::AtomicU64,
     failing: std::sync::atomic::AtomicBool,
@@ -109,7 +109,7 @@ struct AuditWriter {
     rotation: Option<Rotation>,
     health: Arc<AuditHealth>,
     last_sync: std::time::Instant,
-    /// Records lost since the log was last writable; noted in the log once it is again.
+    /// Known failed records not yet covered by an appended loss notice.
     lost_pending: u64,
 }
 
@@ -125,27 +125,44 @@ impl AuditWriter {
         }
     }
 
-    /// Reopens the log after a failure (dropping the old handle first releases its lock).
+    /// Reopens after failure and writes pending loss before any following record or sync.
     fn ensure_open(&mut self) -> bool {
-        if self.log.is_some() {
+        if self.log.is_none() {
+            match AuditLog::open_with(&self.path, self.rotation) {
+                Ok(log) => self.log = Some(log),
+                Err(e) => {
+                    self.fail("reopen", &e);
+                    return false;
+                }
+            }
+        }
+        if self.lost_pending > 0 {
+            let note = format!("AUDIT_LOST|Records:{}", self.lost_pending);
+            if self.write(note).is_err() {
+                return false;
+            }
+            self.lost_pending = 0;
+        }
+        true
+    }
+
+    /// Queue losses are separate from failed records. Retain the count if the notice
+    /// cannot be appended; a failed notice is not another lost user record.
+    fn note_queue_overflow(&mut self, dropped: &std::sync::atomic::AtomicU64) -> bool {
+        use std::sync::atomic::Ordering;
+        let lost = dropped.swap(0, Ordering::Relaxed);
+        if lost == 0 {
             return true;
         }
-        match AuditLog::open_with(&self.path, self.rotation) {
-            Ok(log) => {
-                self.log = Some(log);
-                if self.lost_pending > 0 {
-                    let note = format!("AUDIT_LOST|Records:{}", self.lost_pending);
-                    if self.write(note).is_ok() {
-                        self.lost_pending = 0;
-                    }
-                }
-                self.log.is_some()
-            }
-            Err(e) => {
-                self.fail("reopen", &e);
-                false
-            }
+        if !self.ensure_open()
+            || self
+                .write(format!("AUDIT_QUEUE_OVERFLOW|Dropped:{}", lost))
+                .is_err()
+        {
+            dropped.fetch_add(lost, Ordering::Relaxed);
+            return false;
         }
+        true
     }
 
     fn write(&mut self, payload: String) -> Result<(), ()> {
@@ -157,7 +174,7 @@ impl AuditWriter {
             Ok(_) => Ok(()),
             Err(common::audit_log::AuditError::PayloadTooLarge(n)) => {
                 log::error!("[Audit] Record of {} bytes dropped: too large", n);
-                Ok(())
+                Err(())
             }
             Err(e) => {
                 self.health.write_errors.fetch_add(1, Ordering::Relaxed);
@@ -168,18 +185,19 @@ impl AuditWriter {
         }
     }
 
-    fn record(&mut self, payload: String) {
+    fn record(&mut self, payload: String, dropped: &std::sync::atomic::AtomicU64) {
         use std::sync::atomic::Ordering;
-        if !self.ensure_open() || self.write(payload).is_err() {
+        if !self.note_queue_overflow(dropped) || !self.ensure_open() || self.write(payload).is_err()
+        {
             self.lost_pending += 1;
             self.health.lost.fetch_add(1, Ordering::Relaxed);
         }
     }
 
-    fn sync(&mut self) -> bool {
+    fn sync(&mut self, dropped: &std::sync::atomic::AtomicU64) -> bool {
         use std::sync::atomic::Ordering;
         self.last_sync = std::time::Instant::now();
-        if !self.ensure_open() {
+        if !self.note_queue_overflow(dropped) || !self.ensure_open() {
             return false;
         }
         let result = self.log.as_mut().map(|l| l.sync());
@@ -202,6 +220,38 @@ impl AuditWriter {
             None => false,
         }
     }
+
+    fn run(
+        mut self,
+        rx: std::sync::mpsc::Receiver<AuditMsg>,
+        dropped: Arc<std::sync::atomic::AtomicU64>,
+    ) {
+        use std::sync::mpsc::RecvTimeoutError;
+        loop {
+            let wait = SentinelDb::SYNC_INTERVAL.saturating_sub(self.last_sync.elapsed());
+            match rx.recv_timeout(wait) {
+                Ok(AuditMsg::Flush(ack)) => {
+                    let ok = self.sync(&dropped);
+                    let _ = ack.send(ok);
+                }
+                Ok(AuditMsg::Record(payload)) => {
+                    self.record(payload, &dropped);
+                    let unsynced = self.log.as_ref().map_or(0, |l| l.unsynced());
+                    if unsynced >= SentinelDb::SYNC_BATCH
+                        || self.last_sync.elapsed() >= SentinelDb::SYNC_INTERVAL
+                    {
+                        self.sync(&dropped);
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    self.sync(&dropped);
+                }
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        self.sync(&dropped);
+        log::info!("SentinelDb persistence thread terminated.");
+    }
 }
 
 impl SentinelDb {
@@ -221,7 +271,7 @@ impl SentinelDb {
         health
             .last_sync_ok_ms
             .store(now_ms(), std::sync::atomic::Ordering::Relaxed);
-        let mut writer = AuditWriter {
+        let writer = AuditWriter {
             log: Some(log),
             path: std::path::PathBuf::from(path),
             rotation,
@@ -230,38 +280,7 @@ impl SentinelDb {
             lost_pending: 0,
         };
 
-        std::thread::spawn(move || {
-            use std::sync::atomic::Ordering;
-            use std::sync::mpsc::RecvTimeoutError;
-            loop {
-                let wait = Self::SYNC_INTERVAL.saturating_sub(writer.last_sync.elapsed());
-                match rx.recv_timeout(wait) {
-                    Ok(AuditMsg::Flush(ack)) => {
-                        let ok = writer.sync();
-                        let _ = ack.send(ok);
-                    }
-                    Ok(AuditMsg::Record(payload)) => {
-                        let lost = dropped_writer.swap(0, Ordering::Relaxed);
-                        if lost > 0 {
-                            writer.record(format!("AUDIT_QUEUE_OVERFLOW|Dropped:{}", lost));
-                        }
-                        writer.record(payload);
-                        let unsynced = writer.log.as_ref().map_or(0, |l| l.unsynced());
-                        if unsynced >= Self::SYNC_BATCH
-                            || writer.last_sync.elapsed() >= Self::SYNC_INTERVAL
-                        {
-                            writer.sync();
-                        }
-                    }
-                    Err(RecvTimeoutError::Timeout) => {
-                        writer.sync();
-                    }
-                    Err(RecvTimeoutError::Disconnected) => break,
-                }
-            }
-            writer.sync();
-            log::info!("SentinelDb persistence thread terminated.");
-        });
+        std::thread::spawn(move || writer.run(rx, dropped_writer));
 
         Ok(Self {
             tx,
@@ -288,8 +307,11 @@ impl SentinelDb {
         }
     }
 
-    /// Waits up to `wait` in total until everything queued so far is written and fsynced (used
-    /// on shutdown). Returns whether that was confirmed.
+    /// Processes preceding queued records, emits pending known loss notices and fsyncs
+    /// the audit within `wait` (used on shutdown). A true result confirms this barrier,
+    /// not a complete history: discarded records remain losses reported by replay/metrics.
+    /// Quiesce producers first to include all their completed submissions; this is not a
+    /// snapshot or an acknowledgement for concurrent submissions after the barrier.
     pub fn flush(&self, wait: Duration) -> bool {
         let deadline = std::time::Instant::now() + wait;
         let (ack_tx, ack_rx) = std::sync::mpsc::sync_channel(1);
@@ -432,7 +454,7 @@ struct Args {
 
     /// Replay this node's detector decisions from an audit log with this build's code, report
     /// what is reproduced, mismatched or lacks context, then exit (ADR-0016). Exit status:
-    /// 0 nonempty replay without mismatches or insufficient context, 1 a mismatch,
+    /// 0 nonempty replay without mismatches, insufficient context or audit gaps, 1 a mismatch,
     /// 2 incomplete/empty replay or invalid audit chain. Protected-set refusals are excluded.
     #[arg(long, value_name = "AUDIT_LOG")]
     replay: Option<std::path::PathBuf>,
@@ -2875,6 +2897,211 @@ mod tests {
         for text in decoys {
             assert!(payloads.contains(&format!("CLIENT_LOG|Message:{}", text.trim()).into_bytes()));
         }
+    }
+
+    fn read_audit(path: &str) -> Vec<String> {
+        let mut reader = common::audit_log::AuditReader::open(std::path::Path::new(path)).unwrap();
+        let mut lines = Vec::new();
+        while let Some(record) = reader.next_record().unwrap() {
+            lines.push(String::from_utf8(record.payload).unwrap());
+        }
+        lines
+    }
+
+    fn loss_test_prefix() -> Vec<String> {
+        vec![crate::replay::StartContext {
+            build: "loss-test".into(), node: 1, ttl_base_secs: 60, ttl_max_secs: 600,
+        }.record(), "DYNAMIC_BLOCK_V4|IP:198.51.100.7|TTL:60s|Reason:ids: scan|Enforced|Claim:new|At:1000000|Event:ids/1".into()]
+    }
+
+    // A real bounded channel can be filled before its real writer starts, so no
+    // scheduler race or production test hook is needed to force TrySendError::Full.
+    fn paused_audit(
+        name: &str,
+        capacity: usize,
+    ) -> (
+        SentinelDb,
+        AuditWriter,
+        std::sync::mpsc::Receiver<AuditMsg>,
+        String,
+    ) {
+        let path = temp_log(name);
+        let mut log = AuditLog::open(std::path::Path::new(&path)).unwrap();
+        for line in loss_test_prefix() {
+            log.append(line.as_bytes()).unwrap();
+        }
+        log.sync().unwrap();
+        let (tx, rx) = std::sync::mpsc::sync_channel(capacity);
+        let health = Arc::new(AuditHealth::default());
+        let db = SentinelDb {
+            tx,
+            dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            overflow_total: std::sync::atomic::AtomicU64::new(0),
+            health: health.clone(),
+        };
+        let writer = AuditWriter {
+            log: Some(log),
+            path: path.clone().into(),
+            rotation: None,
+            health,
+            last_sync: std::time::Instant::now(),
+            lost_pending: 0,
+        };
+        (db, writer, rx, path)
+    }
+
+    #[test]
+    fn oversized_audit_records_are_counted_and_marked_before_following_data_or_flush() {
+        let mut observations = Vec::new();
+        for following in [false, true] {
+            let path = temp_log(if following {
+                "oversize-next"
+            } else {
+                "oversize-tail"
+            });
+            let db = SentinelDb::init(&path, None).unwrap();
+            let mut expected = loss_test_prefix();
+            for line in &expected {
+                db.append(line.clone());
+            }
+            db.append("x".repeat(common::audit_log::MAX_PAYLOAD + 1));
+            if following {
+                db.append("AFTER_LOSS".into());
+            }
+            let flushed = db.flush(Duration::from_secs(2));
+            expected.push("AUDIT_LOST|Records:1".into());
+            if following {
+                expected.push("AFTER_LOSS".into());
+            }
+            let status = db.status();
+            let lines = read_audit(&path);
+            let replay = crate::replay::print_report(std::path::Path::new(&path), "loss-test");
+            observations.push((flushed, status, lines, expected, replay));
+        }
+        for (flushed, status, lines, expected, replay) in observations {
+            assert!(flushed, "the loss notice and surviving records should sync");
+            assert_eq!(status.lost, 1);
+            assert!(
+                status.healthy,
+                "oversize rejection does not poison a writable log"
+            );
+            assert_eq!(lines, expected);
+            assert_eq!(replay, 2, "a synced gap is not complete evidence");
+        }
+    }
+
+    #[test]
+    fn a_flush_records_real_queue_overflow_without_a_following_record() {
+        let (db, writer, rx, path) = paused_audit("overflow-flush", 1);
+        let (ack_tx, ack_rx) = std::sync::mpsc::sync_channel(1);
+        db.tx.try_send(AuditMsg::Flush(ack_tx)).unwrap();
+        db.append("DROPPED".into()); // The queued barrier fills the real bounded channel.
+        assert_eq!(db.overflow_total(), 1);
+        let dropped = db.dropped.clone();
+        let thread = std::thread::spawn(move || writer.run(rx, dropped));
+        let flushed = ack_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let lines = read_audit(&path);
+        let pending = db.dropped.load(std::sync::atomic::Ordering::Relaxed);
+        drop(db);
+        thread.join().unwrap();
+        assert!(flushed);
+        assert_eq!(pending, 0, "the barrier must drain the loss counter");
+        let mut expected = loss_test_prefix();
+        expected.push("AUDIT_QUEUE_OVERFLOW|Dropped:1".into());
+        assert_eq!(lines, expected);
+        assert_eq!(
+            crate::replay::print_report(std::path::Path::new(&path), "loss-test"),
+            2
+        );
+    }
+
+    #[test]
+    fn idle_sync_records_real_queue_overflow_without_a_following_record() {
+        let (db, writer, rx, path) = paused_audit("overflow-idle", 0);
+        db.append("DROPPED".into()); // No receiver is waiting on this rendezvous channel.
+        assert_eq!(db.overflow_total(), 1);
+        let dropped = db.dropped.clone();
+        let thread = std::thread::spawn(move || writer.run(rx, dropped));
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while db
+            .health
+            .last_sync_ok_ms
+            .load(std::sync::atomic::Ordering::Relaxed)
+            == 0
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // Capture evidence BEFORE dropping the sender: disconnected final-sync cannot
+        // make an idle-sync regression pass after the fact.
+        let synced = db
+            .health
+            .last_sync_ok_ms
+            .load(std::sync::atomic::Ordering::Relaxed)
+            > 0;
+        let pending = db.dropped.load(std::sync::atomic::Ordering::Relaxed);
+        let lines = read_audit(&path);
+        drop(db);
+        thread.join().unwrap();
+        assert!(synced);
+        assert_eq!(pending, 0);
+        let mut expected = loss_test_prefix();
+        expected.push("AUDIT_QUEUE_OVERFLOW|Dropped:1".into());
+        assert_eq!(lines, expected);
+    }
+
+    #[test]
+    fn disconnected_final_sync_records_real_queue_overflow() {
+        let (db, writer, rx, path) = paused_audit("overflow-disconnect", 0);
+        db.append("DROPPED".into());
+        assert_eq!(db.overflow_total(), 1);
+        let dropped = db.dropped.clone();
+        drop(db);
+        let thread = std::thread::spawn(move || writer.run(rx, dropped));
+        thread.join().unwrap();
+        let mut expected = loss_test_prefix();
+        expected.push("AUDIT_QUEUE_OVERFLOW|Dropped:1".into());
+        assert_eq!(read_audit(&path), expected);
+    }
+
+    #[test]
+    fn a_failed_loss_notice_retains_its_count_until_recovery() {
+        use std::sync::atomic::Ordering;
+        let (db, mut writer, _rx, path) = paused_audit("notice-recovery", 1);
+        writer.log = None; // Release the real log's exclusive writer lock.
+        let saved_path = writer.path.clone();
+        writer.path = saved_path.parent().unwrap().to_path_buf(); // Opening a directory as a log fails.
+        db.dropped.store(5, Ordering::Relaxed);
+        writer.record("LOST_WHILE_UNAVAILABLE".into(), &db.dropped);
+        assert_eq!(db.dropped.load(Ordering::Relaxed), 5);
+        assert_eq!(db.status().lost, 1);
+        assert!(!writer.sync(&db.dropped));
+        assert_eq!(
+            db.dropped.load(Ordering::Relaxed),
+            5,
+            "failed sync must not erase notices"
+        );
+        writer.path = saved_path;
+        db.dropped.fetch_add(2, Ordering::Relaxed); // New drops join the retained count.
+        writer.record("AFTER_RECOVERY".into(), &db.dropped);
+        assert!(writer.sync(&db.dropped));
+        assert_eq!(db.dropped.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            db.status().lost,
+            1,
+            "a failed notice isn't another lost user record"
+        );
+        let mut expected = loss_test_prefix();
+        expected.extend([
+            "AUDIT_LOST|Records:1".into(),
+            "AUDIT_QUEUE_OVERFLOW|Dropped:7".into(),
+            "AFTER_RECOVERY".into(),
+        ]);
+        assert_eq!(read_audit(&path), expected);
+        assert_eq!(
+            crate::replay::print_report(std::path::Path::new(&path), "loss-test"),
+            2
+        );
     }
 
     /// F07: with an event every 30 ms the old writer's 100 ms receive timeout never fired and

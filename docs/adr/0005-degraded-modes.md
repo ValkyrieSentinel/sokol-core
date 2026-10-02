@@ -15,7 +15,20 @@
 - **Аудит.**
   - Один процес-записувач на журнал (lock-файл `<db-path>.lock`).
   - «Записано» означає лише успішний `fsync` (кожні 100 мс).
-  - Після збою writer отруєний, втрачені записи рахуються й позначаються записом `AUDIT_LOST`.
+  - Невдалий запис закриває handle для повторного відкриття. Відомі невписані записи,
+    включно із завеликим payload, рахуються в `sokol_audit_lost_total` і позначаються
+    `AUDIT_LOST` перед наступними даними або sync. Завеликий payload не отруює
+    справний журнал; `healthy` описує поточну можливість запису, не повноту історії.
+  - Втрати bounded-черги мають окремий `AUDIT_QUEUE_OVERFLOW`. Лічильник читається
+    перед записом і кожним sync, включно з Flush, idle та завершенням каналу. Якщо
+    повідомлення не записалось, його кількість повертається для повтору, а наступний
+    звичайний запис не проходить поперед нього. Точний час втрати не відновлюється:
+    маркер може зупинити replay раніше за фактичний пропуск.
+  - Успішний `flush` підтверджує обробку попередніх queued-записів, запис повідомлень
+    про відомі втрати й sync, а не виживання всіх початкових записів. Завершіть producers
+    перед flush для фінального бар’єра. Replay із маркером втрати дає неповний результат.
+    Збій диска/процесу може не дати записати навіть маркер; failed sync/reopen може
+    втратити хвіст. Повної crash durability це не доводить (AUDIT-R1/R2).
   - Метрики `sokol_audit_*`.
 - **Стан.** Збій запису, зміна, що чекає на диск понад 5 с, або провал відновлення дають
   DEGRADED (ADR-0004).
@@ -42,6 +55,12 @@
 
 - Аудит: `a_second_writer_is_refused_while_the_first_holds_the_log`,
   `a_failed_write_that_cannot_be_undone_poisons_the_writer`, `torn_tail_is_truncated_on_open`.
+- Облік записувача: `oversized_audit_records_are_counted_and_marked_before_following_data_or_flush`,
+  `a_flush_records_real_queue_overflow_without_a_following_record`,
+  `idle_sync_records_real_queue_overflow_without_a_following_record`,
+  `disconnected_final_sync_records_real_queue_overflow`,
+  `a_failed_loss_notice_retains_its_count_until_recovery`. Справжні канал, журнал,
+  worker-loop і помилка відкриття; синхронізований пропуск не видається за CLI 0.
 - Заповнений диск аудиту (tmpfs) перевірено окремим живим сценарієм, поза CI:
   enforcement триває, вузол у DEGRADED, потім `AUDIT_LOST`.
 - Стан: smoke із завислим і пошкодженим файлом стану (ADR-0004).
