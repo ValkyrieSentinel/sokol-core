@@ -116,6 +116,51 @@ class RecoveryTests(unittest.TestCase):
                             with self.assertRaises(socket.timeout):
                                 reader.readline(4097)
 
+    def test_pending_pretruncate_offset_cannot_skip_regrown_file_after_restart(self):
+        with tempfile.TemporaryDirectory(prefix="sokol-truncate-", dir="/tmp") as directory:
+            root = Path(directory)
+            eve, cursor, ipc = root / "eve.json", root / "cursor", root / "ipc.sock"
+            prefix = "{}\n" * 100
+            eve.write_text(prefix + alert("203.0.113.10"))
+            inode = eve.stat().st_ino
+            args = [str(self.binary), "--eve", str(eve), "--cursor-file", str(cursor),
+                    "--ipc-socket", str(ipc)]
+            expected_ips = ["203.0.113.11", "203.0.113.12"]
+            with running(args + ["--from-start"]) as proc:
+                await_cursor(cursor, {"inode": inode, "position": len(prefix)}, proc)
+                # Detectable copytruncate keeps the inode but replaces its contents.
+                first = alert(expected_ips[0])
+                self.assertLess(len(first), len(prefix))
+                eve.write_text(first)
+                self.assertEqual(eve.stat().st_ino, inode)
+                # The adapter retries a missing socket without blocking its reader.
+                # Leave the short file visible for several 50 ms reader iterations.
+                time.sleep(1.2)
+                with eve.open("a") as file:
+                    file.write(alert(expected_ips[1]))
+                self.assertGreater(eve.stat().st_size, len(prefix))
+                await_cursor(cursor, {"inode": inode, "position": 0}, proc)
+
+            # Old-file queued data is gone; every alert in current contents must replay.
+            with socket.socket(socket.AF_UNIX) as server:
+                server.bind(str(ipc))
+                server.listen(1)
+                server.settimeout(WAIT_SECONDS)
+                with running(args) as proc:
+                    conn, _ = server.accept()
+                    with conn:
+                        conn.settimeout(WAIT_SECONDS)
+                        with conn.makefile("rb") as reader:
+                            self.assertEqual(reader.readline(4097), b"ACK\n")
+                            conn.sendall(b"OK ack\n")
+                            for ip in expected_ips:
+                                line = reader.readline(4097).decode()
+                                self.assertTrue(line.startswith("SIGNAL#"), line)
+                                self.assertEqual(line.partition(":")[2],
+                                                 f"suricata|{ip}|-|sid:123 recovery probe\n")
+                                conn.sendall(b"OK applied\n")
+                            await_cursor(cursor, {"inode": inode, "position": eve.stat().st_size}, proc)
+
     def test_bad_records_do_not_drop_neighbouring_alerts(self):
         oversized = json.loads(alert("203.0.113.99"))
         oversized["padding"] = "x" * (1024 * 1024)
