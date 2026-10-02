@@ -107,11 +107,48 @@ impl Blocklist for MemoryLists {
 
 type Fields<'a> = BTreeMap<&'a str, &'a str>;
 
-/// `TAG|Key:value|...` -> (tag, fields). A field without a key is ignored.
+/// The node's protected-refusal marker precedes its free-text reason.
+fn is_protected_refusal(tag: &str, payload: &str) -> bool {
+    tag == "BLOCK_REFUSED"
+        && payload
+            .split('|')
+            .nth(2)
+            .is_some_and(|field| field.starts_with("Protected:"))
+}
+
+/// Parse the current node writers' layout, keeping the entire free-text Reason opaque.
+/// Leading fields precede Reason; detector context is appended after it. Source/event ids
+/// cannot contain '|', so the LAST matching context boundary belongs to the node, not Reason.
 fn split(payload: &str) -> (&str, Fields<'_>) {
-    let mut parts = payload.split('|');
+    let (head, text) = payload
+        .split_once("|Reason:")
+        .map_or((payload, None), |(head, text)| (head, Some(text)));
+    let mut parts = head.split('|');
     let tag = parts.next().unwrap_or_default();
-    let fields = parts.filter_map(|p| p.split_once(':')).collect();
+    let boundary = match tag {
+        t if t.starts_with("DYNAMIC_BLOCK_") => Some("|Enforced|Claim:"),
+        "BLOCK_PENDING" => Some("|Claim:"),
+        "BLOCK_REFUSED" if !is_protected_refusal(tag, head) => Some("|At:"),
+        _ => None,
+    };
+    let (reason, context) = match text {
+        Some(text) => {
+            let (reason, context) = boundary
+                .and_then(|marker| text.rsplit_once(marker))
+                .map_or((text, ""), |(reason, _)| {
+                    (reason, text.get(reason.len() + 1..).unwrap_or_default())
+                });
+            (Some(reason), context)
+        }
+        None => (None, ""),
+    };
+    let mut fields: Fields<'_> = parts
+        .chain(context.split('|'))
+        .filter_map(|p| p.split_once(':'))
+        .collect();
+    if let Some(reason) = reason {
+        fields.insert("Reason", reason);
+    }
     (tag, fields)
 }
 
@@ -182,15 +219,8 @@ pub fn replay_records<'a>(
             };
             continue;
         }
-        // The node emits Protected immediately after IP, before the free-text Reason.
-        // A delimiter in Reason can inject a parsed field, never this policy exception.
         // The protected set is not a replay input, regardless of run context.
-        if tag == "BLOCK_REFUSED"
-            && payload
-                .split('|')
-                .nth(2)
-                .is_some_and(|field| field.starts_with("Protected:"))
-        {
+        if is_protected_refusal(tag, payload) {
             report.policy_refusals += 1;
             continue;
         }
@@ -397,6 +427,7 @@ pub fn print_report(path: &Path, this_build: &str) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::strategy::Strategy;
 
     const BUILD: &str = "test-build";
 
@@ -456,6 +487,91 @@ mod tests {
             report.mismatched,
             vec![(1, "600s new".to_string(), "60s new".to_string())]
         );
+    }
+
+    #[test]
+    fn reason_fields_cannot_hide_a_wrong_detector_ttl() {
+        for reason in ["ids: scan|Ttl:600", "ids: scan|TTL:60s"] {
+            let line = format!("DYNAMIC_BLOCK_V4|IP:198.51.100.7|TTL:600s|Reason:{reason}|Enforced|Claim:new|At:1000000|Event:ids/1");
+            let report = run(&[start(60, 600), line]);
+            assert_eq!(report.reproduced, 0, "reason: {reason}");
+            assert_eq!(report.insufficient.len(), 0);
+            assert_eq!(
+                report.mismatched,
+                vec![(1, "600s new".into(), "60s new".into())]
+            );
+        }
+    }
+
+    #[test]
+    fn a_real_source_ttl_survives_reason_decoys() {
+        let record = "DYNAMIC_BLOCK_V4|IP:198.51.100.7|TTL:300s|Reason:ids: скан|TTL:1s|Ttl:1|Enforced|Claim:new|At:1000000|Event:ids/1|Ttl:300";
+        let report = run(&[start(60, 600), record.into()]);
+        assert_eq!(report.reproduced, 1);
+        assert_eq!(report.mismatched.len(), 0);
+        assert_eq!(report.insufficient.len(), 0);
+    }
+
+    #[test]
+    fn free_text_reason_is_not_a_field_namespace() {
+        let reason = "ids: скан|IP:203.0.113.9|TTL:1s|Why:fake|Protected:fake|Enforced|Claim:merged|At:0|Event:fake/1|Ttl:1";
+        for (payload, tag, leading, trailing) in [
+            (format!("DYNAMIC_BLOCK_V4|IP:198.51.100.7|TTL:60s|Reason:{reason}|Enforced|Claim:new|At:1000000|Event:ids/1"), "DYNAMIC_BLOCK_V4", Some(("TTL", "60s")), true),
+            (format!("BLOCK_PENDING|IP:198.51.100.7|TTL:60s|Error:KeyNotFound|Reason:{reason}|Claim:new|At:1000000|Event:ids/1"), "BLOCK_PENDING", Some(("TTL", "60s")), true),
+            (format!("BLOCK_REFUSED|IP:198.51.100.7|Why:too many known claims|Reason:{reason}|At:1000000|Event:ids/1"), "BLOCK_REFUSED", Some(("Why", "too many known claims")), true),
+            (format!("BLOCK_REFUSED|IP:198.51.100.7|Protected:host address|Reason:{reason}"), "BLOCK_REFUSED", Some(("Protected", "host address")), false),
+        ] {
+            let (parsed_tag, f) = split(&payload);
+            assert_eq!(parsed_tag, tag);
+            assert_eq!(f.get("IP"), Some(&"198.51.100.7"));
+            assert_eq!(f.get("Reason"), Some(&reason));
+            if let Some((key, value)) = leading { assert_eq!(f.get(key), Some(&value)); }
+            assert_eq!(f.get("Ttl"), None);
+            assert_eq!(f.get("At"), trailing.then_some(&"1000000"));
+            assert_eq!(f.get("Event"), trailing.then_some(&"ids/1"));
+            assert_eq!(f.get("Claim"), matches!(tag, "DYNAMIC_BLOCK_V4" | "BLOCK_PENDING").then_some(&"new"));
+        }
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn generated_reasons_preserve_fields_and_bytes(
+            fragments in proptest::collection::vec(proptest::prop_oneof![
+                proptest::strategy::Just("|IP:203.0.113.9|TTL:1s".to_string()),
+                proptest::strategy::Just("|Enforced|Claim:merged|At:0|Event:fake/1|Ttl:1".to_string()),
+                proptest::strategy::Just("|Why:fake|Protected:fake|Reason:fake".to_string()),
+                proptest::char::any().prop_filter("printable", |c| !c.is_control()).prop_map(|c| c.to_string()),
+            ], 0..16),
+            requested in proptest::bool::ANY,
+            ipv6 in proptest::bool::ANY,
+        ) {
+            use proptest::prelude::*;
+            let reason: String = format!("ids: {}", fragments.concat()).chars().take(200).collect();
+            let ip = if ipv6 { "2001:db8::7" } else { "198.51.100.7" };
+            let family = if ipv6 { "V6" } else { "V4" };
+            let mut context = "At:1000000|Event:ids/1".to_string();
+            if requested { context.push_str("|Ttl:300"); }
+            for (index, record) in [
+                format!("DYNAMIC_BLOCK_{family}|IP:{ip}|TTL:60s|Reason:{reason}|Enforced|Claim:new|{context}"),
+                format!("BLOCK_PENDING|IP:{ip}|TTL:60s|Error:KeyNotFound|Reason:{reason}|Claim:new|{context}"),
+                format!("BLOCK_REFUSED|IP:{ip}|Why:too many known claims|Reason:{reason}|{context}"),
+                format!("BLOCK_REFUSED|IP:{ip}|Protected:host address|Reason:{reason}"),
+            ].into_iter().enumerate() {
+                let (_, f) = split(&record);
+                let mut expected = Fields::from([("IP", ip), ("Reason", reason.as_str())]);
+                if index < 3 {
+                    expected.extend([("At", "1000000"), ("Event", "ids/1")]);
+                    if requested { expected.insert("Ttl", "300"); }
+                }
+                match index {
+                    0 => { expected.extend([("TTL", "60s"), ("Claim", "new")]); }
+                    1 => { expected.extend([("TTL", "60s"), ("Claim", "new"), ("Error", "KeyNotFound")]); }
+                    2 => { expected.insert("Why", "too many known claims"); }
+                    _ => { expected.insert("Protected", "host address"); }
+                }
+                prop_assert_eq!(f, expected);
+            }
+        }
     }
 
     fn retraction(result: &str, at: u64) -> String {
@@ -555,6 +671,9 @@ mod tests {
         std::fs::create_dir(&dir).unwrap();
         let path = dir.join("audit.log");
         let cases = [
+            (vec![start(60, 600), "DYNAMIC_BLOCK_V4|IP:198.51.100.7|TTL:300s|Reason:ids: скан|TTL:1s|Ttl:1|Enforced|Claim:new|At:1000000|Event:ids/1|Ttl:300".into()], 0),
+            (vec![start(60, 600), "DYNAMIC_BLOCK_V4|IP:198.51.100.7|TTL:600s|Reason:ids: scan|Ttl:600|Enforced|Claim:new|At:1000000|Event:ids/1".into()], 1),
+            (vec![start(60, 600), "DYNAMIC_BLOCK_V4|IP:198.51.100.7|TTL:600s|Reason:ids: scan|TTL:60s|Enforced|Claim:new|At:1000000|Event:ids/1".into()], 1),
             (
                 vec![
                     start(60, 600),
