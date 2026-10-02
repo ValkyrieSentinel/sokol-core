@@ -24,11 +24,30 @@ allows immediate renewal; zero rate admits nothing. Policy admission is before o
 framing validation and delivery, so it does not establish that an alert was queued or ACKed.
 Capacity refusal increments a saturating counter and is reported per batch. Such alerts
 are skipped: no retry obligation is created, and checkpointing may advance past them.
+Cooldown-refused attempts also increment a saturating counter and are logged per batch.
+Cooldown starts at policy admission, so even a later never-written expiry leaves it active.
+This intentionally throttles admission during outages; fresh same-source alerts can be
+suppressed until it ends. That suppression is not ACK evidence or guaranteed delivery.
 
 Regression input: 100,000 different IPv4 addresses at one `Instant`, 24-hour cooldown,
 and a rate quota above the fixture size, then one more different address. The previous threshold-and-retain
 implementation accepted the extra address because none had expired. The real-cap test
 failed at that admission assertion before the fix. This does not assert a production outage.
+
+## Forwarding freshness
+
+| ID | Invariant and enforcement point | Executable evidence |
+|---|---|---|
+| SUR-T1 | A parsed timestamp consumes the configured age budget. Future timestamps grant at most that budget from observation. Integer conversion and local-clock addition are checked; stale/unrepresentable timestamps do not enqueue. Missing/invalid timestamps retain the untimed policy. | `forwarding_budget_ages_exactly_and_future_timestamps_cannot_enlarge_it` |
+| IPC-T1 | An opt-in forwarding deadline is checked before connection/backoff work and after handshake, immediately before preparing a send/retry. Expired FIFO entries are removed in pairs and increment `expired`, never a node-answer result. Each removal spends flush work budget. Source TTL entries still render retractions and require ACK; expired entries behind an unexpired FIFO head wait until they reach the front. | `forwarding_expiry_is_counted_loss_not_an_ack_and_spends_flush_budget`, `invalid_freshness_input_does_not_evict_or_create_a_deadline`, `lost_ack_then_freshness_expiry_does_not_resend_or_undo_the_signal`, `lost_answer_keeps_expiry_and_later_retry_sends_its_retraction` |
+
+The actual-process case `RecoveryTests.test_alert_expiring_during_handshake_is_not_forwarded`
+checks both first send and lost-ACK retry, including a fresh same-source alert suppressed
+by the still-active admission cooldown (verified diagnostic). After a delayed handshake, the next wire command
+is a new fresh alert, never the stale one or a fabricated retraction; checkpointing advances.
+Before the fix both scenarios sent the stale alert. Freshness expiry is intentional forwarding
+loss. Already applied effects remain under node policy, not a local undo. It does not shorten
+acknowledged block TTL, and does not bound write/scheduler/node time after the final check.
 
 ## Source, queue, acknowledgement and checkpoint
 
@@ -39,8 +58,8 @@ Owners: [Follower and adapter loop](../orchestrator/src/bin/sokol-suricata.rs),
 |---|---|---|
 | SUR-R1 | Complete records read before a later I/O error are returned alongside the error; unfinished bytes and their starting position survive for retry. Byte/line quotas still apply. | `a_read_error_preserves_completed_alerts_and_unfinished_bytes`, `read_errors_before_a_complete_line_preserve_the_cursor_and_retry_bytes` (fault injected through the actual buffered scanner). |
 | SUR-C1 | A queued offset is usable only for the same observed content token and inode. Otherwise checkpoint position is zero in the current file. A loaded resume anchor survives failed source open/seek until successful installation. | `detected_truncation_fences_offsets_from_previous_contents`, `resume_retains_its_anchor_while_the_source_is_missing`, `failed_install_does_not_erase_the_selected_resume_anchor`; process cases below. |
-| SUR-Q1 | At checkpoint time, queued positions correspond to the remaining FIFO outbox entries. Only successful push adds a position; overflow removes the oldest pair; after flush the loop trims positions to remaining pending length. Outbox request/deadline entries are likewise paired. | `invalid_input_cannot_evict_a_queued_signal`, `a_full_queue_drops_the_oldest_and_counts_it`; actual process restart/ACK cases below exercise cursor alignment. |
-| IPC-A1 | Transport failure, unknown reply or missing terminating LF retains the current obligation. A complete recognized final reply removes it; bounded overflow is an explicit, counted loss path. ACK outcome is node acceptance/refusal, not proof of durable storage or completed kernel enforcement. | `unknown_reply_keeps_the_obligation_and_a_later_ack_retires_it`, `an_unterminated_ack_does_not_retire_the_signal`, overflow test above. |
+| SUR-Q1 | At checkpoint time, queued positions correspond to the remaining FIFO outbox entries. Only successful push adds a position; overflow removes the oldest pair; forwarding expiry drops its request/deadline pair; after flush the loop trims positions to remaining pending length. Outbox request/deadline entries are likewise paired. | `invalid_input_cannot_evict_a_queued_signal`, `a_full_queue_drops_the_oldest_and_counts_it`; actual process restart/ACK cases below exercise cursor alignment. |
+| IPC-A1 | Transport failure, unknown reply or missing terminating LF retains an unexpired obligation. A complete recognized final reply removes it; bounded overflow and an opt-in forwarding deadline are explicit, separately counted local loss paths. ACK outcome is node acceptance/refusal, not proof of durable storage or completed kernel enforcement. | `unknown_reply_keeps_the_obligation_and_a_later_ack_retires_it`, `an_unterminated_ack_does_not_retire_the_signal`, overflow test above. |
 
 [Process regressions](../scripts/test_suricata_recovery.py) run the actual adapter against
 an EVE file and an IPC server: `RecoveryTests.test_pending_same_file_survives_process_loss`,

@@ -6,9 +6,11 @@
 //! or a malformed line would not change the answer). A node that is down, restarting or not
 //! answering leaves the signal queued; delivery is retried with a growing pause. The queue is
 //! bounded: when it is full the oldest signal is dropped and counted.
+//! push_before() additionally drops stale forwarding attempts with a separate expired counter;
+//! this is local policy loss, never a node acknowledgement or a retraction.
 //! push() rejects malformed framing or oversized wire lines before changing that queue;
 //! its Result reports local admission only, never delivery. Callers must handle rejection.
-//! Unknown or incomplete reply lines retain the signal and reconnect with backoff; only a
+//! Unknown or incomplete replies retain unexpired signals and reconnect with backoff; only a
 //! complete recognized acknowledgement is final. ADR-0019 retraction acknowledgements
 //! are Recorded outcomes too. This does not establish durable storage.
 //! Each answer (including the ACK handshake) is limited to 8192 bytes including newline
@@ -236,17 +238,24 @@ impl TimedLine {
     }
 }
 
+enum Deadline {
+    SourceTtl(TimedLine),
+    ForwardBefore(Instant),
+}
+
 pub struct Outbox {
     socket: PathBuf,
     queue: VecDeque<String>,
     // Exactly one entry per queued line, including ordinary lines without an expiry.
-    deadlines: VecDeque<Option<TimedLine>>,
+    deadlines: VecDeque<Option<Deadline>>,
     cap: usize,
     conn: Option<Conn>,
     backoff: Duration,
     retry_at: Option<Instant>,
     /// Signals dropped because the queue was full.
     pub lost: u64,
+    /// Local forwarding-policy losses; no node reply or undo of an earlier attempt.
+    pub expired: u64,
     /// Whether the last attempt failed (for logging an outage once).
     pub failing: bool,
 }
@@ -262,6 +271,7 @@ impl Outbox {
             backoff: BACKOFF_MIN,
             retry_at: None,
             lost: 0,
+            expired: 0,
             failing: false,
         }
     }
@@ -287,7 +297,7 @@ impl Outbox {
     /// Both possible wire frames are validated before any queue mutation. The
     /// caller owns command semantics and the expiry clock; acknowledgement rules,
     /// overflow, and backoff are the same as push(). This is in-memory state.
-    #[allow(dead_code)] // Suricata includes this module but uses ordinary push().
+    #[allow(dead_code)] // Suricata uses push/push_before; source TTL is CrowdSec policy.
     pub fn push_with_deadline(
         &mut self,
         line: &str,
@@ -316,42 +326,85 @@ impl Outbox {
         };
         self.push(line)?;
         if let Some(last) = self.deadlines.back_mut() {
-            *last = Some(timing);
+            *last = Some(Deadline::SourceTtl(timing));
         }
         Ok(())
+    }
+
+    /// Forward only while the local freshness budget remains. Validate before mutation.
+    /// Expiry is a counted local loss, including after a lost ACK; it does not retract
+    /// possibly applied effects. Use push_with_deadline for source TTL + retraction.
+    #[allow(dead_code)] // CrowdSec uses source TTL, not a forwarding freshness budget.
+    pub fn push_before(&mut self, line: &str, before: Instant) -> io::Result<()> {
+        self.push(line)?;
+        if let Some(last) = self.deadlines.back_mut() {
+            *last = Some(Deadline::ForwardBefore(before));
+        }
+        Ok(())
+    }
+
+    fn expire_front(&mut self) -> bool {
+        if !matches!(self.deadlines.front(), Some(Some(Deadline::ForwardBefore(at)))
+            if Instant::now() >= *at)
+        {
+            return false;
+        }
+        self.queue.pop_front();
+        self.deadlines.pop_front();
+        self.expired = self.expired.saturating_add(1);
+        true
     }
 
     pub fn pending(&self) -> usize {
         self.queue.len()
     }
 
-    /// Delivers up to `max` queued signals, in order. Stops at the first transport failure; the
-    /// rest (and the failed one) stay queued and are retried after a growing pause. Returns the
-    /// node's answer for each signal that left the queue, and the transport error if any.
+    /// Handles up to `max` queued signals in FIFO order (answers plus freshness losses).
+    /// Freshness expiry is checked during backoff and again after opening/handshake.
+    /// Stops at transport failure; unexpired obligations retain the existing backoff.
+    /// Returns node answers only; local expiry is reported through the expired counter.
     pub fn flush(&mut self, max: usize) -> (Vec<(String, Outcome)>, Option<String>) {
         let mut done = Vec::new();
-        if self.retry_at.is_some_and(|t| Instant::now() < t) {
-            return (done, None);
-        }
+        // Preserve the ordinary answer bound; each local loss spends one of its slots.
+        let mut max = max;
         while done.len() < max {
+            if self.expire_front() {
+                // The loop condition proves max > 0 here.
+                max -= 1;
+                continue;
+            }
+            if self.retry_at.is_some_and(|t| Instant::now() < t) {
+                break;
+            }
             let Some(line) = self.queue.front().cloned() else {
                 break;
             };
-            let timing = self.deadlines.front().and_then(|entry| entry.as_ref());
-            let prepare = || timing.map_or_else(|| line.clone(), |t| t.render(Instant::now()));
-            let mut wire = line.clone();
-            let reply = match self.conn.as_mut() {
-                Some(conn) => {
-                    wire = prepare();
-                    conn.exchange(&wire)
-                }
-                None => Conn::open(&self.socket).and_then(|mut c| {
-                    wire = prepare();
-                    let r = c.exchange(&wire);
-                    self.conn = Some(c);
-                    r
-                }),
+            let ready = if self.conn.is_none() {
+                Conn::open(&self.socket).map(|conn| self.conn = Some(conn))
+            } else {
+                Ok(())
             };
+            // The ACK handshake may consume the last of the freshness budget.
+            if ready.is_ok() && self.expire_front() {
+                // A successful handshake followed by policy expiry proves reachability,
+                // even though no signal acknowledgement will reset outage state.
+                self.failing = false;
+                self.backoff = BACKOFF_MIN;
+                self.retry_at = None;
+                // The loop condition proves max > 0 here.
+                max -= 1;
+                continue;
+            }
+            let wire = match self.deadlines.front() {
+                Some(Some(Deadline::SourceTtl(timing))) => timing.render(Instant::now()),
+                _ => line,
+            };
+            let reply = ready.and_then(|()| {
+                self.conn
+                    .as_mut()
+                    .ok_or_else(|| io::Error::other("delivery connection unavailable"))?
+                    .exchange(&wire)
+            });
             match reply.and_then(|text| Outcome::parse(&text)) {
                 Ok(outcome) => {
                     self.queue.pop_front();
@@ -362,7 +415,7 @@ impl Outbox {
                     done.push((wire, outcome));
                 }
                 Err(e) => {
-                    // The line may or may not have reached the node; it is sent again later.
+                    // The line may have reached the node; retry later unless its forwarding budget expires.
                     self.conn = None;
                     self.failing = true;
                     self.retry_at = Some(Instant::now() + self.backoff);
@@ -421,6 +474,73 @@ mod tests {
     }
 
     #[test]
+    fn forwarding_expiry_is_counted_loss_not_an_ack_and_spends_flush_budget() {
+        let path = temp_socket("freshness-budget");
+        let mut out = Outbox::new(&path, 4);
+        for id in 0..3 {
+            out.push_before(
+                &format!("SIGNAL#{id}:suricata|203.0.113.7|-|test"),
+                Instant::now(),
+            )
+            .unwrap();
+        }
+        out.retry_at = Some(Instant::now() + Duration::from_secs(60));
+        let (done, error) = out.flush(2);
+        assert!(done.is_empty(), "local expiry is not a node answer");
+        assert!(
+            error.is_none(),
+            "expiry needs no connection even during backoff"
+        );
+        assert_eq!(out.expired, 2);
+        assert_eq!(out.lost, 0, "expiry is distinct from overflow");
+        assert_eq!(out.pending(), 1, "expiry also respects max work");
+        assert_eq!(out.deadlines.len(), 1);
+        out.flush(2);
+        assert_eq!(out.expired, 3);
+        assert_eq!(out.pending(), 0);
+        assert!(out.deadlines.is_empty());
+    }
+
+    #[test]
+    fn invalid_freshness_input_does_not_evict_or_create_a_deadline() {
+        let path = temp_socket("freshness-framing");
+        let mut out = Outbox::new(&path, 1);
+        out.push("SIGNAL:suricata|203.0.113.7|-|test").unwrap();
+        assert!(out.push_before("bad\nline", Instant::now()).is_err());
+        assert_eq!(out.pending(), 1);
+        assert_eq!(out.lost, 0);
+        assert!(out.deadlines.front().unwrap().is_none());
+    }
+
+    #[test]
+    fn lost_ack_then_freshness_expiry_does_not_resend_or_undo_the_signal() {
+        let path = temp_socket("freshness-lost-ack");
+        let mut out = Outbox::new(&path, 2);
+        let line = "SIGNAL#7:suricata|203.0.113.7|-|test";
+        out.push_before(line, Instant::now() + Duration::from_secs(60))
+            .unwrap();
+        let node = fake_node(&path, |line| {
+            assert_eq!(line, "SIGNAL#7:suricata|203.0.113.7|-|test");
+            None
+        });
+        let (done, error) = out.flush(1);
+        assert!(done.is_empty());
+        assert!(error.is_some());
+        node.join().unwrap();
+        assert_eq!(out.pending(), 1);
+        *out.deadlines.front_mut().unwrap() = Some(Deadline::ForwardBefore(Instant::now()));
+        let (done, error) = out.flush(1);
+        assert!(done.is_empty());
+        assert!(
+            error.is_none(),
+            "expired retry needs no new connection or retraction"
+        );
+        assert_eq!(out.expired, 1);
+        assert_eq!(out.pending(), 0);
+        assert!(out.deadlines.is_empty());
+    }
+
+    #[test]
     fn timed_wire_ages_rounds_up_and_retracts_at_its_deadline() {
         let now = Instant::now();
         let line = TimedLine {
@@ -466,7 +586,10 @@ mod tests {
         assert!(done.is_empty() && err.is_some());
         node.join().unwrap();
         assert_eq!(out.pending(), 1);
-        out.deadlines.front_mut().unwrap().as_mut().unwrap().expires = Instant::now();
+        let Some(Some(Deadline::SourceTtl(timing))) = out.deadlines.front_mut() else {
+            panic!("source TTL must be retained after lost answer");
+        };
+        timing.expires = Instant::now();
         std::fs::remove_file(&path).unwrap();
         let node = fake_node(&path, |line| {
             assert_eq!(line, "RETRACT#7:crowdsec|203.0.113.7");

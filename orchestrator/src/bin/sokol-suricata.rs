@@ -77,8 +77,9 @@ struct Args {
     #[arg(long, value_name = "PATH")]
     cursor_file: Option<PathBuf>,
 
-    /// Alerts older than this (by their EVE timestamp) are not forwarded: catching up after a
-    /// long outage must not turn an old event into a new block.
+    /// Forwarding age budget for timestamped alerts, including queueing and retries.
+    /// Expiry drops pending forwarding locally, without undoing possibly applied effects.
+    /// Missing/unparseable timestamps retain the legacy untimed policy.
     #[arg(long, default_value = "600")]
     max_alert_age_secs: u64,
 }
@@ -173,6 +174,7 @@ struct Gate {
     // One entry per retained address, ordered by successful admission time.
     expires: VecDeque<(IpAddr, Instant)>,
     capacity_refused: u64,
+    cooldown_refused: u64,
     window_start: Option<Instant>,
     in_window: u32,
 }
@@ -190,6 +192,7 @@ impl Gate {
             last_sent: HashSet::new(),
             expires: VecDeque::new(),
             capacity_refused: 0,
+            cooldown_refused: 0,
             window_start: None,
             in_window: 0,
         }
@@ -209,6 +212,7 @@ impl Gate {
             }
         }
         if self.last_sent.contains(&ip) {
+            self.cooldown_refused = self.cooldown_refused.saturating_add(1);
             return false;
         }
         let start = *self.window_start.get_or_insert(now);
@@ -228,6 +232,33 @@ impl Gate {
         self.expires.push_back((ip, now));
         true
     }
+}
+
+/// The source's age consumes a local forwarding budget; future timestamps cannot enlarge it.
+/// Missing/unparseable timestamps use the existing untimed policy instead (caller-owned).
+fn forwarding_deadline(
+    at_ms: i64,
+    now_ms: i64,
+    observed: Instant,
+    max_age_secs: u64,
+) -> io::Result<Instant> {
+    let age_ms = u64::try_from((i128::from(now_ms) - i128::from(at_ms)).max(0))
+        .map_err(|_| io::Error::other("alert age exceeds supported range"))?;
+    let remaining = Duration::from_secs(max_age_secs)
+        .checked_sub(Duration::from_millis(age_ms))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "stale alert"))?;
+    if remaining.is_zero() {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "no alert forwarding budget remains",
+        ));
+    }
+    observed.checked_add(remaining).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "alert deadline exceeds local clock range",
+        )
+    })
 }
 
 // Operational quotas, not measured capacity: yield to delivery/checkpointing after either
@@ -503,10 +534,18 @@ impl Follower {
 /// Alerts kept while the node cannot be reached.
 const OUTBOX_CAP: usize = 10_000;
 
-/// Sends what is queued; an alert leaves the queue only when the node has answered it.
+/// Send pending alerts, reporting node answers and counted local freshness losses separately.
 fn deliver(outbox: &mut delivery::Outbox, socket: &Path) {
     let was_failing = outbox.failing;
+    let expired = outbox.expired;
     let (done, err) = outbox.flush(64);
+    let skipped = outbox.expired.saturating_sub(expired);
+    if skipped > 0 {
+        log::warn!(
+            "[sokol-suricata] {} queued alerts expired before forwarding; local policy loss",
+            skipped
+        );
+    }
     for (line, outcome) in done {
         match outcome {
             delivery::Outcome::Applied
@@ -559,7 +598,6 @@ fn main() {
         }
         None => Follower::new(&args.eve, args.from_start),
     };
-    let max_age_ms = (args.max_alert_age_secs as i64).saturating_mul(1000);
     // File-content identity and offset for each queued alert, oldest first.
     // Neither rotation nor detected copytruncate may transplant an old offset.
     let mut queued_at: std::collections::VecDeque<QueuedCursor> = std::collections::VecDeque::new();
@@ -580,23 +618,49 @@ fn main() {
                     log::error!("[sokol-suricata] reading {}: {}", args.eve.display(), error);
                 }
                 let capacity_refused = gate.capacity_refused;
+                let cooldown_refused = gate.cooldown_refused;
+                let observed = Instant::now();
                 let now_ms = chrono::Utc::now().timestamp_millis();
                 for (start, line) in batch.lines {
                     let Some(alert) = decide(&line, &filter) else {
                         continue;
                     };
-                    if alert
-                        .at_ms
-                        .is_some_and(|at| now_ms.saturating_sub(at) > max_age_ms)
-                    {
-                        log::debug!("[sokol-suricata] stale alert from {} skipped", alert.src);
-                        continue;
-                    }
+                    let deadline = match alert.at_ms {
+                        Some(at_ms) => match forwarding_deadline(
+                            at_ms,
+                            now_ms,
+                            observed,
+                            args.max_alert_age_secs,
+                        ) {
+                            Ok(before) => Some(before),
+                            Err(error) => {
+                                if error.kind() == io::ErrorKind::TimedOut {
+                                    log::debug!(
+                                        "[sokol-suricata] stale alert from {} skipped",
+                                        alert.src
+                                    );
+                                } else {
+                                    log::warn!(
+                                        "[sokol-suricata] alert from {} skipped: {}",
+                                        alert.src,
+                                        error
+                                    );
+                                }
+                                continue;
+                            }
+                        },
+                        None => None,
+                    };
                     if !gate.admit(alert.src, Instant::now()) {
                         continue;
                     }
                     let lost = outbox.lost;
-                    if let Err(error) = outbox.push(&alert.signal_line()) {
+                    let line = alert.signal_line();
+                    let queued = match deadline {
+                        Some(before) => outbox.push_before(&line, before),
+                        None => outbox.push(&line),
+                    };
+                    if let Err(error) = queued {
                         log::warn!("[sokol-suricata] alert rejected before queueing: {}", error);
                         continue; // no queued cursor entry for a rejected alert
                     }
@@ -608,6 +672,10 @@ fn main() {
                             OUTBOX_CAP
                         );
                     }
+                }
+                let cooldown_skipped = gate.cooldown_refused.saturating_sub(cooldown_refused);
+                if cooldown_skipped > 0 {
+                    log::warn!("[sokol-suricata] {} alerts skipped: source cooldown active (policy admission, not delivery)", cooldown_skipped);
                 }
                 let skipped = gate.capacity_refused.saturating_sub(capacity_refused);
                 if skipped > 0 {
@@ -720,6 +788,7 @@ mod tests {
         let a: IpAddr = "203.0.113.1".parse().unwrap();
         assert!(gate.admit(a, t0));
         assert!(!gate.admit(a, t0 + Duration::from_secs(10)), "cooldown");
+        assert_eq!(gate.cooldown_refused, 1, "repeat refusal is observable");
         assert!(gate.admit(a, t0 + Duration::from_secs(61)), "cooldown over");
 
         let mut gate = Gate::new(Duration::from_secs(60), 3);
@@ -1490,6 +1559,41 @@ mod tests {
             vec![((2 * (MAX_POLL_LINES + 1)) as u64, "ok\n".into())]
         );
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn forwarding_budget_ages_exactly_and_future_timestamps_cannot_enlarge_it() {
+        let t = Instant::now();
+        assert_eq!(
+            forwarding_deadline(0, 1_500, t, 2).unwrap(),
+            t + Duration::from_millis(500)
+        );
+        assert_eq!(
+            forwarding_deadline(0, 2_000, t, 2).unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert_eq!(
+            forwarding_deadline(0, 2_001, t, 2).unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert_eq!(
+            forwarding_deadline(9_000, 0, t, 2).unwrap(),
+            t + Duration::from_secs(2)
+        );
+        assert_eq!(
+            forwarding_deadline(0, 0, t, 0).unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert_eq!(
+            forwarding_deadline(i64::MIN, i64::MAX, t, 0)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert_eq!(
+            forwarding_deadline(0, 0, t, u64::MAX).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
     }
 
     #[test]

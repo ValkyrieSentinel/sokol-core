@@ -32,12 +32,14 @@ def alert(ip):
 
 
 @contextmanager
-def running(args):
+def running(args, capture=None):
     # File-backed diagnostics cannot fill a pipe and stall the adapter under test.
     with tempfile.TemporaryFile(mode="w+t") as log:
         proc = subprocess.Popen(args, stdout=log, stderr=log,
                                 env={**os.environ, "RUST_LOG": "info"})
         try:
+            if capture is not None:
+                capture.append(log)
             yield proc
         except BaseException:
             log.seek(0)
@@ -217,6 +219,64 @@ class RecoveryTests(unittest.TestCase):
                             parked.rename(eve)
                             with running(args + ["--from-start"]) as proc:
                                 receive(proc)
+
+    def test_alert_expiring_during_handshake_is_not_forwarded(self):
+        for lost_ack in (False, True):
+            with self.subTest(lost_ack=lost_ack):
+                self.check_forwarding_freshness(lost_ack)
+
+    def check_forwarding_freshness(self, lost_ack):
+        with tempfile.TemporaryDirectory(prefix="sokol-age-", dir="/tmp") as directory:
+            root = Path(directory)
+            eve, cursor, ipc = root / "eve.json", root / "cursor", root / "ipc.sock"
+            eve.write_text("")
+            with socket.socket(socket.AF_UNIX) as server:
+                server.bind(str(ipc))
+                server.listen(1)
+                server.settimeout(WAIT_SECONDS)
+                args = [str(self.binary), "--eve", str(eve), "--cursor-file", str(cursor),
+                        "--ipc-socket", str(ipc), "--from-start", "--max-alert-age-secs", "3" if lost_ack else "1"]
+                diagnostics = []
+                with running(args, capture=diagnostics) as proc:
+                    # Observe actual loop/checkpoint progress before creating the timed alert.
+                    await_cursor(cursor, {"inode": eve.stat().st_ino, "position": 0}, proc)
+                    with eve.open("a") as writer:
+                        writer.write(alert("203.0.113.17"))
+                    if lost_ack:
+                        first, _ = server.accept()
+                        with first:
+                            first.settimeout(WAIT_SECONDS)
+                            with first.makefile("rb") as reader:
+                                self.assertEqual(reader.readline(4097), b"ACK\n")
+                                first.sendall(b"OK ack\n")
+                                self.assertIn(b"suricata|203.0.113.17|-|", reader.readline(4097))
+                                time.sleep(1.5)  # consume age budget while still below answer timeout
+                                # The signal may have applied. Close without its final ACK.
+                    conn, _ = server.accept()
+                    with conn:
+                        conn.settimeout(WAIT_SECONDS)
+                        with conn.makefile("rb") as reader:
+                            self.assertEqual(reader.readline(4097), b"ACK\n")
+                            time.sleep(1.2)  # past freshness budget, below the 2s ACK timeout
+                            conn.sendall(b"OK ack\n")
+                            with eve.open("a") as writer:
+                                writer.write(alert("203.0.113.17"))  # same-source policy cooldown remains
+                                writer.write(alert("203.0.113.18"))
+                            # Expiry must not send/retry old 17, invent RETRACT, or stop fresh work.
+                            line = reader.readline(4097)
+                            self.assertTrue(line.startswith(b"SIGNAL#"), line)
+                            self.assertEqual(line.partition(b":")[2],
+                                             b"suricata|203.0.113.18|-|sid:123 recovery probe\n")
+                            conn.sendall(b"OK applied\n")
+                            await_cursor(cursor, {"inode": eve.stat().st_ino,
+                                                  "position": eve.stat().st_size}, proc)
+                            conn.settimeout(0.2)
+                            with self.assertRaises(socket.timeout):
+                                reader.readline(4097)
+                            diagnostics[0].seek(0)
+                            logs = diagnostics[0].read()
+                            self.assertIn("1 queued alerts expired before forwarding", logs)
+                            self.assertIn("1 alerts skipped: source cooldown active", logs)
 
     def test_bad_records_do_not_drop_neighbouring_alerts(self):
         oversized = json.loads(alert("203.0.113.99"))
