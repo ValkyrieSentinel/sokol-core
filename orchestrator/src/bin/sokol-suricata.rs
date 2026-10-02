@@ -26,7 +26,7 @@
         clippy::unimplemented
     )
 )]
-use std::collections::HashMap;
+use std::collections::{HashSet, VecDeque};
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Seek, SeekFrom};
 use std::net::IpAddr;
@@ -62,7 +62,7 @@ struct Args {
     #[arg(long, default_value = "60")]
     cooldown_secs: u64,
 
-    /// Upper bound on signals per second sent to the node.
+    /// Upper bound on alerts admitted per fixed one-second policy window (not IPC pacing).
     #[arg(long, default_value = "50")]
     max_signals_per_sec: u32,
 
@@ -160,31 +160,56 @@ fn decide(line: &str, filter: &Filter) -> Option<Alert> {
     })
 }
 
-/// Suppresses repeats of the same address and caps the overall rate.
+/// Maximum distinct source addresses retained by the adapter cooldown policy.
+const COOLDOWN_CAP: usize = 100_000;
+
+/// Suppresses repeats and bounds policy admission, not delivery or ACK rate.
+/// Calls use nondecreasing Instants and one fixed cooldown for this Gate's lifetime.
 struct Gate {
     cooldown: Duration,
     per_sec: u32,
-    last_sent: HashMap<IpAddr, Instant>,
+    capacity: usize,
+    last_sent: HashSet<IpAddr>,
+    // One entry per retained address, ordered by successful admission time.
+    expires: VecDeque<(IpAddr, Instant)>,
+    capacity_refused: u64,
     window_start: Option<Instant>,
     in_window: u32,
 }
 
 impl Gate {
     fn new(cooldown: Duration, per_sec: u32) -> Self {
+        Self::with_capacity(cooldown, per_sec, COOLDOWN_CAP)
+    }
+
+    fn with_capacity(cooldown: Duration, per_sec: u32, capacity: usize) -> Self {
         Self {
             cooldown,
             per_sec,
-            last_sent: HashMap::new(),
+            capacity,
+            last_sent: HashSet::new(),
+            expires: VecDeque::new(),
+            capacity_refused: 0,
             window_start: None,
             in_window: 0,
         }
     }
 
     fn admit(&mut self, ip: IpAddr, now: Instant) -> bool {
-        if let Some(last) = self.last_sent.get(&ip) {
-            if now.duration_since(*last) < self.cooldown {
-                return false;
+        // Fixed cooldown + monotone time means only a FIFO prefix can expire.
+        // Every admitted tuple is removed once; full-hot refusal never scans the set.
+        // A single call may still remove the entire bounded queue.
+        while self
+            .expires
+            .front()
+            .is_some_and(|(_, at)| now.duration_since(*at) >= self.cooldown)
+        {
+            if let Some((expired, _)) = self.expires.pop_front() {
+                self.last_sent.remove(&expired);
             }
+        }
+        if self.last_sent.contains(&ip) {
+            return false;
         }
         let start = *self.window_start.get_or_insert(now);
         if now.duration_since(start) >= Duration::from_secs(1) {
@@ -194,13 +219,13 @@ impl Gate {
         if self.in_window >= self.per_sec {
             return false;
         }
-        self.in_window += 1;
-        self.last_sent.insert(ip, now);
-        if self.last_sent.len() > 100_000 {
-            let cooldown = self.cooldown;
-            self.last_sent
-                .retain(|_, t| now.duration_since(*t) < cooldown);
+        if self.last_sent.len() >= self.capacity {
+            self.capacity_refused = self.capacity_refused.saturating_add(1);
+            return false; // never evict a live cooldown to admit a new address
         }
+        self.in_window += 1;
+        self.last_sent.insert(ip);
+        self.expires.push_back((ip, now));
         true
     }
 }
@@ -554,6 +579,7 @@ fn main() {
                 if let Some(error) = batch.error {
                     log::error!("[sokol-suricata] reading {}: {}", args.eve.display(), error);
                 }
+                let capacity_refused = gate.capacity_refused;
                 let now_ms = chrono::Utc::now().timestamp_millis();
                 for (start, line) in batch.lines {
                     let Some(alert) = decide(&line, &filter) else {
@@ -582,6 +608,14 @@ fn main() {
                             OUTBOX_CAP
                         );
                     }
+                }
+                let skipped = gate.capacity_refused.saturating_sub(capacity_refused);
+                if skipped > 0 {
+                    log::warn!(
+                        "[sokol-suricata] {} alerts skipped: cooldown memory full ({} addresses)",
+                        skipped,
+                        COOLDOWN_CAP
+                    );
                 }
             }
             Err(e) => log::error!("[sokol-suricata] reading {}: {}", args.eve.display(), e),
@@ -697,6 +731,142 @@ mod tests {
             "198.51.100.200".parse().unwrap(),
             t0 + Duration::from_secs(1)
         ));
+    }
+
+    #[test]
+    fn gate_cooldown_memory_has_a_hard_bound_without_eviction() {
+        let now = Instant::now();
+        let mut gate = Gate::new(Duration::from_secs(86_400), u32::MAX);
+        for ip in 0..COOLDOWN_CAP as u32 {
+            assert!(gate.admit(IpAddr::V4(std::net::Ipv4Addr::from(ip)), now));
+        }
+        let extra = IpAddr::V4(std::net::Ipv4Addr::from(COOLDOWN_CAP as u32));
+        assert!(
+            !gate.admit(extra, now),
+            "full cooldown memory must refuse a new address"
+        );
+        assert!(
+            gate.last_sent.len() <= COOLDOWN_CAP,
+            "memory must not grow beyond its budget"
+        );
+        assert!(
+            !gate.admit(IpAddr::V4(std::net::Ipv4Addr::from(0)), now),
+            "capacity must not evict an unexpired cooldown"
+        );
+    }
+
+    #[test]
+    fn gate_capacity_refusal_keeps_live_cooldowns_and_releases_only_expired_slots() {
+        let t = Instant::now();
+        let a = IpAddr::V4(std::net::Ipv4Addr::from(1));
+        let b = IpAddr::V4(std::net::Ipv4Addr::from(2));
+        let c = IpAddr::V4(std::net::Ipv4Addr::from(3));
+        let mut gate = Gate::with_capacity(Duration::from_secs(5), 2, 2);
+        assert!(gate.admit(a, t));
+        assert!(gate.admit(b, t + Duration::from_secs(1)));
+        assert!(!gate.admit(c, t + Duration::from_secs(2)));
+        assert_eq!(gate.capacity_refused, 1);
+        assert_eq!(gate.in_window, 0, "capacity refusal reserves no rate slot");
+        assert!(!gate.admit(a, t + Duration::from_secs(4)));
+        assert!(!gate.admit(b, t + Duration::from_secs(4)));
+        assert!(
+            gate.admit(c, t + Duration::from_secs(5)),
+            "oldest expired slot is available"
+        );
+        assert!(
+            !gate.admit(b, t + Duration::from_secs(5)),
+            "younger cooldown remains"
+        );
+        assert!(
+            gate.admit(a, t + Duration::from_secs(6)),
+            "next expired slot is available"
+        );
+        assert!(
+            !gate.admit(c, t + Duration::from_secs(6)),
+            "refusals must not renew c early"
+        );
+        assert_eq!(gate.capacity_refused, 1);
+    }
+
+    #[test]
+    fn gate_rate_refusal_does_not_start_cooldown_and_zero_policies_are_defined() {
+        let t = Instant::now();
+        let a = IpAddr::V4(std::net::Ipv4Addr::from(1));
+        let b = IpAddr::V4(std::net::Ipv4Addr::from(2));
+        let mut gate = Gate::with_capacity(Duration::from_secs(60), 1, 2);
+        assert!(gate.admit(a, t));
+        assert!(!gate.admit(b, t));
+        assert!(
+            gate.admit(b, t + Duration::from_secs(1)),
+            "rate refusal did not remember b"
+        );
+
+        let mut gate = Gate::with_capacity(Duration::ZERO, 2, 1);
+        assert!(gate.admit(a, t));
+        assert!(
+            gate.admit(a, t),
+            "zero cooldown permits another policy admission"
+        );
+        assert!(!gate.admit(b, t), "zero cooldown still respects rate");
+        assert!(gate.admit(b, t + Duration::from_secs(1)));
+
+        let mut gate = Gate::with_capacity(Duration::from_secs(60), 0, 2);
+        assert!(!gate.admit(a, t));
+        assert!(!gate.admit(a, t + Duration::from_secs(100)));
+        assert!(gate.last_sent.is_empty());
+        assert!(gate.expires.is_empty());
+        let mut gate = Gate::with_capacity(Duration::ZERO, 1, 0);
+        assert!(!gate.admit(a, t));
+        assert_eq!(gate.in_window, 0);
+        assert_eq!(gate.capacity_refused, 1);
+    }
+
+    #[test]
+    fn gate_generated_history_preserves_cooldown_and_bounded_unique_memory() {
+        let t = Instant::now();
+        let cooldown = Duration::from_millis(300);
+        let mut gate = Gate::with_capacity(cooldown, 7, 4);
+        let mut accepted = std::collections::HashMap::<IpAddr, Instant>::new();
+        let mut random = 7u32;
+        let mut admissions = 0;
+        for step in 0..10_000u64 {
+            random = random.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let ip = IpAddr::V4(std::net::Ipv4Addr::from((random >> 16) % 16));
+            let now = t + Duration::from_millis(step * 53);
+            if gate.admit(ip, now) {
+                if let Some(last) = accepted.insert(ip, now) {
+                    assert!(
+                        now.duration_since(last) >= cooldown,
+                        "no early repeat admission"
+                    );
+                }
+                admissions += 1;
+            }
+            assert!(gate.last_sent.len() <= 4);
+            let queued: HashSet<_> = gate.expires.iter().map(|(ip, _)| *ip).collect();
+            assert_eq!(
+                queued.len(),
+                gate.expires.len(),
+                "one expiry tuple per address"
+            );
+            assert_eq!(
+                queued, gate.last_sent,
+                "expiry and membership have the same owners"
+            );
+            for (ip, at) in &gate.expires {
+                assert_eq!(
+                    accepted.get(ip),
+                    Some(at),
+                    "timestamp comes from successful admission"
+                );
+                assert!(now.duration_since(*at) < cooldown);
+            }
+        }
+        assert!(
+            admissions > 1_000,
+            "history exercises renewal, not just refusals"
+        );
+        assert!(gate.capacity_refused > 0, "history reaches capacity");
     }
 
     fn lines(f: &mut Follower) -> Vec<String> {
