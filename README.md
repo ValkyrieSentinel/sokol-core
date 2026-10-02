@@ -207,9 +207,14 @@ sokol-suricata --eve /var/log/suricata/eve.json --ipc-socket /run/sokol/sokol.so
 With `--cursor-file` the adapter saves the oldest unanswered position for restart.
 Recovery opens only the current EVE path: queued alerts in rotated-away files are not
 recovered after process loss. During live rotation it drains unread bytes from the old
-open file before switching to the new one. Inode and length do not detect truncation
-followed by regrowth beyond the saved position. Alerts older than `--max-alert-age-secs`
-(default 600) are skipped; replayed alerts retain their event IDs for duplicate recognition.
+open file before switching to the new one. Pending positions carry an in-memory content
+identity: after a detected truncation, even on the same inode, old-content work pins the
+current file's recovery cursor to zero. Once that work leaves the queue, the cursor advances
+within the current contents. The saved inode/position format is unchanged. This does not
+recover pre-truncation bytes after process loss. Inode and length still cannot detect
+truncation followed by regrowth beyond the saved position between observations.
+Alerts older than `--max-alert-age-secs` (default 600) are skipped; replayed alerts retain
+their event IDs for duplicate recognition.
 
 The reader processes at most **1 MiB of bytes or 256 completed lines per poll**, counting
 invalid lines too, then yields to delivery and the existing once-per-second checkpoint check. It retains at

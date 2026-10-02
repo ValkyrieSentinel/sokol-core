@@ -217,6 +217,10 @@ struct Follower {
     reader: Option<BufReader<File>>,
     inode: u64,
     position: u64,
+    // A new token on every successful open/reset, including same-inode truncation.
+    // Queued positions keep their token alive; pointer identity cannot be reused
+    // while one of those positions remains pending. It is never serialized.
+    content: std::rc::Rc<()>,
     partial: Vec<u8>,
     discarding: bool,
     budget_exhausted: bool,
@@ -229,6 +233,13 @@ struct Follower {
 struct Cursor {
     inode: u64,
     position: u64,
+}
+
+/// A pending position belongs to one observed incarnation of the file's contents.
+/// Inode alone cannot distinguish positions before and after copytruncate.
+struct QueuedCursor {
+    cursor: Cursor,
+    content: std::rc::Rc<()>,
 }
 
 impl Cursor {
@@ -251,6 +262,7 @@ impl Follower {
             reader: None,
             inode: 0,
             position: 0,
+            content: std::rc::Rc::new(()),
             partial: Vec::new(),
             discarding: false,
             budget_exhausted: false,
@@ -292,6 +304,7 @@ impl Follower {
         self.position = position;
         self.line_start = position;
         self.inode = meta.ino();
+        self.content = std::rc::Rc::new(());
         self.reader = Some(reader);
         self.partial.clear();
         self.discarding = false;
@@ -306,15 +319,27 @@ impl Follower {
         }
     }
 
-    /// Keep queue offsets tied to their source file. While an older file is pending,
-    /// replay the current file from its start after restart rather than transplanting
-    /// an unrelated offset. This does not recover old-file entries after process loss;
-    /// the outbox is in memory and resume only opens the current path.
-    fn checkpoint(&self, oldest: Option<Cursor>) -> Cursor {
+    fn queued_at(&self, position: u64) -> QueuedCursor {
+        QueuedCursor {
+            cursor: Cursor {
+                position,
+                ..self.cursor()
+            },
+            content: std::rc::Rc::clone(&self.content),
+        }
+    }
+
+    /// Keep pending offsets tied to the contents from which they were read.
+    /// After a detected rotation or truncation, pending old-content work pins
+    /// recovery of the current file to its start. This does not retain old bytes
+    /// after process loss or detect truncation/regrowth between observations.
+    fn checkpoint(&self, oldest: Option<&QueuedCursor>) -> Cursor {
         let mut cursor = self.cursor();
         if let Some(oldest) = oldest {
-            cursor.position = if oldest.inode == cursor.inode {
-                oldest.position
+            cursor.position = if std::rc::Rc::ptr_eq(&oldest.content, &self.content)
+                && oldest.cursor.inode == cursor.inode
+            {
+                oldest.cursor.position
             } else {
                 0
             };
@@ -330,6 +355,7 @@ impl Follower {
         self.line_start = self.position;
         reader.seek(SeekFrom::Start(self.position))?;
         self.inode = meta.ino();
+        self.content = std::rc::Rc::new(());
         self.reader = Some(reader);
         self.partial.clear();
         self.discarding = false;
@@ -470,9 +496,9 @@ fn main() {
         None => Follower::new(&args.eve, args.from_start),
     };
     let max_age_ms = (args.max_alert_age_secs as i64).saturating_mul(1000);
-    // File identity and offset for each queued alert, oldest first (the outbox is FIFO too).
-    // A rotation must not transplant an old-file offset into the new file's saved cursor.
-    let mut queued_at: std::collections::VecDeque<Cursor> = std::collections::VecDeque::new();
+    // File-content identity and offset for each queued alert, oldest first.
+    // Neither rotation nor detected copytruncate may transplant an old offset.
+    let mut queued_at: std::collections::VecDeque<QueuedCursor> = std::collections::VecDeque::new();
     let mut saved: Option<Cursor> = None;
     let mut last_save = Instant::now();
     let mut outbox = delivery::Outbox::new(&args.ipc_socket, OUTBOX_CAP);
@@ -486,7 +512,6 @@ fn main() {
     loop {
         match follower.poll() {
             Ok(lines) => {
-                let inode = follower.cursor().inode;
                 let now_ms = chrono::Utc::now().timestamp_millis();
                 for (start, line) in lines {
                     let Some(alert) = decide(&line, &filter) else {
@@ -507,10 +532,7 @@ fn main() {
                         log::warn!("[sokol-suricata] alert rejected before queueing: {}", error);
                         continue; // no queued cursor entry for a rejected alert
                     }
-                    queued_at.push_back(Cursor {
-                        inode,
-                        position: start,
-                    });
+                    queued_at.push_back(follower.queued_at(start));
                     if outbox.lost > lost {
                         queued_at.pop_front();
                         log::error!(
@@ -529,7 +551,7 @@ fn main() {
         if let Some(path) = args.cursor_file.as_deref() {
             if last_save.elapsed() >= Duration::from_secs(1) {
                 last_save = Instant::now();
-                let cursor = follower.checkpoint(queued_at.front().copied());
+                let cursor = follower.checkpoint(queued_at.front());
                 if saved != Some(cursor) {
                     match cursor.save(path) {
                         Ok(()) => saved = Some(cursor),
@@ -776,13 +798,10 @@ mod tests {
         std::fs::write(&path, "already read\nold pending\n").unwrap();
         let mut follower = Follower::new(&path, true);
         let old_lines = follower.poll().unwrap();
-        let old = Cursor {
-            inode: follower.cursor().inode,
-            position: old_lines[1].0,
-        };
+        let old = follower.queued_at(old_lines[1].0);
         assert_eq!(
-            follower.checkpoint(Some(old)),
-            old,
+            follower.checkpoint(Some(&old)),
+            old.cursor,
             "same-file queue position is retained"
         );
 
@@ -790,12 +809,12 @@ mod tests {
         let new_content = "new first\nnew second\nnew third\n";
         std::fs::write(&path, new_content).unwrap();
         let new_lines = follower.poll().unwrap();
-        assert_ne!(follower.cursor().inode, old.inode);
+        assert_ne!(follower.cursor().inode, old.cursor.inode);
         assert!(
-            new_content.len() as u64 > old.position,
+            new_content.len() as u64 > old.cursor.position,
             "old offset would be accepted in the new file"
         );
-        let checkpoint = follower.checkpoint(Some(old));
+        let checkpoint = follower.checkpoint(Some(&old));
         let saved = dir.join("cursor");
         checkpoint.save(&saved).unwrap();
         let (mut restarted, _) = Follower::resume(&path, Cursor::load(&saved).unwrap(), false);
@@ -813,16 +832,57 @@ mod tests {
         );
 
         // After old-file entries and the first new entry leave the queue, advance within this file.
-        let pending_new = Cursor {
-            inode: follower.cursor().inode,
-            position: new_lines[1].0,
-        };
-        assert_eq!(follower.checkpoint(Some(pending_new)), pending_new);
+        let pending_new = follower.queued_at(new_lines[1].0);
+        assert_eq!(follower.checkpoint(Some(&pending_new)), pending_new.cursor);
         assert_eq!(
             follower.checkpoint(None),
             follower.cursor(),
             "empty queue may checkpoint the read end"
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn detected_truncation_fences_offsets_from_previous_contents() {
+        let dir = std::env::temp_dir().join(format!(
+            "sokol-suricata-truncate-queue-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("eve.json");
+        std::fs::write(&path, "already read\nold pending\n").unwrap();
+        let mut follower = Follower::new(&path, true);
+        let old_lines = follower.poll().unwrap();
+        let old = follower.queued_at(old_lines[1].0);
+        assert_eq!(follower.checkpoint(Some(&old)), old.cursor);
+
+        // The reader observes shorter contents before they regrow past the old offset.
+        std::fs::write(&path, "new first\n").unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().ino(), old.cursor.inode);
+        let first = follower.poll().unwrap();
+        assert_eq!(first[0].1, "new first\n");
+        let mut writer = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writer.write_all(b"new second\nnew third\n").unwrap();
+        let more = follower.poll().unwrap();
+        assert!(std::fs::metadata(&path).unwrap().len() > old.cursor.position);
+        let checkpoint = follower.checkpoint(Some(&old));
+        assert_eq!(
+            checkpoint.position, 0,
+            "same inode must not transplant an old-content offset"
+        );
+        let (mut restarted, _) = Follower::resume(&path, checkpoint, false);
+        assert_eq!(
+            lines(&mut restarted).concat(),
+            "new first\nnew second\nnew third\n"
+        );
+
+        // Once only current-content work remains, checkpoint its actual pending position.
+        let pending = follower.queued_at(more[0].0);
+        assert_eq!(follower.checkpoint(Some(&pending)), pending.cursor);
+        assert_eq!(follower.checkpoint(None), follower.cursor());
         std::fs::remove_dir_all(dir).unwrap();
     }
 
