@@ -267,11 +267,17 @@ fn poll(args: &Args, startup: bool) -> Result<String, String> {
 const OUTBOX_CAP: usize = 100_000;
 
 /// Sends what is queued at `pause` per signal; a decision leaves the queue only when the node
-/// has answered it. Stops at the first transport failure (retried on the next round).
+/// has answered it. Returns on transport failure or active backoff so the main loop can poll
+/// LAPI again. A pending retry is not a successful delivery.
 fn deliver(outbox: &mut delivery::Outbox, socket: &Path, pause: Duration) {
     while outbox.pending() > 0 {
         let was_failing = outbox.failing;
         let (done, err) = outbox.flush(1);
+        // Backoff reports no completion and no new error. Do not wait it out here:
+        // the main loop must keep polling LAPI for new decisions and retractions.
+        if done.is_empty() && err.is_none() {
+            return;
+        }
         for (line, outcome) in done {
             match outcome {
                 delivery::Outcome::Refused(why) => {
@@ -495,6 +501,32 @@ mod tests {
         ] {
             assert_eq!(batch_from(body, &local()).unwrap(), Batch::default());
         }
+    }
+
+    #[test]
+    fn delivery_yields_during_backoff_without_attempting_another_connection() {
+        use std::os::unix::net::UnixListener;
+        let directory =
+            std::env::temp_dir().join(format!("sokol-cs-backoff-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let socket = directory.join("ipc.sock");
+        let mut outbox = delivery::Outbox::new(&socket, 4);
+        outbox.push("RETRACT#71:crowdsec|203.0.113.71").unwrap();
+        // Missing socket starts the real outbox backoff, leaving the command queued.
+        assert!(outbox.flush(1).1.is_some());
+        let listener = UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        // No fake peer responds: an erroneous retry can finish via the answer timeout.
+        deliver(&mut outbox, &socket, Duration::ZERO);
+        let attempted = listener.accept();
+        drop(listener);
+        std::fs::remove_dir_all(directory).unwrap();
+        assert!(
+            matches!(attempted, Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+            "delivery must return to the poll loop while the outbox is backing off"
+        );
+        assert_eq!(outbox.pending(), 1);
+        assert!(outbox.failing);
     }
 
     #[test]
