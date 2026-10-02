@@ -53,7 +53,7 @@ def running(args, capture=None):
 
 def read_log(log):
     # Unlike seek/read, pread does not move the child's shared output offset.
-    return os.pread(log.fileno(), os.fstat(log.fileno()).st_size, 0).decode()
+    return os.pread(log.fileno(), os.fstat(log.fileno()).st_size, 0).decode(errors="replace")
 
 
 def await_cursor(path, expected, proc):
@@ -98,7 +98,7 @@ class RecoveryTests(unittest.TestCase):
                     with self.assertRaises(socket.timeout):
                         server.accept()
 
-    def test_cooldown_diagnostics_aggregate_across_batches_and_flush_at_eof(self):
+    def test_cooldown_diagnostics_aggregate_across_batches_without_losing_counts(self):
         with tempfile.TemporaryDirectory(prefix="sokol-rec-", dir="/tmp") as directory:
             root = Path(directory)
             eve, cursor, ipc = root / "eve.json", root / "cursor", root / "ipc.sock"
@@ -137,7 +137,7 @@ class RecoveryTests(unittest.TestCase):
                             self.assertEqual(sum(counts), repeats)
                             elapsed = time.monotonic() - started
                             self.assertLessEqual(len(counts), int(elapsed) + 1,
-                                                 "refusal warnings must be spaced by a second")
+                                                 "refusal report decisions must be spaced by a second")
                             conn.settimeout(0.2)
                             with self.assertRaises(socket.timeout):
                                 reader.readline(4097)

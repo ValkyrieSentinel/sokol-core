@@ -235,11 +235,13 @@ can select the destination instead of the source and the adapter does not know t
 Cooldown starts at policy admission and remains active even if the queued alert expires
 without a write. Fresh same-source alerts can therefore be suppressed until cooldown
 ends; refusals are counted as `alerts skipped: source cooldown active`.
-Cooldown and full-cache warnings aggregate across batches and are spaced at least one
-monotonic second apart (at most one line per category per emission). Pending counts
-are also checked on idle/error polls; slow delivery or scheduling can delay emission.
-Counts saturate at `u64::MAX`, and pending diagnostics do not survive process loss.
-Other log categories are unaffected.
+Cooldown and full-cache warnings aggregate across batches. Report decisions are spaced
+at least one monotonic second apart, with at most one line per category per report.
+Pending counts are also checked on idle/error polls. Slow work can delay reporting;
+slow stderr writes can make visible lines appear closer together. Log-level filters
+may suppress output; reporting baselines advance even when WARN is disabled. Counts
+saturate at `u64::MAX`, and pending diagnostics do not survive process loss. Other log
+categories are unaffected; rate-window refusals remain uncounted and silent.
 This preserves the admission throttle during outages; it does not promise delivery of
 an active attack's first alert. Successful acknowledged blocks retain the node's normal TTL/escalation policy; freshness
 is a forwarding limit, not a block TTL. Time after the final check (write, scheduling,

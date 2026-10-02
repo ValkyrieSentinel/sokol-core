@@ -245,7 +245,7 @@ impl Gate {
 }
 
 /// Aggregate monotone refusal counters across batches, including later empty/error polls.
-/// Emissions are at least one second apart; totals saturate, like the owning Gate counters.
+/// Report decisions are at least one second apart; totals saturate, like Gate counters.
 /// No per-address storage and no promise that pending diagnostics survive process loss.
 #[derive(Default)]
 struct AdmissionDiagnostics {

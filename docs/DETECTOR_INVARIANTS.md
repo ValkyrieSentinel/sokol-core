@@ -38,19 +38,23 @@ failed at that admission assertion before the fix. This does not assert a produc
 
 | ID | Invariant and enforcement point | Executable evidence |
 |---|---|---|
-| SUR-D1 | Cooldown and capacity refusal warning emissions are separated by at least one monotonic second; each emission contains at most one line per category. Fixed-size reporting state retains the difference between cumulative and reported counters, including across empty/error polls. Reported deltas sum to observed refusals before counter saturation. | `refusal_diagnostics_preserve_counts_and_space_emissions_across_batches`, `refusal_diagnostics_do_not_wrap_or_reemit_saturated_totals`; actual process `RecoveryTests.test_cooldown_diagnostics_aggregate_across_batches_and_flush_at_eof` |
+| SUR-D1 | Decisions to report cooldown and capacity refusals are separated by at least one monotonic second; each report generates at most one line per category. Fixed-size reporting state retains the difference between cumulative and reported counters, including across empty/error polls. Generated report deltas sum to observed refusals before counter saturation. | `refusal_diagnostics_preserve_counts_and_space_emissions_across_batches`, `refusal_diagnostics_do_not_wrap_or_reemit_saturated_totals`; actual process `RecoveryTests.test_cooldown_diagnostics_aggregate_across_batches_without_losing_counts` |
 
-The first nonempty report may be immediate. Emission is checked outside the source-poll
+The first nonempty report may be immediate. Reports are checked outside the source-poll
 match, before delivery: idle/error polls can flush earlier pending counts, but blocked
-work and scheduling can delay a check. This is an emission-spacing bound for two warning
-categories, not a deadline or a bound on all logging. Counters saturate at `u64::MAX`;
-additional refusals beyond saturation are not observable. Pending reports are in memory
+work and scheduling can delay a check. The bound concerns decision instants, not visible
+line spacing: slow stderr writes can make visible lines appear closer together. Log-level
+filters can suppress output; baselines advance even when WARN is disabled. This is not
+a deadline or a bound on all logging. Rate-window refusals remain uncounted and silent.
+Counters saturate at `u64::MAX`; additional refusals beyond saturation are not observable. Pending reports are in memory
 and may be lost on process death. Neither skipped-alert count establishes delivery.
 
 Regression input: one admitted source followed by 4096 repeats over 17 reader batches.
 Before aggregation the actual process emitted 17 warnings in roughly one second, and
 the emission-count assertion failed. The revised loop preserves all 4096 refusal counts
-and flushes the remaining report after reaching EOF, without a new alert.
+by the final check at EOF. On a slow host reports may occur during batch processing;
+the unit test separately demonstrates a pending report with no new refusals at the next
+one-second check.
 
 ## Forwarding freshness
 
