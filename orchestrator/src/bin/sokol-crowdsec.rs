@@ -39,7 +39,7 @@
 )]
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use clap::Parser;
 
@@ -78,6 +78,9 @@ struct Args {
 struct Batch {
     /// Ready-to-send `SIGNAL:` lines.
     signals: Vec<String>,
+    /// Signal index, rounded source TTL, and its expiry retraction.
+    deadlines: std::collections::BTreeMap<usize, (u64, String)>,
+    skipped_duration: usize,
     skipped_origin: usize,
     skipped_not_ban: usize,
     skipped_scope: usize,
@@ -233,9 +236,23 @@ fn batch_from(body: &str, origins: &[String]) -> Result<Batch, String> {
             Some(id) => format!("SIGNAL#{}", id),
             None => "SIGNAL".to_string(),
         };
-        // ADR-0019 T2: CrowdSec's duration is the block's, within the node's ceiling.
-        if let Some(secs) = duration_secs(field("duration")) {
+        // Explicit but expired/invalid durations must not fall back to node escalation.
+        // Missing duration retains the legacy SIGNAL policy. Timed events need an id
+        // so expiry after a lost ACK can retract the possibly applied signal.
+        if decision.get("duration").is_some() {
+            let Some(secs) = duration_secs(field("duration")) else {
+                batch.skipped_duration += 1;
+                continue;
+            };
+            let Some(id) = decision.get("id").and_then(|v| v.as_u64()) else {
+                batch.skipped_duration += 1;
+                continue;
+            };
             verb.push_str(&format!(";ttl={}", secs));
+            batch.deadlines.insert(
+                batch.signals.len(),
+                (secs, format!("RETRACT#{}:crowdsec|{}", id, ip)),
+            );
         }
         batch
             .signals
@@ -320,6 +337,8 @@ fn main() {
     );
 
     loop {
+        // Conservative local anchor includes the HTTP round-trip and parsing time.
+        let fetched_at = Instant::now();
         match poll(&args, startup).and_then(|body| batch_from(&body, &args.origins)) {
             Ok(batch) => {
                 startup = false;
@@ -340,9 +359,24 @@ fn main() {
                 }
                 // Queued, not yet delivered: the outbox keeps them until the node answers, so a
                 // batch fetched while the node is down is not lost.
+                if batch.skipped_duration > 0 {
+                    log::warn!("[sokol-crowdsec] skipped {} invalid/expired or unidentifiable timed decisions", batch.skipped_duration);
+                }
                 let lost = outbox.lost;
-                for line in &batch.signals {
-                    if let Err(error) = outbox.push(line) {
+                for (index, line) in batch.signals.iter().enumerate() {
+                    let queued = match batch.deadlines.get(&index) {
+                        Some((seconds, expired)) => fetched_at
+                            .checked_add(Duration::from_secs(*seconds))
+                            .ok_or_else(|| {
+                                std::io::Error::new(
+                                    std::io::ErrorKind::InvalidInput,
+                                    "decision expiry exceeds local clock range",
+                                )
+                            })
+                            .and_then(|until| outbox.push_with_deadline(line, until, expired)),
+                        None => outbox.push(line),
+                    };
+                    if let Err(error) = queued {
                         log::warn!(
                             "[sokol-crowdsec] decision rejected before queueing: {}",
                             error
@@ -439,6 +473,32 @@ mod tests {
             "retractions first, then the new decision; a community one is not ours"
         );
         assert_eq!((batch.deleted, batch.deleted_skipped), (2, 1));
+    }
+
+    #[test]
+    fn explicit_expired_or_invalid_duration_never_becomes_escalated_signal() {
+        for duration in [
+            serde_json::json!("-1s"),
+            serde_json::json!("0s"),
+            serde_json::json!("nonsense"),
+            serde_json::Value::Null,
+            serde_json::json!(10),
+        ] {
+            let mut body: serde_json::Value = serde_json::from_str(STARTUP).unwrap();
+            body["new"][0]["duration"] = duration;
+            let batch = batch_from(&body.to_string(), &local()).unwrap();
+            assert!(batch.signals.is_empty());
+            assert_eq!(batch.skipped_duration, 1);
+        }
+        let mut body: serde_json::Value = serde_json::from_str(STARTUP).unwrap();
+        body["new"][0].as_object_mut().unwrap().remove("id");
+        assert!(
+            batch_from(&body.to_string(), &local())
+                .unwrap()
+                .signals
+                .is_empty(),
+            "timed signals need an id to retract after a lost ACK"
+        );
     }
 
     #[test]

@@ -256,6 +256,24 @@ makes these fields optional). A malformed initial response is logged and leaves
 each decision; existing origin/type/scope filters still apply. It does not guarantee
 replay of a rejected delta after the server has advanced its stream position.
 
+Timed CrowdSec signals retain a monotonic expiry anchored before the HTTP request.
+Each delivery attempt recalculates the remaining TTL after the ACK handshake;
+expired events send their `RETRACT#id` even if an earlier signal's answer was lost.
+The retraction stays queued until a recognized answer. Positive durations require
+an event id; explicit invalid/non-positive durations are skipped and counted,
+rather than falling back to node escalation. Only a missing `duration` key retains the legacy node policy; an explicit
+`null` is invalid. This changes the expired-duration fallback in ADR-0019.
+
+Retries retain the same event id: while the node remembers it, a repeated SIGNAL
+returns `OK duplicate` and does not shorten the TTL of an already accepted signal.
+Its later expiry RETRACT is the separate request to remove that event's support.
+
+Durations and remaining TTLs are rounded up to whole seconds. The local anchor
+conservatively includes the HTTP round-trip; it is not an authoritative server
+expiry. Time spent after preparing the wire (write, node processing, scheduling)
+can still extend the effective end. The node's permanent-block policy, bounded
+event memory, queue overflow and adapter process loss retain their existing limits.
+
 A decision's CrowdSec `duration` is the block's TTL, capped by `--block-ttl-max`; the node does
 not escalate it again (CrowdSec already did). A decision deleted in CrowdSec
 (`cscli decisions delete`) is taken back on the node and, through the mesh, on its peers. The
