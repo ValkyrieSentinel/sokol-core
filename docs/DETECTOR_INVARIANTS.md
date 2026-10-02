@@ -171,6 +171,10 @@ Owner: [replay_records / print_report](../orchestrator/src/replay.rs),
 | REPLAY-R1 | A recorded retraction capacity refusal that the fresh replay cannot reproduce is unverified. Its speculative table is discarded; dependent decisions are insufficient until a new usable start record. It is neither a verified refusal nor a cascade of mismatches. | `an_unverified_capacity_refusal_fences_dependent_replay_until_a_fresh_start`, `a_wrong_retraction_outcome_remains_a_mismatch` |
 | REPLAY-R2 | Any insufficient decision prevents CLI success even when earlier/later decisions reproduce. Actual mismatches retain exit 1; complete nonempty replay has exit 0; incomplete/empty replay has exit 2. | `a_partially_reproduced_audit_is_not_a_successful_cli_result` (real chained files and `print_report`), XDP smoke requires zero insufficient decisions |
 | REPLAY-R3 | In current detector writer layouts, `Reason` is opaque data: it cannot override leading `IP`/`TTL`/`Why`/`Protected` or appended `Claim`/`At`/`Event`/`Ttl`. The complete reason bytes are retained. | `reason_fields_cannot_hide_a_wrong_detector_ttl`, `a_real_source_ttl_survives_reason_decoys`, `free_text_reason_is_not_a_field_namespace`, `generated_reasons_preserve_fields_and_bytes`, chained-file CLI cases |
+| REPLAY-R4 | Signal-socket `DB_LOG` text has a fixed `CLIENT_LOG` outer tag and cannot supply node lifecycle/decision/loss records. | `client_logs_cannot_supply_replay_authority` (real writer/reader/CLI), XDP smoke client ACK/dump/fresh-replay checks |
+| REPLAY-R5 | Explicit loss markers fence dependent replay until a usable start. Any marker prevents CLI 0, including a tail/pre-context gap; known mismatches retain 1. | `explicit_audit_gaps_fence_dependent_decisions`, `a_gap_alone_prevents_a_successful_cli_result` (real chained files) |
+| AUDIT-R1 | Oversized records are known losses, not successful appends. Before following data or sync, `AUDIT_LOST` accounts for them even on a still-writable log. | `oversized_audit_records_are_counted_and_marked_before_following_data_or_flush` (real asynchronous writer, chained file, metrics and CLI) |
+| AUDIT-R2 | Queue loss is emitted before following data and every sync path: explicit Flush, idle timeout, disconnected final sync. A failed notice retains its sampled count; that record cannot bypass the notice. Cross-producer drop publication and send are not atomic. | `a_flush_records_real_queue_overflow_without_a_following_record`, `idle_sync_records_real_queue_overflow_without_a_following_record`, `disconnected_final_sync_records_real_queue_overflow`, `a_failed_loss_notice_retains_its_count_until_recovery` (actual Full channels, writer loop and unavailable-path recovery) |
 
 Baseline regressions: a recorded capacity refusal replayed as `lifted`, then its retry
 as `duplicate`, producing two mismatches on a table changed by speculation. A journal
@@ -221,7 +225,8 @@ forwards client text under `DB_LOG:NODE=...`; this change separates audit record
 not the operator telemetry consumer.
 The reply still acknowledges queue submission, not durable storage. Internal node
 writers continue using `append` and their original tags. Trap finalisation is now
-client data, still visible in monitor dumps. Existing unwrapped logs are not migrated;
+client data, still visible in monitor dumps; the TUI tier is now `CLIENT_LOG` unless
+a later `TIER=` field supplies a display tier. Existing unwrapped logs are not migrated;
 replay still requires the same build. This is separation at the socket entry point,
 not a signature, isolation from filesystem writers or a claim that client text is true.
 
@@ -241,14 +246,67 @@ fence conservatively. Any gap in the input makes CLI 2 unless a known mismatch
 already requires CLI 1; this includes a tail gap, a gap before usable context, and
 a later fresh run that reproduces. Fresh complete input still returns 0.
 
-This consumes explicit markers, not proof that every loss is marked. Current writer
-limits remain: oversized payloads can be discarded without `AUDIT_LOST`; queue drops
-are emitted when a later Record is handled, not by Flush alone; failed sync/recovery
-can lose a tail. A process or disk failure may prevent the marker itself reaching disk.
-No detection of arbitrary missing whole records or complete crash durability is claimed.
-Client-wrapped marker text is not a gap declaration (REPLAY-R4).
+This consumes explicit markers, not proof that every loss is marked. AUDIT-R1/R2
+now cover oversize rejection and terminal queue drops while the writer can persist
+the notice. Failed sync/recovery can still lose a tail; a process or disk failure
+may prevent the marker itself reaching disk. No detection of arbitrary missing
+whole records or complete crash durability is claimed. Client-wrapped marker text
+is not a gap declaration (REPLAY-R4).
 
 Regressions exercise both marker kinds, dependent duplicates/new decisions, fresh-run
 recovery, invalid counters and the real chained-file CLI, including tail/pre-context
 gaps and mismatch precedence. Semantic controls must catch unwrapped client text,
 ignored gaps, continued table use after a gap and gap-free CLI success at the tail.
+
+## AUDIT-R1/R2: known loss precedes dependent records and sync
+
+Owner: `AuditWriter::record`, `AuditWriter::sync`, `AuditWriter::run` in
+[main.rs](../orchestrator/src/main.rs); [ADR-0005](adr/0005-degraded-modes.md).
+
+An oversize rejection leaves the healthy log handle open, increments `AuditHealth.lost`
+(`sokol_audit_lost_total`) and accumulates a pending `AUDIT_LOST` notice. Both record
+and sync paths emit that notice before continuing, including on a log that never
+needed to reopen. No truncation, split payload or silent successful append is used.
+The notice covers rejected records; it does not turn them into reproduced evidence.
+
+Queue-drop counts are sampled before each record and sync. A successfully appended
+`AUDIT_QUEUE_OVERFLOW` drains the sampled count; if opening/appending its notice fails,
+the count is added back, preserving concurrent new drops. Ordinary records cannot
+bypass a failed notice: they are counted as additional failed records. Retrying a
+notice is not itself counted as another lost user record. When the log recovers,
+failed-record and sampled queue-loss notices precede subsequent data. This ordering
+covers drops with a happens-before link to the later send (e.g. the same producer).
+Across independent producers, `try_send(Full)` and publishing its counter are not
+atomic; another record may be sent/written in that window before the notice is known.
+The later marker still prevents CLI 0, but an intervening comparison may become a
+mismatch rather than insufficient. No atomic ordering across producers is claimed.
+Since the drop counter
+has no queue position, a fence may precede records queued before the actual loss;
+it conservatively discards replay context rather than assigning an exact loss time.
+
+Every worker sync calls this same path: Flush, periodic idle sync, batch/interval sync
+and the final sync after sender disconnection. `flush(true)` confirms that the barrier
+processed preceding queued records, appended sampled pending loss notices and completed
+sync; it does **not** mean all original records survived or replay can return 0.
+Quiesce producers to include all completed submissions: a barrier does not freeze or
+acknowledge concurrent later submissions. Current production shutdown still leaves
+IPC/mesh producers running across the barrier, so later submissions may be lost on
+process exit without a marker; quiescing them remains a separate implementation task.
+If a notice cannot be appended, sync returns
+false and pending counts remain for retry; the retry interval stays bounded by the
+existing 100 ms receive timeout rather than a zero-wait busy loop. Process termination
+or persistent disk failure can still prevent a notice from being written. Failed sync
+and reopen/torn-tail durability accounting remains a separate limit; this is not a
+crash-complete audit guarantee.
+
+Baseline regressions compiled and failed after behavior-preserving worker extraction:
+oversize loss was zero, Flush/idle left the pending drop counter at one, disconnected
+sync omitted the marker, recovery left seven queue drops unrecorded. Actual bounded
+channels are filled before the actual worker starts, forcing `TrySendError::Full`
+deterministically without production test hooks. The idle test captures evidence
+before disconnection, so final-sync behavior cannot mask a timeout regression.
+Semantic controls must reject silent oversize success, skipping loss on a healthy
+handle, skipping queue accounting in sync, dropping failed notice counts and writing
+ordinary records ahead of sampled pending queue loss or ending after appending a
+notice without successful disconnected final sync. Existing fresh complete replay remains 0;
+real synced loss notices give 2, not a complete-evidence success.

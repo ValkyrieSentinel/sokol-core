@@ -491,7 +491,7 @@ pub fn render(s: &Snapshot) -> String {
         &mut out,
         "sokol_audit_lost_total",
         "counter",
-        "Audit records that could not be written while the log was unavailable (queue overflow is counted separately).",
+        "Audit records not written due to an unavailable log or oversized payload (queue overflow is counted separately).",
     );
     let _ = writeln!(out, "sokol_audit_lost_total {}", s.audit_lost);
     family(
