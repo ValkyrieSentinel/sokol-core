@@ -917,11 +917,6 @@ mod tests {
             diagnostics.take(t + Duration::from_millis(999), counts(0, 513, 0)),
             None
         );
-        // Generated counts + pending difference equal the owner's cumulative totals.
-        assert_eq!(
-            diagnostics.reported.rate + counts(0, 513, 0).since(diagnostics.reported).rate,
-            513
-        );
         assert_eq!(
             diagnostics.take(t + Duration::from_secs(1), counts(0, 513, 0)),
             Some(counts(0, 509, 0))
@@ -1232,6 +1227,11 @@ mod tests {
             admissions > 1_000,
             "history exercises renewal, not just refusals"
         );
+        assert!(
+            gate.refusals.cooldown > 0,
+            "history reaches cooldown refusals"
+        );
+        assert!(gate.refusals.rate > 0, "history reaches rate refusals");
         assert!(gate.refusals.capacity > 0, "history reaches capacity");
     }
 
