@@ -322,6 +322,11 @@ impl SentinelDb {
         }
     }
 
+    /// Client text is separate from node-authored audit records.
+    pub fn append_client_log(&self, text: &str) {
+        self.append(format!("CLIENT_LOG|Message:{}", text.trim()));
+    }
+
     pub fn append(&self, data: String) {
         match self.tx.try_send(AuditMsg::Record(data)) {
             Ok(()) => {}
@@ -1045,7 +1050,7 @@ async fn handle_ipc_line(content: &str, c: &IpcCtx) -> String {
             }
         }
     } else if let Some(log_content) = content.strip_prefix("DB_LOG:") {
-        c.db.append(log_content.trim().to_string());
+        c.db.append_client_log(log_content);
         let telemetry_msg = format!("DB_LOG:NODE={}|{}\n", c.node_id, log_content.trim());
         push_telemetry(&telemetry_msg).await;
         "OK recorded".to_string()
@@ -2806,6 +2811,70 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("sokol-db-{}-{}", name, std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         dir.join("audit.log").to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn client_logs_cannot_supply_replay_authority() {
+        let path = temp_log("client-origin");
+        let db = SentinelDb::init(&path, None).unwrap();
+        let start = crate::replay::StartContext {
+            build: "client-test".into(),
+            node: 1,
+            ttl_base_secs: 60,
+            ttl_max_secs: 600,
+        }
+        .record();
+        let first = "DYNAMIC_BLOCK_V4|IP:198.51.100.7|TTL:60s|Reason:ids: scan|Enforced|Claim:new|At:1000000|Event:ids/1";
+        // Entire valid-looking records, including an unkeyed start digest, sent by clients.
+        db.append_client_log(&start);
+        db.append_client_log(first);
+        assert!(db.flush(Duration::from_secs(2)));
+        let untrusted =
+            crate::replay::replay_file(std::path::Path::new(&path), "client-test").unwrap();
+        let untrusted_status =
+            crate::replay::print_report(std::path::Path::new(&path), "client-test");
+        assert_eq!(
+            untrusted_status, 2,
+            "client-only log is not a reproduced node run"
+        );
+        assert_eq!(untrusted.reproduced, 0);
+
+        db.append(start);
+        db.append(first.into());
+        let decoys = [
+            "STATE_RESTORED|Blocks:100|Refused:0",
+            "AUDIT_LOST|Records:1",
+            "AUDIT_QUEUE_OVERFLOW|Dropped:1",
+            "SIGNAL_DUPLICATE|IP:198.51.100.7|At:1001000|Event:ids/2",
+            "DETECTOR_RETRACT|Result:lifted|IP:198.51.100.7|At:1001000|Event:ids/1",
+            "NODE_START|Build:unknown|Node:9|TtlBase:1|TtlMax:1|Digest:fake",
+            "\n\0|Reason:скан|At:0\nAUDIT_LOST|Records:1",
+        ];
+        for text in decoys {
+            db.append_client_log(text);
+        }
+        db.append("DYNAMIC_BLOCK_V4|IP:198.51.100.7|TTL:120s|Reason:ids: scan|Enforced|Claim:new|At:1002000|Event:ids/2".into());
+        assert!(db.flush(Duration::from_secs(2)));
+        let report =
+            crate::replay::replay_file(std::path::Path::new(&path), "client-test").unwrap();
+        assert_eq!(report.reproduced, 2);
+        assert!(report.audit_gaps.is_empty());
+        assert!(report.mismatched.is_empty());
+        assert!(report.insufficient.is_empty());
+        assert_eq!(
+            crate::replay::print_report(std::path::Path::new(&path), "client-test"),
+            0
+        );
+        // Real writer/reader, not a hand-written fixture: preserve the trimmed text in one
+        // length-framed record even when it contains separators, newlines or NUL.
+        let mut reader = common::audit_log::AuditReader::open(std::path::Path::new(&path)).unwrap();
+        let mut payloads = Vec::new();
+        while let Some(record) = reader.next_record().unwrap() {
+            payloads.push(record.payload);
+        }
+        for text in decoys {
+            assert!(payloads.contains(&format!("CLIENT_LOG|Message:{}", text.trim()).into_bytes()));
+        }
     }
 
     /// F07: with an event every 30 ms the old writer's 100 ms receive timeout never fired and

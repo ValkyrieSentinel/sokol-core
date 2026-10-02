@@ -205,9 +205,47 @@ characters, as non-Signal writers need not apply the Signal input filter.
 This is parsing for current writer layouts under the existing exact-build replay rule,
 not a new general audit schema or authentication of arbitrary forged/legacy bytes.
 Unsupported layouts may lack context; missing context still prevents CLI success.
-Historical log bytes, node outcomes and audit writers are not rewritten. In particular,
-the existing `DB_LOG` IPC command can append arbitrary record-shaped payloads to this
-same chain; replay does not attest node origin or prevent a client forging an entire
-record. The two mismatch regressions concern text within the current decision layout,
-not closure of that separate record-origin boundary. Chain validation
-checks integrity, not authenticity against an actor able to rewrite the chain.
+Historical log bytes and node outcomes are not rewritten. REPLAY-R4 below closes
+client whole-record injection for new `DB_LOG` writes; it does not authenticate old
+unwrapped records or protect against an actor able to rewrite the chain.
+
+## REPLAY-R4: client text cannot supply node records
+
+The signal socket's `DB_LOG:<text>` calls `SentinelDb::append_client_log`, which
+writes one length-framed `CLIENT_LOG|Message:<trimmed text>` record. The fixed outer
+tag is ignored by decision replay: embedded `NODE_START`, decisions, `STATE_RESTORED`
+and loss markers remain text. Delimiters, internal newlines, NUL and Unicode are
+retained; existing outer trimming, `OK recorded` and downstream telemetry are unchanged.
+The reply still acknowledges queue submission, not durable storage. Internal node
+writers continue using `append` and their original tags. Trap finalisation is now
+client data, still visible in monitor dumps. Existing unwrapped logs are not migrated;
+replay still requires the same build. This is separation at the socket entry point,
+not a signature, isolation from filesystem writers or a claim that client text is true.
+
+A real `SentinelDb`/`AuditReader` regression rejects a client-only forged start/decision
+as a node run (CLI 2), verifies exact wrapped bytes, and reproduces actual decisions
+across client lifecycle/loss/decision decoys. XDP smoke sends lifecycle/loss decoys
+through the real ACK socket, checks the wrapper/replies, and requires the later fresh
+run's replay to remain complete (CLI 0).
+
+## REPLAY-R5: explicit audit loss invalidates dependent replay
+
+Every top-level `AUDIT_LOST` or `AUDIT_QUEUE_OVERFLOW` marker fences the current
+table until a new usable `NODE_START`. Dependent decisions are `INSUFFICIENT`, not
+matches or speculative mismatches. Marker counts are reported separately from lost
+record counts and unverified decisions. Counters that are zero or malformed still
+fence conservatively. Any gap in the input makes CLI 2 unless a known mismatch
+already requires CLI 1; this includes a tail gap, a gap before usable context, and
+a later fresh run that reproduces. Fresh complete input still returns 0.
+
+This consumes explicit markers, not proof that every loss is marked. Current writer
+limits remain: oversized payloads can be discarded without `AUDIT_LOST`; queue drops
+are emitted when a later Record is handled, not by Flush alone; failed sync/recovery
+can lose a tail. A process or disk failure may prevent the marker itself reaching disk.
+No detection of arbitrary missing whole records or complete crash durability is claimed.
+Client-wrapped marker text is not a gap declaration (REPLAY-R4).
+
+Regressions exercise both marker kinds, dependent duplicates/new decisions, fresh-run
+recovery, invalid counters and the real chained-file CLI, including tail/pre-context
+gaps and mismatch precedence. Semantic controls must catch unwrapped client text,
+ignored gaps, continued table use after a gap and gap-free CLI success at the tail.
