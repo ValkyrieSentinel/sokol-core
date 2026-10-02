@@ -243,6 +243,11 @@ Only local decisions (origins `crowdsec` and `cscli`) are forwarded by default; 
 (`CAPI`, `lists`) can hold tens of thousands of addresses and are added with `--origins` only if the
 mesh should carry them. Range decisions are forwarded as prefixes.
 
+While IPC delivery is backing off, the adapter returns to its LAPI polling loop
+instead of waiting inside delivery; queued commands remain pending. Polling is
+still sequential with HTTP requests and active deliveries, not a fixed-period
+scheduler or a bound on draining a large healthy queue.
+
 The adapter validates the decision-stream envelope before queueing any commands. The
 root must be an object; `new` and `deleted`, when present and non-null, must be arrays
 of objects. Missing/null/empty sections remain valid (the [upstream response model](https://github.com/crowdsecurity/crowdsec/blob/master/pkg/models/decisions_stream_response.go)
