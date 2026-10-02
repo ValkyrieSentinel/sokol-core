@@ -161,6 +161,63 @@ class RecoveryTests(unittest.TestCase):
                                 conn.sendall(b"OK applied\n")
                             await_cursor(cursor, {"inode": inode, "position": eve.stat().st_size}, proc)
 
+    def test_missing_source_keeps_resume_anchor_across_wait_and_process_loss(self):
+        for restart in [False, True]:
+            with self.subTest(restart=restart):
+                with tempfile.TemporaryDirectory(prefix="sokol-defer-", dir="/tmp") as directory:
+                    root = Path(directory)
+                    eve, cursor, ipc = root / "eve.json", root / "cursor", root / "ipc.sock"
+                    parked = root / "eve.parked"
+                    prefix = alert("203.0.113.13")
+                    eve.write_text(prefix + alert("203.0.113.14"))
+                    expected = {"inode": eve.stat().st_ino, "position": len(prefix)}
+                    cursor.write_text(json.dumps(expected))
+                    written = cursor.stat().st_mtime_ns
+                    eve.rename(parked)
+                    args = [str(self.binary), "--eve", str(eve), "--cursor-file", str(cursor),
+                            "--ipc-socket", str(ipc)]
+                    with socket.socket(socket.AF_UNIX) as server:
+                        server.bind(str(ipc))
+                        server.listen(1)
+                        server.settimeout(WAIT_SECONDS)
+
+                        def receive(proc):
+                            conn, _ = server.accept()
+                            with conn:
+                                conn.settimeout(WAIT_SECONDS)
+                                with conn.makefile("rb") as reader:
+                                    self.assertEqual(reader.readline(4097), b"ACK\n")
+                                    conn.sendall(b"OK ack\n")
+                                    line = reader.readline(4097).decode()
+                                    self.assertTrue(line.startswith("SIGNAL#"), line)
+                                    self.assertEqual(line.partition(":")[2],
+                                                     "suricata|203.0.113.14|-|sid:123 recovery probe\n")
+                                    conn.sendall(b"OK applied\n")
+                                    await_cursor(cursor, {"inode": eve.stat().st_ino,
+                                                          "position": eve.stat().st_size}, proc)
+                                    conn.settimeout(0.2)
+                                    with self.assertRaises(socket.timeout):
+                                        reader.readline(4097)
+
+                        with running(args + ([] if restart else ["--from-start"])) as proc:
+                            # Wait for an actual periodic checkpoint while the path is absent.
+                            # Reading the pre-existing cursor alone would race startup.
+                            deadline = time.monotonic() + WAIT_SECONDS
+                            while cursor.stat().st_mtime_ns == written:
+                                self.assertIsNone(proc.poll(), "adapter exited while awaiting source")
+                                if time.monotonic() >= deadline:
+                                    self.fail("no checkpoint while source was missing")
+                                time.sleep(0.05)
+                            self.assertEqual(json.loads(cursor.read_text()), expected,
+                                             "absence must not erase the selected resume anchor")
+                            if not restart:
+                                parked.rename(eve)
+                                receive(proc)
+                        if restart:
+                            parked.rename(eve)
+                            with running(args + ["--from-start"]) as proc:
+                                receive(proc)
+
     def test_bad_records_do_not_drop_neighbouring_alerts(self):
         oversized = json.loads(alert("203.0.113.99"))
         oversized["padding"] = "x" * (1024 * 1024)

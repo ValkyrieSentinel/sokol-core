@@ -205,6 +205,11 @@ sokol-suricata --eve /var/log/suricata/eve.json --ipc-socket /run/sokol/sokol.so
 ```
 
 With `--cursor-file` the adapter saves the oldest unanswered position for restart.
+A loaded cursor remains selected while the EVE path is missing or cannot be opened;
+waiting checkpoints preserve it. After opening succeeds, the adapter checks that actual
+file's inode and length, resuming the same file or reading a replacement/shortened file
+from zero. A saved cursor takes precedence over `--from-start`. With no saved cursor,
+the existing initial-read behavior remains.
 Recovery opens only the current EVE path: queued alerts in rotated-away files are not
 recovered after process loss. During live rotation it drains unread bytes from the old
 open file before switching to the new one. Pending positions carry an in-memory content

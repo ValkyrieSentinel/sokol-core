@@ -223,6 +223,8 @@ struct ReadBatch {
 struct Follower {
     path: PathBuf,
     reader: Option<BufReader<File>>,
+    // Retain a selected restart anchor until a file is successfully opened/positioned.
+    pending_resume: Option<Cursor>,
     inode: u64,
     position: u64,
     // A new token on every successful open/reset, including same-inode truncation.
@@ -264,10 +266,11 @@ impl Cursor {
 }
 
 impl Follower {
-    fn new(path: &Path, from_start: bool) -> Self {
-        let mut f = Self {
+    fn unopened(path: &Path) -> Self {
+        Self {
             path: path.to_path_buf(),
             reader: None,
+            pending_resume: None,
             inode: 0,
             position: 0,
             content: std::rc::Rc::new(()),
@@ -275,37 +278,47 @@ impl Follower {
             discarding: false,
             budget_exhausted: false,
             line_start: 0,
-        };
+        }
+    }
+
+    fn new(path: &Path, from_start: bool) -> Self {
+        let mut f = Self::unopened(path);
         let _ = f.open(!from_start);
         f
     }
 
-    /// Resumes at a saved cursor: at its position if the file is the same one and not shorter,
-    /// from the start if it was rotated or is shorter than the saved position (the remaining
-    /// content is unread), otherwise as `new`. Inode/length cannot detect truncation followed
-    /// by regrowth beyond the saved position. Says what it did.
-    fn resume(path: &Path, cursor: Cursor, from_start: bool) -> (Self, &'static str) {
-        let mut f = Self::new(path, from_start);
-        let Ok(meta) = std::fs::metadata(path) else {
-            return (f, "no file yet");
-        };
-        if meta.ino() == cursor.inode && meta.len() >= cursor.position {
-            if f.open_at(cursor.position).is_ok() {
-                return (f, "resumed at the saved position");
-            }
-        } else if meta.ino() != cursor.inode && f.open(false).is_ok() {
-            return (
-                f,
-                "file rotated while down; reading the new one from its start",
-            );
-        } else if meta.len() < cursor.position && f.open(false).is_ok() {
-            return (f, "file truncated while down; reading it from its start");
-        }
-        (f, "saved position no longer valid; starting as usual")
+    /// The saved cursor selects the initial position independently of --from-start.
+    /// If opening fails, retain it for later polls and checkpoints. On a successful
+    /// open, use the actual descriptor's inode/length to select resume or replay.
+    /// Inode/length cannot detect truncation/regrowth between observations.
+    fn resume(path: &Path, cursor: Cursor) -> (Self, &'static str) {
+        let mut f = Self::unopened(path);
+        f.pending_resume = Some(cursor);
+        let how = f
+            .open_saved(cursor)
+            .unwrap_or("waiting for the source to resume");
+        (f, how)
     }
 
-    fn open_at(&mut self, position: u64) -> io::Result<()> {
+    fn open_saved(&mut self, cursor: Cursor) -> io::Result<&'static str> {
         let file = File::open(&self.path)?;
+        let meta = file.metadata()?;
+        let (position, how) = if meta.ino() != cursor.inode {
+            (
+                0,
+                "file rotated while down; reading the new one from its start",
+            )
+        } else if meta.len() < cursor.position {
+            (0, "file truncated while down; reading it from its start")
+        } else {
+            (cursor.position, "resumed at the saved position")
+        };
+        self.install(file, position)?;
+        Ok(how)
+    }
+
+    /// Commit reader state only after metadata and seek have both succeeded.
+    fn install(&mut self, file: File, position: u64) -> io::Result<()> {
         let meta = file.metadata()?;
         let mut reader = BufReader::new(file);
         reader.seek(SeekFrom::Start(position))?;
@@ -314,6 +327,7 @@ impl Follower {
         self.inode = meta.ino();
         self.content = std::rc::Rc::new(());
         self.reader = Some(reader);
+        self.pending_resume = None;
         self.partial.clear();
         self.discarding = false;
         Ok(())
@@ -321,6 +335,9 @@ impl Follower {
 
     /// The cursor just past the last complete line read.
     fn cursor(&self) -> Cursor {
+        if let Some(cursor) = self.pending_resume {
+            return cursor;
+        }
         Cursor {
             inode: self.inode,
             position: self.line_start,
@@ -357,17 +374,8 @@ impl Follower {
 
     fn open(&mut self, at_end: bool) -> io::Result<()> {
         let file = File::open(&self.path)?;
-        let meta = file.metadata()?;
-        let mut reader = BufReader::new(file);
-        self.position = if at_end { meta.len() } else { 0 };
-        self.line_start = self.position;
-        reader.seek(SeekFrom::Start(self.position))?;
-        self.inode = meta.ino();
-        self.content = std::rc::Rc::new(());
-        self.reader = Some(reader);
-        self.partial.clear();
-        self.discarding = false;
-        Ok(())
+        let position = if at_end { file.metadata()?.len() } else { 0 };
+        self.install(file, position)
     }
 
     /// One bounded batch of complete lines, each with its starting byte position.
@@ -376,7 +384,14 @@ impl Follower {
     fn poll(&mut self) -> io::Result<ReadBatch> {
         self.budget_exhausted = false; // errors/EOF must not cause a busy retry loop
         match std::fs::metadata(&self.path) {
-            Ok(_) if self.reader.is_none() => self.open(false)?,
+            Ok(_) if self.reader.is_none() => {
+                if let Some(cursor) = self.pending_resume {
+                    let how = self.open_saved(cursor)?;
+                    log::info!("[sokol-suricata] {} ({:?})", how, cursor);
+                } else {
+                    self.open(false)?;
+                }
+            }
             Ok(meta) if meta.ino() != self.inode => {
                 // Budgeted polls may leave unread old-file bytes. Drain that descriptor
                 // before switching; every returned batch still belongs to one inode.
@@ -513,7 +528,7 @@ fn main() {
     );
     let mut follower = match args.cursor_file.as_deref().and_then(Cursor::load) {
         Some(cursor) => {
-            let (f, how) = Follower::resume(&args.eve, cursor, args.from_start);
+            let (f, how) = Follower::resume(&args.eve, cursor);
             log::info!("[sokol-suricata] {} ({:?})", how, cursor);
             f
         }
@@ -765,7 +780,7 @@ mod tests {
             .open(&path)
             .unwrap();
         w.write_all(b"three\n").unwrap();
-        let (mut f, how) = Follower::resume(&path, cursor, false);
+        let (mut f, how) = Follower::resume(&path, cursor);
         assert_eq!(how, "resumed at the saved position");
         assert_eq!(
             lines(&mut f),
@@ -776,9 +791,86 @@ mod tests {
         // Rotated while down: the new file is read from its start.
         std::fs::rename(&path, dir.join("eve.json.1")).unwrap();
         std::fs::write(&path, "four\n").unwrap();
-        let (mut f, how) = Follower::resume(&path, cursor, false);
+        let (mut f, how) = Follower::resume(&path, cursor);
         assert!(how.starts_with("file rotated"), "{}", how);
         assert_eq!(lines(&mut f), vec!["four\n"]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn resume_retains_its_anchor_while_the_source_is_missing() {
+        let dir =
+            std::env::temp_dir().join(format!("sokol-suricata-deferred-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("eve.json");
+        let parked = dir.join("eve.parked");
+        let prefix = "already read\n";
+        for mode in ["same", "rotated", "truncated"] {
+            std::fs::write(&path, format!("{prefix}pending\n")).unwrap();
+            let saved = Cursor {
+                inode: std::fs::metadata(&path).unwrap().ino(),
+                position: prefix.len() as u64,
+            };
+            std::fs::rename(&path, &parked).unwrap();
+            let (mut follower, _) = Follower::resume(&path, saved);
+            assert_eq!(
+                follower.cursor(),
+                saved,
+                "absence is not a new source identity"
+            );
+            for _ in 0..3 {
+                assert!(follower.poll().unwrap().lines.is_empty());
+                assert_eq!(follower.checkpoint(None), saved);
+            }
+            let expected = match mode {
+                "same" => {
+                    std::fs::rename(&parked, &path).unwrap();
+                    "pending\n"
+                }
+                "rotated" => {
+                    std::fs::write(&path, "replacement starts here\n").unwrap();
+                    "replacement starts here\n"
+                }
+                _ => {
+                    std::fs::rename(&parked, &path).unwrap();
+                    std::fs::write(&path, "new\n").unwrap();
+                    "new\n"
+                }
+            };
+            assert_eq!(lines(&mut follower).concat(), expected);
+            assert!(lines(&mut follower).is_empty());
+            assert_eq!(
+                follower.checkpoint(None).position,
+                std::fs::metadata(&path).unwrap().len()
+            );
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn failed_install_does_not_erase_the_selected_resume_anchor() {
+        let dir = std::env::temp_dir().join(format!(
+            "sokol-suricata-deferred-seek-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("absent.json");
+        let anchor = Cursor {
+            inode: 17,
+            position: 23,
+        };
+        let (mut follower, _) = Follower::resume(&path, anchor);
+        let token = follower.content.clone();
+        // A real unseekable descriptor fails after open, without a runtime failpoint.
+        let (stream, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let file = File::from(std::os::fd::OwnedFd::from(stream));
+        assert!(follower.install(file, anchor.position).is_err());
+        assert_eq!(follower.cursor(), anchor);
+        assert_eq!(follower.pending_resume, Some(anchor));
+        assert!(follower.reader.is_none());
+        assert!(std::rc::Rc::ptr_eq(&token, &follower.content));
+        assert_eq!(follower.position, 0);
+        assert_eq!(follower.line_start, 0);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -795,27 +887,21 @@ mod tests {
         std::fs::write(&path, format!("{ALERT}\n")).unwrap();
         assert_eq!(std::fs::metadata(&path).unwrap().ino(), old.inode);
         assert!(std::fs::metadata(&path).unwrap().len() < old.position);
-        for from_start in [false, true] {
-            let (mut follower, how) = Follower::resume(&path, old, from_start);
-            assert!(how.starts_with("file truncated"), "{how}");
-            let recovered = lines(&mut follower);
-            assert_eq!(
-                recovered,
-                vec![format!("{ALERT}\n")],
-                "from_start={from_start}"
-            );
-            assert!(decide(&recovered[0], &filter()).is_some());
-            assert!(
-                lines(&mut follower).is_empty(),
-                "do not reread on the next poll"
-            );
-            let next = follower.cursor();
-            let (mut resumed, _) = Follower::resume(&path, next, false);
-            assert!(
-                lines(&mut resumed).is_empty(),
-                "the new cursor resumes at the new end"
-            );
-        }
+        let (mut follower, how) = Follower::resume(&path, old);
+        assert!(how.starts_with("file truncated"), "{how}");
+        let recovered = lines(&mut follower);
+        assert_eq!(recovered, vec![format!("{ALERT}\n")]);
+        assert!(decide(&recovered[0], &filter()).is_some());
+        assert!(
+            lines(&mut follower).is_empty(),
+            "do not reread on the next poll"
+        );
+        let next = follower.cursor();
+        let (mut resumed, _) = Follower::resume(&path, next);
+        assert!(
+            lines(&mut resumed).is_empty(),
+            "the new cursor resumes at the new end"
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -849,7 +935,7 @@ mod tests {
         let checkpoint = follower.checkpoint(Some(&old));
         let saved = dir.join("cursor");
         checkpoint.save(&saved).unwrap();
-        let (mut restarted, _) = Follower::resume(&path, Cursor::load(&saved).unwrap(), false);
+        let (mut restarted, _) = Follower::resume(&path, Cursor::load(&saved).unwrap());
         assert_eq!(
             lines(&mut restarted).concat(),
             new_content,
@@ -905,7 +991,7 @@ mod tests {
             checkpoint.position, 0,
             "same inode must not transplant an old-content offset"
         );
-        let (mut restarted, _) = Follower::resume(&path, checkpoint, false);
+        let (mut restarted, _) = Follower::resume(&path, checkpoint);
         assert_eq!(
             lines(&mut restarted).concat(),
             "new first\nnew second\nnew third\n"
@@ -1049,7 +1135,7 @@ mod tests {
             vec![(0, "first\n".into()), (8, "last\n".into())]
         );
         assert_eq!(follower.cursor().position, 13);
-        let (mut resumed, _) = Follower::resume(&path, follower.cursor(), false);
+        let (mut resumed, _) = Follower::resume(&path, follower.cursor());
         assert!(lines(&mut resumed).is_empty());
         std::fs::remove_dir_all(dir).unwrap();
     }
