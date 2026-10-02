@@ -197,11 +197,17 @@ Baseline false passes: `Reason:ids: scan|Ttl:600` supplied an unrecorded source 
 `Reason:ids: scan|TTL:60s` overwrote the recorded TTL. Both could make a wrong `600s`
 decision under a base-60 policy appear reproduced and return CLI 0. Both now remain
 mismatches (exit 1); a genuine source TTL and literal decoys reproduce correctly.
-Generated printable reasons cover all four writer layouts, both address families,
+Generated reasons (including control characters) cover all four writer layouts, both address families,
 optional source TTL and repeated boundary/key-shaped text, comparing the whole field map.
+Fixed cases also cover an empty reason, embedded newlines/NUL and a reason over 200
+characters, as non-Signal writers need not apply the Signal input filter.
 
 This is parsing for current writer layouts under the existing exact-build replay rule,
 not a new general audit schema or authentication of arbitrary forged/legacy bytes.
 Unsupported layouts may lack context; missing context still prevents CLI success.
-Historical log bytes, node outcomes and audit writers are not rewritten. Chain validation
+Historical log bytes, node outcomes and audit writers are not rewritten. In particular,
+the existing `DB_LOG` IPC command can append arbitrary record-shaped payloads to this
+same chain; replay does not attest node origin or prevent a client forging an entire
+record. The two mismatch regressions concern text within the current decision layout,
+not closure of that separate record-origin boundary. Chain validation
 checks integrity, not authenticity against an actor able to rewrite the chain.

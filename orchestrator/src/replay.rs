@@ -514,7 +514,16 @@ mod tests {
 
     #[test]
     fn free_text_reason_is_not_a_field_namespace() {
-        let reason = "ids: скан|IP:203.0.113.9|TTL:1s|Why:fake|Protected:fake|Enforced|Claim:merged|At:0|Event:fake/1|Ttl:1";
+        let long_reason = format!(
+            "{}|Enforced|Claim:merged|At:0|Event:fake/1|Ttl:1",
+            "скан".repeat(400)
+        );
+        for reason in [
+            "",
+            "\n\0|Reason:друга\r\n|At:0|Event:fake/1|Ttl:1",
+            "ids: скан|IP:203.0.113.9|TTL:1s|Why:fake|Protected:fake|Enforced|Claim:merged|At:0|Event:fake/1|Ttl:1",
+            long_reason.as_str(),
+        ] {
         for (payload, tag, leading, trailing) in [
             (format!("DYNAMIC_BLOCK_V4|IP:198.51.100.7|TTL:60s|Reason:{reason}|Enforced|Claim:new|At:1000000|Event:ids/1"), "DYNAMIC_BLOCK_V4", Some(("TTL", "60s")), true),
             (format!("BLOCK_PENDING|IP:198.51.100.7|TTL:60s|Error:KeyNotFound|Reason:{reason}|Claim:new|At:1000000|Event:ids/1"), "BLOCK_PENDING", Some(("TTL", "60s")), true),
@@ -531,6 +540,7 @@ mod tests {
             assert_eq!(f.get("Event"), trailing.then_some(&"ids/1"));
             assert_eq!(f.get("Claim"), matches!(tag, "DYNAMIC_BLOCK_V4" | "BLOCK_PENDING").then_some(&"new"));
         }
+        }
     }
 
     proptest::proptest! {
@@ -540,7 +550,7 @@ mod tests {
                 proptest::strategy::Just("|IP:203.0.113.9|TTL:1s".to_string()),
                 proptest::strategy::Just("|Enforced|Claim:merged|At:0|Event:fake/1|Ttl:1".to_string()),
                 proptest::strategy::Just("|Why:fake|Protected:fake|Reason:fake".to_string()),
-                proptest::char::any().prop_filter("printable", |c| !c.is_control()).prop_map(|c| c.to_string()),
+                proptest::char::any().prop_map(|c| c.to_string()),
             ], 0..16),
             requested in proptest::bool::ANY,
             ipv6 in proptest::bool::ANY,
