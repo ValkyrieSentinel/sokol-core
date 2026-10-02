@@ -170,6 +170,7 @@ Owner: [replay_records / print_report](../orchestrator/src/replay.rs),
 |---|---|---|
 | REPLAY-R1 | A recorded retraction capacity refusal that the fresh replay cannot reproduce is unverified. Its speculative table is discarded; dependent decisions are insufficient until a new usable start record. It is neither a verified refusal nor a cascade of mismatches. | `an_unverified_capacity_refusal_fences_dependent_replay_until_a_fresh_start`, `a_wrong_retraction_outcome_remains_a_mismatch` |
 | REPLAY-R2 | Any insufficient decision prevents CLI success even when earlier/later decisions reproduce. Actual mismatches retain exit 1; complete nonempty replay has exit 0; incomplete/empty replay has exit 2. | `a_partially_reproduced_audit_is_not_a_successful_cli_result` (real chained files and `print_report`), XDP smoke requires zero insufficient decisions |
+| REPLAY-R3 | In current detector writer layouts, `Reason` is opaque data: it cannot override leading `IP`/`TTL`/`Why`/`Protected` or appended `Claim`/`At`/`Event`/`Ttl`. The complete reason bytes are retained. | `reason_fields_cannot_hide_a_wrong_detector_ttl`, `a_real_source_ttl_survives_reason_decoys`, `free_text_reason_is_not_a_field_namespace`, `generated_reasons_preserve_fields_and_bytes`, chained-file CLI cases |
 
 Baseline regressions: a recorded capacity refusal replayed as `lifted`, then its retry
 as `duplicate`, producing two mismatches on a table changed by speculation. A journal
@@ -184,5 +185,29 @@ existing scope; there is no complete mesh/resource-state reconstruction. Protect
 refusals remain separately counted outside replay scope, even at exit 0. Only the node's
 `Protected:` field immediately after `IP:` qualifies; a marker embedded in free-text
 `Reason:` cannot exempt a capacity refusal from checking (`a_protected_marker_in_free_text_cannot_exclude_a_detector_decision`, also tested through the chained-file CLI). This
-is a bound on this policy exception, not a redesign of the legacy delimiter format. Chain validation
+protects that exception. Replay now also isolates the entire reason from parsed metadata.
+Leading fields come before `Reason:`; the last `|Enforced|Claim:` (enforced block),
+`|Claim:` (pending block) or `|At:` (capacity refusal) begins the node's appended fields.
+Protected refusals have no appended context. Current writers append those boundaries
+and validate source/event ids to exclude `|`; a matching marker inside the reason is
+therefore earlier than the node's actual one. The parser retains the whole reason,
+including delimiters and Unicode, rather than filtering or decoding it.
+
+Baseline false passes: `Reason:ids: scan|Ttl:600` supplied an unrecorded source TTL;
+`Reason:ids: scan|TTL:60s` overwrote the recorded TTL. Both could make a wrong `600s`
+decision under a base-60 policy appear reproduced and return CLI 0. Both now remain
+mismatches (exit 1); a genuine source TTL and literal decoys reproduce correctly.
+Generated reasons (including control characters) cover all four writer layouts, both address families,
+optional source TTL and repeated boundary/key-shaped text, comparing the whole field map.
+Fixed cases also cover an empty reason, embedded newlines/NUL and a reason over 200
+characters, as non-Signal writers need not apply the Signal input filter.
+
+This is parsing for current writer layouts under the existing exact-build replay rule,
+not a new general audit schema or authentication of arbitrary forged/legacy bytes.
+Unsupported layouts may lack context; missing context still prevents CLI success.
+Historical log bytes, node outcomes and audit writers are not rewritten. In particular,
+the existing `DB_LOG` IPC command can append arbitrary record-shaped payloads to this
+same chain; replay does not attest node origin or prevent a client forging an entire
+record. The two mismatch regressions concern text within the current decision layout,
+not closure of that separate record-origin boundary. Chain validation
 checks integrity, not authenticity against an actor able to rewrite the chain.
