@@ -134,7 +134,7 @@ class StreamTests(unittest.TestCase):
                     elif failure == "http-error":
                         status, body = 503, b"temporary error"
                     else:
-                        body = b'{"new":['
+                        body = b"{}"  # valid JSON; only the HTTP body is truncated
                 elif index == 2 and self.path.endswith("startup=true"):
                     # The lost delta was consumed at the server. Its current retained
                     # state recovers both an active decision and the prior deletion.
