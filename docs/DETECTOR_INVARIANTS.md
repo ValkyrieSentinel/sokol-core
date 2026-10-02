@@ -1,6 +1,6 @@
 # Detector invariants
 
-This ledger records properties of the current Suricata adapter and shared IPC outbox.
+This ledger records properties of the current Suricata and CrowdSec adapters and shared IPC outbox.
 Code owns behavior; named tests are executable evidence, not a proof of deployment or
 an extension of Stargate's frozen model certificates. The scope is one adapter process
 unless a restart test explicitly says otherwise.
@@ -84,6 +84,30 @@ is a new fresh alert, never the stale one or a fabricated retraction; checkpoint
 Before the fix both scenarios sent the stale alert. Freshness expiry is intentional forwarding
 loss. Already applied effects remain under node policy, not a local undo. It does not shorten
 acknowledged block TTL, and does not bound write/scheduler/node time after the final check.
+
+## CrowdSec configuration and pacing
+
+Owner: [Args and signal_pause](../orchestrator/src/bin/sokol-crowdsec.rs).
+
+| ID | Invariant and enforcement point | Executable evidence |
+|---|---|---|
+| CS-P1 | The parsed command pacing rate is a `NonZeroU32`. Zero is rejected by `Args::parse` before outbox construction, LAPI polling or IPC; a zero rate cannot silently become one command per second. Default 200 and positive `u32` bounds remain valid, and zero poll interval remains a separate valid policy. | `cli_rejects_zero_ipc_pacing_before_startup`, `cli_pacing_accepts_positive_u32_bounds_and_zero_poll_interval`; actual process `StreamTests.test_zero_pacing_fails_before_lapi_or_ipc_requests` |
+| CS-P2 | For positive rate `r`, requested pause `n` is the smallest whole-nanosecond interval satisfying `n * r >= 1,000,000,000`. Thus `1 <= n <= 1,000,000,000`; `(n - 1) * r` is insufficient. Integer ceiling avoids a shorter fractional rounding or zero pause at large rates. | `ipc_pacing_interval_does_not_round_below_the_configured_budget`, `ipc_pacing_intervals_are_positive_minimal_integer_budgets` (rates 1–10,000 and boundary values up to `u32::MAX`). |
+
+Baseline zero-rate regression: the real adapter contacted the fixture's LAPI, performed
+`ACK`, sent `SIGNAL#71;ttl=60` and remained running; the test expected CLI exit code 2
+and no requests. The adapter formerly clamped zero to one. It now refuses the invalid
+configuration before either peer is used. The process test observes local fake peers;
+it does not assert production-node effects. A separate arithmetic regression found that
+rate 3 produced 333,333,333 ns via `f64`, so three intervals were less than one second.
+That assertion failed before upward integer rounding; the revised request is 333,333,334 ns.
+
+The pacing pause follows each completed exchange, including retractions. The first
+command can be immediate; endpoint latency, poll work, backoff and scheduler delay also
+contribute to spacing. CS-P2 describes a requested sleep interval, not a sliding-window
+rate limiter, wall-clock deadline or throughput promise. Scheduling, FIFO/ACK retention,
+source TTL and poll-error recovery keep their existing semantics. No certificate in
+Stargate's frozen Boolean model claims these integer/configuration properties.
 
 ## Source, queue, acknowledgement and checkpoint
 

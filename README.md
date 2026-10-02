@@ -304,8 +304,14 @@ yields between commands when the next poll is due, so a healthy backlog does not
 have to drain before new decisions and retractions are fetched. FIFO order and
 ACK retention remain intact; fetched retractions join the existing queue.
 `--poll-secs` measures the wait after a poll and queue insertion finish, while
-`--max-signals-per-sec` still paces each completed delivery. During backoff the
-loop waits up to 50 ms, or until a poll is due, before checking retry readiness. A zero poll
+`--max-signals-per-sec` paces each completed IPC command (signals and retractions).
+This rate must be a positive `u32` (default 200); zero is a CLI error before any LAPI
+or IPC request. Previously zero silently became one command per second. Suricata's
+separate zero-admission policy is unchanged. The pacing interval is the smallest whole
+nanosecond duration no shorter than `1 / rate`, rounded upward with integer arithmetic;
+large rates retain at least a one-nanosecond requested pause. This defines the local
+sleep budget, not a sliding-window command quota or measured throughput. During backoff
+the loop waits up to 50 ms, or until a poll is due, before checking retry readiness. A zero poll
 interval permits one delivery attempt per poll to avoid starving the sender.
 
 This is cooperative scheduling: an in-flight HTTP request, one IPC exchange or
