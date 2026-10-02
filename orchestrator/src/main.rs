@@ -1129,6 +1129,20 @@ fn log_inbound_budget(peers: usize) {
     );
 }
 
+fn detector_retraction_reply(out: &block_table::DetectorRetraction) -> String {
+    use block_table::DetectorRetraction as R;
+    match out {
+        R::Refused => "OK refused retraction state capacity",
+        R::Duplicate => "OK duplicate",
+        R::BeforeSignal => "OK recorded before its signal",
+        R::NotHolding => "OK nothing held",
+        R::StillHeld => "OK still held by other reasons",
+        R::Lifted { reissued: None, .. } => "OK lifted",
+        R::Lifted { .. } => "OK shortened",
+    }
+    .into()
+}
+
 /// A detector takes back one of its events (ADR-0019). The block ends, or gets shorter, only as
 /// far as no other reason holds it; this node's own claims are retracted mesh-wide.
 async fn retract_detection(r: &signal::Retract, c: &IpcCtx) -> String {
@@ -1142,6 +1156,7 @@ async fn retract_detection(r: &signal::Retract, c: &IpcCtx) -> String {
         )
     };
     let label = out.label();
+    let reply = detector_retraction_reply(&out);
     let claims = match &out {
         block_table::DetectorRetraction::Lifted { retracted, .. } => retracted.len(),
         _ => 0,
@@ -1180,13 +1195,7 @@ async fn retract_detection(r: &signal::Retract, c: &IpcCtx) -> String {
         };
         let _ = c.registry.broadcast(&cmd, c.node_id, &c.crypto).await;
     }
-    match label {
-        "duplicate" => "OK duplicate".into(),
-        "before_signal" => "OK recorded before its signal".into(),
-        "not_holding" => "OK nothing held".into(),
-        "still_held" => "OK still held by other reasons".into(),
-        other => format!("OK {}", other),
-    }
+    reply
 }
 
 /// What a detector said about its decision, beyond the target (ADR-0009, ADR-0019).
@@ -2782,6 +2791,14 @@ async fn main() -> Result<(), anyhow::Error> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_retraction_capacity_refusal_is_not_an_ipc_success() {
+        assert_eq!(
+            super::detector_retraction_reply(&crate::block_table::DetectorRetraction::Refused),
+            "OK refused retraction state capacity"
+        );
+    }
+
     use super::*;
 
     fn temp_log(name: &str) -> String {

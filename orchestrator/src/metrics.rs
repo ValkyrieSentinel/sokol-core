@@ -242,7 +242,7 @@ pub fn render(s: &Snapshot) -> String {
         &mut out,
         "sokol_detector_retractions_total",
         "counter",
-        "Detector retractions (RETRACT, ADR-0019) by result: lifted, shortened, still_held (another reason holds), not_holding, before_signal, duplicate.",
+        "Detector retractions (RETRACT, ADR-0019) by result: lifted, shortened, still_held (another reason holds), not_holding, before_signal, duplicate, refused (state capacity).",
     );
     for (label, n) in crate::block_table::RETRACTION_RESULTS
         .iter()

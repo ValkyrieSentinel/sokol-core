@@ -784,6 +784,24 @@ mod tests {
         node.join().unwrap();
     }
     #[test]
+    fn a_retraction_capacity_refusal_is_a_final_refusal_not_a_recorded_effect() {
+        let path = temp_socket("retract-capacity");
+        let node = fake_node(&path, |_| Some("OK refused retraction state capacity"));
+        let mut out = Outbox::new(&path, 1);
+        out.push("RETRACT#7:crowdsec|203.0.113.1").unwrap();
+        let (done, err) = out.flush(1);
+        assert!(err.is_none());
+        assert_eq!(done.len(), 1);
+        assert_eq!(
+            done[0].1,
+            Outcome::Refused("retraction state capacity".into())
+        );
+        assert_eq!(out.pending(), 0, "final refusal creates no transport retry");
+        drop(out);
+        node.join().unwrap();
+    }
+
+    #[test]
     fn all_current_retraction_acknowledgements_are_final() {
         for (index, reply) in [
             "OK recorded before its signal",
