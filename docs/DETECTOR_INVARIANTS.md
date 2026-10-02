@@ -1,6 +1,7 @@
 # Detector invariants
 
-This ledger records properties of the current Suricata and CrowdSec adapters and shared IPC outbox.
+This ledger records properties of the Suricata and CrowdSec adapters, the node's
+detector retraction and shared IPC outbox.
 Code owns behavior; named tests are executable evidence, not a proof of deployment or
 an extension of Stargate's frozen model certificates. The scope is one adapter process
 unless a restart test explicitly says otherwise.
@@ -134,3 +135,34 @@ regrowth between observations. Cooldown, age/severity/signature/UTF-8/size filte
 overflow, periodic checkpoints and bounded node event memory remain operational limits.
 These identity/time/cardinality properties are checked on their Rust owners, not encoded
 as a Boolean certificate claiming to cover the full adapter.
+
+## Node retraction admission
+
+Owner: [BlockTable::retract_detection](../orchestrator/src/block_table.rs),
+[node IPC reply](../orchestrator/src/main.rs), [Outbox](../orchestrator/src/delivery.rs).
+
+| ID | Invariant and enforcement point | Executable evidence |
+|---|---|---|
+| NODE-R1 | When an identified event requires lifting/shortening own detector claims, capacity is checked for every missing retraction record, owner entry and replacement claim before support removal or replay-marker insertion. Capacity refusal preserves claims, support and event memory; after capacity is freed the same explicit request remains eligible. | `a_capacity_refusal_preserves_retraction_intent_for_retry`, `a_shortening_capacity_refusal_keeps_both_event_supports`, `retraction_admission_reserves_every_needed_record`, `a_full_retractor_set_preserves_support_until_its_owner_fits` |
+| NODE-R2 | Admission counts missing records, not all claims: a full global record table can update a suitable existing record. A still-held event requires no new claim/tombstone storage. | `an_existing_record_can_accept_its_owner_at_the_global_capacity`, `an_event_still_held_needs_no_new_retraction_storage`, `a_plain_lift_needs_no_free_claim_slot` |
+| NODE-R3 | Capacity refusal is reported as `refused` in audit/metrics and `OK refused retraction state capacity` over IPC. The outbox classifies it as a final refusal, not a recorded lift or transport retry. | `a_retraction_capacity_refusal_is_not_an_ipc_success`, `a_retraction_capacity_refusal_is_a_final_refusal_not_a_recorded_effect` |
+
+Baseline regressions: a full retraction map returned `lifted` while the block remained;
+a full claim map returned `still_held` while consuming the event support and replay marker.
+Both assertions failed on those outcomes before the fix. Tests inject the documented
+cardinality limits directly into the native table's fake-map fixture, compare saved
+claims/support/events before and after refusal, then free one slot and retry the same id.
+The multi-claim case requires two records and refuses even when one slot is available.
+
+The reservation holds under the node's table lock; this is admission for detector
+retractions, not a transaction guarantee for all mesh/operator table operations. Refusal
+updates diagnostics but creates no removal, broadcast or background retry obligation.
+Kernel deletion may still fail and remain pending after an admitted retraction. Bounded
+support/event memory, asynchronous persistence and mesh delivery keep their existing
+limits. These tests do not certify physical NIC behavior or distributed atomic removal.
+
+Audit replay re-runs decisions in a fresh table. A capacity-dependent `refused` result
+needs the same initial claim/retraction occupancy and owner sets to reproduce; an audit
+slice without that state can produce a mismatch. Replay does not currently distinguish
+that missing resource context from other mismatches. The record remains a reported
+refusal; a fresh replay outcome is not evidence that it succeeded in the original node.

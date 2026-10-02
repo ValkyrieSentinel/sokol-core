@@ -76,6 +76,8 @@ fn later(a: Option<u64>, b: Option<u64>) -> Option<u64> {
 /// What a detector's retraction of one of its events did (ADR-0019).
 #[derive(Debug, PartialEq, Eq)]
 pub enum DetectorRetraction {
+    /// Required claim/retraction storage is full; intent and replay markers are unchanged.
+    Refused,
     /// This retraction was already handled.
     Duplicate,
     /// The event had not been signalled yet: remembered, so its late signal adds nothing.
@@ -96,6 +98,7 @@ pub enum DetectorRetraction {
 impl DetectorRetraction {
     pub fn label(&self) -> &'static str {
         match self {
+            Self::Refused => "refused",
             Self::Duplicate => "duplicate",
             Self::BeforeSignal => "before_signal",
             Self::NotHolding => "not_holding",
@@ -107,13 +110,14 @@ impl DetectorRetraction {
 }
 
 /// Labels of [`DetectorRetraction::label`], in counter order.
-pub const RETRACTION_RESULTS: [&str; 6] = [
+pub const RETRACTION_RESULTS: [&str; 7] = [
     "duplicate",
     "before_signal",
     "not_holding",
     "still_held",
     "lifted",
     "shortened",
+    "refused",
 ];
 
 /// A single address as a host network (/32 or /128); `::ffff:a.b.c.d` becomes `a.b.c.d/32`.
@@ -1069,10 +1073,54 @@ impl<B: Blocklist> BlockTable<B> {
         now_ms: u64,
     ) -> DetectorRetraction {
         // Sources are alphanumeric with - and _, so "<source>/retract" names no real source.
-        if !self.first_sighting(&format!("{}/retract", source), id, now_ms) {
+        let retract_source = format!("{}/retract", source);
+        if self
+            .events
+            .get(&event_key(&retract_source, id))
+            .is_some_and(|seen| now_ms.saturating_sub(*seen) <= ms(EVENT_MEMORY))
+        {
             return DetectorRetraction::Duplicate;
         }
         let key = event_key(source, id);
+        let supported = self
+            .support
+            .get(&net)
+            .is_some_and(|list| list.iter().any(|s| s.event == Some(key)));
+        let own = if supported {
+            self.own_effective(net, ClaimKind::Detector, now_ms)
+        } else {
+            Vec::new()
+        };
+        let remaining = self.support.get(&net).and_then(|list| {
+            list.iter()
+                .filter(|s| s.event != Some(key) && s.until.is_none_or(|u| u > now_ms))
+                .map(|s| s.until)
+                .reduce(later)
+        });
+        let longest = own.iter().map(|(_, e)| *e).reduce(later).flatten();
+        let shortening = matches!(remaining, Some(Some(end)) if longest.is_none_or(|l| end < l));
+        // Admission is checked before removing support or recording a replay marker.
+        // The table lock makes these reservations valid until the records are inserted.
+        if !own.is_empty() && (remaining.is_none() || shortening) {
+            let needed = own
+                .iter()
+                .filter(|(id, _)| !self.retractions.contains_key(id))
+                .count();
+            let records_fit = needed <= MAX_KNOWN_CLAIMS.saturating_sub(self.retractions.len())
+                && own.iter().all(|(id, _)| {
+                    self.retractions.get(id).is_none_or(|r| {
+                        r.operator
+                            || r.by_nodes.contains(&self.node_id)
+                            || r.by_nodes.len() < MAX_RETRACTORS
+                    })
+                });
+            if !records_fit || (shortening && self.claims.len() >= MAX_KNOWN_CLAIMS) {
+                return DetectorRetraction::Refused;
+            }
+        }
+        if !self.first_sighting(&retract_source, id, now_ms) {
+            return DetectorRetraction::Duplicate;
+        }
         let removed = self.support.get_mut(&net).and_then(|list| {
             let i = list.iter().position(|s| s.event == Some(key))?;
             Some(list.remove(i))
@@ -1085,28 +1133,17 @@ impl<B: Blocklist> BlockTable<B> {
             };
         }
         self.dirty = true;
-        let remaining = self.support.get(&net).and_then(|list| {
-            list.iter()
-                .filter(|s| s.until.is_none_or(|u| u > now_ms))
-                .map(|s| s.until)
-                .reduce(later)
-        });
         if self.support.get(&net).is_some_and(|l| l.is_empty()) {
             self.support.remove(&net);
         }
-        let own = self.own_effective(net, ClaimKind::Detector, now_ms);
         if own.is_empty() {
             return DetectorRetraction::NotHolding;
         }
-        let longest = own.iter().map(|(_, e)| *e).reduce(later).flatten();
         let reissued = match remaining {
             None => None,
             // The rest holds at least as long as the running block: nothing changes.
             Some(None) => return DetectorRetraction::StillHeld,
             Some(Some(end)) if longest.is_none_or(|l| end < l) => {
-                if self.claims.len() >= MAX_KNOWN_CLAIMS {
-                    return DetectorRetraction::StillHeld;
-                }
                 let reason = own
                     .iter()
                     .filter_map(|(id, _)| self.claims.get(id))
@@ -2213,6 +2250,226 @@ mod tests {
 
     fn lifted(out: &DetectorRetraction) -> bool {
         matches!(out, DetectorRetraction::Lifted { reissued: None, .. })
+    }
+
+    fn fill_retraction_memory(t: &mut BlockTable<FakeLists>, free: usize) {
+        for i in 0..MAX_KNOWN_CLAIMS - free - t.retractions.len() {
+            t.retractions.insert(
+                format!("flood-{i}"),
+                Retraction {
+                    operator: false,
+                    by_nodes: vec![2],
+                    forget_ms: Some(T0 + 600 * S),
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn retraction_admission_reserves_every_needed_record() {
+        let mut t = table(1, 64);
+        signal(&mut t, "crowdsec", "17", "203.0.113.9", T0, None).unwrap();
+        // More than one own claim can be restored for a target. Both need tombstones.
+        t.issue_own(
+            ip("203.0.113.9"),
+            ClaimKind::Detector,
+            "second",
+            T0,
+            Some(T0 + 60 * S),
+        );
+        fill_retraction_memory(&mut t, 1);
+        let before = t.take_persisted(T0 + S);
+        assert_eq!(
+            t.retract_detection("crowdsec", "17", ip("203.0.113.9"), T0 + S)
+                .label(),
+            "refused"
+        );
+        assert_eq!(t.take_persisted(T0 + S), before);
+        t.retractions.remove("flood-0");
+        let out = t.retract_detection("crowdsec", "17", ip("203.0.113.9"), T0 + 2 * S);
+        let DetectorRetraction::Lifted { retracted, .. } = out else {
+            panic!("expected lift");
+        };
+        assert_eq!(retracted.len(), 2);
+        assert_eq!(t.retractions.len(), MAX_KNOWN_CLAIMS);
+        assert!(!t.is_blocked(ip("203.0.113.9")));
+    }
+
+    #[test]
+    fn an_existing_record_can_accept_its_owner_at_the_global_capacity() {
+        let mut t = table(1, 64);
+        let claim = signal(&mut t, "crowdsec", "17", "203.0.113.9", T0, None)
+            .unwrap()
+            .claim;
+        t.retractions.insert(
+            claim.id(),
+            Retraction {
+                operator: false,
+                by_nodes: vec![2],
+                forget_ms: claim.expires_ms,
+            },
+        );
+        fill_retraction_memory(&mut t, 0);
+        assert!(lifted(&t.retract_detection(
+            "crowdsec",
+            "17",
+            ip("203.0.113.9"),
+            T0 + S
+        )));
+        assert_eq!(t.retractions.len(), MAX_KNOWN_CLAIMS);
+        assert!(t.retractions[&claim.id()].by_nodes.contains(&1));
+        assert!(!t.is_blocked(ip("203.0.113.9")));
+    }
+
+    #[test]
+    fn a_full_retractor_set_preserves_support_until_its_owner_fits() {
+        let mut t = table(1, 64);
+        let claim = signal(&mut t, "crowdsec", "17", "203.0.113.9", T0, None)
+            .unwrap()
+            .claim;
+        t.retractions.insert(
+            claim.id(),
+            Retraction {
+                operator: false,
+                by_nodes: vec![2, 3, 4, 5],
+                forget_ms: claim.expires_ms,
+            },
+        );
+        let before = t.take_persisted(T0 + S);
+        assert_eq!(
+            t.retract_detection("crowdsec", "17", ip("203.0.113.9"), T0 + S)
+                .label(),
+            "refused"
+        );
+        assert_eq!(t.take_persisted(T0 + S), before);
+        assert!(t.is_blocked(ip("203.0.113.9")));
+        t.retractions.get_mut(&claim.id()).unwrap().by_nodes.pop();
+        assert!(lifted(&t.retract_detection(
+            "crowdsec",
+            "17",
+            ip("203.0.113.9"),
+            T0 + 2 * S
+        )));
+        assert!(!t.is_blocked(ip("203.0.113.9")));
+    }
+
+    #[test]
+    fn an_event_still_held_needs_no_new_retraction_storage() {
+        let mut t = table(1, 64);
+        signal(&mut t, "crowdsec", "17", "203.0.113.9", T0, Some(60)).unwrap();
+        signal(&mut t, "suricata", "5", "203.0.113.9", T0 + S, None).unwrap();
+        fill_retraction_memory(&mut t, 0);
+        assert_eq!(
+            t.retract_detection("crowdsec", "17", ip("203.0.113.9"), T0 + 2 * S),
+            DetectorRetraction::StillHeld
+        );
+        assert!(t.is_blocked(ip("203.0.113.9")));
+        assert_eq!(
+            t.retract_detection("crowdsec", "17", ip("203.0.113.9"), T0 + 3 * S),
+            DetectorRetraction::Duplicate
+        );
+        assert_eq!(t.retractions.len(), MAX_KNOWN_CLAIMS);
+    }
+
+    fn fill_claim_memory(t: &mut BlockTable<FakeLists>, seed: &Claim) {
+        for i in 0..MAX_KNOWN_CLAIMS - t.claims.len() {
+            t.claims.insert(
+                format!("flood-{i}"),
+                Held {
+                    claim: Claim {
+                        issuer: 2,
+                        ..seed.clone()
+                    },
+                    net: ip("203.0.113.9"),
+                    until_ms: seed.expires_ms,
+                    end_local: seed.expires_ms,
+                    allowed: true,
+                    in_quota: false,
+                    ended: false,
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn a_plain_lift_needs_no_free_claim_slot() {
+        let mut t = table(1, 64);
+        let claim = signal(&mut t, "crowdsec", "17", "203.0.113.9", T0, None)
+            .unwrap()
+            .claim;
+        fill_claim_memory(&mut t, &claim);
+        assert_eq!(t.claims.len(), MAX_KNOWN_CLAIMS);
+        assert!(lifted(&t.retract_detection(
+            "crowdsec",
+            "17",
+            ip("203.0.113.9"),
+            T0 + S
+        )));
+        assert!(!t.is_blocked(ip("203.0.113.9")));
+        assert_eq!(
+            t.claims.len(),
+            MAX_KNOWN_CLAIMS,
+            "no replacement claim needed"
+        );
+        assert_eq!(t.retractions.len(), 1);
+    }
+
+    #[test]
+    fn a_shortening_capacity_refusal_keeps_both_event_supports() {
+        let mut t = table(1, 64);
+        let long = signal(&mut t, "crowdsec", "17", "203.0.113.9", T0, Some(600))
+            .unwrap()
+            .claim;
+        signal(&mut t, "suricata", "5", "203.0.113.9", T0 + S, None).unwrap();
+        fill_claim_memory(&mut t, &long);
+        let before = t.take_persisted(T0 + 2 * S);
+        let out = t.retract_detection("crowdsec", "17", ip("203.0.113.9"), T0 + 2 * S);
+        assert_eq!(
+            out.label(),
+            "refused",
+            "capacity is not another holding reason"
+        );
+        assert_eq!(
+            t.take_persisted(T0 + 2 * S),
+            before,
+            "refusal must preserve supports and replay markers"
+        );
+        t.claims.remove("flood-0");
+        let out = t.retract_detection("crowdsec", "17", ip("203.0.113.9"), T0 + 3 * S);
+        assert_eq!(out.label(), "shortened");
+        t.tick(T0 + 62 * S);
+        assert!(
+            !t.is_blocked(ip("203.0.113.9")),
+            "remaining Suricata reason ends on time"
+        );
+    }
+
+    #[test]
+    fn a_capacity_refusal_preserves_retraction_intent_for_retry() {
+        let mut t = table(1, 64);
+        signal(&mut t, "crowdsec", "17", "203.0.113.9", T0, None).unwrap();
+        fill_retraction_memory(&mut t, 0);
+        let before = t.take_persisted(T0 + S);
+        let out = t.retract_detection("crowdsec", "17", ip("203.0.113.9"), T0 + S);
+        assert_eq!(
+            out.label(),
+            "refused",
+            "a full record table cannot claim a lift"
+        );
+        assert!(t.is_blocked(ip("203.0.113.9")));
+        assert_eq!(
+            t.take_persisted(T0 + S),
+            before,
+            "refusal must not consume intent"
+        );
+        t.retractions.remove("flood-0");
+        assert!(lifted(&t.retract_detection(
+            "crowdsec",
+            "17",
+            ip("203.0.113.9"),
+            T0 + 2 * S
+        )));
+        assert!(!t.is_blocked(ip("203.0.113.9")));
     }
 
     #[test]

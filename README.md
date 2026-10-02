@@ -386,7 +386,11 @@ A detector with its own decision lifecycle can also send (ADR-0019):
   - `OK still held by other reasons`;
   - `OK nothing held`;
   - `OK recorded before its signal`: the late signal then adds nothing;
-  - `OK duplicate`.
+  - `OK duplicate`;
+  - `OK refused retraction state capacity`: the necessary claim or retraction record
+    storage is full. Supports, claims and replay markers stay unchanged; a later explicit
+    retry can succeed after capacity is available. This is a final refusal for the current
+    outbox request, not an automatic retry or a promise of eventual removal.
 
   Events without an id, such as `DROP_IMMEDIATE` or the trap, cannot be taken back.
   `sokol_detector_retractions_total{result}` counts the answers.
