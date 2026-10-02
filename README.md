@@ -251,10 +251,15 @@ scheduler or a bound on draining a large healthy queue.
 The adapter validates the decision-stream envelope before queueing any commands. The
 root must be an object; `new` and `deleted`, when present and non-null, must be arrays
 of objects. Missing/null/empty sections remain valid (the [upstream response model](https://github.com/crowdsecurity/crowdsec/blob/master/pkg/models/decisions_stream_response.go)
-makes these fields optional). A malformed initial response is logged and leaves
-`startup=true` for the next poll. This is shape validation, not complete validation of
-each decision; existing origin/type/scope filters still apply. It does not guarantee
-replay of a rejected delta after the server has advanced its stream position.
+makes these fields optional). Any HTTP, body-read, JSON or envelope error requests
+`startup=true` again on the next poll; only a usable batch returns to delta mode.
+This [full-stream request](https://docs.crowdsec.net/docs/local_api/bouncers/)
+recovers active decisions and whatever expired records the server still retains
+([upstream controller at e3f795d](https://github.com/crowdsecurity/crowdsec/blob/e3f795da3d064a172d475436e51275ceb13c8ff5/pkg/apiserver/controllers/v1/decisions.go)).
+The local outbox is retained throughout. Full replay can repeat event ids and
+increase response size/queue pressure; node deduplication and overflow limits
+still apply. Purged records, semantically skipped entries and unreported server
+errors cannot be recovered this way. Envelope checking remains shape validation.
 
 Timed CrowdSec signals retain a monotonic expiry anchored before the HTTP request.
 Each delivery attempt recalculates the remaining TTL after the ACK handshake;

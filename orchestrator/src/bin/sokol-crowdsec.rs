@@ -390,7 +390,15 @@ fn main() {
                     );
                 }
             }
-            Err(e) => log::warn!("[sokol-crowdsec] LAPI poll failed: {}", e),
+            Err(e) => {
+                // The server may have advanced its cursor even when the client did
+                // not obtain a usable batch. Ask for retained full state next time.
+                startup = true;
+                log::warn!(
+                    "[sokol-crowdsec] LAPI poll failed: {}; requesting full stream on next poll",
+                    e
+                );
+            }
         }
         deliver(&mut outbox, &args.ipc_socket, pause);
         std::thread::sleep(Duration::from_secs(args.poll_secs));
