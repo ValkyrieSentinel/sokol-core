@@ -218,8 +218,21 @@ current file's recovery cursor to zero. Once that work leaves the queue, the cur
 within the current contents. The saved inode/position format is unchanged. This does not
 recover pre-truncation bytes after process loss. Inode and length still cannot detect
 truncation followed by regrowth beyond the saved position between observations.
-Alerts older than `--max-alert-age-secs` (default 600) are skipped; replayed alerts retain
-their event IDs for duplicate recognition.
+Timestamped alerts older than `--max-alert-age-secs` (default 600) are skipped. For a
+remaining freshness budget, the adapter also keeps a monotonic forwarding deadline,
+checked before connecting and again after the ACK handshake, on initial send and retries.
+The measured age consumes that budget; future timestamps cannot grant more than the
+configured interval from observation. An unrepresentable local deadline is logged and
+skipped. Missing or unparseable timestamps retain the legacy untimed policy.
+An expired queued alert is removed as **counted local policy loss**, not a node ACK:
+`queued alerts expired before forwarding` reports it, and its queued cursor is released.
+After a lost ACK the signal may already have applied; local expiry neither retries it
+nor undoes the node's effects. Suricata does not emit an expiry RETRACT because the node
+can select the destination instead of the source and the adapter does not know that target.
+Successful acknowledged blocks retain the node's normal TTL/escalation policy; freshness
+is a forwarding limit, not a block TTL. Time after the final check (write, scheduling,
+node processing) has no deadline guarantee. Replayed alerts retain their event IDs for
+duplicate recognition.
 
 The reader processes at most **1 MiB of bytes or 256 completed lines per poll**, counting
 invalid lines too, then yields to delivery and the existing once-per-second checkpoint check. It retains at
