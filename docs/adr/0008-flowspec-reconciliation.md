@@ -94,23 +94,23 @@
   тільки CLI read перевіряють відмову без записів для обох сімейств. Canonical CI
   вимагає окремий позитивний marker цієї перевірки в кожному сімействі.
 
-FLOWSPEC-R6: worker слухає actual wanted changes і shutdown також під час
-pending round. Зміна перериває старий раунд і починає нове RIB read; shutdown
-починає наявну десятисекундну спробу cleanup. Уже встановлений shutdown і закриття
-publisher channel також запускають cleanup. Основний tick публікує тільки змінені
-prefix sets, щоб однакові публікації не зривали slow calls. CLI child при скасуванні
-kill-on-drop; повторне читання спостерігає RIB для наступного плану, але не є fence
-для remote RPC, який може застосуватися пізніше, навіть при direct/exec CLI.
-Порожній cleanup read перед пізнім add не гарантує відсутності правил після виходу.
-Це не atomic revocation, rollback чи доказ eventual progress при постійній зміні
-наміру: за повільного GoBGP можуть не виконуватися й записи. Потрібне стабільне
-вікно для CLI calls. Wrappers мають `exec` CLI, бо kill-on-drop завершує прямий
-child, не process tree. Скасована відповідь прийнятої команди може не залишити
-ACK-аудиту. Квота 64 є per-round, не лімітом частоти між перерваними раундами.
-Великий backlog при змінах на кожному tick може зривати observation і за звичайної
-швидкості CLI. Production shutdown publisher одноразово надсилає true; false
-notification у поточному API теж консервативно перезапускає раунд.
-Ownership, policy і повноваження залишаються тими самими.
+FLOWSPEC-R6 (#136) додав переривання pending round при зміні wanted чи shutdown
+і publication тільки змінених prefix sets. FLOWSPEC-R7 уточнює межу переривання:
+RIB reads зберігаються, перед плануванням читається актуальний desired set, а
+кожна queued/pending команда дозволена лише за актуальним membership її prefix.
+Несуперечливі зміни зберігають той самий CLI future; недоречна команда скасовується,
+перед наступним планом заново читається RIB. Post-write read також завершується;
+convergence стосується sampled target, зміна якого запускає наступний раунд одразу.
+Shutdown true, already-true flag і закриття publisher переривають normal work та
+починають наявну десятисекундну спробу cleanup; false не скасовує роботу.
+Це не atomic revocation, rollback чи fence для remote RPC, який може застосуватися
+після нового читання навіть при direct/exec CLI. Порожній cleanup read перед пізнім
+add не гарантує відсутності правил після виходу. Wrappers мають `exec` CLI, бо
+kill-on-drop завершує прямий child, не process tree. Скасована відповідь прийнятої
+команди може не залишити ACK-аудиту. Збереження корисних calls не гарантує eventual
+convergence при безперервній зміні того самого prefix; counts/time можуть
+оновлюватись при негайному новому раунді з health 0. Квота 64 є per-round,
+не лімітом частоти між раундами. Ownership, policy і повноваження ті самі.
 
 ## Коли переглянути
 

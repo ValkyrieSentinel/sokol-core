@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parent.parent
 # The expectation is independent of the command implementation under test.
 ABSENT = {
     "Flowspec: expired block is withdrawn upstream",
+    "Flowspec: dynamic rule after retained read is withdrawn upstream",
     "observe mode: no Flowspec rule reaches upstream for a new block",
     "Flowspec: shutdown withdraws the node's rules upstream",
     "Flowspec: the next run withdraws the crashed run's stale rule",
@@ -21,6 +22,7 @@ ABSENT = {
 }
 PRESENT = {
     "Flowspec: upstream receives a discard rule for the dynamic block",
+    "Flowspec: retained read leads to the new dynamic discard upstream",
     "Flowspec: upstream receives a discard rule for the static block",
     "observe mode: another system's upstream rule is untouched",
     "Flowspec: another system's rule is left alone",
