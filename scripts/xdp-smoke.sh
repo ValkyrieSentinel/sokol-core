@@ -6,6 +6,7 @@
 #   sudo scripts/xdp-smoke.sh [path/to/orchestrator]
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/flowspec-rib.sh"
+source "$(dirname "${BASH_SOURCE[0]}")/audit-verdict.sh"
 
 BIN="${1:-target/release/orchestrator}"
 NS=sokol-smoke-peer
@@ -763,7 +764,7 @@ check "a trap hit from a protected address is audited as refused, not enforced" 
 check "a trap hit from an unprotected address is audited as enforced" \
     grep -aq "TRAP_HIT|Port:2324|IP:$TRAP_OPEN|Action:EnforcedDrop" "$WORK/events.sntl"
 MONITOR_BIN="$(dirname "$BIN")/monitor"
-check "monitor --verify accepts the audit chain" bash -c "'$MONITOR_BIN' --verify '$WORK/events.sntl' | grep -q '^OK'"
+check "monitor --verify accepts the audit chain" audit_verdict intact "$WORK/events.sntl"
 check "audit log from the first run is re-verified on restart" \
     grep -qE "Audit log .* opened: [1-9][0-9]* records verified" "$LOG"
 check "strict mode: unfragmented traffic from $ALLOWED_IP passes" ping_from "$ALLOWED_IP"
@@ -852,12 +853,12 @@ check "TTL: dynamic block of $ALLOWED_IP is enforced" bash -c "! ip netns exec $
 sleep 3
 check "TTL: dynamic block expires after --block-ttl" ping_from "$ALLOWED_IP"
 check "audit log rotated into segments" bash -c "ls '$WORK'/events.sntl.0* >/dev/null 2>&1"
-check "monitor --verify accepts the chain across rotated segments" bash -c "'$MONITOR_BIN' --verify '$WORK/events.sntl' | grep -q '^OK'"
+check "monitor --verify accepts the chain across rotated segments" audit_verdict intact "$WORK/events.sntl"
 FIRST_SEGMENT=$(ls "$WORK"/events.sntl.0* | head -1)
 cp "$FIRST_SEGMENT" "$WORK/segment.bak"
 # Flip a bit (a fixed byte could already be there, and the "edit" would change nothing).
 python3 -c "import sys; f = open(sys.argv[1], 'r+b'); f.seek(40); b = f.read(1)[0]; f.seek(40); f.write(bytes([b ^ 1]))" "$FIRST_SEGMENT"
-check "monitor --verify detects an edited segment" bash -c "! '$MONITOR_BIN' --verify '$WORK/events.sntl' >/dev/null"
+check "monitor --verify detects an edited segment" audit_verdict broken "$WORK/events.sntl"
 cp "$WORK/segment.bak" "$FIRST_SEGMENT"
 if [ ${#FLOWSPEC_ARGS[@]} -gt 0 ]; then
     check "Flowspec: expired block is withdrawn upstream" flowspec_rule absent "$ALLOWED_IP/32"

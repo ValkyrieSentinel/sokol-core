@@ -23,7 +23,7 @@ use std::process::Command;
 use std::thread;
 use std::time::Duration;
 
-use common::audit_log::{rotated_segments, verify_chain, AuditReader};
+use common::audit_log::{rotated_segments, verify_chain, AuditReader, ChainVerifyError};
 
 const DB_FILE: &str = "/var/lib/sokol/audit.log";
 
@@ -172,7 +172,8 @@ fn to_hex(bytes: &[u8]) -> String {
 }
 
 /// `monitor --verify [path]`: checks every retained segment and the active log as one chain.
-/// Exit code 0 = intact, 1 = broken. Record the printed head somewhere the node cannot write
+/// Exit code 0 = verified retained chain, 1 = observed corruption, 2 = unverified (I/O).
+/// Record the printed head somewhere the node cannot write
 /// to make later rewrites of the whole chain detectable.
 fn verify(path: &str) -> ! {
     match verify_chain(Path::new(path)) {
@@ -187,9 +188,13 @@ fn verify(path: &str) -> ! {
             );
             std::process::exit(0);
         }
-        Err(e) => {
+        Err(e @ ChainVerifyError::Broken { .. }) => {
             println!("BROKEN {}: {}", path, e);
             std::process::exit(1);
+        }
+        Err(e) => {
+            println!("UNVERIFIED {}: {}", path, e);
+            std::process::exit(2);
         }
     }
 }

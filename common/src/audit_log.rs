@@ -509,10 +509,49 @@ pub struct ChainSummary {
     pub head: [u8; CHAIN_LEN],
 }
 
+/// A failed read is not evidence that the chain is corrupt. The classification is
+/// structural, never inferred from the rendered diagnostic.
+#[derive(Debug)]
+pub enum ChainVerifyError {
+    Broken { path: PathBuf, reason: String },
+    Unverified { path: PathBuf, reason: String },
+}
+
+impl ChainVerifyError {
+    fn unverified(path: &Path, error: impl std::fmt::Display) -> Self {
+        Self::Unverified {
+            path: path.to_path_buf(),
+            reason: error.to_string(),
+        }
+    }
+
+    fn record(path: &Path, error: AuditError) -> Self {
+        match error {
+            AuditError::Corrupt { .. } => Self::Broken {
+                path: path.to_path_buf(),
+                reason: error.to_string(),
+            },
+            _ => Self::unverified(path, error),
+        }
+    }
+}
+
+impl std::fmt::Display for ChainVerifyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Broken { path, reason } | Self::Unverified { path, reason } => {
+                write!(f, "{}: {}", path.display(), reason)
+            }
+        }
+    }
+}
+
+impl std::error::Error for ChainVerifyError {}
+
 /// Verifies every retained segment and the active file as one chain.
-pub fn verify_chain(path: &Path) -> Result<ChainSummary, String> {
+pub fn verify_chain(path: &Path) -> Result<ChainSummary, ChainVerifyError> {
     let mut files: Vec<PathBuf> = rotated_segments(path)
-        .map_err(|e| e.to_string())?
+        .map_err(|e| ChainVerifyError::unverified(path, e))?
         .into_iter()
         .map(|(_, p)| p)
         .collect();
@@ -522,29 +561,39 @@ pub fn verify_chain(path: &Path) -> Result<ChainSummary, String> {
     let mut expected: Option<(u64, [u8; CHAIN_LEN])> = None;
     let mut first_seq = None;
     for (i, file) in files.iter().enumerate() {
-        let name = file.display();
-        let mut reader = AuditReader::open(file).map_err(|e| format!("{}: {}", name, e))?;
+        let mut reader =
+            AuditReader::open(file).map_err(|e| ChainVerifyError::unverified(file, e))?;
         while reader
             .next_record()
-            .map_err(|e| format!("{}: {}", name, e))?
+            .map_err(|e| ChainVerifyError::record(file, e))?
             .is_some()
         {}
         let start = reader.segment_start().unwrap_or((0, [0u8; CHAIN_LEN]));
         if let Some(exp) = expected {
             if start != exp {
-                return Err(format!(
-                    "{}: does not continue the previous segment (starts at seq {}, expected {}); a segment is missing, reordered or edited",
-                    name, start.0, exp.0
-                ));
+                return Err(ChainVerifyError::Broken {
+                    path: file.to_path_buf(),
+                    reason: format!("does not continue the previous segment (starts at seq {}, expected {}); a segment is missing, reordered or edited", start.0, exp.0),
+                });
             }
         }
-        let len = std::fs::metadata(file).map_err(|e| e.to_string())?.len();
-        if i < rotated && len != reader.offset() {
-            return Err(format!(
-                "{}: rotated segment has {} trailing bytes",
-                name,
-                len - reader.offset()
+        let len = std::fs::metadata(file)
+            .map_err(|e| ChainVerifyError::unverified(file, e))?
+            .len();
+        if len < reader.offset() {
+            return Err(ChainVerifyError::unverified(
+                file,
+                "file shortened during verification",
             ));
+        }
+        if i < rotated && len != reader.offset() {
+            return Err(ChainVerifyError::Broken {
+                path: file.to_path_buf(),
+                reason: format!(
+                    "rotated segment has {} trailing bytes",
+                    len - reader.offset()
+                ),
+            });
         }
         first_seq.get_or_insert(start.0);
         expected = Some((reader.next_seq(), reader.head()));
@@ -788,7 +837,7 @@ mod tests {
         let saved = std::fs::read(middle).unwrap();
         std::fs::remove_file(middle).unwrap();
         let err = verify_chain(&path).unwrap_err();
-        assert!(err.contains("does not continue"), "{}", err);
+        assert!(err.to_string().contains("does not continue"), "{}", err);
         std::fs::write(middle, &saved).unwrap();
         assert!(verify_chain(&path).is_ok());
 
@@ -799,6 +848,7 @@ mod tests {
         std::fs::write(first, &bytes).unwrap();
         assert!(verify_chain(&path)
             .unwrap_err()
+            .to_string()
             .contains("hash chain mismatch"));
     }
 
