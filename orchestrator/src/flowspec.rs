@@ -6,7 +6,7 @@
 //! round, so a crash of the orchestrator, a restart of gobgpd or an operation whose outcome was
 //! unknown (timeout) converges on the next round. Rules without the community (other systems')
 //! and rules learned from peers are not selected for removal. Observed foreign local NLRI
-//! collisions refuse writes; other writers must serialize changes (the CLI has no CAS).
+//! collisions skip only the affected operations; other writers must serialize changes (the CLI has no CAS).
 use ipnet::IpNet;
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -367,19 +367,26 @@ async fn round(
 ) -> Result<Observation, String> {
     let started = Instant::now();
     let observed = cli.observed().await?;
-    let (announce, withdraw) = plan(wanted, &observed.owned, &observed.discard);
-    // A local add/delete addresses the NLRI, not an ownership community. Refuse
-    // all writes if a planned operation would touch an observed foreign local path.
-    if let Some(net) = announce
-        .iter()
-        .chain(withdraw.iter())
-        .find(|n| observed.foreign_local.contains(n))
-    {
-        return Err(format!(
-            "local FlowSpec path collision for {}; no writes in this round",
-            show(net)
-        ));
-    }
+    // CLI writes address NLRI rather than ownership. Exclude known collisions
+    // before applying the work quota, so they cannot starve unrelated unblocking.
+    let mut collisions: Vec<_> = wanted
+        .difference(&observed.discard)
+        .chain(observed.owned.difference(wanted))
+        .filter(|n| observed.foreign_local.contains(n))
+        .copied()
+        .collect();
+    collisions.sort();
+    collisions.dedup();
+    let writable_wanted = wanted
+        .difference(&observed.foreign_local)
+        .copied()
+        .collect();
+    let writable_owned = observed
+        .owned
+        .difference(&observed.foreign_local)
+        .copied()
+        .collect();
+    let (announce, withdraw) = plan(&writable_wanted, &writable_owned, &observed.discard);
     let changed = !announce.is_empty() || !withdraw.is_empty();
     for (is_announce, net) in withdraw
         .into_iter()
@@ -402,12 +409,22 @@ async fn round(
     }
     // A successful write acknowledges the CLI operation, not the resulting RIB.
     // Keep unknown readback as an error, never replace it with arithmetic guesses.
-    if changed {
+    let observation = if changed {
         let started = Instant::now();
-        Ok(cli.observed().await?.observation(started))
+        cli.observed().await?.observation(started)
     } else {
-        Ok(observed.observation(started))
+        observed.observation(started)
+    };
+    if let Some(net) = collisions.first() {
+        // Non-colliding work has progressed, but the full round is incomplete.
+        // Preserve the last successful counts/time with health already revoked.
+        return Err(format!(
+            "local FlowSpec path collision for {} ({} skipped); non-colliding operations completed",
+            show(net),
+            collisions.len()
+        ));
     }
+    Ok(observation)
 }
 
 #[cfg(test)]
@@ -932,12 +949,51 @@ esac
             assert_eq!(refused.count, before.count);
             assert_eq!(refused.discard_count, before.discard_count);
             assert_eq!(refused.started, before.started);
+            // A persistent collision must not stall expiry/unblock elsewhere,
+            // including the empty wanted set used by shutdown reconciliation.
+            let stale = one(if net.addr().is_ipv4() {
+                "198.51.100.8"
+            } else {
+                "2001:db8::8"
+            });
+            let fresh = one(if net.addr().is_ipv4() {
+                "198.51.100.9"
+            } else {
+                "2001:db8::9"
+            });
+            live.put(stale, "discard", "65001:6666").await;
+            assert!(checked_round(
+                &live.fixture.cli,
+                &HashSet::from([net, fresh]),
+                &db,
+                &readback
+            )
+            .await
+            .is_err());
+            let progressed = live.fixture.cli.observed().await.unwrap();
+            assert!(!progressed.owned.contains(&stale));
+            assert!(progressed.discard.contains(&fresh));
+            assert!(progressed.foreign_local.contains(&net));
+            assert!(!readback.snapshot().ok);
+            // Shutdown's ordinary no-collision path must still withdraw fresh.
+            checked_round(&live.fixture.cli, &HashSet::new(), &db, &readback)
+                .await
+                .unwrap();
+            assert!(live.fixture.cli.observed().await.unwrap().owned.is_empty());
+            assert!(live
+                .fixture
+                .cli
+                .observed()
+                .await
+                .unwrap()
+                .foreign_local
+                .contains(&net));
             // Fixture owner cleanup, not an action of the Sokol reconciliation round.
             live.fixture.cli.apply(false, net).await.unwrap();
             // Direct stdout keeps the positive execution marker visible in CI even
             // when libtest captures successful test output. An unset env is no proof.
             use std::io::Write as _;
-            writeln!(std::io::stdout(), "PASS live GoBGP {}: wrong action repaired, unwanted action withdrawn, foreign local path preserved", family(&net)).unwrap();
+            writeln!(std::io::stdout(), "PASS live GoBGP {}: wrong action repaired, unwanted action withdrawn, foreign local path preserved, unrelated rules progress", family(&net)).unwrap();
         }
     }
 
@@ -985,6 +1041,76 @@ esac
             crate::metrics::render_with_flowspec(&crate::metrics::Snapshot::default(), &readback);
         assert!(text.contains("sokol_flowspec_discard_rules 0\n"));
         assert!(text.contains("sokol_flowspec_announced 1\n"));
+    }
+
+    #[tokio::test]
+    async fn collisions_do_not_starve_unrelated_withdrawals_or_announcements() {
+        let fixture = RoundFixture::new(RIB, "{}", false);
+        let db = fixture.db();
+        let readback = Readback::default();
+        readback.enable();
+        checked_round(&fixture.cli, &ips(&["198.51.100.7"]), &db, &readback)
+            .await
+            .unwrap();
+        let previous = readback.snapshot();
+        let mut raw: serde_json::Value = serde_json::from_str(RIB).unwrap();
+        let mut wanted = ips(&["203.0.113.7"]);
+        // More collisions than the work quota, sorted before the safe announce.
+        // They must not spend quota or block the unrelated owned withdrawal.
+        for host in 0..=MAX_OPS_PER_ROUND {
+            let net = one(&format!("192.0.2.{host}"));
+            let mut path = raw["[source: 198.51.100.7/32]"][0].clone();
+            path["nlri"]["value"][0]["value"]["prefix"] = net.to_string().into();
+            path["attrs"][1]["communities"] = serde_json::json!([4259915535u32]);
+            raw[format!("[source: {net}]")] = serde_json::json!([path]);
+            wanted.insert(net);
+        }
+        std::fs::write(fixture.dir.join("before.json"), raw.to_string()).unwrap();
+        std::fs::write(fixture.dir.join("calls"), "").unwrap();
+        assert!(checked_round(&fixture.cli, &wanted, &db, &readback)
+            .await
+            .is_err());
+        let calls = std::fs::read_to_string(fixture.dir.join("calls")).unwrap();
+        let writes: Vec<_> = calls
+            .lines()
+            .filter(|l| l.contains(" add ") || l.contains(" del "))
+            .collect();
+        assert_eq!(writes.len(), 2, "collision prevented unrelated progress");
+        assert!(writes[0].contains(" del match source 198.51.100.7/32 then discard"));
+        assert!(writes[1].contains(" add match source 203.0.113.7/32 then discard"));
+        assert_eq!(fixture.reads(), 4);
+        let failed = readback.snapshot();
+        assert!(!failed.ok);
+        assert_eq!(failed.count, previous.count);
+        assert_eq!(failed.discard_count, previous.discard_count);
+        assert_eq!(failed.started, previous.started);
+
+        // Shutdown uses wanted empty. Fence an overlapping nonzero-ID path,
+        // while still withdrawing an unrelated owned prefix.
+        let mut shutdown: serde_json::Value = serde_json::from_str(RIB).unwrap();
+        let owned = shutdown["[source: 198.51.100.7/32]"][0].clone();
+        let mut foreign = owned.clone();
+        foreign["LocalID"] = 1.into();
+        shutdown["[source: 198.51.100.7/32]"] = serde_json::json!([owned, foreign]);
+        let mut other = shutdown["[source: 198.51.100.7/32]"][0].clone();
+        other["nlri"]["value"][0]["value"]["prefix"] = "203.0.113.7/32".into();
+        shutdown["[source: 203.0.113.7/32]"] = serde_json::json!([other]);
+        std::fs::remove_file(fixture.dir.join("applied")).unwrap();
+        std::fs::write(fixture.dir.join("before.json"), shutdown.to_string()).unwrap();
+        std::fs::write(fixture.dir.join("calls"), "").unwrap();
+        assert!(checked_round(&fixture.cli, &HashSet::new(), &db, &readback)
+            .await
+            .is_err());
+        let calls = std::fs::read_to_string(fixture.dir.join("calls")).unwrap();
+        let writes: Vec<_> = calls
+            .lines()
+            .filter(|l| l.contains(" add ") || l.contains(" del "))
+            .collect();
+        assert_eq!(writes.len(), 1);
+        assert!(writes[0].contains(" del match source 203.0.113.7/32 then discard"));
+        assert_eq!(fixture.reads(), 4);
+        assert!(!readback.snapshot().ok);
+        assert_eq!(readback.snapshot().started, previous.started);
     }
 
     #[tokio::test]

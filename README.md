@@ -568,8 +568,9 @@ The pinned GoBGP represents canonical discard as exactly one traffic-rate extend
 not satisfy that contract. A restarted gobgpd's missing rules are announced again.
 
 Peer paths and foreign local paths are not selected for removal. If a planned operation
-shares its source-only NLRI with an observed foreign local path, the whole round refuses
-writes and readback health becomes 0. Distinct ownership communities alone do not isolate
+shares its source-only NLRI with an observed foreign local path, that operation is skipped
+before applying the work quota; unrelated withdrawals and announcements continue. Readback
+health remains 0 and the last successful counts/time are retained while work is skipped. Distinct ownership communities alone do not isolate
 writers: GoBGP's CLI can replace another local path at the same NLRI. Serialize shared-daemon
 writers or give them exclusive source-prefix namespaces. The CLI has no atomic compare-and-swap;
 a writer racing between read and apply remains outside this guarantee.
@@ -592,7 +593,10 @@ These five values are sampled together from the worker for each HTTP response.
 A consumer chooses its acceptable age; health alone gives no freshness guarantee.
 The two RIB families are read sequentially, not as an atomic network snapshot.
 Neither count proves selection or enforcement by an upstream router, or equality with the
-wanted set. `FLOWSPEC_ANNOUNCE`/`WITHDRAW` audit records acknowledge successful CLI operations,
+wanted set. A policy that adds or changes extended communities can prevent canonical
+discard convergence, causing repeated announcements and audit records within the quota.
+Use a compatible local policy; health alone does not detect this mismatch.
+`FLOWSPEC_ANNOUNCE`/`WITHDRAW` audit records acknowledge successful CLI operations,
 not the subsequent observation.
 
 Run gobgpd with a neighbor for each upstream router and the `ipv4-flowspec` / `ipv6-flowspec`
