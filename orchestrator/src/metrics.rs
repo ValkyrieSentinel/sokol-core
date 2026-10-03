@@ -70,6 +70,7 @@ pub struct Snapshot {
     pub audit_lost: u64,
     pub audit_sync_age_ms: u64,
     pub flowspec_announced: usize,
+    pub flowspec_discard_rules: usize,
     pub flowspec_enabled: bool,
     pub flowspec_readback_ok: bool,
     pub flowspec_read_started: Option<Instant>,
@@ -90,6 +91,7 @@ pub fn render_with_flowspec(s: &Snapshot, readback: &crate::flowspec::Readback) 
     let view = readback.snapshot();
     let mut snapshot = s.clone();
     snapshot.flowspec_announced = view.count;
+    snapshot.flowspec_discard_rules = view.discard_count;
     snapshot.flowspec_enabled = view.enabled;
     snapshot.flowspec_readback_ok = view.ok;
     snapshot.flowspec_read_started = view.started;
@@ -538,6 +540,17 @@ fn render_at(s: &Snapshot, now: Instant) -> String {
         "Owned source-prefix rules in the last successful local GoBGP RIB read; not router enforcement.",
     );
     let _ = writeln!(out, "sokol_flowspec_announced {}", s.flowspec_announced);
+    family(
+        &mut out,
+        "sokol_flowspec_discard_rules",
+        "gauge",
+        "Owned full source-prefix paths with one verified zero traffic-rate action in the last successful local RIB read; not upstream enforcement.",
+    );
+    let _ = writeln!(
+        out,
+        "sokol_flowspec_discard_rules {}",
+        s.flowspec_discard_rules
+    );
     family(
         &mut out,
         "sokol_flowspec_enabled",

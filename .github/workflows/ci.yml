@@ -38,6 +38,8 @@ jobs:
     env:
       BPF_LINKER_SHA256: ${{ matrix.bpf_linker_sha256 }}
       GOBGP_SHA256: ${{ matrix.gobgp_sha256 }}
+      # Mandatory real CLI/daemon action and collision tests on both architectures.
+      SOKOL_GOBGP_TEST_BIN: /usr/local/bin
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
