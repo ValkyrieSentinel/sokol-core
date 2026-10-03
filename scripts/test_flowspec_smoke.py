@@ -56,14 +56,14 @@ class FlowSpecMetrics(unittest.TestCase):
         cls.helper = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(cls.helper)
 
-    def samples(self, enabled=1, ok=0, count=1, age=3):
+    def samples(self, enabled=1, ok=0, count=1, age=3, discard=None):
         return "\n".join(f"{name} {value}" for name, value in zip(
-            self.helper.NAMES, (enabled, ok, count, age))) + "\n"
+            self.helper.NAMES, (enabled, ok, count, age, count if discard is None else discard))) + "\n"
 
     def test_retained_count_only_passes_with_explicit_failure_and_age(self):
         self.assertTrue(self.helper.matches(self.samples(), "failed", 1, 2))
         for text in (self.samples(ok=1), self.samples(age=-1),
-                     self.samples(age=0), self.samples(count=0)):
+                     self.samples(age=0), self.samples(count=0), self.samples(discard=0)):
             self.assertFalse(self.helper.matches(text, "failed", 1, 2))
 
     def test_disabled_and_observed_empty_are_different(self):
@@ -75,7 +75,7 @@ class FlowSpecMetrics(unittest.TestCase):
         for text in (self.samples().replace("sokol_flowspec_readback_ok 0\n", ""),
                      self.samples() + "sokol_flowspec_announced 1\n",
                      self.samples(age="nan"), self.samples(age="inf"),
-                     self.samples(ok=2), self.samples(count=1.5)):
+                     self.samples(ok=2), self.samples(count=1.5), self.samples(discard=2), self.samples(discard="nan")):
             with self.assertRaises(ValueError):
                 self.helper.matches(text, "failed", 1, 2)
 

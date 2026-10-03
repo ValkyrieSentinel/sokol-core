@@ -547,3 +547,75 @@ These gauges describe the latest round and retained local observation. They do n
 supply an atomic IPv4/IPv6 RIB snapshot, a universal freshness deadline, process
 liveness, convergence, action validation or upstream enforcement. A consumer must
 select its own acceptable age. No new permission or detector policy is introduced.
+
+## FLOWSPEC-R3: ownership does not establish discard or conditional-write authority
+
+Owner: `flowspec.rs::parse_rib`, `plan`, `round` and the coherent worker-to-HTTP
+bridge in `metrics.rs`. Managed scope is local ID-zero paths with the configured
+standard community and exactly one full source-prefix component (IPv6 offset 0).
+Ownership is independent of action: a wrong-action owned path still gets withdrawn
+when unwanted; a wanted prefix missing canonical discard is re-announced. The
+existing withdrawal-first order, 64-operation cap, call timeout and shutdown
+attempt budget remain unchanged.
+
+Canonical discard means exactly one extended-community attribute containing
+exactly one traffic-rate action (type 128, subtype 6), uint16 AS and numeric rate
+zero, with no type-25 IPv6-specific extended-community attribute. Missing, nonzero,
+unknown, duplicate or combined actions do not satisfy this
+contract. `sokol_flowspec_announced` retains its ownership count;
+`sokol_flowspec_discard_rules` reports the validated subset. Counts, health and time
+come from one worker snapshot. Post-write reads, failed-round retention and age
+semantics follow R1/R2. CLI acceptance without an effect cannot increase the
+validated count; a successful read may still observe wrong actions (ok is not
+convergence).
+
+A real GoBGP 4.9.0 experiment showed that a local add at the same source-only NLRI
+replaces an existing foreign local path despite distinct ownership communities.
+Before applying the operation quota, the production round excludes required
+operations that collide with observed foreign local paths. Non-colliding withdrawals
+and announcements still progress, including shutdown reconciliation. Peer paths are not local CLI targets;
+nonzero local IDs are outside the managed scope and fence overlapping operations.
+Any skipped operation leaves health revoked and retains the previous successful
+counts/time, even after safe writes and a full post-write read. This prevents known
+collisions, not races: CLI AddPath/DeletePath has no atomic ownership compare-and-swap.
+Shared-daemon writers must serialize or use exclusive source-prefix namespaces.
+
+Reproduction: `owned_non_discard_action_is_replaced_when_still_wanted` and
+`foreign_only_collision_performs_no_write` failed behaviorally on the
+previous implementation. Six raw captures from a pinned-source local daemon cover
+owned rate-limit, owned discard and foreign discard in IPv4 and IPv6; provenance
+is in `orchestrator/tests/fixtures/README.md`.
+`live_gobgp_round_repairs_actions_and_preserves_foreign_local_paths` executes the
+production read/plan/write/re-read flow against a real daemon for both families:
+repairs rate-limit 100 to discard, withdraws an unwanted wrong action, then refuses
+a foreign-only collision while its full raw RIB response remains byte-identical.
+It then checks unrelated withdrawal/announcement and shutdown cleanup while the
+foreign path remains present. It also replaces traffic-rate zero combined with
+a type-25 IPv6 redirect for both families. An
+unset `SOKOL_GOBGP_TEST_BIN` skips that local test; canonical x86/ARM CI requires it
+and requires two positive execution markers in the Test step. A framework PASS
+after skip is no proof. The same marker predicate refuses a deliberately skipped
+local live-test invocation; pipefail also preserves a failed cargo status through tee.
+
+Local checks passed 26 production-module tests, including real GoBGP for both
+families, and 13 Python smoke/health refusal tests. The portable Rust harness uses
+actual common code with audit/target/label stand-ins; canonical Linux CI exercises
+the actual owners. Eleven compiling semantic mutations were rejected by assertions:
+ownership treated as discard, dropping wrong-action owned paths, bypassed collision
+refusal, accepting a small positive rate, accepting combined actions, publishing
+ownership as discard, ignoring source offset, ignoring local ID, refusing the whole
+round, applying the quota before excluding collisions, and ignoring a separate
+IPv6-specific extended-community action. Independent Claude review
+found that the first all-or-nothing collision preflight starved unrelated unblocking.
+`collisions_do_not_starve_unrelated_withdrawals_or_announcements` failed on that
+head and now checks more collisions than the quota, safe withdrawal/announcement,
+retained health/counts/time and shutdown with an overlapping nonzero-ID path.
+A separate IPv6 redirect regression failed on the accepted initial amendment
+head and now refuses that combination for both family captures. Existing HTTP
+smoke expectations now also require the known fixture count to be canonical discard.
+
+Limits: this is a conservative pinned-GoBGP action and local-NLRI contract, not
+validation of the entire JSON schema, a best-path decision, desired-set equality,
+atomic two-family snapshot, upstream enforcement, crash-complete withdrawal or
+concurrent-writer isolation. No Stargate checker, frozen source/results or delivery
+shadow pins change.

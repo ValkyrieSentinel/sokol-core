@@ -5,7 +5,8 @@
 //! compares the wanted blocks with what gobgpd's RIB actually holds for that community on every
 //! round, so a crash of the orchestrator, a restart of gobgpd or an operation whose outcome was
 //! unknown (timeout) converges on the next round. Rules without the community (other systems')
-//! and rules learned from peers are never touched.
+//! and rules learned from peers are not selected for removal. Observed foreign local NLRI
+//! collisions skip only the affected operations; other writers must serialize changes (the CLI has no CAS).
 use ipnet::IpNet;
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -32,6 +33,7 @@ pub const SHUTDOWN_BUDGET: Duration = Duration::from_secs(10);
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Observation {
     count: usize,
+    discard_count: usize,
     started: Instant,
 }
 
@@ -41,6 +43,7 @@ pub struct ReadbackView {
     pub enabled: bool,
     pub ok: bool,
     pub count: usize,
+    pub discard_count: usize,
     pub started: Option<Instant>,
 }
 
@@ -65,8 +68,34 @@ impl Readback {
     fn completed(&self, observation: Observation) {
         let mut view = self.0.lock().unwrap_or_else(|p| p.into_inner());
         view.count = observation.count;
+        view.discard_count = observation.discard_count;
         view.started = Some(observation.started);
         view.ok = true;
+    }
+}
+
+/// Local paths in the CLI-managed source-only NLRI scope. Ownership and action
+/// are separate: a wrong-action owned path still needs cleanup if no longer wanted.
+#[derive(Debug, Default)]
+pub struct Rib {
+    owned: HashSet<IpNet>,
+    discard: HashSet<IpNet>,
+    foreign_local: HashSet<IpNet>,
+}
+
+impl Rib {
+    fn extend(&mut self, other: Self) {
+        self.owned.extend(other.owned);
+        self.discard.extend(other.discard);
+        self.foreign_local.extend(other.foreign_local);
+    }
+
+    fn observation(&self, started: Instant) -> Observation {
+        Observation {
+            count: self.owned.len(),
+            discard_count: self.discard.len(),
+            started,
+        }
     }
 }
 
@@ -142,28 +171,29 @@ impl GobgpCli {
     }
 
     /// This node's rules as gobgpd's RIB holds them now.
-    pub async fn observed(&self) -> Result<HashSet<IpNet>, String> {
-        let mut own = HashSet::new();
+    pub async fn observed(&self) -> Result<Rib, String> {
+        let mut own = Rib::default();
         for fam in ["ipv4-flowspec", "ipv6-flowspec"] {
             let mut args = self.args.clone();
             args.extend(["global", "rib", "-a", fam, "-j"].map(String::from));
             let out = self.run(args).await?;
-            own.extend(parse_own_rules(&out, self.community_value())?);
+            own.extend(parse_rib(&out, self.community_value())?);
         }
         Ok(own)
     }
 }
 
-/// Rules in `gobgp global rib -a <flowspec> -j` output that this node owns: originated locally
-/// (no `peer-address`), carrying `community`, and matching exactly one source prefix.
-pub fn parse_own_rules(json: &[u8], community: u32) -> Result<HashSet<IpNet>, String> {
+/// Parse the pinned GoBGP JSON. A managed path is local, ID zero, tagged and
+/// matches one full source prefix (IPv6 offset zero). Other local paths sharing
+/// that exact NLRI are collisions; learned peer paths are not local CLI targets.
+pub fn parse_rib(json: &[u8], community: u32) -> Result<Rib, String> {
     let text = String::from_utf8_lossy(json);
     if text.trim().is_empty() || text.trim() == "null" {
-        return Ok(HashSet::new());
+        return Ok(Rib::default());
     }
     let rib: serde_json::Map<String, serde_json::Value> =
         serde_json::from_str(&text).map_err(|e| format!("unreadable RIB: {}", e))?;
-    let mut own = HashSet::new();
+    let mut own = Rib::default();
     for paths in rib.values() {
         for path in paths.as_array().into_iter().flatten() {
             let remote = path
@@ -184,26 +214,85 @@ pub fn parse_own_rules(json: &[u8], community: u32) -> Result<HashSet<IpNet>, St
                 .and_then(|n| n.get("value"))
                 .and_then(|v| v.as_array());
             let source = match components.map(|c| c.as_slice()) {
-                Some([only]) if only.get("type").and_then(|t| t.as_u64()) == Some(2) => only
-                    .get("value")
-                    .and_then(|v| v.get("prefix"))
-                    .and_then(|p| p.as_str())
-                    .and_then(|p| p.parse::<IpNet>().ok()),
+                Some([only])
+                    if only.get("type").and_then(|t| t.as_u64()) == Some(2)
+                        && only.get("offset").is_none_or(|v| v.as_u64() == Some(0)) =>
+                {
+                    only.get("value")
+                        .and_then(|v| v.get("prefix"))
+                        .and_then(|p| p.as_str())
+                        .and_then(|p| p.parse::<IpNet>().ok())
+                }
                 _ => None,
             };
-            if let (false, true, Some(net)) = (remote, tagged, source) {
-                own.insert(net);
+            if let (false, Some(net)) = (remote, source) {
+                // The CLI uses LocalID=0; it cannot safely select a tagged
+                // nonzero-ID path using only this prefix and community.
+                let cli_id = path.get("LocalID").is_none_or(|v| v.as_u64() == Some(0));
+                if tagged && cli_id {
+                    own.owned.insert(net);
+                    if has_canonical_discard(path) {
+                        own.discard.insert(net);
+                    }
+                } else {
+                    own.foreign_local.insert(net);
+                }
             }
         }
     }
     Ok(own)
 }
 
-/// What to announce and withdraw so that `observed` becomes `wanted`, at most
+/// GoBGP 4.9.0 emits discard as one traffic-rate extended community (0x8006)
+/// with numeric rate zero. Multiple/unknown actions are not canonical discard.
+fn has_canonical_discard(path: &serde_json::Value) -> bool {
+    let Some(attrs) = path.get("attrs").and_then(|v| v.as_array()) else {
+        return false;
+    };
+    // IPv6-specific redirects use a separate extended-community attribute.
+    // A zero traffic-rate action combined with type 25 is not canonical discard.
+    if attrs
+        .iter()
+        .any(|a| a.get("type").and_then(|v| v.as_u64()) == Some(25))
+    {
+        return false;
+    }
+    let mut extended = attrs
+        .iter()
+        .filter(|a| a.get("type").and_then(|v| v.as_u64()) == Some(16));
+    let Some(attribute) = extended.next() else {
+        return false;
+    };
+    if extended.next().is_some() {
+        return false;
+    }
+    match attribute
+        .get("value")
+        .and_then(|v| v.as_array())
+        .map(|v| v.as_slice())
+    {
+        Some([action]) => {
+            action.get("type").and_then(|v| v.as_u64()) == Some(128)
+                && action.get("subtype").and_then(|v| v.as_u64()) == Some(6)
+                && action
+                    .get("as")
+                    .and_then(|v| v.as_u64())
+                    .is_some_and(|v| v <= u16::MAX as u64)
+                && action.get("rate").and_then(|v| v.as_f64()) == Some(0.0)
+        }
+        _ => false,
+    }
+}
+
+/// Withdraw owned paths no longer wanted; announce missing or non-discard wanted paths, at most
 /// `MAX_OPS_PER_ROUND` operations, withdrawals first (they unblock traffic).
-pub fn plan(wanted: &HashSet<IpNet>, observed: &HashSet<IpNet>) -> (Vec<IpNet>, Vec<IpNet>) {
+pub fn plan(
+    wanted: &HashSet<IpNet>,
+    observed: &HashSet<IpNet>,
+    discard: &HashSet<IpNet>,
+) -> (Vec<IpNet>, Vec<IpNet>) {
     let mut withdraw: Vec<IpNet> = observed.difference(wanted).copied().collect();
-    let mut announce: Vec<IpNet> = wanted.difference(observed).copied().collect();
+    let mut announce: Vec<IpNet> = wanted.difference(discard).copied().collect();
     withdraw.sort();
     announce.sort();
     withdraw.truncate(MAX_OPS_PER_ROUND);
@@ -286,7 +375,26 @@ async fn round(
 ) -> Result<Observation, String> {
     let started = Instant::now();
     let observed = cli.observed().await?;
-    let (announce, withdraw) = plan(wanted, &observed);
+    // CLI writes address NLRI rather than ownership. Exclude known collisions
+    // before applying the work quota, so they cannot starve unrelated unblocking.
+    let mut collisions: Vec<_> = wanted
+        .difference(&observed.discard)
+        .chain(observed.owned.difference(wanted))
+        .filter(|n| observed.foreign_local.contains(n))
+        .copied()
+        .collect();
+    collisions.sort();
+    collisions.dedup();
+    let writable_wanted = wanted
+        .difference(&observed.foreign_local)
+        .copied()
+        .collect();
+    let writable_owned = observed
+        .owned
+        .difference(&observed.foreign_local)
+        .copied()
+        .collect();
+    let (announce, withdraw) = plan(&writable_wanted, &writable_owned, &observed.discard);
     let changed = !announce.is_empty() || !withdraw.is_empty();
     for (is_announce, net) in withdraw
         .into_iter()
@@ -309,18 +417,22 @@ async fn round(
     }
     // A successful write acknowledges the CLI operation, not the resulting RIB.
     // Keep unknown readback as an error, never replace it with arithmetic guesses.
-    if changed {
+    let observation = if changed {
         let started = Instant::now();
-        Ok(Observation {
-            count: cli.observed().await?.len(),
-            started,
-        })
+        cli.observed().await?.observation(started)
     } else {
-        Ok(Observation {
-            count: observed.len(),
-            started,
-        })
+        observed.observation(started)
+    };
+    if let Some(net) = collisions.first() {
+        // Non-colliding work has progressed, but the full round is incomplete.
+        // Preserve the last successful counts/time with health already revoked.
+        return Err(format!(
+            "local FlowSpec path collision for {} ({} skipped); non-colliding operations completed",
+            show(net),
+            collisions.len()
+        ));
     }
+    Ok(observation)
 }
 
 #[cfg(test)]
@@ -374,18 +486,119 @@ mod tests {
 
     #[test]
     fn only_local_rules_with_our_community_and_a_single_source_are_ours() {
-        let own = parse_own_rules(RIB.as_bytes(), 4259912202).unwrap();
-        assert_eq!(own, ips(&["198.51.100.7"]));
-        assert!(parse_own_rules(RIB.as_bytes(), 1).unwrap().is_empty());
-        assert!(parse_own_rules(b"", 1).unwrap().is_empty());
-        assert!(parse_own_rules(b"{}", 1).unwrap().is_empty());
-        assert!(parse_own_rules(b"not json", 1).is_err());
+        let own = parse_rib(RIB.as_bytes(), 4259912202).unwrap();
+        assert_eq!(own.owned, ips(&["198.51.100.7"]));
+        assert!(parse_rib(RIB.as_bytes(), 1).unwrap().owned.is_empty());
+        assert!(parse_rib(b"", 1).unwrap().owned.is_empty());
+        assert!(parse_rib(b"{}", 1).unwrap().owned.is_empty());
+        assert!(parse_rib(b"not json", 1).is_err());
+    }
+
+    #[test]
+    fn captured_gobgp_actions_separate_ownership_from_discard_for_both_families() {
+        let entries: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/gobgp-4.9.0-actions.json"))
+                .unwrap();
+        for entry in entries.as_array().unwrap() {
+            let rib = parse_rib(entry["rib"].to_string().as_bytes(), 4259912202).unwrap();
+            match entry["label"].as_str().unwrap() {
+                "owned-rate-limit" => {
+                    assert_eq!(rib.owned.len(), 1);
+                    assert!(rib.discard.is_empty());
+                }
+                "owned-replaced-by-discard" => {
+                    assert_eq!(rib.owned.len(), 1);
+                    assert_eq!(rib.discard, rib.owned);
+                }
+                "foreign-local" => {
+                    assert!(rib.owned.is_empty());
+                    assert_eq!(rib.foreign_local.len(), 1);
+                }
+                _ => panic!("unknown captured observation"),
+            }
+        }
+        assert_eq!(entries.as_array().unwrap().len(), 6);
+    }
+
+    #[test]
+    fn missing_unknown_duplicate_and_nonzero_actions_are_not_discard() {
+        let zero = serde_json::json!({"type":128,"subtype":6,"as":0,"rate":0});
+        let variants = [
+            serde_json::json!([]),
+            serde_json::json!([{"type":128,"subtype":6,"as":0,"rate":100}]),
+            serde_json::json!([{"type":128,"subtype":6,"as":0,"rate":0.000001}]),
+            serde_json::json!([{"type":128,"subtype":6,"as":0,"rate":"0"}]),
+            serde_json::json!([{"type":128,"subtype":7,"terminal":true}]),
+            serde_json::json!([{"type":128,"subtype":8,"value":"65001:1"}]),
+            serde_json::json!([zero, zero]),
+            serde_json::json!([zero, {"type":128,"subtype":8,"value":"65001:1"}]),
+        ];
+        for actions in variants {
+            let mut raw: serde_json::Value = serde_json::from_str(RIB).unwrap();
+            raw["[source: 198.51.100.7/32]"][0]["attrs"][2]["value"] = actions;
+            let rib = parse_rib(raw.to_string().as_bytes(), 4259912202).unwrap();
+            assert_eq!(rib.owned, ips(&["198.51.100.7"]));
+            assert!(rib.discard.is_empty());
+        }
+        // IPv6 redirect is carried by a separate type-25 attribute, not type 16.
+        // Reject it alongside traffic-rate zero in both family observations.
+        let captures: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/gobgp-4.9.0-actions.json"))
+                .unwrap();
+        for entry in captures
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["label"] == "owned-replaced-by-discard")
+        {
+            let mut raw = entry["rib"].clone();
+            let path = &mut raw.as_object_mut().unwrap().values_mut().next().unwrap()[0];
+            path["attrs"]
+                .as_array_mut()
+                .unwrap()
+                .push(serde_json::json!({
+                    "type":25,"value":[{"type":128,"subtype":11,"value":"2001:db8::1:1"}]
+                }));
+            let rib = parse_rib(raw.to_string().as_bytes(), 4259912202).unwrap();
+            assert_eq!(rib.owned.len(), 1);
+            assert!(rib.discard.is_empty(), "IPv6-specific action was ignored");
+        }
+        let mut raw: serde_json::Value = serde_json::from_str(RIB).unwrap();
+        let attrs = raw["[source: 198.51.100.7/32]"][0]["attrs"]
+            .as_array_mut()
+            .unwrap();
+        attrs.push(attrs[2].clone());
+        assert!(parse_rib(raw.to_string().as_bytes(), 4259912202)
+            .unwrap()
+            .discard
+            .is_empty());
+    }
+
+    #[test]
+    fn source_offset_and_nonzero_local_id_do_not_grant_cli_ownership() {
+        let mut raw: serde_json::Value = serde_json::from_str(RIB).unwrap();
+        raw["[source: 198.51.100.7/32]"][0]["nlri"]["value"][0]["offset"] = 16.into();
+        let rib = parse_rib(raw.to_string().as_bytes(), 4259912202).unwrap();
+        assert!(rib.owned.is_empty());
+        assert!(
+            !rib.foreign_local.contains(&one("198.51.100.7")),
+            "a different NLRI is not a CLI collision"
+        );
+        raw["[source: 198.51.100.7/32]"][0]["nlri"]["value"][0]["offset"] = 0.into();
+        raw["[source: 198.51.100.7/32]"][0]["LocalID"] = 1.into();
+        let rib = parse_rib(raw.to_string().as_bytes(), 4259912202).unwrap();
+        assert!(rib.owned.is_empty());
+        assert!(rib.foreign_local.contains(&one("198.51.100.7")));
     }
 
     #[test]
     fn plans_against_what_the_rib_holds() {
         // F03: after a restart the node remembers nothing; the RIB still has an old rule.
-        let (announce, withdraw) = plan(&ips(&["203.0.113.2"]), &ips(&["203.0.113.1"]));
+        let (announce, withdraw) = plan(
+            &ips(&["203.0.113.2"]),
+            &ips(&["203.0.113.1"]),
+            &ips(&["203.0.113.1"]),
+        );
         assert_eq!(announce, vec![one("203.0.113.2")]);
         assert_eq!(
             withdraw,
@@ -393,7 +606,7 @@ mod tests {
             "a stale rule from a previous run is withdrawn"
         );
         // F03: gobgpd lost its RIB; the wanted rules are announced again.
-        let (announce, withdraw) = plan(&ips(&["203.0.113.2"]), &HashSet::new());
+        let (announce, withdraw) = plan(&ips(&["203.0.113.2"]), &HashSet::new(), &HashSet::new());
         assert_eq!(announce, vec![one("203.0.113.2")]);
         assert!(withdraw.is_empty());
     }
@@ -404,7 +617,7 @@ mod tests {
         let wanted: HashSet<IpNet> = (0..200)
             .map(|i| one(&format!("10.1.{}.{}", i / 250, i % 250)))
             .collect();
-        let (announce, withdraw) = plan(&wanted, &observed);
+        let (announce, withdraw) = plan(&wanted, &observed, &observed);
         assert_eq!(withdraw.len(), 10);
         assert_eq!(announce.len() + withdraw.len(), MAX_OPS_PER_ROUND);
     }
@@ -529,6 +742,7 @@ esac
         let old = readback.snapshot();
         assert!(old.enabled && old.ok);
         assert_eq!(old.count, 1);
+        assert_eq!(old.discard_count, 1);
         assert!(old.started.is_some());
 
         // The actual RIB no longer contains our rule. Even plausible JSON on
@@ -541,6 +755,7 @@ esac
         let failed = readback.snapshot();
         assert!(failed.enabled && !failed.ok);
         assert_eq!(failed.count, old.count);
+        assert_eq!(failed.discard_count, old.discard_count);
         assert_eq!(failed.started, old.started);
 
         std::fs::remove_file(fixture.dir.join("fail")).unwrap();
@@ -550,6 +765,7 @@ esac
         let recovered = readback.snapshot();
         assert!(recovered.enabled && recovered.ok);
         assert_eq!(recovered.count, 0);
+        assert_eq!(recovered.discard_count, 0);
         assert!(recovered.started.unwrap() > old.started.unwrap());
     }
 
@@ -638,6 +854,322 @@ esac
         assert!(!failed.contains("sokol_flowspec_readback_age_seconds -1.000\n"));
     }
 
+    struct LiveGobgp {
+        fixture: RoundFixture,
+        daemon: std::process::Child,
+    }
+
+    impl Drop for LiveGobgp {
+        fn drop(&mut self) {
+            let _ = self.daemon.kill();
+            let _ = self.daemon.wait();
+        }
+    }
+
+    impl LiveGobgp {
+        async fn start(bin_dir: &std::path::Path) -> Self {
+            let mut fixture = RoundFixture::new("{}", "{}", false);
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            drop(listener);
+            let config = fixture.dir.join("gobgp.toml");
+            std::fs::write(
+                &config,
+                "[global.config]\n as = 65001\n router-id = \"127.0.0.1\"\n port = -1\n",
+            )
+            .unwrap();
+            let log = std::fs::File::create(fixture.dir.join("daemon.log")).unwrap();
+            let daemon = std::process::Command::new(bin_dir.join("gobgpd"))
+                .arg("-f")
+                .arg(config)
+                .arg("--api-hosts")
+                .arg(format!("127.0.0.1:{port}"))
+                .stdout(log.try_clone().unwrap())
+                .stderr(log)
+                .spawn()
+                .unwrap();
+            fixture.cli.bin = bin_dir.join("gobgp");
+            fixture.cli.args = vec!["-p".into(), port.to_string()];
+            let live = Self { fixture, daemon };
+            for _ in 0..50 {
+                if live.fixture.cli.observed().await.is_ok() {
+                    return live;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            panic!(
+                "gobgpd did not become ready: {}",
+                std::fs::read_to_string(live.fixture.dir.join("daemon.log")).unwrap()
+            );
+        }
+
+        async fn put(&self, net: IpNet, action: &str, community: &str) {
+            let mut args = self.fixture.cli.args.clone();
+            args.extend(
+                [
+                    "global",
+                    "rib",
+                    "-a",
+                    family(&net),
+                    "add",
+                    "match",
+                    "source",
+                ]
+                .map(String::from),
+            );
+            args.push(net.to_string());
+            args.push("then".into());
+            args.extend(action.split_whitespace().map(String::from));
+            args.extend(["community", community].map(String::from));
+            self.fixture.cli.run(args).await.unwrap();
+        }
+
+        async fn raw(&self, net: IpNet) -> Vec<u8> {
+            let mut args = self.fixture.cli.args.clone();
+            args.extend(["global", "rib", "-a", family(&net), "-j"].map(String::from));
+            self.fixture.cli.run(args).await.unwrap()
+        }
+    }
+
+    #[tokio::test]
+    async fn live_gobgp_round_repairs_actions_and_preserves_foreign_local_paths() {
+        let Some(bin_dir) = std::env::var_os("SOKOL_GOBGP_TEST_BIN") else {
+            eprintln!("SKIP live GoBGP: SOKOL_GOBGP_TEST_BIN is unset (required in canonical CI)");
+            return;
+        };
+        let live = LiveGobgp::start(std::path::Path::new(&bin_dir)).await;
+        let db = live.fixture.db();
+        let readback = Readback::default();
+        readback.enable();
+        for net in [one("198.51.100.7"), one("2001:db8::7")] {
+            let wanted = HashSet::from([net]);
+            live.put(net, "rate-limit 100", "65001:6666").await;
+            let initial = live.fixture.cli.observed().await.unwrap();
+            assert_eq!(initial.owned, wanted);
+            assert!(initial.discard.is_empty());
+            checked_round(&live.fixture.cli, &wanted, &db, &readback)
+                .await
+                .unwrap();
+            let fixed = readback.snapshot();
+            assert_eq!(fixed.count, 1);
+            assert_eq!(fixed.discard_count, 1);
+            assert!(fixed.ok);
+            assert_eq!(live.fixture.cli.observed().await.unwrap().discard, wanted);
+
+            live.put(net, "discard redirect 2001:db8::1:1", "65001:6666")
+                .await;
+            let combined = live.fixture.cli.observed().await.unwrap();
+            assert_eq!(combined.owned, wanted);
+            assert!(
+                combined.discard.is_empty(),
+                "separate IPv6 redirect counted as discard"
+            );
+            checked_round(&live.fixture.cli, &wanted, &db, &readback)
+                .await
+                .unwrap();
+            assert_eq!(live.fixture.cli.observed().await.unwrap().discard, wanted);
+
+            live.put(net, "rate-limit 100", "65001:6666").await;
+            let removed = checked_round(&live.fixture.cli, &HashSet::new(), &db, &readback)
+                .await
+                .unwrap();
+            assert_eq!(removed.count, 0);
+            assert_eq!(removed.discard_count, 0);
+            assert!(live.fixture.cli.observed().await.unwrap().owned.is_empty());
+
+            live.put(net, "discard", "65001:9999").await;
+            let foreign = live.raw(net).await;
+            let before = readback.snapshot();
+            assert!(checked_round(&live.fixture.cli, &wanted, &db, &readback)
+                .await
+                .is_err());
+            assert_eq!(
+                live.raw(net).await,
+                foreign,
+                "known foreign NLRI must not be replaced"
+            );
+            let refused = readback.snapshot();
+            assert!(!refused.ok);
+            assert_eq!(refused.count, before.count);
+            assert_eq!(refused.discard_count, before.discard_count);
+            assert_eq!(refused.started, before.started);
+            // A persistent collision must not stall expiry/unblock elsewhere,
+            // including the empty wanted set used by shutdown reconciliation.
+            let stale = one(if net.addr().is_ipv4() {
+                "198.51.100.8"
+            } else {
+                "2001:db8::8"
+            });
+            let fresh = one(if net.addr().is_ipv4() {
+                "198.51.100.9"
+            } else {
+                "2001:db8::9"
+            });
+            live.put(stale, "discard", "65001:6666").await;
+            assert!(checked_round(
+                &live.fixture.cli,
+                &HashSet::from([net, fresh]),
+                &db,
+                &readback
+            )
+            .await
+            .is_err());
+            let progressed = live.fixture.cli.observed().await.unwrap();
+            assert!(!progressed.owned.contains(&stale));
+            assert!(progressed.discard.contains(&fresh));
+            assert!(progressed.foreign_local.contains(&net));
+            assert!(!readback.snapshot().ok);
+            // Shutdown's ordinary no-collision path must still withdraw fresh.
+            checked_round(&live.fixture.cli, &HashSet::new(), &db, &readback)
+                .await
+                .unwrap();
+            assert!(live.fixture.cli.observed().await.unwrap().owned.is_empty());
+            assert!(live
+                .fixture
+                .cli
+                .observed()
+                .await
+                .unwrap()
+                .foreign_local
+                .contains(&net));
+            // Fixture owner cleanup, not an action of the Sokol reconciliation round.
+            live.fixture.cli.apply(false, net).await.unwrap();
+            // Direct stdout keeps the positive execution marker visible in CI even
+            // when libtest captures successful test output. An unset env is no proof.
+            use std::io::Write as _;
+            writeln!(std::io::stdout(), "PASS live GoBGP {}: wrong action repaired, unwanted action withdrawn, foreign local path preserved, unrelated rules progress", family(&net)).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn owned_non_discard_action_is_replaced_when_still_wanted() {
+        let non_discard = RIB.replace("\"rate\":0", "\"rate\":100");
+        let fixture = RoundFixture::new(&non_discard, RIB, false);
+        let db = fixture.db();
+        let wanted = ips(&["198.51.100.7"]);
+        round(&fixture.cli, &wanted, &db).await.unwrap();
+        let calls = std::fs::read_to_string(fixture.dir.join("calls")).unwrap();
+        assert!(
+            calls.contains(" add match source 198.51.100.7/32 then discard"),
+            "a wanted source with the wrong action was treated as reconciled"
+        );
+        assert_eq!(fixture.reads(), 4);
+    }
+
+    #[tokio::test]
+    async fn unwanted_wrong_action_is_withdrawn_and_no_effect_repair_stays_unverified() {
+        let non_discard = RIB.replace("\"rate\":0", "\"rate\":100");
+        let fixture = RoundFixture::new(&non_discard, "{}", false);
+        let db = fixture.db();
+        let observation = round(&fixture.cli, &HashSet::new(), &db).await.unwrap();
+        assert_eq!(observation.count, 0);
+        assert_eq!(observation.discard_count, 0);
+        let calls = std::fs::read_to_string(fixture.dir.join("calls")).unwrap();
+        assert!(calls.contains(" del match source 198.51.100.7/32 then discard"));
+
+        let fixture = RoundFixture::new(&non_discard, &non_discard, false);
+        let db = fixture.db();
+        let readback = Readback::default();
+        readback.enable();
+        checked_round(&fixture.cli, &ips(&["198.51.100.7"]), &db, &readback)
+            .await
+            .unwrap();
+        let view = readback.snapshot();
+        assert!(view.ok, "successful read is not convergence");
+        assert_eq!(view.count, 1);
+        assert_eq!(
+            view.discard_count, 0,
+            "a no-effect CLI success cannot fabricate discard"
+        );
+        let text =
+            crate::metrics::render_with_flowspec(&crate::metrics::Snapshot::default(), &readback);
+        assert!(text.contains("sokol_flowspec_discard_rules 0\n"));
+        assert!(text.contains("sokol_flowspec_announced 1\n"));
+    }
+
+    #[tokio::test]
+    async fn collisions_do_not_starve_unrelated_withdrawals_or_announcements() {
+        let fixture = RoundFixture::new(RIB, "{}", false);
+        let db = fixture.db();
+        let readback = Readback::default();
+        readback.enable();
+        checked_round(&fixture.cli, &ips(&["198.51.100.7"]), &db, &readback)
+            .await
+            .unwrap();
+        let previous = readback.snapshot();
+        let mut raw: serde_json::Value = serde_json::from_str(RIB).unwrap();
+        let mut wanted = ips(&["203.0.113.7"]);
+        // More collisions than the work quota, sorted before the safe announce.
+        // They must not spend quota or block the unrelated owned withdrawal.
+        for host in 0..=MAX_OPS_PER_ROUND {
+            let net = one(&format!("192.0.2.{host}"));
+            let mut path = raw["[source: 198.51.100.7/32]"][0].clone();
+            path["nlri"]["value"][0]["value"]["prefix"] = net.to_string().into();
+            path["attrs"][1]["communities"] = serde_json::json!([4259915535u32]);
+            raw[format!("[source: {net}]")] = serde_json::json!([path]);
+            wanted.insert(net);
+        }
+        std::fs::write(fixture.dir.join("before.json"), raw.to_string()).unwrap();
+        std::fs::write(fixture.dir.join("calls"), "").unwrap();
+        assert!(checked_round(&fixture.cli, &wanted, &db, &readback)
+            .await
+            .is_err());
+        let calls = std::fs::read_to_string(fixture.dir.join("calls")).unwrap();
+        let writes: Vec<_> = calls
+            .lines()
+            .filter(|l| l.contains(" add ") || l.contains(" del "))
+            .collect();
+        assert_eq!(writes.len(), 2, "collision prevented unrelated progress");
+        assert!(writes[0].contains(" del match source 198.51.100.7/32 then discard"));
+        assert!(writes[1].contains(" add match source 203.0.113.7/32 then discard"));
+        assert_eq!(fixture.reads(), 4);
+        let failed = readback.snapshot();
+        assert!(!failed.ok);
+        assert_eq!(failed.count, previous.count);
+        assert_eq!(failed.discard_count, previous.discard_count);
+        assert_eq!(failed.started, previous.started);
+
+        // Shutdown uses wanted empty. Fence an overlapping nonzero-ID path,
+        // while still withdrawing an unrelated owned prefix.
+        let mut shutdown: serde_json::Value = serde_json::from_str(RIB).unwrap();
+        let owned = shutdown["[source: 198.51.100.7/32]"][0].clone();
+        let mut foreign = owned.clone();
+        foreign["LocalID"] = 1.into();
+        shutdown["[source: 198.51.100.7/32]"] = serde_json::json!([owned, foreign]);
+        let mut other = shutdown["[source: 198.51.100.7/32]"][0].clone();
+        other["nlri"]["value"][0]["value"]["prefix"] = "203.0.113.7/32".into();
+        shutdown["[source: 203.0.113.7/32]"] = serde_json::json!([other]);
+        std::fs::remove_file(fixture.dir.join("applied")).unwrap();
+        std::fs::write(fixture.dir.join("before.json"), shutdown.to_string()).unwrap();
+        std::fs::write(fixture.dir.join("calls"), "").unwrap();
+        assert!(checked_round(&fixture.cli, &HashSet::new(), &db, &readback)
+            .await
+            .is_err());
+        let calls = std::fs::read_to_string(fixture.dir.join("calls")).unwrap();
+        let writes: Vec<_> = calls
+            .lines()
+            .filter(|l| l.contains(" add ") || l.contains(" del "))
+            .collect();
+        assert_eq!(writes.len(), 1);
+        assert!(writes[0].contains(" del match source 203.0.113.7/32 then discard"));
+        assert_eq!(fixture.reads(), 4);
+        assert!(!readback.snapshot().ok);
+        assert_eq!(readback.snapshot().started, previous.started);
+    }
+
+    #[tokio::test]
+    async fn foreign_only_collision_performs_no_write() {
+        let foreign = RIB.replace("4259912202", "4259915535");
+        let fixture = RoundFixture::new(&foreign, RIB, false);
+        let db = fixture.db();
+        let result = round(&fixture.cli, &ips(&["198.51.100.7"]), &db).await;
+        assert!(
+            result.is_err(),
+            "adding the same NLRI replaces the foreign local path"
+        );
+        assert!(!fixture.dir.join("applied").exists());
+    }
+
     #[tokio::test]
     async fn an_accepted_announce_without_a_rib_effect_is_not_counted() {
         let fixture = RoundFixture::new("{}", "{}", false);
@@ -646,7 +1178,10 @@ esac
         assert_eq!(round(&fixture.cli, &wanted, &db).await.unwrap().count, 0);
         assert_eq!(fixture.reads(), 4);
         assert_eq!(
-            plan(&wanted, &fixture.cli.observed().await.unwrap()).0,
+            {
+                let rib = fixture.cli.observed().await.unwrap();
+                plan(&wanted, &rib.owned, &rib.discard).0
+            },
             vec![one("198.51.100.7")]
         );
     }
@@ -664,7 +1199,10 @@ esac
         );
         assert_eq!(fixture.reads(), 4);
         assert_eq!(
-            plan(&HashSet::new(), &fixture.cli.observed().await.unwrap()).1,
+            {
+                let rib = fixture.cli.observed().await.unwrap();
+                plan(&HashSet::new(), &rib.owned, &rib.discard).1
+            },
             vec![one("198.51.100.7")]
         );
     }

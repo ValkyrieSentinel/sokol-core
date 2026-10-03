@@ -555,20 +555,34 @@ drops a torn record) and, once it can write again, records how many records were
 With `--flowspec-gobgp /usr/local/bin/gobgp` every active block is announced as an RFC 8955
 Flowspec rule `match source <ip>/32 then discard` through a local
 [GoBGP](https://github.com/osrg/gobgp) daemon, so routers that accept Flowspec drop the traffic
-before it reaches this node's link. Expired or lifted blocks are withdrawn, and all of the node's
-rules are withdrawn when it shuts down.
+before it reaches this node's link. Expired or lifted blocks are withdrawn. Withdrawal of the node's managed rules
+is attempted within the shutdown budget. Colliding owned paths can remain upstream
+until their shared-daemon ownership is resolved.
 
 Every rule carries the node's ownership community (`--flowspec-community`, default
 `64512:<node-id>`; give each node that shares a gobgpd its own). Every second a separate worker
-reads gobgpd's RIB and makes this node's rules, and only those, equal to its active blocks (at
-most 64 changes per round). So rules left behind by a crashed run are withdrawn by the next one,
-rules a restarted gobgpd lost are announced again, a gobgp call that timed out (it is killed) is
-settled by the next read, and other systems' rules or rules learned from peers are never
-touched. A slow or hung gobgpd never delays the main loop. `sokol_flowspec_announced` is the
-number of the node's source-prefix rules last seen in the local RIB. After a round
-changes rules, the worker reads both families again before publishing that count;
-a successful CLI write alone cannot update it. Failed readback retains the last
-successful observation, which may be stale. Read it together with:
+reconciles the active blocks with local, tagged, ID-zero paths matching one full source prefix
+(IPv6 offset zero), at most 64 changes per round. Unwanted owned paths are withdrawn even if
+their action is wrong; missing or non-discard wanted paths are announced with `discard`.
+The pinned GoBGP represents canonical discard as exactly one traffic-rate extended community
+(type 128, subtype 6), numeric rate zero and no type-25 IPv6-specific extended-community attribute.
+Missing, unknown, nonzero or combined actions do
+not satisfy that contract. A restarted gobgpd's missing rules are announced again.
+
+Peer paths and foreign local paths are not selected for removal. If a planned operation
+shares its source-only NLRI with an observed foreign local path, that operation is skipped
+before applying the work quota; unrelated withdrawals and announcements continue. Readback
+health remains 0 and the last successful counts/time are retained while work is skipped. Distinct ownership communities alone do not isolate
+writers: GoBGP's CLI can replace another local path at the same NLRI. Serialize shared-daemon
+writers or give them exclusive source-prefix namespaces. The CLI has no atomic compare-and-swap;
+a writer racing between read and apply remains outside this guarantee.
+
+A slow or hung gobgpd runs apart from the main loop. `sokol_flowspec_announced` counts owned
+paths in this scope last seen in the local RIB, regardless of action.
+`sokol_flowspec_discard_rules` counts the subset satisfying the canonical discard contract.
+After writes, both families are read again before either count is published; CLI success
+alone cannot update them. Failed rounds retain the last successful counts and time, which
+may be stale. Read them together with:
 
 - `sokol_flowspec_enabled`: 1 when the worker is configured; 0 when disabled or in observe mode.
 - `sokol_flowspec_readback_ok`: 1 after the latest round completed successfully;
@@ -577,12 +591,15 @@ successful observation, which may be stale. Read it together with:
   successful two-family read; -1 before any successful observation. It continues
   to grow after failure and is computed when scraped, independently of the main tick.
 
-These four values are sampled together from the worker for each HTTP response.
+These five values are sampled together from the worker for each HTTP response.
 A consumer chooses its acceptable age; health alone gives no freshness guarantee.
 The two RIB families are read sequentially, not as an atomic network snapshot.
-This count does not validate the discard
-action or prove that an upstream router applied it. `FLOWSPEC_ANNOUNCE`/`WITHDRAW`
-audit records acknowledge successful CLI operations, not the subsequent observation.
+Neither count proves selection or enforcement by an upstream router, or equality with the
+wanted set. A policy that adds or changes extended communities can prevent canonical
+discard convergence, causing repeated announcements and audit records within the quota.
+Use a compatible local policy; health alone does not detect this mismatch.
+`FLOWSPEC_ANNOUNCE`/`WITHDRAW` audit records acknowledge successful CLI operations,
+not the subsequent observation.
 
 Run gobgpd with a neighbor for each upstream router and the `ipv4-flowspec` / `ipv6-flowspec`
 address families enabled, then point the orchestrator at its API:
@@ -603,7 +620,7 @@ instances.
 `sokol_xdp_dropped_packets_total{reason=...}` (`blocklist` for every blocked source, `malformed_header`, `invalid_tcp_flags`, `fragment_blocked`), `sokol_xdp_events_suppressed_total`,
 `sokol_blocks_active`, `sokol_p2p_active_peers`, `sokol_audit_queue_overflow_total`,
 `sokol_flowspec_announced`, `sokol_flowspec_enabled`, `sokol_flowspec_readback_ok`,
-`sokol_flowspec_readback_age_seconds`, `sokol_cluster_status`, `sokol_cluster_nodes`,
+`sokol_flowspec_readback_age_seconds`, `sokol_flowspec_discard_rules`, `sokol_cluster_status`, `sokol_cluster_nodes`,
 `sokol_cluster_nodes_under_attack`, `sokol_cluster_storm_engaged`.
 
 Kernel drop events reach user space at most 64 times per second per CPU (trap-port events only

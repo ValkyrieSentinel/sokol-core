@@ -6,7 +6,8 @@ import time
 import urllib.request
 
 NAMES = ("sokol_flowspec_enabled", "sokol_flowspec_readback_ok",
-         "sokol_flowspec_announced", "sokol_flowspec_readback_age_seconds")
+         "sokol_flowspec_announced", "sokol_flowspec_readback_age_seconds",
+         "sokol_flowspec_discard_rules")
 
 
 def matches(text, state, count, minimum_age):
@@ -21,16 +22,18 @@ def matches(text, state, count, minimum_age):
             values[fields[0]] = float(fields[1])
     if set(values) != set(NAMES) or not all(math.isfinite(v) for v in values.values()):
         raise ValueError("missing or nonfinite FlowSpec sample")
-    enabled, ok, observed, age = (values[name] for name in NAMES)
+    enabled, ok, observed, age, discard = (values[name] for name in NAMES)
     if enabled not in (0, 1) or ok not in (0, 1) or observed < 0 or not observed.is_integer():
         raise ValueError("invalid FlowSpec state/count")
+    if discard < 0 or not discard.is_integer() or discard > observed:
+        raise ValueError("invalid FlowSpec discard count")
     if age < 0 and age != -1 or ok == 1 and (enabled != 1 or age < 0):
         raise ValueError("invalid FlowSpec age/status")
     if state == "disabled":
-        return (enabled, ok, observed, age) == (0, 0, 0, -1)
+        return (enabled, ok, observed, age, discard) == (0, 0, 0, -1, 0)
     if state not in ("ok", "failed"):
         raise ValueError("invalid expectation")
-    return enabled == 1 and ok == (state == "ok") and observed == count and age >= minimum_age
+    return enabled == 1 and ok == (state == "ok") and observed == count and discard == count and age >= minimum_age
 
 
 def main():

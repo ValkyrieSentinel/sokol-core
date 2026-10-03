@@ -38,6 +38,8 @@ jobs:
     env:
       BPF_LINKER_SHA256: ${{ matrix.bpf_linker_sha256 }}
       GOBGP_SHA256: ${{ matrix.gobgp_sha256 }}
+      # Mandatory real CLI/daemon action and collision tests on both architectures.
+      SOKOL_GOBGP_TEST_BIN: /usr/local/bin
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
@@ -103,7 +105,13 @@ jobs:
         run: cargo build --release --locked
 
       - name: Test
-        run: cargo test --release --locked
+        run: |
+          set -o pipefail
+          cargo test --release --locked | tee /tmp/sokol-cargo-test.log
+          # An env regression must not turn an optional local skip into CI proof.
+          for family in ipv4-flowspec ipv6-flowspec; do
+            grep -Fq "PASS live GoBGP ${family}:" /tmp/sokol-cargo-test.log
+          done
 
       - name: Clippy
         run: cargo clippy --release --locked --all-targets -- -D warnings
