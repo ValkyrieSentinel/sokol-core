@@ -476,10 +476,11 @@ effect cannot manufacture presence/absence. A failed post-write command, even wi
 valid partial stdout, or malformed JSON is an error; the worker retains its prior
 successful count. An unchanged round returns its initial observation without two
 extra queries. The existing ownership predicate, withdrawal-first order and
-64-operation cap remain unchanged. A changed round adds at most two CLI calls;
+64-operation cap remain unchanged. A changed fixed-target round adds at most two CLI calls;
 with 5-second per-call timeouts the configured call-wait allowance is
 `(2 + 64 + 2) × 5 s`, not a hard round deadline. Scheduling, process teardown and
 other work remain outside it; shutdown retains its separate attempt budget.
+FLOWSPEC-R8 below accounts separately for live-intent cancellation refreshes.
 The worker notices shutdown between rounds; the outer task timeout can cancel a
 slow in-flight round before the inner withdrawal attempt begins.
 
@@ -865,7 +866,7 @@ extra read. Queued mirror cases refuse obsolete commands even after a compatible
 first command completes. Readback and an independent real CLI verify the final
 owned and canonical-discard sets; shutdown removes owned paths and foreign raw RIB
 bytes remain unchanged. Existing real R6 accepted-unknown-write reversals and shutdown
-cases remain. Canonical x86/ARM CI now requires ten family-specific positive markers.
+cases remain. At #137, canonical x86/ARM CI required ten family-specific positive markers.
 The full orchestrator smoke also changes the actual block table during a second
 held read, witnesses main publication through its following block-count snapshot,
 and checks original-child completion, new discard propagation upstream,
@@ -900,3 +901,51 @@ atomic publication/CLI authorization is claimed. Cancellation is not rollback;
 a fresh read is not a fence for a late remote RPC, and empty cleanup does not prove
 absence after exit. Direct-child kill, sampled convergence, incomplete CLI-ACK audit
 and bounded cleanup retain the R6 limits. No new authority or enforcement guarantee.
+
+## FLOWSPEC-R8: a superseded prefix keeps the remaining original queue
+
+At base `e1d2cfe` (#137), cancelling the first pending command abandoned the entire
+plan. The base-API regression
+`a_superseded_command_does_not_abandon_stable_queued_work` compiled and failed its
+assertion: revoke and restore the held first prefix during recovery readback, and
+the worker tries that first prefix again without reaching a stable second prefix.
+
+Reconciliation now retains the finite initial withdrawal-first plan (at most 64
+distinct NLRIs). An obsolete queued command has never started and is skipped.
+Cancelling a pending command has an unknown effect: refresh both RIB families
+before continuing. Each remaining command checks current membership, whether its
+effect is still needed, and fresh foreign-local collision classification. Satisfied
+work is skipped; a new collision cannot overwrite the foreign path, while other
+queued work can continue. An unreadable refresh stops all subsequent writes and
+preserves previous successful observation counts/time with health revoked.
+Replacement commands belong to the next plan, after final readback. Supersession
+forces that plan even when current intent equals the original sampled set (ABA).
+No new persistent scheduling state, actor authority or additional planned writes.
+
+The actual GoBGP 4.9.0 worker test
+`live_gobgp_worker_keeps_stable_cohort_after_supersession` checks six cases in each
+family: stable add, stable delete, stable add after cancelled delete, fresh foreign
+collision, already-satisfied queued work and failed refresh despite valid stdout.
+The held first call has not reached RPC in these cases; existing R6 tests separately
+cover accepted unknown writes. Independent actual CLI readback, exact command logs
+and raw foreign-family RIB comparisons check progress and refusals. The fixture
+removes the intentionally held first prefix through a separate CLI before shutdown;
+that is test cleanup, not evidence of worker withdrawal for that prefix.
+A separate regression requires immediate retry after ABA. Local extraction passes
+47 production FlowSpec/metrics tests with declared audit/target/label stand-ins.
+Compiled controls must reject early abandonment, stale read reuse, ignoring fresh
+collisions, duplicate satisfied commands and omission of the ABA retry. Canonical
+CI requires twelve family-specific positive markers and rejects optional-test skip.
+Full native Linux x86/ARM owners, 31 production smoke assertions, demo/runbook,
+independent exact-head static review and unchanged pinned Stargate shadow remain
+separate gates before merge. Existing 14 Python refusal checks remain.
+
+Limits: this is consideration of the remaining original plan under readable RIB
+and successful other CLI calls, not unconditional fairness or convergence. Errors
+still abort the queue; continuously failing prefixes or backlog beyond the quota
+can starve work. Each cancellation adds two reads; up to 64 cancellations give a
+coarse `(2 + 64 + 128 + 2) × 5 s = 980 s` call bound. It is not a rate or latency
+budget; shutdown still preempts the worker independently of main. Non-atomic RIB
+reads, serialized-writer assumptions, sampled-target publication, coalesced watch
+notifications, remote late RPC effects, direct-child kill, incomplete CLI-ACK audit
+and bounded cleanup retain R6/R7 limits. No checker/model/frozen capture/pin change.
