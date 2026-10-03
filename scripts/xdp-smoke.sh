@@ -809,7 +809,12 @@ start_gobgp_pair() {
     gobgpd -f "$WORK/gobgp-node.toml" --api-hosts 127.0.0.1:50051 >"$WORK/gobgpd-node.log" 2>&1 &
     gobgpd -f "$WORK/gobgp-upstream.toml" --api-hosts 127.0.0.1:50052 >"$WORK/gobgpd-upstream.log" 2>&1 &
     for _ in $(seq 1 40); do
-        gobgp -p 50051 neighbor 2>/dev/null | grep -q Establ && return 0
+        # BGP can establish before the upstream's independent gRPC API is ready.
+        # The RIB assertions below require both APIs, not just the node's peer state.
+        if gobgp -p 50052 neighbor >/dev/null 2>&1 && \
+            gobgp -p 50051 neighbor 2>/dev/null | grep -q Establ; then
+            return 0
+        fi
         sleep 0.5
     done
     return 1
@@ -897,17 +902,18 @@ shutdown_connections() {
     python3 - "$ORCH_PID" "$WORK/control.sock" <<'SHUTDOWN_PY'
 import os, signal, socket, sys, threading
 active = socket.socket(socket.AF_UNIX); active.settimeout(4); active.connect("/run/sokol.sock")
-f = active.makefile("rw")
+f = active.makefile("r")
 for line, wanted in [("ACK", "OK ack"), ("DROP_IMMEDIATE:198.51.100.199", "OK applied")]:
-    f.write(line + "\n"); f.flush(); assert f.readline().strip() == wanted
+    active.sendall((line + "\n").encode()); assert f.readline().strip() == wanted
 idle = socket.socket(socket.AF_UNIX); idle.settimeout(4); idle.connect(sys.argv[2])
 # An answered read-only command proves that the idle connection has a live handler.
-idle.sendall(b"LIST_BANS\n"); assert idle.recv(65536).startswith(b"OK ")
+idle_file = idle.makefile("rb")
+idle.sendall(b"LIST_BANS\n"); assert idle_file.readline().startswith(b"OK ")
 started = threading.Event(); closed = threading.Event(); failures = []
 def submit_until_closed():
     try:
         for i in range(500):
-            f.write("DB_LOG:shutdown-active-%d\n" % i); f.flush()
+            active.sendall(("DB_LOG:shutdown-active-%d\n" % i).encode())
             reply = f.readline()
             if not reply:
                 closed.set(); return
@@ -925,10 +931,10 @@ os.kill(int(sys.argv[1]), signal.SIGINT)
 assert closed.wait(4), "shutdown left active handler open"
 thread.join(1); assert not thread.is_alive() and not failures, failures
 try:
-    assert idle.recv(1) == b"", "shutdown left idle handler open"
+    assert idle_file.read(1) == b"", "shutdown left idle handler open"
 except ConnectionResetError:
     pass
-idle.close(); f.close(); active.close()
+idle_file.close(); idle.close(); f.close(); active.close()
 SHUTDOWN_PY
 }
 check "shutdown closes active IPC and idle control handlers" shutdown_connections

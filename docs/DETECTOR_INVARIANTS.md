@@ -345,7 +345,9 @@ This is a boundary for completed local decisions, not a drain of every input: un
 socket/mesh messages and kernel ring records may be discarded without becoming decisions.
 P2P transport children, including the writer and ping tasks of seed connections, can
 outlive their parent; they hold no table/audit handle and cannot create local decisions
-after the mesh consumer is joined. Cancelling seed maintenance does not join these children. A host discovery `spawn_blocking` call
+after the mesh consumer is joined. Cancelling seed maintenance does not join these children.
+Axum's accepted HTTP metrics tasks can also outlive the registered server; they hold only
+its read-only metrics snapshot, no table/audit handle. A host discovery `spawn_blocking` call
 already running cannot be cancelled by Tokio, but it holds no table/audit handle and its
 cancelled parent cannot publish its result. It can still delay runtime teardown. Cooperative
 cancellation is not a hard wall-clock deadline for non-yielding code or blocking OS calls.
