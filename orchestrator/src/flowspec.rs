@@ -367,6 +367,19 @@ pub fn plan(
     (announce, withdraw)
 }
 
+/// Publish only changed prefix sets. Main ticks with identical intent must not
+/// cancel a slow read/write on every tick and starve successful observations.
+pub fn update_wanted(sender: &watch::Sender<HashSet<IpNet>>, next: HashSet<IpNet>) -> bool {
+    sender.send_if_modified(|current| {
+        if *current == next {
+            false
+        } else {
+            *current = next;
+            true
+        }
+    })
+}
+
 /// Keeps gobgpd's rules for this node equal to `wanted` until shutdown, then withdraws them.
 /// Runs on its own task, so a slow or hung gobgpd never delays expiry, metrics or shutdown of
 /// the main loop. `readback` retains the last observation and marks pending/failed rounds.
@@ -379,21 +392,45 @@ pub async fn run_worker(
 ) {
     let mut ticker = tokio::time::interval(Duration::from_secs(1));
     let mut reported_error = false;
-    loop {
+    'worker: loop {
+        if *shutdown.borrow() {
+            break;
+        }
         tokio::select! {
-            _ = shutdown.changed() => if *shutdown.borrow() { break },
+            biased;
+            result = shutdown.changed() => {
+                if result.is_err() || *shutdown.borrow() { break }
+                continue;
+            },
+            result = wanted.changed() => if result.is_err() { break },
             _ = ticker.tick() => {}
         }
-        let target = wanted.borrow_and_update().clone();
-        match checked_round(&cli, &target, &db, &readback).await {
-            Ok(_) => {
-                reported_error = false;
-            }
-            Err(e) => {
-                if !reported_error {
-                    log::error!("[Flowspec] {}; retrying every second", e);
+        loop {
+            let target = wanted.borrow_and_update().clone();
+            // Dropping a pending CLI future kills that child, but does not undo
+            // effects it may already have had. Re-read before planning new work.
+            tokio::select! {
+                biased;
+                result = shutdown.changed() => {
+                    if result.is_err() || *shutdown.borrow() { break 'worker }
+                    continue;
+                },
+                result = wanted.changed() => {
+                    if result.is_err() { break 'worker }
+                    continue;
+                },
+                result = checked_round(&cli, &target, &db, &readback) => {
+                    match result {
+                        Ok(_) => reported_error = false,
+                        Err(e) => {
+                            if !reported_error {
+                                log::error!("[Flowspec] {}; retrying every second", e);
+                            }
+                            reported_error = true;
+                        }
+                    }
+                    break;
                 }
-                reported_error = true;
             }
         }
     }
@@ -804,6 +841,190 @@ esac
         }
     }
 
+    async fn eventually(mut predicate: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            if predicate() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        predicate()
+    }
+
+    fn copy_cli(cli: &GobgpCli) -> GobgpCli {
+        GobgpCli {
+            bin: cli.bin.clone(),
+            args: cli.args.clone(),
+            community: cli.community,
+        }
+    }
+
+    async fn superseded_read(before: &str, initial: HashSet<IpNet>, latest: HashSet<IpNet>) {
+        let fixture = RoundFixture::new(before, before, false);
+        std::fs::write(fixture.dir.join("pause"), "").unwrap();
+        let readback = Arc::new(Readback::default());
+        readback.enable();
+        let (wanted_tx, wanted_rx) = watch::channel(initial);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let worker = tokio::spawn(run_worker(
+            copy_cli(&fixture.cli),
+            wanted_rx,
+            shutdown_rx,
+            Arc::new(fixture.db()),
+            readback.clone(),
+        ));
+        assert!(eventually(|| fixture.dir.join("entered").exists()).await);
+        wanted_tx.send(latest.clone()).unwrap();
+        let restarted = eventually(|| fixture.reads() >= 2).await;
+        std::fs::remove_file(fixture.dir.join("pause")).unwrap();
+        let recovered = eventually(|| {
+            let view = readback.snapshot();
+            view.ok && view.converged && view.count == latest.len()
+        })
+        .await;
+        let calls = std::fs::read_to_string(fixture.dir.join("calls")).unwrap();
+        // The fake writes acknowledge without effect; let shutdown see an empty RIB.
+        std::fs::write(fixture.dir.join("before.json"), "{}").unwrap();
+        std::fs::write(fixture.dir.join("after.json"), "{}").unwrap();
+        shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), worker)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(recovered, "latest stable intent did not recover");
+        assert!(
+            !calls
+                .lines()
+                .any(|line| line.contains(" add ") || line.contains(" del ")),
+            "superseded read led to an obsolete write: {calls}"
+        );
+        assert!(restarted, "intent did not interrupt the paused read");
+    }
+
+    #[tokio::test]
+    async fn superseded_read_cannot_announce_a_revoked_target() {
+        superseded_read("{}", ips(&["198.51.100.7"]), HashSet::new()).await;
+    }
+
+    #[tokio::test]
+    async fn superseded_read_cannot_withdraw_a_restored_target() {
+        superseded_read(RIB, HashSet::new(), ips(&["198.51.100.7"])).await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_interrupts_a_paused_round_before_obsolete_announcement() {
+        let fixture = RoundFixture::new("{}", "{}", false);
+        std::fs::write(fixture.dir.join("pause"), "").unwrap();
+        let readback = Arc::new(Readback::default());
+        readback.enable();
+        let (_wanted_tx, wanted_rx) = watch::channel(ips(&["198.51.100.7"]));
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let worker = tokio::spawn(run_worker(
+            copy_cli(&fixture.cli),
+            wanted_rx,
+            shutdown_rx,
+            Arc::new(fixture.db()),
+            readback.clone(),
+        ));
+        assert!(eventually(|| fixture.dir.join("entered").exists()).await);
+        shutdown_tx.send(true).unwrap();
+        let cleanup_started = eventually(|| fixture.reads() >= 2).await;
+        std::fs::remove_file(fixture.dir.join("pause")).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), worker)
+            .await
+            .unwrap()
+            .unwrap();
+        let calls = std::fs::read_to_string(fixture.dir.join("calls")).unwrap();
+        assert!(
+            !calls.contains(" add "),
+            "shutdown announced an obsolete target: {calls}"
+        );
+        assert!(cleanup_started, "shutdown waited for the whole old round");
+        assert!(readback.snapshot().ok && readback.snapshot().converged);
+    }
+
+    #[tokio::test]
+    async fn identical_intent_ticks_do_not_interrupt_a_slow_round() {
+        let fixture = RoundFixture::new("{}", RIB, false);
+        std::fs::write(fixture.dir.join("pause"), "").unwrap();
+        let target = ips(&["198.51.100.7"]);
+        let (wanted_tx, wanted_rx) = watch::channel(target.clone());
+        let witness = wanted_tx.subscribe();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let readback = Arc::new(Readback::default());
+        readback.enable();
+        let worker = tokio::spawn(run_worker(
+            copy_cli(&fixture.cli),
+            wanted_rx,
+            shutdown_rx,
+            Arc::new(fixture.db()),
+            readback.clone(),
+        ));
+        assert!(eventually(|| fixture.dir.join("entered").exists()).await);
+        for _ in 0..64 {
+            assert!(!update_wanted(&wanted_tx, target.clone()));
+            tokio::task::yield_now().await;
+        }
+        assert!(!witness.has_changed().unwrap());
+        assert_eq!(fixture.reads(), 1);
+        std::fs::remove_file(fixture.dir.join("pause")).unwrap();
+        let recovered = eventually(|| readback.snapshot().converged).await;
+        std::fs::write(fixture.dir.join("before.json"), "{}").unwrap();
+        std::fs::write(fixture.dir.join("after.json"), "{}").unwrap();
+        shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), worker)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            recovered,
+            "identical publications starved a successful round"
+        );
+        assert!(update_wanted(&wanted_tx, ips(&["198.51.100.8"])));
+        assert!(
+            witness.has_changed().unwrap(),
+            "same count with other prefix must notify"
+        );
+    }
+
+    #[tokio::test]
+    async fn already_requested_shutdown_and_closed_publishers_start_cleanup() {
+        for stop in ["already_shutdown", "intent_closed", "shutdown_closed"] {
+            let fixture = RoundFixture::new(RIB, "{}", false);
+            let (wanted_tx, wanted_rx) = watch::channel(ips(&["198.51.100.7"]));
+            let (shutdown_tx, shutdown_rx) = watch::channel(stop == "already_shutdown");
+            let mut wanted_tx = Some(wanted_tx);
+            let mut shutdown_tx = Some(shutdown_tx);
+            if stop == "intent_closed" {
+                drop(wanted_tx.take());
+            }
+            if stop == "shutdown_closed" {
+                drop(shutdown_tx.take());
+            }
+            let readback = Arc::new(Readback::default());
+            readback.enable();
+            tokio::time::timeout(
+                Duration::from_secs(3),
+                run_worker(
+                    copy_cli(&fixture.cli),
+                    wanted_rx,
+                    shutdown_rx,
+                    Arc::new(fixture.db()),
+                    readback.clone(),
+                ),
+            )
+            .await
+            .expect("closed publishers must not spin or keep old intent");
+            let view = readback.snapshot();
+            assert!(view.ok && view.converged);
+            assert_eq!(view.count, 0);
+            assert!(std::fs::read_to_string(fixture.dir.join("calls"))
+                .unwrap()
+                .contains(" del "));
+        }
+    }
+
     #[tokio::test]
     async fn failed_readback_retains_count_and_age_until_recovery() {
         let fixture = RoundFixture::new(RIB, "{}", false);
@@ -1019,6 +1240,167 @@ esac
             let mut args = self.fixture.cli.args.clone();
             args.extend(["global", "rib", "-a", family(&net), "-j"].map(String::from));
             self.fixture.cli.run(args).await.unwrap()
+        }
+    }
+
+    #[tokio::test]
+    async fn live_gobgp_worker_preempts_intent_and_recovers_unknown_writes() {
+        use std::io::Write as _;
+        let Some(bin_dir) = std::env::var_os("SOKOL_GOBGP_TEST_BIN") else {
+            eprintln!("SKIP live GoBGP: SOKOL_GOBGP_TEST_BIN is unset (required in canonical CI)");
+            return;
+        };
+        let live = LiveGobgp::start(std::path::Path::new(&bin_dir)).await;
+        for (net, foreign_net) in [
+            (one("198.51.100.7"), one("198.51.100.8")),
+            (one("2001:db8::7"), one("2001:db8::8")),
+        ] {
+            live.put(foreign_net, "discard", "65001:9999").await;
+            let foreign = live.raw(foreign_net).await;
+            for (case, present, hold_op, stop) in [
+                ("revoked_add", false, "read", false),
+                ("restored_delete", true, "read", false),
+                ("accepted_add", false, "add", false),
+                ("accepted_delete", true, "del", false),
+                ("shutdown", false, "read", true),
+                ("accepted_add_shutdown", false, "add", true),
+            ] {
+                if present {
+                    live.fixture.cli.apply(true, net).await.unwrap();
+                }
+                let dir = live.fixture.dir.join(format!("{}-{case}", family(&net)));
+                std::fs::create_dir(&dir).unwrap();
+                let hold = dir.join("hold");
+                let entered = dir.join("entered");
+                let calls_file = dir.join("calls");
+                std::fs::write(&hold, "").unwrap();
+                std::fs::write(&calls_file, "").unwrap();
+                let wrapper = dir.join("cli.sh");
+                std::fs::write(
+                    &wrapper,
+                    r#"#!/bin/sh
+real="$1"; dir="$2"; hold_op="$3"; shift 3
+printf '%s\n' "$*" >> "$dir/calls"
+op=read
+case "$*" in *' add '*) op=add ;; *' del '*) op=del ;; esac
+if [ "$op" = "$hold_op" ] && [ -f "$dir/hold" ]; then
+  # Write effects occur in real GoBGP before the wrapper withholds its response.
+  if [ "$op" != read ]; then "$real" "$@" || exit $?; fi
+  touch "$dir/entered"
+  while [ -f "$dir/hold" ]; do sleep 0.01; done
+  if [ "$op" != read ]; then exit 0; fi
+fi
+exec "$real" "$@"
+"#,
+                )
+                .unwrap();
+                let mut args = vec![
+                    wrapper.to_str().unwrap().to_string(),
+                    live.fixture.cli.bin.to_str().unwrap().to_string(),
+                    dir.to_str().unwrap().to_string(),
+                    hold_op.to_string(),
+                ];
+                args.extend(live.fixture.cli.args.clone());
+                let cli = GobgpCli {
+                    bin: "/bin/sh".into(),
+                    args,
+                    community: live.fixture.cli.community,
+                };
+                let before = if present {
+                    HashSet::from([net])
+                } else {
+                    HashSet::new()
+                };
+                let initial = if present {
+                    HashSet::new()
+                } else {
+                    HashSet::from([net])
+                };
+                let readback = Arc::new(Readback::default());
+                readback.enable();
+                let db = Arc::new(live.fixture.db());
+                checked_round(&live.fixture.cli, &before, &db, &readback)
+                    .await
+                    .unwrap();
+                let old = readback.snapshot();
+                assert!(old.ok && old.converged);
+                let (wanted_tx, wanted_rx) = watch::channel(initial);
+                let (shutdown_tx, shutdown_rx) = watch::channel(false);
+                let worker = tokio::spawn(run_worker(
+                    cli,
+                    wanted_rx,
+                    shutdown_rx,
+                    db,
+                    readback.clone(),
+                ));
+                assert!(eventually(|| entered.exists()).await);
+                let pending = readback.snapshot();
+                assert!(!pending.ok && !pending.converged);
+                assert_eq!(pending.count, old.count);
+                assert_eq!(pending.started, old.started);
+                // Independently observe the already-committed effect before cancelling its reply.
+                if hold_op != "read" {
+                    let actual = live.fixture.cli.observed().await.unwrap();
+                    let effected = if present {
+                        HashSet::new()
+                    } else {
+                        HashSet::from([net])
+                    };
+                    assert_eq!(actual.owned, effected);
+                    assert_eq!(actual.discard, effected);
+                }
+                let reads = || {
+                    std::fs::read_to_string(&calls_file)
+                        .unwrap()
+                        .lines()
+                        .filter(|line| line.ends_with(" -j"))
+                        .count()
+                };
+                let old_reads = reads();
+                if stop {
+                    shutdown_tx.send(true).unwrap();
+                } else {
+                    assert!(update_wanted(&wanted_tx, before.clone()));
+                }
+                let restarted = eventually(|| reads() > old_reads).await;
+                std::fs::remove_file(&hold).unwrap();
+                let recovered = eventually(|| {
+                    let view = readback.snapshot();
+                    view.ok && view.converged && view.count == before.len()
+                })
+                .await;
+                let calls = std::fs::read_to_string(&calls_file).unwrap();
+                if !stop {
+                    shutdown_tx.send(true).unwrap();
+                }
+                tokio::time::timeout(Duration::from_secs(3), worker)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(
+                    restarted && recovered,
+                    "{case}: no preemption/recovery: {calls}"
+                );
+                let writes: Vec<_> = calls
+                    .lines()
+                    .filter(|line| line.contains(" add ") || line.contains(" del "))
+                    .collect();
+                if hold_op == "read" {
+                    assert!(writes.is_empty(), "obsolete {case} write: {calls}");
+                } else {
+                    assert_eq!(writes.len(), 2, "unknown write must be reconciled: {calls}");
+                    assert!(writes[0].contains(&format!(" {hold_op} ")));
+                    let reverse = if hold_op == "add" { "del" } else { "add" };
+                    assert!(writes[1].contains(&format!(" {reverse} ")));
+                }
+                assert!(live.fixture.cli.observed().await.unwrap().owned.is_empty());
+                assert_eq!(
+                    live.raw(foreign_net).await,
+                    foreign,
+                    "{case}: foreign RIB changed"
+                );
+            }
+            writeln!(std::io::stdout(), "PASS live intent preemption {}: obsolete add/delete refused, accepted unknown writes reconciled, shutdown starts cleanup, foreign path preserved", family(&net)).unwrap();
         }
     }
 

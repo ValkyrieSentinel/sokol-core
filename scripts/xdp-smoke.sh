@@ -851,6 +851,11 @@ if [ -f "$1/readback-fail" ]; then
     printf '{}\n'
     exit 7
 fi
+if [ -f "$1/readback-slow" ] && [ ! -f "$1/readback-slow-started" ]; then
+    touch "$1/readback-slow-started"
+    sleep 2
+    touch "$1/readback-slow-completed"
+fi
 real=$2
 shift 2
 exec "$real" "$@"
@@ -895,6 +900,16 @@ cp "$WORK/segment.bak" "$FIRST_SEGMENT"
 if [ ${#FLOWSPEC_ARGS[@]} -gt 0 ]; then
     check "Flowspec: expired block is withdrawn upstream" flowspec_rule absent "$ALLOWED_IP/32"
     check "Flowspec metrics: completed read reports the static rule" flowspec_metrics converged 1 0
+    # Actual main ticks publish unchanged intent during this two-second CLI read.
+    # A notification on every tick would kill the child before it writes completion.
+    touch "$WORK/readback-slow"
+    check "Flowspec worker: slow read reached the CLI" bash -c "
+        for _ in \$(seq 1 80); do [ -f '$WORK/readback-slow-started' ] && exit 0; sleep 0.1; done
+        exit 1"
+    sleep 2.5
+    check "Flowspec worker: unchanged main ticks let the slow read complete" test -f "$WORK/readback-slow-completed"
+    check "Flowspec metrics: slow read restores convergence" flowspec_metrics converged 1 0
+    rm "$WORK/readback-slow"
     touch "$WORK/readback-fail"
     # Change the actual local RIB behind the failed reader, independently of the worker.
     gobgp -p 50051 global rib -a ipv4-flowspec del match source "$BLOCKED_IP/32" then discard community 65001:6666

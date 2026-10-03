@@ -757,3 +757,63 @@ downstream router enforcement or eventual progress. A consumer chooses an accept
 age. Unverified/disabled zero does not establish a divergent RIB. Existing audit
 records still acknowledge CLI operations, not observed postconditions. No new model,
 checker, frozen evidence or delivery-shadow pin is needed for this bounded predicate.
+
+## FLOWSPEC-R6: superseded intent interrupts pending reconciliation
+
+At base `3d078ed`, the worker awaited a whole sampled-target round before looking
+for new intent or shutdown. Three regressions, initially using only the base API,
+failed on actual obsolete CLI commands after compilation: a revoked target still
+received an add, a restored target still received a delete, and shutdown still
+allowed an add before cleanup. Controlled child reads paused before planning;
+changing the desired set or shutdown then releasing the read exposed each write.
+
+The worker now selects shutdown and actual intent changes before polling the pending
+round, drops that round and starts fresh reconciliation or the existing shutdown
+cleanup. `update_wanted` compares full prefix sets before notifying the channel.
+Identical main ticks do not cancel slow reads. A pre-existing shutdown flag or closed
+intent/shutdown publisher starts cleanup instead of spinning or retaining old intent.
+No operation or permission is added. Per-call timeout, withdrawal-first planning,
+per-round quota, R1–R5 observations and the ten-second shutdown budget remain.
+
+`superseded_read_cannot_announce_a_revoked_target` and
+`superseded_read_cannot_withdraw_a_restored_target` cover the mirror cases through
+actual child processes and the production worker.
+`shutdown_interrupts_a_paused_round_before_obsolete_announcement` checks cleanup
+starts while the old read is paused.
+`identical_intent_ticks_do_not_interrupt_a_slow_round` checks the actual publication
+helper, unchanged notifications and same-count/different-prefix changes.
+`already_requested_shutdown_and_closed_publishers_start_cleanup` checks the
+already-true flag and both closed-channel cases.
+
+`live_gobgp_worker_preempts_intent_and_recovers_unknown_writes` executes the worker
+against actual GoBGP 4.9.0 for both families. Controlled wrappers pause an initial
+read or withhold a response after real GoBGP already applied an add/delete. The
+test independently observes the committed effect before cancellation; a fresh
+worker read then leads to the required opposite operation. Shutdown is checked
+both during a read and after an accepted add. Each case checks successful recovery
+and foreign raw RIB preservation. Canonical x86/ARM CI requires eight family-specific
+positive markers, including both new preemption markers; a skipped test is no proof.
+The full orchestrator smoke additionally holds one read for two seconds and requires
+the original child to complete across unchanged main ticks, followed by verified
+HTTP convergence. This binds publication deduplication to the actual main consumer.
+
+Seven compiled semantic mutants were rejected on assertions: ignoring intent or
+shutdown during a pending round, missing a pre-existing shutdown, notifying every
+identical tick, deduplicating by cardinality, retaining the old target and restarting
+old work after shutdown. Marker controls accept all eight positive markers and reject
+removal of each family-specific marker, framework success after actual live-test
+skip, and loss of a failed test's exit through tee. Local extraction passed all 41
+production-module tests with actual common code and declared audit/target/label
+stand-ins. Full final-head native x86/ARM CI and independent static review remain
+separate required gates before merge.
+
+Limits: the select boundary is cooperative; publication and CLI invocation are not
+atomic. A command already accepted by GoBGP can take effect even when its local
+future/child is cancelled. Cancellation is not rollback or evidence of no effect.
+RIB readback, not arithmetic or a cancelled reply, determines the next plan. Ongoing
+intent churn can prevent completed observations; the 64-operation quota is per
+round, not a rate budget across restarts. Cleanup is a bounded attempt, not guaranteed
+withdrawal. Sampled-round convergence still does not prove latest intent, actual
+path IDs, best-path selection or upstream enforcement. Checker, frozen captures,
+results and delivery-shadow pins remain unchanged; ordinary regressions suffice
+for this concrete worker scheduling contract.
