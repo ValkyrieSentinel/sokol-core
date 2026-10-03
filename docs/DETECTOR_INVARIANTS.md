@@ -811,13 +811,19 @@ Limits: the select boundary is cooperative; publication and CLI invocation are n
 atomic. A command already accepted by GoBGP can take effect even when its local
 future/child is cancelled. Cancellation is not rollback or evidence of no effect.
 RIB readback, not arithmetic or a cancelled reply, determines the next plan.
+That read is an observation, not a fence for a remote RPC still in flight: a request
+sent by a direct/exec CLI can land after it. Shutdown can observe an empty RIB and
+return success before a late add; it does not guarantee no rules after worker exit.
 Kill-on-drop kills the direct subprocess, not its descendants. Wrappers must exec
 the CLI; a non-exec child can land a late effect after a fresh read. The live wrapper
 withholds its reply only after its real GoBGP subprocess has already completed.
 A cancelled accepted command can have no CLI-acknowledgement audit record; these
 records are not a complete effect history. Ongoing intent churn with slow GoBGP can
 prevent every write as well as completed observations. Progress needs a stable
-window long enough for the necessary calls; the 64-operation quota is per
+window; even normally fast calls with a large backlog and per-tick changes can
+keep observation health revoked throughout an attack. Production shutdown sends
+true once; a false notification also conservatively interrupts the current round.
+The window must allow the necessary calls; the 64-operation quota is per
 round, not a rate budget across restarts. Cleanup is a bounded attempt, not guaranteed
 withdrawal. Sampled-round convergence still does not prove latest intent, actual
 path IDs, best-path selection or upstream enforcement. Checker, frozen captures,
