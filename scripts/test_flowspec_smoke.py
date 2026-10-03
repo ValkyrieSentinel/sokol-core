@@ -80,6 +80,46 @@ class FlowSpecMetrics(unittest.TestCase):
                 self.helper.matches(text, "failed", 1, 2)
 
 
+class RunbookHealth(unittest.TestCase):
+    # Exercise the actual consumer; the old wildcard rejected correctly disabled
+    # FlowSpec. Missing mandatory health and HTTP failures must still fail.
+    REQUIRED = ("sokol_audit_healthy", "sokol_state_healthy",
+                "sokol_state_restore_ok", "sokol_protected_refresh_ok")
+
+    def run_health(self, text, status=0):
+        source = (ROOT / "scripts/runbook-rehearsal.sh").read_text()
+        function = re.search(r"^node_health\(\) \{\n.*?^\}", source, re.MULTILINE | re.DOTALL)
+        self.assertIsNotNone(function, "missing actual runbook health consumer")
+        # An actual function instead of a Python imitation, with only HTTP replaced.
+        script = "curl() { printf '%s\\n' \"$HEALTH_BODY\"; return \"$HEALTH_STATUS\"; }\n"
+        script += function.group() + "\nnode_health\n"
+        return subprocess.run(["bash", "-uo", "pipefail", "-c", script],
+                              env={**os.environ, "HEALTH_BODY": text, "HEALTH_STATUS": str(status)},
+                              capture_output=True, text=True, timeout=3)
+
+    def healthy(self):
+        return "\n".join(f"{name} 1" for name in self.REQUIRED) + "\n"
+
+    def test_disabled_or_pending_optional_readback_is_not_node_failure(self):
+        for enabled in (0, 1):
+            result = self.run_health(self.healthy() + f"sokol_flowspec_enabled {enabled}\nsokol_flowspec_readback_ok 0\n")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_every_required_health_sample_must_exist_and_succeed(self):
+        for name in self.REQUIRED:
+            for replacement in ("", f"{name} 0\n", f"{name} nan\n", f"{name} 1 extra\n"):
+                result = self.run_health(self.healthy().replace(f"{name} 1\n", replacement))
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertEqual(self.run_health(self.healthy() + f"{name} 1\n").returncode, 1)
+
+    def test_empty_and_failed_http_cannot_report_healthy(self):
+        self.assertEqual(self.run_health("").returncode, 1)
+        for text in ("", self.healthy()):
+            result = self.run_health(text, status=7)
+            self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+            self.assertIn("UNVERIFIED", result.stderr)
+
+
 class FlowSpecSmoke(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory(prefix='sokol-rib-gate-')

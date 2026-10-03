@@ -73,7 +73,7 @@ journalctl -u sokol-orchestrator -n 50 --no-pager
 | Що перевірити | Як | Очікується |
 |---|---|---|
 | Версія й збірка | `metric sokol_build_info` | `version=…,build=<commit>` |
-| Здоров'я | метрики `*_healthy`, `*_ok` з §4; дашборд показує `MODE` з heartbeat | усі `1`, `MODE=NORMAL` |
+| Здоров'я вузла | `sokol_audit_healthy`, `sokol_state_healthy`, `sokol_state_restore_ok`, `sokol_protected_refresh_ok`; дашборд показує `MODE` з heartbeat | усі чотири присутні й `1`, `MODE=NORMAL`; FlowSpec перевіряється окремо за §5.7 |
 | XDP на інтерфейсі | `ip -d link show eth0` | `prog/xdp` |
 | Піри з'єднані | `metric sokol_p2p_active_peers` | кількість інших вузлів |
 | Бани оператора | `ctl LIST_BANS` | `OK <n> …` |

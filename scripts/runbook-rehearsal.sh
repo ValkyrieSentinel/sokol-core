@@ -25,6 +25,31 @@ step() { echo; echo "== $*"; }
 ctl() { printf '%s\n' "$1" | sudo nc -U -q1 /run/sokol/control.sock; }
 metric() { curl -s http://127.0.0.1:9469/metrics | grep "^$1"; }
 value() { metric "$1" | awk '{print $2}' | head -1; }
+# Required node health, matching the runbook §4 and the dashboard/alert scope.
+# Optional worker status (e.g. FlowSpec pending/disabled) has its own contract.
+node_health() {
+    local snapshot
+    if ! snapshot=$(curl -fsS --max-time 2 http://127.0.0.1:9469/metrics); then
+        printf 'UNVERIFIED node health: HTTP read failed\n' >&2
+        return 2
+    fi
+    printf '%s\n' "$snapshot" | awk '
+        BEGIN {
+            split("sokol_audit_healthy sokol_state_healthy sokol_state_restore_ok sokol_protected_refresh_ok", names)
+            for (i in names) required[names[i]] = 1
+        }
+        $1 in required {
+            if (seen[$1]++ || NF != 2 || $2 !~ /^1(\.0+)?$/) bad[$1] = $0
+        }
+        END {
+            failed = 0
+            for (name in required) {
+                if (!seen[name]) {print "missing " name; failed = 1}
+                else if (name in bad) {print "unhealthy " bad[name]; failed = 1}
+            }
+            exit failed
+        }'
+}
 reachable() { ip netns exec "$NS" ping -c 1 -W 1 -I "$1" "$HOST_IP" >/dev/null 2>&1; }
 wait_until() { local t=$1; shift; for _ in $(seq 1 $((t * 5))); do "$@" && return 0; sleep 0.2; done; return 1; }
 up() { systemctl is-active --quiet sokol-orchestrator && [ -n "$(value sokol_build_info)" ]; }
@@ -85,8 +110,11 @@ fi
 [ "$(stat -c %a /var/lib/sokol/node.key)" = 600 ] && pass "§2 the key file is 0600" || fail "§2 key file mode $(stat -c %a /var/lib/sokol/node.key)"
 metric sokol_build_info | grep -q "build=\"$( /usr/local/bin/sokol-orchestrator --version | sed 's/.*build \(.*\))/\1/')\"" \
     && pass "§3 build: $(metric sokol_build_info | grep -o 'build="[^"]*"')" || fail "§3 sokol_build_info: $(metric sokol_build_info)"
-bad=$(curl -s http://127.0.0.1:9469/metrics | awk '$1 ~ /^sokol_[a-z_]*(_healthy|_ok)$/ && $2 != 1 {print $1"="$2}')
-[ -z "$bad" ] && pass "§3 every *_healthy and *_ok metric is 1" || fail "§3 not healthy: $bad"
+if health=$(node_health); then
+    pass "§3 all four required node health metrics are 1"
+else
+    fail "§3 node health unverified or unhealthy: $health"
+fi
 ip -d link show "$IF" | grep -q 'prog/xdp' && pass "§3 prog/xdp on $IF" || fail "§3 no XDP program on $IF"
 [ "$(value sokol_p2p_active_peers)" = 0 ] && pass "§3 peers: 0 (a single node)" || fail "§3 peers $(value sokol_p2p_active_peers)"
 ctl LIST_BANS | grep -q '^OK 0' && pass "§3 ctl LIST_BANS: $(ctl LIST_BANS | head -1)" || fail "§3 ctl LIST_BANS: $(ctl LIST_BANS | head -1)"

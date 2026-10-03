@@ -535,6 +535,14 @@ covered by the CLI-failure refusal regressions. The smoke's wait/age limits
 are test conditions, not production SLOs. Parsing rejects missing, duplicate,
 nonfinite or invalid samples; an HTTP error cannot satisfy an observation.
 
+Native end-to-end CI exposed an additional consumer: the runbook rehearsal assumed
+all `_ok` metrics must be 1, including a correctly disabled FlowSpec worker. The
+runbook and actual rehearsal now name the same four required node health series as
+the dashboard/alert. Tests execute that shell consumer: optional pending/disabled
+readback is allowed; each missing, zero, malformed or duplicate mandatory series
+and empty/failed HTTP are rejected. This does not change runtime MODE/authority;
+FlowSpec remains separately observable under its own contract.
+
 These gauges describe the latest round and retained local observation. They do not
 supply an atomic IPv4/IPv6 RIB snapshot, a universal freshness deadline, process
 liveness, convergence, action validation or upstream enforcement. A consumer must
