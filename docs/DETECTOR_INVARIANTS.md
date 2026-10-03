@@ -289,9 +289,8 @@ and the final sync after sender disconnection. `flush(true)` confirms that the b
 processed preceding queued records, appended sampled pending loss notices and completed
 sync; it does **not** mean all original records survived or replay can return 0.
 Quiesce producers to include all completed submissions: a barrier does not freeze or
-acknowledge concurrent later submissions. Current production shutdown still leaves
-IPC/mesh producers running across the barrier, so later submissions may be lost on
-process exit without a marker; quiescing them remains a separate implementation task.
+acknowledge concurrent later submissions. Production shutdown now joins the decision
+and audit producers before final state persistence and this barrier (SHUTDOWN-S1/S2).
 If a notice cannot be appended, sync returns
 false and pending counts remain for retry; the retry interval stays bounded by the
 existing 100 ms receive timeout rather than a zero-wait busy loop. Process termination
@@ -310,3 +309,57 @@ handle, skipping queue accounting in sync, dropping failed notice counts and wri
 ordinary records ahead of sampled pending queue loss or ending after appending a
 notice without successful disconnected final sync. Existing fresh complete replay remains 0;
 real synced loss notices give 2, not a complete-evidence success.
+
+
+## SHUTDOWN-S1/S2: producers stop before final state and audit
+
+Owners: [shutdown.rs](../orchestrator/src/shutdown.rs), the task registrations and
+shutdown sequence in [main.rs](../orchestrator/src/main.rs).
+
+| ID | Invariant | Executable evidence |
+|---|---|---|
+| SHUTDOWN-S1 | Once quiescence returns, registered listeners and accepted IPC/control children have been dropped; they cannot mutate the final table snapshot or submit records after the terminal audit submission. Child registration is closed before cancellation, including concurrent registration. | `quiesce_joins_a_stalled_producer_before_final_state_and_audit`, `child_handlers_are_joined_with_their_listener`, `a_closed_owner_refuses_late_child_registration`, `producer_quiescence_keeps_shutdown_record_last`; active/idle socket XDP shutdown smoke |
+| SHUTDOWN-S2 | A cleanup-worker timeout cancels and joins the task instead of detaching it. Table mutation and its decision audit submission precede cancellable network awaits. | `a_timed_out_cleanup_worker_is_cancelled_and_joined`, `local_decision_is_audited_before_cancellable_mesh_publication` (actual registry lock held); XDP final-state/audit checks |
+
+The task set owns the ring-buffer consumer, mesh-command consumer, telemetry processor,
+traps, host-policy refresh, local listeners and their accepted children. Seed maintenance,
+peer snapshot sender, P2P listener and metrics server also stop through this set. Completed
+entries are reaped on registration; weak child spawners cannot retain the owner through a
+reference cycle. Owner drop cancels tasks on startup errors too
+(`dropping_the_owner_does_not_leave_a_child_reference_cycle`); normal shutdown additionally
+joins every registered task before proceeding.
+
+Shutdown stops the main tick, closes registration, aborts and joins producers, awaits the
+FlowSpec withdrawal worker within its existing budget (abort + join on timeout), then
+persists the last table and submits `NODE_SHUTDOWN` followed by the audit flush. Local
+block and operator flush audit submissions precede mesh publication; host-policy replacement,
+table recheck and its audit submissions share one poll after acquiring the table lock.
+This avoids cancellation between the mutation and its decision audit submission; queue or
+disk loss still follows AUDIT-R1/R2. The trap's companion `TRAP_HIT` follows publication
+and can be cancelled after the decision record; it is not replay authority or promised
+as part of the terminal decision boundary. A command already applied can lose its network publication
+or ACK during shutdown, so a missing reply does not establish refusal. Adapters retain
+unanswered intent under their existing retry protocol.
+
+This is a boundary for completed local decisions, not a drain of every input: unread
+socket/mesh messages and kernel ring records may be discarded without becoming decisions.
+P2P transport children, including the writer and ping tasks of seed connections, can
+outlive their parent; they hold no table/audit handle and cannot create local decisions
+after the mesh consumer is joined. Cancelling seed maintenance does not join these children.
+Axum's accepted HTTP metrics tasks can also outlive the registered server; they hold only
+its read-only metrics snapshot, no table/audit handle. A host discovery `spawn_blocking` call
+already running cannot be cancelled by Tokio, but it holds no table/audit handle and its
+cancelled parent cannot publish its result. It can still delay runtime teardown. Cooperative
+cancellation is not a hard wall-clock deadline for non-yielding code or blocking OS calls.
+State writes retain their existing five-second wait and audit flush its two-second wait;
+failures are reported and never imply successful durability. No SIGKILL/crash-complete,
+all-packet, all-input, or successful-upstream-withdrawal guarantee is added. Under audit queue
+loss the terminal record itself can be dropped and marked as loss, so its presence is not
+promised by quiescence alone.
+
+The detached-task equivalence control uses the prior `tokio::spawn`/discarded-handle pattern:
+compiled tests reject surviving parent/child tasks, owner-drop leaks and a cleanup timeout
+that detaches. The actual chained-audit regression additionally rejects a surviving child
+receiver at final fsync. The decision regression rejects moving mesh publication back ahead
+of the audit submission. Canonical Linux CI uses the actual policy, registry and kernel
+smoke; the portable owner extraction uses kernel/transport/policy stand-ins for local checks.

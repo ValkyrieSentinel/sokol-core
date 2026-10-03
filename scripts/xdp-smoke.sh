@@ -809,7 +809,12 @@ start_gobgp_pair() {
     gobgpd -f "$WORK/gobgp-node.toml" --api-hosts 127.0.0.1:50051 >"$WORK/gobgpd-node.log" 2>&1 &
     gobgpd -f "$WORK/gobgp-upstream.toml" --api-hosts 127.0.0.1:50052 >"$WORK/gobgpd-upstream.log" 2>&1 &
     for _ in $(seq 1 40); do
-        gobgp -p 50051 neighbor 2>/dev/null | grep -q Establ && return 0
+        # BGP can establish before the upstream's independent gRPC API is ready.
+        # The RIB assertions below require both APIs, not just the node's peer state.
+        if gobgp -p 50052 neighbor >/dev/null 2>&1 && \
+            gobgp -p 50051 neighbor 2>/dev/null | grep -q Establ; then
+            return 0
+        fi
         sleep 0.5
     done
     return 1
@@ -889,6 +894,66 @@ if [ ${#FLOWSPEC_ARGS[@]} -gt 0 ]; then
     stop_orchestrator
 fi
 check "SIGINT/SIGTERM shutdown is graceful" grep -q "terminated gracefully" "$LOG"
+
+# Real shutdown boundary: one active signal client plus an idle accepted control client.
+# ACK establishes the decision before the signal; keep submitting audit text until EOF.
+start_orchestrator --block-ttl 3600
+shutdown_connections() {
+    python3 - "$ORCH_PID" "$WORK/control.sock" <<'SHUTDOWN_PY'
+import os, signal, socket, sys, threading
+active = socket.socket(socket.AF_UNIX); active.settimeout(4); active.connect("/run/sokol.sock")
+f = active.makefile("r")
+for line, wanted in [("ACK", "OK ack"), ("DROP_IMMEDIATE:198.51.100.199", "OK applied")]:
+    active.sendall((line + "\n").encode()); assert f.readline().strip() == wanted
+idle = socket.socket(socket.AF_UNIX); idle.settimeout(4); idle.connect(sys.argv[2])
+# An answered read-only command proves that the idle connection has a live handler.
+idle_file = idle.makefile("rb")
+idle.sendall(b"LIST_BANS\n"); assert idle_file.readline().startswith(b"OK ")
+started = threading.Event(); closed = threading.Event(); failures = []
+def submit_until_closed():
+    try:
+        for i in range(500):
+            active.sendall(("DB_LOG:shutdown-active-%d\n" % i).encode())
+            reply = f.readline()
+            if not reply:
+                closed.set(); return
+            assert reply.strip() == "OK recorded"
+            started.set()
+            closed.wait(0.01)
+        failures.append("active socket never closed")
+    except (BrokenPipeError, ConnectionResetError):
+        closed.set()
+    except Exception as error:
+        failures.append(str(error))
+thread = threading.Thread(target=submit_until_closed); thread.start()
+assert started.wait(2), "producer did not become active"
+os.kill(int(sys.argv[1]), signal.SIGINT)
+assert closed.wait(4), "shutdown left active handler open"
+thread.join(1); assert not thread.is_alive() and not failures, failures
+try:
+    assert idle_file.read(1) == b"", "shutdown left idle handler open"
+except ConnectionResetError:
+    pass
+idle_file.close(); idle.close(); f.close(); active.close()
+SHUTDOWN_PY
+}
+check "shutdown closes active IPC and idle control handlers" shutdown_connections
+for _ in $(seq 1 100); do
+    kill -0 "$ORCH_PID" 2>/dev/null || break
+    sleep 0.1
+done
+check "shutdown exits without forced kill after producers quiesce" bash -c '! kill -0 "$1" 2>/dev/null' _ "$ORCH_PID"
+stop_orchestrator
+check "shutdown confirms producer quiescence" grep -q 'Decision and audit producers quiesced' "$LOG"
+"$(dirname "$BIN")/monitor" --dump "$WORK/events.sntl" | cut -f3 >"$WORK/shutdown-audit.txt"
+check "shutdown terminal audit record is last after active submissions" \
+    test "$(tail -n1 "$WORK/shutdown-audit.txt")" = NODE_SHUTDOWN
+check "shutdown final snapshot retains the accepted decision" python3 - "$LAST_STATE" <<'SHUTDOWN_STATE_PY'
+import json, sys
+with open(sys.argv[1]) as file:
+    state = json.load(file)
+assert any(c["target"] == "198.51.100.199" for c in state["claims"]), state
+SHUTDOWN_STATE_PY
 
 # Unprivileged run: only the capabilities the systemd unit grants.
 NONROOT="$WORK/nonroot"

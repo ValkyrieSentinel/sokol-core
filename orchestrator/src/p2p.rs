@@ -948,6 +948,12 @@ pub struct PeerRegistry {
 }
 
 impl PeerRegistry {
+    /// Owner regressions can suspend publication at the actual registry lock.
+    #[cfg(test)]
+    pub(crate) fn peers_for_test(&self) -> PeerMap {
+        self.peers.clone()
+    }
+
     pub fn new(trust: TrustStore) -> Self {
         Self {
             peers: Arc::new(RwLock::new(HashMap::new())),
