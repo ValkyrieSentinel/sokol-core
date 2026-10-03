@@ -1037,7 +1037,11 @@ esac
         }
         let pending_reads = fixture.reads();
         std::fs::remove_file(fixture.dir.join("pause")).unwrap();
-        let completed = eventually(|| readback.snapshot().converged).await;
+        let completed = eventually(|| {
+            let view = readback.snapshot();
+            view.converged && view.count == 1
+        })
+        .await;
         std::fs::write(fixture.dir.join("before.json"), "{}").unwrap();
         std::fs::write(fixture.dir.join("after.json"), "{}").unwrap();
         shutdown_tx.send(true).unwrap();

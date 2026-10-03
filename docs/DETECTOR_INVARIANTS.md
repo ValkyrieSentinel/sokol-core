@@ -869,7 +869,9 @@ cases remain. Canonical x86/ARM CI now requires ten family-specific positive mar
 The full orchestrator smoke also changes the actual block table during a second
 held read, witnesses main publication through its following block-count snapshot,
 and checks original-child completion, new discard propagation upstream,
-HTTP convergence and subsequent withdrawal. Existing refusal controls include both
+HTTP convergence, operator-control ACK and subsequent withdrawal. The sensor-event
+socket does not accept `UNBAN_IP`; revocation uses the actual operator socket.
+Existing refusal controls include both
 new upstream assertions; CLI failure/partial stdout cannot pass them.
 
 The post-write publication regression separately verifies that a changed latest

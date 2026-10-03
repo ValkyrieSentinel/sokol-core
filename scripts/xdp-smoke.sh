@@ -932,7 +932,8 @@ if [ ${#FLOWSPEC_ARGS[@]} -gt 0 ]; then
         exit 1"
     check "Flowspec: retained read leads to the new dynamic discard upstream" wait_flowspec_rule present "$ALLOWED_IP/32"
     check "Flowspec metrics: retained read recovers the changed target" flowspec_metrics converged 2 0
-    ipc "UNBAN_IP:$ALLOWED_IP"
+    check "Flowspec worker: operator acknowledges revocation of the changed block" bash -o pipefail -c "
+        printf 'UNBAN_IP:$ALLOWED_IP\\n' | nc -U -q1 '$WORK/control.sock' | grep -q '^OK unbanned $ALLOWED_IP'"
     check "Flowspec: dynamic rule after retained read is withdrawn upstream" wait_flowspec_rule absent "$ALLOWED_IP/32"
     check "Flowspec metrics: changed target returns to the static rule" flowspec_metrics converged 1 0
     touch "$WORK/readback-fail"
