@@ -555,8 +555,8 @@ drops a torn record) and, once it can write again, records how many records were
 With `--flowspec-gobgp /usr/local/bin/gobgp` every active block is announced as an RFC 8955
 Flowspec rule `match source <ip>/32 then discard` through a local
 [GoBGP](https://github.com/osrg/gobgp) daemon, so routers that accept Flowspec drop the traffic
-before it reaches this node's link. Expired or lifted blocks are withdrawn, and all of the node's
-withdrawal is attempted within the shutdown budget. Colliding owned paths can remain upstream
+before it reaches this node's link. Expired or lifted blocks are withdrawn. Withdrawal of the node's managed rules
+is attempted within the shutdown budget. Colliding owned paths can remain upstream
 until their shared-daemon ownership is resolved.
 
 Every rule carries the node's ownership community (`--flowspec-community`, default

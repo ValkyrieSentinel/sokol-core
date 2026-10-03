@@ -1158,7 +1158,7 @@ esac
     }
 
     #[tokio::test]
-    async fn foreign_local_path_collision_refuses_before_any_write() {
+    async fn foreign_only_collision_performs_no_write() {
         let foreign = RIB.replace("4259912202", "4259915535");
         let fixture = RoundFixture::new(&foreign, RIB, false);
         let db = fixture.db();

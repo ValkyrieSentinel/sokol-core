@@ -581,7 +581,7 @@ collisions, not races: CLI AddPath/DeletePath has no atomic ownership compare-an
 Shared-daemon writers must serialize or use exclusive source-prefix namespaces.
 
 Reproduction: `owned_non_discard_action_is_replaced_when_still_wanted` and
-`foreign_local_path_collision_refuses_before_any_write` failed behaviorally on the
+`foreign_only_collision_performs_no_write` failed behaviorally on the
 previous implementation. Six raw captures from a pinned-source local daemon cover
 owned rate-limit, owned discard and foreign discard in IPv4 and IPv6; provenance
 is in `orchestrator/tests/fixtures/README.md`.
@@ -593,7 +593,9 @@ It then checks unrelated withdrawal/announcement and shutdown cleanup while the
 foreign path remains present. It also replaces traffic-rate zero combined with
 a type-25 IPv6 redirect for both families. An
 unset `SOKOL_GOBGP_TEST_BIN` skips that local test; canonical x86/ARM CI requires it
-and emits two positive execution markers. A framework PASS after skip is no proof.
+and requires two positive execution markers in the Test step. A framework PASS
+after skip is no proof. The same marker predicate refuses a deliberately skipped
+local live-test invocation; pipefail also preserves a failed cargo status through tee.
 
 Local checks passed 26 production-module tests, including real GoBGP for both
 families, and 13 Python smoke/health refusal tests. The portable Rust harness uses

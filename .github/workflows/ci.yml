@@ -105,7 +105,13 @@ jobs:
         run: cargo build --release --locked
 
       - name: Test
-        run: cargo test --release --locked
+        run: |
+          set -o pipefail
+          cargo test --release --locked | tee /tmp/sokol-cargo-test.log
+          # An env regression must not turn an optional local skip into CI proof.
+          for family in ipv4-flowspec ipv6-flowspec; do
+            grep -Fq "PASS live GoBGP ${family}:" /tmp/sokol-cargo-test.log
+          done
 
       - name: Clippy
         run: cargo clippy --release --locked --all-targets -- -D warnings
