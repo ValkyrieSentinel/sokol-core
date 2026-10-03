@@ -207,6 +207,11 @@ pub fn parse_rib(json: &[u8], community: u32) -> Result<Rib, String> {
                     .ok_or("unreadable RIB: peer-address must be a string")?
                     .is_empty(),
             };
+            // Known peer paths cannot be targeted by the local CLI. Their
+            // remaining metadata must not fence unrelated local reconciliation.
+            if remote {
+                continue;
+            }
             let cli_id = match path.get("LocalID") {
                 None => true,
                 Some(value) => {
@@ -229,6 +234,11 @@ pub fn parse_rib(json: &[u8], community: u32) -> Result<Rib, String> {
                     .filter(|kind| *kind <= u8::MAX as u64)
                     .ok_or("unreadable RIB: attribute type must be uint8")?;
                 if kind == 8 {
+                    // The pinned GoBGP producer encodes a nil community slice
+                    // as null. It establishes no ownership tag.
+                    if attr.get("communities").is_some_and(|v| v.is_null()) {
+                        continue;
+                    }
                     let communities = attr
                         .get("communities")
                         .and_then(|v| v.as_array())
@@ -1344,7 +1354,7 @@ exec "$real" "$@"
             ("/LocalID", serde_json::json!("0")),
             ("/attrs", serde_json::json!({})),
             ("/attrs/1/type", serde_json::json!("8")),
-            ("/attrs/1/communities", serde_json::json!(null)),
+            ("/attrs/1/communities", serde_json::json!("not an array")),
             ("/attrs/1/communities/0", serde_json::json!("65001:6666")),
             ("/nlri/value", serde_json::json!(null)),
             ("/nlri/value/0/type", serde_json::json!("2")),
@@ -1374,6 +1384,80 @@ exec "$real" "$@"
                 "invalid peer identity authorized withdrawal"
             );
         }
+    }
+
+    #[test]
+    fn captured_empty_communities_do_not_establish_ownership() {
+        let captures: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/gobgp-4.9.0-empty-community.json"
+        ))
+        .unwrap();
+        for capture in captures.as_array().unwrap() {
+            let rib =
+                parse_rib(capture["stdout"].as_str().unwrap().as_bytes(), 4259912202).unwrap();
+            assert!(rib.owned.is_empty());
+            assert!(rib.discard.is_empty());
+            assert_eq!(
+                rib.foreign_local,
+                ips(&[capture["prefix"].as_str().unwrap()])
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_community_is_foreign_and_does_not_block_other_withdrawals() {
+        // GoBGP's nil uint32 slice marshals as null; an empty standard
+        // community is untagged, not corrupt or owned.
+        for communities in [serde_json::json!(null), serde_json::json!([])] {
+            let mut foreign: serde_json::Value = serde_json::from_str(RIB).unwrap();
+            foreign["[source: 198.51.100.7/32]"][0]["attrs"][1]["communities"] = communities;
+            let mut combined = foreign.clone();
+            let owned: serde_json::Value = serde_json::from_str(RIB).unwrap();
+            let mut path = owned["[source: 198.51.100.7/32]"][0].clone();
+            path["nlri"]["value"][0]["value"]["prefix"] = serde_json::json!("198.51.100.8/32");
+            combined["[source: 198.51.100.8/32]"] = serde_json::json!([path]);
+            let parsed = parse_rib(foreign.to_string().as_bytes(), 4259912202).unwrap();
+            assert!(parsed.owned.is_empty());
+            assert!(parsed
+                .foreign_local
+                .contains(&"198.51.100.7/32".parse().unwrap()));
+            let fixture = RoundFixture::new(&combined.to_string(), &foreign.to_string(), false);
+            let db = fixture.db();
+            let readback = Readback::default();
+            readback.enable();
+            checked_round(&fixture.cli, &HashSet::new(), &db, &readback)
+                .await
+                .unwrap();
+            let calls = std::fs::read_to_string(fixture.dir.join("calls")).unwrap();
+            assert!(calls.contains(" del match source 198.51.100.8/32 "));
+            assert!(!calls.contains(" del match source 198.51.100.7/32 "));
+            assert!(readback.snapshot().ok);
+            assert_eq!(readback.snapshot().count, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_metadata_does_not_block_local_reconciliation() {
+        let mut raw: serde_json::Value = serde_json::from_str(RIB).unwrap();
+        // A known peer path is never a local CLI target or collision.
+        let remote = &mut raw["[source: 203.0.113.9/32]"][0];
+        assert!(remote["peer-address"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty()));
+        remote["LocalID"] = serde_json::json!("unknown");
+        remote["attrs"] = serde_json::json!(null);
+        remote["nlri"]["value"] = serde_json::json!(null);
+        let fixture = RoundFixture::new(&raw.to_string(), "{}", false);
+        let db = fixture.db();
+        let readback = Readback::default();
+        readback.enable();
+        checked_round(&fixture.cli, &HashSet::new(), &db, &readback)
+            .await
+            .unwrap();
+        let calls = std::fs::read_to_string(fixture.dir.join("calls")).unwrap();
+        assert!(calls.contains(" del match source 198.51.100.7/32 "));
+        assert!(!calls.contains(" del match source 203.0.113.9/32 "));
+        assert!(readback.snapshot().ok);
     }
 
     #[tokio::test]

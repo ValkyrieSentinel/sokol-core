@@ -13,3 +13,14 @@ Canonical CI uses its existing checksum-pinned Linux 4.9.0 binaries instead and
 executes the production reconciliation against a real daemon for both families.
 Captures are parser fixtures; they do not establish upstream enforcement or a
 conditional-write guarantee. See FLOWSPEC-R3 in `docs/DETECTOR_INVARIANTS.md`.
+
+## Empty standard communities
+
+`gobgp-4.9.0-empty-community.json` retains raw CLI stdout captured on 2026-10-03
+from the same pinned source/toolchain and isolated configuration, for both families.
+A gRPC `AddPath` used `apiutil.NewPath`, a single source component, origin 2,
+`bgp.NewPathAttributeCommunities(nil)`, traffic-rate zero and MP_REACH_NLRI with
+an unspecified nexthop. The CLI round trip emits type 8 with `communities: null`.
+There is no ownership tag; these local paths must remain foreign. The new captures
+extend parser compatibility evidence; canonical CI does not execute this Go injector.
+The original action captures are unchanged.

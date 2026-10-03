@@ -629,12 +629,13 @@ malformed destination values were silently skipped. Mistyped identity fields cou
 classify an unknown origin as local, authorize withdrawal or hide a collision.
 
 A read now requires strict UTF-8/JSON with an object root and an array of path
-objects per destination. Each path has an attributes array and a nonempty NLRI
-component array. Attribute/component types, standard community values, any present
+objects per destination. After a valid nonempty peer-address excludes a peer path, each local path
+has an attributes array and a nonempty NLRI component array. Attribute/component types, standard community values, any present
 peer-address/LocalID, and source prefix/offset must be usable for classification.
 Absent peer-address/LocalID remain compatible with the pinned local captures.
-Malformed classification data rejects the entire read, rather than silently
-omitting paths. A genuine empty object remains a successful empty observation.
+The pinned producer’s `communities: null` means an empty list, not an unknown
+ownership tag. Other malformed local classification data rejects the entire read,
+rather than silently omitting paths. A genuine empty object remains a successful empty observation.
 Unknown or malformed action payloads do not certify discard; otherwise classifiable
 owned paths retain R3 repair/withdrawal behavior. This is not full-schema validation.
 
@@ -655,14 +656,30 @@ fault injection at the CLI boundary, not a claim that GoBGP normally emits corru
 JSON. Canonical x86/ARM CI requires positive execution markers for these refusals
 and the existing action/collision checks in each family; a skipped test is no proof.
 
-Local checks passed 29 production-module Rust tests including the actual daemon
+Local checks passed 32 production-module Rust tests including the actual daemon
 for IPv4/IPv6, 13 Python smoke/health refusal tests, and Clippy. The portable Rust
 harness retains audit/target/label stand-ins and actual common code; native CI
-uses the actual owners. Eight compiling semantic controls were rejected on test
+uses the actual owners. Eleven compiling semantic controls were rejected on test
 assertions: normalizing missing output, skipping malformed destination collections,
 accepting unknown peer identity, defaulting malformed LocalID to zero, skipping
 malformed community/source data, defaulting malformed source offset and lossy
-UTF-8 decoding.
+UTF-8 decoding, rejecting a legitimate null community, validating irrelevant remote
+metadata, and treating an empty community as an ownership tag.
+
+Independent Claude review held the initial candidate because pinned GoBGP accepts
+a zero-length COMMUNITIES attribute and marshals it as null. An actual isolated
+daemon confirmed this for both families through gRPC AddPath and CLI readback;
+new raw captures record it without changing the original action captures.
+`captured_empty_communities_do_not_establish_ownership` checks both captures.
+`empty_community_is_foreign_and_does_not_block_other_withdrawals` failed on the
+held candidate, then checks that valid null/empty community data remains foreign
+while unrelated owned withdrawal progresses. Missing communities on a local type-8
+attribute remain unknown and rejected; the pinned producer always emits the field.
+`remote_metadata_does_not_block_local_reconciliation` also failed behaviorally on
+the held parser using an existing peer path. It confirms
+that known peer metadata cannot stall local withdrawal or become a local target.
+These are producer-compatibility and consumer-boundary regressions, not a new
+full-schema validator.
 
 An invalid initial read permits no writes. An invalid post-write read does not
 undo accepted CLI operations; it withholds a new observation. R1/R2 stale-count

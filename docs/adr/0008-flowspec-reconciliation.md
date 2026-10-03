@@ -28,8 +28,11 @@
 - Порожній RIB закріпленого CLI — JSON-об’єкт `{}`. Порожній stdout, `null`,
   невалідні UTF-8/JSON чи непридатна структура шляхів не підтверджують відсутність.
   Кожен destination містить масив об’єктів шляхів; attrs і NLRI components — масиви.
-  Типи атрибутів/components, standard communities, LocalID, peer-address та source
-  prefix/offset перевіряються перед класифікацією. Відсутні peer-address і LocalID
+  Peer-address перевіряється першим: відомий шлях піра не є локальною CLI-ціллю
+  і виключається перед рештою перевірок. Для локальних шляхів типи атрибутів/components,
+  standard communities, LocalID та source prefix/offset перевіряються перед
+  класифікацією. GoBGP серіалізує порожню standard community як `null`; це
+  дозволений порожній список, що не встановлює ownership tag. Відсутні peer-address і LocalID
   лишаються дозволеними, як у закріплених локальних capture; наявні мають коректний тип.
   Це мінімальний контракт полів класифікації, не повна JSON schema. Невідома чи
   неканонічна дія власного шляху лишається приводом до repair/withdrawal за R3.

@@ -583,7 +583,9 @@ paths in this scope last seen in the local RIB, regardless of action.
 After writes, both families are read again before either count is published; CLI success
 alone cannot update them. The pinned CLI represents an empty RIB as `{}`. Missing stdout,
 `null`, invalid UTF-8/JSON, malformed path collections or unclassifiable ownership/source
-fields fail the read, even when the CLI exits zero. An invalid initial read authorizes no
+fields on local paths fail the read, even when the CLI exits zero. A known peer path
+is excluded before checking its other metadata. GoBGP’s `communities: null` is a
+valid empty standard community list and establishes no ownership tag. An invalid initial read authorizes no
 writes; an invalid post-write read cannot confirm their result. This validates the fields
 used for local identity and source selection, not the whole GoBGP JSON schema.
 Failed rounds retain the last successful counts and time, which may be stale. Read them together with:
