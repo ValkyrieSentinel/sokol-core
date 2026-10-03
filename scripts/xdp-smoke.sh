@@ -2,7 +2,7 @@
 # XDP smoke test: attach the real orchestrator to a veth pair and check that
 # traffic from a --block'ed source is dropped while other traffic passes.
 #
-# Needs root (netns, XDP attach). Linux only.
+# Needs root, Python 3, bpftool and iputils ping (netns, XDP attach/test-run). Linux only.
 #   sudo scripts/xdp-smoke.sh [path/to/orchestrator]
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/flowspec-rib.sh"
@@ -15,6 +15,8 @@ PEER_IF=sokol-smk1
 HOST_IP=10.231.0.1
 ALLOWED_IP=10.231.0.2
 BLOCKED_IP=10.231.0.3
+PROBE_CONTROL_IP=10.231.0.250
+XDP_PROBE="$(dirname "${BASH_SOURCE[0]}")/xdp_probe.py"
 WORK="$(mktemp -d)"
 LOG="$WORK/orchestrator.log"
 ORCH_PID=""
@@ -67,6 +69,13 @@ ping_from() {
     ip netns exec "$NS" ping -c 2 -W 1 -I "$1" "$HOST_IP" >/dev/null 2>&1
 }
 
+xdp_drop() {  # source, ping count, optional fragment flag; helper errors never invert to pass
+    local source="$1" count="$2"; shift 2
+    python3 "$XDP_PROBE" --interface "$HOST_IF" --namespace "$NS" \
+        --source "$source" --destination "$HOST_IP" --control "$PROBE_CONTROL_IP" \
+        --count "$count" "$@"
+}
+
 ip netns add "$NS"
 ip link add "$HOST_IF" type veth peer name "$PEER_IF"
 ip link set "$PEER_IF" netns "$NS"
@@ -74,6 +83,7 @@ ip addr add "$HOST_IP/24" dev "$HOST_IF"
 ip link set "$HOST_IF" up
 ip netns exec "$NS" ip addr add "$ALLOWED_IP/24" dev "$PEER_IF"
 ip netns exec "$NS" ip addr add "$BLOCKED_IP/24" dev "$PEER_IF"
+ip netns exec "$NS" ip addr add "$PROBE_CONTROL_IP/24" dev "$PEER_IF"
 ip netns exec "$NS" ip link set "$PEER_IF" up
 ip netns exec "$NS" ip link set lo up
 
@@ -134,7 +144,7 @@ orchestrator_up() {
 check "orchestrator starts on $HOST_IF" orchestrator_up
 check "fragmented IPv4 from $ALLOWED_IP passes (issue #5)" ping_fragmented_from "$ALLOWED_IP"
 check "traffic from $ALLOWED_IP passes" ping_from "$ALLOWED_IP"
-check "traffic from blocked $BLOCKED_IP is dropped" bash -c "! ip netns exec $NS ping -c 2 -W 1 -I $BLOCKED_IP $HOST_IP >/dev/null 2>&1"
+check "traffic from blocked $BLOCKED_IP is dropped" xdp_drop "$BLOCKED_IP" 2
 
 metric() {
     curl -s http://127.0.0.1:9469/metrics | awk -v m="$1" '$1 == m { print $2 }'
@@ -284,7 +294,7 @@ MOVED_IP=10.231.0.16
 ip netns exec "$NS" ip addr add "$MOVED_IP/24" dev "$PEER_IF"
 printf 'BAN_IP:%s\n' "$MOVED_IP" | nc -U -q1 "$WORK/control.sock" >/dev/null
 check "a banned address is dropped before it moves to this node" \
-    bash -c "! ip netns exec $NS ping -c 2 -W 1 -I $MOVED_IP $HOST_IP >/dev/null 2>&1"
+    xdp_drop "$MOVED_IP" 2
 ip addr add "$MOVED_IP/32" dev "$HOST_IF"
 for _ in $(seq 1 30); do grep -q "Block of $MOVED_IP released: it is protected now" "$LOG" && break; sleep 0.2; done
 check "an address that becomes this node's own is released within the refresh period" \
@@ -400,7 +410,7 @@ check "an address in 10.231.0.128/26 reaches the node before the prefix block" \
     ip netns exec "$NS" ping -c 1 -W 1 -I "$CIDR_IP" "$HOST_IP"
 check "control socket bans a /26 prefix" bash -c "printf 'BAN_IP:10.231.0.128/26\\n' | nc -U -q1 '$WORK/control.sock' | grep -q '^OK banned 10.231.0.128/26'"
 check "an address inside the banned prefix is dropped in XDP" \
-    bash -c "! ip netns exec $NS ping -c 2 -W 1 -I $CIDR_IP $HOST_IP >/dev/null 2>&1"
+    xdp_drop "$CIDR_IP" 2
 check "an address outside the prefix still passes" ping_from "$ALLOWED_IP"
 check "a prefix covering this node is refused" bash -c "printf 'BAN_IP:10.231.0.0/24\\n' | nc -U -q1 '$WORK/control.sock' | grep -q '^ERR 10.231.0.0/24 is protected (address of this node)'"
 check "a prefix wider than /16 is refused" bash -c "printf 'BAN_IP:198.0.0.0/8\\n' | nc -U -q1 '$WORK/control.sock' | grep -q 'wider than'"
@@ -445,7 +455,7 @@ done
 check "operator sees the node via its heartbeat" bash -c "curl -s -H 'Authorization: Bearer $OP_TOKEN' http://127.0.0.1:3900/api/data | grep -q '\"id\":1'"
 check "operator ban via dashboard API succeeds" bash -c "curl -s -X POST -H 'Authorization: Bearer $OP_TOKEN' -H 'Content-Type: application/json' -d '{\"ip\":\"$ALLOWED_IP\",\"action\":\"add\"}' http://127.0.0.1:3900/api/nodes/1/blacklist | grep -q '\"success\":true'"
 sleep 0.3
-check "operator ban is enforced in XDP" bash -c "! ip netns exec $NS ping -c 1 -W 1 -I $ALLOWED_IP $HOST_IP >/dev/null 2>&1"
+check "operator ban is enforced in XDP" xdp_drop "$ALLOWED_IP" 1
 op /api/nodes/1/blacklist "{\"ip\":\"$ALLOWED_IP\",\"action\":\"remove\"}" >/dev/null
 sleep 0.3
 check "operator unban lifts the block" ping_from "$ALLOWED_IP"
@@ -497,7 +507,7 @@ if command -v suricata >/dev/null; then
     LAST_REPLY=$(grep -o '^\[[0-9.]*\]' "$WORK/probe-ping.log" | tail -1 | tr -d '[]')
     check "Suricata alert is forwarded as a signal with an event id" grep -Eq "SIGNAL#[0-9a-f]{32}:suricata\|$PROBE_IP\|$HOST_IP\|sid:1000001" "$WORK/adapter.log"
     check "Suricata alert blocks the probing address in XDP" \
-        bash -c "! ip netns exec $NS ping -c 2 -W 1 -I $PROBE_IP $HOST_IP >/dev/null 2>&1"
+        xdp_drop "$PROBE_IP" 2
     check "the block reason names Suricata and the rule" grep -q "Dynamic block enforced in XDP: $PROBE_IP.*suricata: sid:1000001 SOKOL TEST telnet probe" "$LOG"
     if [ -n "$LAST_REPLY" ]; then
         echo "      probe -> last reply before block: $(awk -v a="$T_PROBE" -v b="$LAST_REPLY" 'BEGIN { printf "%.0f ms", (b - a) * 1000 }')"
@@ -556,7 +566,7 @@ if command -v cscli >/dev/null && command -v crowdsec >/dev/null; then
     check "CrowdSec remaining duration is forwarded and enforced exactly" \
         python3 "$(dirname "$0")/check_crowdsec_ttl.py" "$WORK/crowdsec-adapter.log" "$LOG" "$CS_IP"
     check "CrowdSec ban blocks the address in XDP" \
-        bash -c "! ip netns exec $NS ping -c 2 -W 1 -I $CS_IP $HOST_IP >/dev/null 2>&1"
+        xdp_drop "$CS_IP" 2
     check "the block reason names CrowdSec and the scenario" grep -q "Dynamic block enforced in XDP: $CS_IP.*crowdsec: sokol smoke ban" "$LOG"
     # A restarted adapter replays every active decision (startup=true); the node recognises the
     # decision id and adds no strike.
@@ -589,7 +599,7 @@ if command -v cscli >/dev/null && command -v crowdsec >/dev/null; then
         sleep 0.2
     done
     check "a decision made while the node was down is enforced once it is back" \
-        bash -c "! ip netns exec $NS ping -c 2 -W 1 -I $CS_IP2 $HOST_IP >/dev/null 2>&1"
+        xdp_drop "$CS_IP2" 2
     check "the node's answer is logged by the adapter" grep -q "$CS_IP2.*(Applied)" "$WORK/crowdsec-adapter.log"
     # R27-05: the node restarted above; the event memory came back with its state, so a replay
     # by a restarted adapter is still a duplicate (not a new event that renews the block).
@@ -647,14 +657,14 @@ sleep 1
 ip netns exec "$NS" nc -w 7 -s "$TRAP_IP" "$HOST_IP" 2323 </dev/null >/dev/null 2>&1 || true
 sleep 1
 check "trident trap blocks a silent connection in XDP" \
-    bash -c "! ip netns exec $NS ping -c 2 -W 1 -I $TRAP_IP $HOST_IP >/dev/null 2>&1"
+    xdp_drop "$TRAP_IP" 2
 check "the trap's block carries its reason" \
     grep -q "Dynamic block enforced in XDP: $TRAP_IP.*trident: trap port 2323: connected without sending data" "$LOG"
 kill "$TRAP_PID" 2>/dev/null || true; TRAP_PID=""
 
 ipc "DROP_IMMEDIATE:$ALLOWED_IP"
 sleep 0.5
-check "root IPC DROP_IMMEDIATE blocks $ALLOWED_IP" bash -c "! ip netns exec $NS ping -c 2 -W 1 -I $ALLOWED_IP $HOST_IP >/dev/null 2>&1"
+check "root IPC DROP_IMMEDIATE blocks $ALLOWED_IP" xdp_drop "$ALLOWED_IP" 2
 # F11: a local producer cannot make the node hold connections (and tasks) without bound.
 HOLDERS=()
 for _ in $(seq 1 70); do
@@ -697,7 +707,7 @@ check "a log that does not verify is not replayed" bash -c \
     "! '$BIN' --replay '$WORK/tampered.sntl' >'$WORK/replay-tampered.out' 2>&1; grep -q '^NOT REPLAYED' '$WORK/replay-tampered.out'"
 STATE_FILE=$LAST_STATE start_orchestrator
 check "an operator ban survives a restart" \
-    bash -c "! ip netns exec $NS ping -c 2 -W 1 -I $PERSIST_IP $HOST_IP >/dev/null 2>&1"
+    xdp_drop "$PERSIST_IP" 2
 check "the restart reports restored blocks" grep -q "Restored .* of this node's blocks" "$LOG"
 # R26-04: an operator decision is on disk before it is answered OK, so SIGKILL right after the
 # answer (no graceful shutdown, no tick in between) does not lose it.
@@ -713,7 +723,7 @@ check "a killed node leaves no XDP program on the interface" \
     bash -c "! ip -d link show $HOST_IF | grep -q 'prog/xdp'"
 STATE_FILE=$LAST_STATE start_orchestrator
 check "an operator ban answered OK survives SIGKILL right after the answer" \
-    bash -c "! ip netns exec $NS ping -c 2 -W 1 -I $KILL_BAN $HOST_IP >/dev/null 2>&1"
+    xdp_drop "$KILL_BAN" 2
 printf 'UNBAN_IP:%s\n' "$KILL_BAN" | nc -U -q1 "$WORK/control.sock" >/dev/null
 printf 'UNBAN_IP:%s\n' "$PERSIST_IP" | nc -U -q1 "$WORK/control.sock" >/dev/null
 # R27-03: a hung state write (its temp file is a FIFO nobody reads) must not stall the node:
@@ -729,7 +739,7 @@ T_REPLY=$(date +%s.%N)
 check "a ban is answered within the durable wait while the disk hangs, and says so" \
     bash -c "echo '$HUNG_REPLY' | grep -q '^OK .*WARNING: not yet durable' && awk -v a=$T_BAN -v b=$T_REPLY 'BEGIN { exit !(b - a < 4) }'"
 check "the ban is enforced although not yet durable" \
-    bash -c "! ip netns exec $NS ping -c 2 -W 1 -I $HUNG_IP $HOST_IP >/dev/null 2>&1"
+    xdp_drop "$HUNG_IP" 2
 check "a hung state write makes the node DEGRADED" wait_metric sokol_state_healthy 0
 PENDING1=$(metric sokol_state_pending_seconds); sleep 2.5; PENDING2=$(metric sokol_state_pending_seconds)
 check "the maintenance tick keeps running while the write hangs" \
@@ -768,7 +778,7 @@ check "monitor --verify accepts the audit chain" audit_verdict intact "$WORK/eve
 check "audit log from the first run is re-verified on restart" \
     grep -qE "Audit log .* opened: [1-9][0-9]* records verified" "$LOG"
 check "strict mode: unfragmented traffic from $ALLOWED_IP passes" ping_from "$ALLOWED_IP"
-check "strict mode: fragmented IPv4 is dropped" bash -c "! ip netns exec $NS ping -c 2 -W 1 -s 3000 -I $ALLOWED_IP $HOST_IP >/dev/null 2>&1"
+check "strict mode: fragmented IPv4 is dropped" xdp_drop "$ALLOWED_IP" 2 --fragment
 
 stop_orchestrator
 start_orchestrator --xdp-mode generic
@@ -776,7 +786,7 @@ check "--xdp-mode generic attaches in SKB mode" bash -c "ip -d link show $HOST_I
 stop_orchestrator
 start_orchestrator --xdp-mode native
 check "--xdp-mode native attaches in driver mode (veth supports it)" bash -c "ip -d link show $HOST_IF | grep -qw xdp && ! ip -d link show $HOST_IF | grep -q xdpgeneric"
-check "native mode: blocked source is dropped" bash -c "! ip netns exec $NS ping -c 1 -W 1 -I $BLOCKED_IP $HOST_IP >/dev/null 2>&1"
+check "native mode: blocked source is dropped" xdp_drop "$BLOCKED_IP" 1
 # Pilot phase 0 (--enforce observe): every decision is made and counted, nothing is dropped.
 stop_orchestrator
 start_orchestrator --xdp-mode native --enforce observe --drop-ipv4-fragments
@@ -833,7 +843,8 @@ if command -v gobgpd >/dev/null; then
 else
     skip gobgp "BGP Flowspec checks (gobgpd not installed)"
 fi
-start_orchestrator --block-ttl 2 --audit-max-bytes 600 --audit-keep 50 "${FLOWSPEC_ARGS[@]}"
+# Leave time for BGP readback and the kernel/live probe inside the lease.
+start_orchestrator --block-ttl 10 --audit-max-bytes 600 --audit-keep 50 "${FLOWSPEC_ARGS[@]}"
 ipc "DROP_IMMEDIATE:$ALLOWED_IP"
 sleep 0.5
 if [ ${#FLOWSPEC_ARGS[@]} -gt 0 ]; then
@@ -849,8 +860,8 @@ if [ ${#FLOWSPEC_ARGS[@]} -gt 0 ]; then
         tail -5 "$WORK/gobgpd-node.log" "$WORK/gobgpd-upstream.log" 2>/dev/null || true
     fi
 fi
-check "TTL: dynamic block of $ALLOWED_IP is enforced" bash -c "! ip netns exec $NS ping -c 1 -W 1 -I $ALLOWED_IP $HOST_IP >/dev/null 2>&1"
-sleep 3
+check "TTL: dynamic block of $ALLOWED_IP is enforced" xdp_drop "$ALLOWED_IP" 1
+sleep 11
 check "TTL: dynamic block expires after --block-ttl" ping_from "$ALLOWED_IP"
 check "audit log rotated into segments" bash -c "ls '$WORK'/events.sntl.0* >/dev/null 2>&1"
 check "monitor --verify accepts the chain across rotated segments" audit_verdict intact "$WORK/events.sntl"
@@ -863,7 +874,7 @@ cp "$WORK/segment.bak" "$FIRST_SEGMENT"
 if [ ${#FLOWSPEC_ARGS[@]} -gt 0 ]; then
     check "Flowspec: expired block is withdrawn upstream" flowspec_rule absent "$ALLOWED_IP/32"
 fi
-check "TTL: static --block stays in force" bash -c "! ip netns exec $NS ping -c 1 -W 1 -I $BLOCKED_IP $HOST_IP >/dev/null 2>&1"
+check "TTL: static --block stays in force" xdp_drop "$BLOCKED_IP" 1
 
 stop_orchestrator
 if [ ${#FLOWSPEC_ARGS[@]} -gt 0 ]; then
