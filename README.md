@@ -583,6 +583,25 @@ path can make it count as owned while ID-zero CLI withdrawal fails to remove it.
 
 A slow or hung gobgpd runs apart from the main loop. `sokol_flowspec_announced` counts owned
 paths in this scope last seen in the local RIB, regardless of action.
+An actual change to the desired prefix set interrupts a pending round and starts a
+new RIB read for the latest set. Identical main ticks send no notification, so they
+do not repeatedly cancel slow calls. Shutdown interrupts normal reconciliation and
+starts the existing ten-second withdrawal attempt; an already-set shutdown flag or
+a closed intent/shutdown channel also starts cleanup. Cancellation kills the
+direct child but cannot undo a command already accepted by GoBGP. The next read
+observes the RIB for replanning; it is not a fence for a remote RPC still in flight,
+which can take effect after that read, even with a direct/exec CLI. Shutdown can
+observe an empty RIB before a late add lands; cleanup success does not guarantee
+that no rule remains. A publication and a CLI call are not atomic; this
+stops obsolete work once the worker observes the change, not at the publication instant.
+CLI wrappers must `exec` the CLI; kill-on-drop does not kill a process tree. A
+non-exec descendant can outlive cancellation and act after the next RIB read.
+Continuous changes with slow GoBGP can prevent every write as well as completed
+observations; useful progress requires a stable intent window long enough for the
+necessary calls. The 64-operation quota is
+per round, not a rate limit across interrupted rounds.
+Even normally fast calls with a large backlog can prevent completed observations
+under per-tick changes, leaving readback health revoked throughout an attack.
 `sokol_flowspec_discard_rules` counts the subset satisfying the canonical discard contract.
 After writes, both families are read again before either count is published; CLI success
 alone cannot update them. The pinned CLI represents an empty RIB as `{}`. Missing stdout,
@@ -618,6 +637,8 @@ discard convergence, causing repeated announcements and audit records within the
 Use a compatible local policy; health alone does not detect this mismatch.
 `FLOWSPEC_ANNOUNCE`/`WITHDRAW` audit records acknowledge successful CLI operations,
 not the subsequent observation.
+An accepted command whose local reply is cancelled can have no acknowledgement
+record; those records are not a complete history of GoBGP effects.
 
 Run gobgpd with a neighbor for each upstream router and the `ipv4-flowspec` / `ipv6-flowspec`
 address families enabled, then point the orchestrator at its API:

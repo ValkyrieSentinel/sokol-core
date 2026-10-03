@@ -2742,7 +2742,7 @@ async fn main() -> Result<(), anyhow::Error> {
                 snapshot.cluster_storm_engaged = cluster.storm_engaged;
 
                 if flowspec_worker.is_some() {
-                    let _ = flowspec_tx.send(blocks.lock().await.active_ips());
+                    flowspec::update_wanted(&flowspec_tx, blocks.lock().await.active_ips());
                 }
                 *metrics_snapshot.write().unwrap_or_else(|p| p.into_inner()) = snapshot;
 
