@@ -581,8 +581,12 @@ A slow or hung gobgpd runs apart from the main loop. `sokol_flowspec_announced` 
 paths in this scope last seen in the local RIB, regardless of action.
 `sokol_flowspec_discard_rules` counts the subset satisfying the canonical discard contract.
 After writes, both families are read again before either count is published; CLI success
-alone cannot update them. Failed rounds retain the last successful counts and time, which
-may be stale. Read them together with:
+alone cannot update them. The pinned CLI represents an empty RIB as `{}`. Missing stdout,
+`null`, invalid UTF-8/JSON, malformed path collections or unclassifiable ownership/source
+fields fail the read, even when the CLI exits zero. An invalid initial read authorizes no
+writes; an invalid post-write read cannot confirm their result. This validates the fields
+used for local identity and source selection, not the whole GoBGP JSON schema.
+Failed rounds retain the last successful counts and time, which may be stale. Read them together with:
 
 - `sokol_flowspec_enabled`: 1 when the worker is configured; 0 when disabled or in observe mode.
 - `sokol_flowspec_readback_ok`: 1 after the latest round completed successfully;

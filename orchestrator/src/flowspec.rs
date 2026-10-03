@@ -187,48 +187,96 @@ impl GobgpCli {
 /// matches one full source prefix (IPv6 offset zero). Other local paths sharing
 /// that exact NLRI are collisions; learned peer paths are not local CLI targets.
 pub fn parse_rib(json: &[u8], community: u32) -> Result<Rib, String> {
-    let text = String::from_utf8_lossy(json);
-    if text.trim().is_empty() || text.trim() == "null" {
-        return Ok(Rib::default());
-    }
+    // Only an actual JSON object can establish absence. Do not normalize missing
+    // stdout/null or silently skip unclassifiable entries into a healthy empty RIB.
     let rib: serde_json::Map<String, serde_json::Value> =
-        serde_json::from_str(&text).map_err(|e| format!("unreadable RIB: {}", e))?;
+        serde_json::from_slice(json).map_err(|e| format!("unreadable RIB: {}", e))?;
     let mut own = Rib::default();
     for paths in rib.values() {
-        for path in paths.as_array().into_iter().flatten() {
-            let remote = path
-                .get("peer-address")
-                .and_then(|v| v.as_str())
-                .is_some_and(|s| !s.is_empty());
-            let tagged = path
+        let paths = paths
+            .as_array()
+            .ok_or("unreadable RIB: paths must be an array")?;
+        for path in paths {
+            if !path.is_object() {
+                return Err("unreadable RIB: path must be an object".into());
+            }
+            let remote = match path.get("peer-address") {
+                None => false,
+                Some(value) => !value
+                    .as_str()
+                    .ok_or("unreadable RIB: peer-address must be a string")?
+                    .is_empty(),
+            };
+            let cli_id = match path.get("LocalID") {
+                None => true,
+                Some(value) => {
+                    value
+                        .as_u64()
+                        .filter(|id| *id <= u32::MAX as u64)
+                        .ok_or("unreadable RIB: LocalID must be uint32")?
+                        == 0
+                }
+            };
+            let attrs = path
                 .get("attrs")
                 .and_then(|a| a.as_array())
-                .into_iter()
-                .flatten()
-                .filter(|a| a.get("type").and_then(|t| t.as_u64()) == Some(8))
-                .filter_map(|a| a.get("communities").and_then(|c| c.as_array()))
-                .flatten()
-                .any(|c| c.as_u64() == Some(community as u64));
+                .ok_or("unreadable RIB: attrs must be an array")?;
+            let mut tagged = false;
+            for attr in attrs {
+                let kind = attr
+                    .get("type")
+                    .and_then(|v| v.as_u64())
+                    .filter(|kind| *kind <= u8::MAX as u64)
+                    .ok_or("unreadable RIB: attribute type must be uint8")?;
+                if kind == 8 {
+                    let communities = attr
+                        .get("communities")
+                        .and_then(|v| v.as_array())
+                        .ok_or("unreadable RIB: communities must be an array")?;
+                    for value in communities {
+                        let value = value
+                            .as_u64()
+                            .filter(|value| *value <= u32::MAX as u64)
+                            .ok_or("unreadable RIB: community must be uint32")?;
+                        tagged |= value == u64::from(community);
+                    }
+                }
+            }
             let components = path
                 .get("nlri")
                 .and_then(|n| n.get("value"))
-                .and_then(|v| v.as_array());
-            let source = match components.map(|c| c.as_slice()) {
-                Some([only])
-                    if only.get("type").and_then(|t| t.as_u64()) == Some(2)
-                        && only.get("offset").is_none_or(|v| v.as_u64() == Some(0)) =>
-                {
-                    only.get("value")
+                .and_then(|v| v.as_array())
+                .filter(|v| !v.is_empty())
+                .ok_or("unreadable RIB: NLRI components must be a nonempty array")?;
+            let mut source = None;
+            for component in components {
+                let kind = component
+                    .get("type")
+                    .and_then(|v| v.as_u64())
+                    .filter(|kind| *kind <= u8::MAX as u64)
+                    .ok_or("unreadable RIB: component type must be uint8")?;
+                if kind == 2 {
+                    let prefix = component
+                        .get("value")
                         .and_then(|v| v.get("prefix"))
-                        .and_then(|p| p.as_str())
+                        .and_then(|v| v.as_str())
                         .and_then(|p| p.parse::<IpNet>().ok())
+                        .ok_or("unreadable RIB: invalid source prefix")?;
+                    let offset = match component.get("offset") {
+                        None => 0,
+                        Some(value) => value
+                            .as_u64()
+                            .filter(|offset| *offset <= 128)
+                            .ok_or("unreadable RIB: invalid source offset")?,
+                    };
+                    if components.len() == 1 && offset == 0 {
+                        source = Some(prefix);
+                    }
                 }
-                _ => None,
-            };
+            }
             if let (false, Some(net)) = (remote, source) {
                 // The CLI uses LocalID=0; it cannot safely select a tagged
                 // nonzero-ID path using only this prefix and community.
-                let cli_id = path.get("LocalID").is_none_or(|v| v.as_u64() == Some(0));
                 if tagged && cli_id {
                     own.owned.insert(net);
                     if has_canonical_discard(path) {
@@ -489,8 +537,18 @@ mod tests {
         let own = parse_rib(RIB.as_bytes(), 4259912202).unwrap();
         assert_eq!(own.owned, ips(&["198.51.100.7"]));
         assert!(parse_rib(RIB.as_bytes(), 1).unwrap().owned.is_empty());
-        assert!(parse_rib(b"", 1).unwrap().owned.is_empty());
+        assert!(parse_rib(b"", 1).is_err());
         assert!(parse_rib(b"{}", 1).unwrap().owned.is_empty());
+        assert!(parse_rib(b" \n{}\n", 1).unwrap().owned.is_empty());
+        let mut invalid_utf8 = RIB
+            .replace("\"best\":true", "\"best\":true,\"note\":\"marker\"")
+            .into_bytes();
+        let marker = invalid_utf8
+            .windows(6)
+            .position(|w| w == b"marker")
+            .unwrap();
+        invalid_utf8[marker] = 0xff;
+        assert!(parse_rib(&invalid_utf8, 4259912202).is_err());
         assert!(parse_rib(b"not json", 1).is_err());
     }
 
@@ -933,6 +991,7 @@ esac
 
     #[tokio::test]
     async fn live_gobgp_round_repairs_actions_and_preserves_foreign_local_paths() {
+        use std::io::Write as _;
         let Some(bin_dir) = std::env::var_os("SOKOL_GOBGP_TEST_BIN") else {
             eprintln!("SKIP live GoBGP: SOKOL_GOBGP_TEST_BIN is unset (required in canonical CI)");
             return;
@@ -988,6 +1047,60 @@ esac
                 foreign,
                 "known foreign NLRI must not be replaced"
             );
+            // Corrupt only this family's CLI read, leaving the actual daemon's
+            // foreign path intact. A missing/unclassifiable read cannot authorize
+            // an add that would replace that path, even with a zero CLI exit code.
+            let wrapper = live.fixture.dir.join("fault-cli.sh");
+            let fault = live.fixture.dir.join("fault.json");
+            let writes = live.fixture.dir.join("forwarded-writes");
+            std::fs::write(
+                &wrapper,
+                format!(
+                    r#"#!/bin/sh
+real="$1"
+fault="$2"
+writes="$3"
+shift 3
+case "$*" in
+  *' -a {family} -j') cat "$fault"; exit 0 ;;
+  *' add '*|*' del '*) touch "$writes" ;;
+esac
+exec "$real" "$@"
+"#,
+                    family = family(&net)
+                ),
+            )
+            .unwrap();
+            let mut args = vec![
+                wrapper.to_str().unwrap().to_string(),
+                live.fixture.cli.bin.to_str().unwrap().to_string(),
+                fault.to_str().unwrap().to_string(),
+                writes.to_str().unwrap().to_string(),
+            ];
+            args.extend(live.fixture.cli.args.clone());
+            let broken_cli = GobgpCli {
+                bin: "/bin/sh".into(),
+                args,
+                community: live.fixture.cli.community,
+            };
+            for invalid in ["", " \n", "null", "{\"unclassifiable\":null}"] {
+                std::fs::write(&fault, invalid).unwrap();
+                assert!(checked_round(&broken_cli, &wanted, &db, &readback)
+                    .await
+                    .is_err());
+                assert!(!writes.exists(), "unusable read forwarded a write");
+                assert_eq!(
+                    live.raw(net).await,
+                    foreign,
+                    "unusable read replaced the real foreign path"
+                );
+                let view = readback.snapshot();
+                assert!(!view.ok);
+                assert_eq!(view.count, before.count);
+                assert_eq!(view.discard_count, before.discard_count);
+                assert_eq!(view.started, before.started);
+            }
+            writeln!(std::io::stdout(), "PASS live RIB refusal {}: invalid read preserves foreign path, no writes, prior observation retained", family(&net)).unwrap();
             let refused = readback.snapshot();
             assert!(!refused.ok);
             assert_eq!(refused.count, before.count);
@@ -1036,7 +1149,6 @@ esac
             live.fixture.cli.apply(false, net).await.unwrap();
             // Direct stdout keeps the positive execution marker visible in CI even
             // when libtest captures successful test output. An unset env is no proof.
-            use std::io::Write as _;
             writeln!(std::io::stdout(), "PASS live GoBGP {}: wrong action repaired, unwanted action withdrawn, foreign local path preserved, unrelated rules progress", family(&net)).unwrap();
         }
     }
@@ -1155,6 +1267,113 @@ esac
         assert_eq!(fixture.reads(), 4);
         assert!(!readback.snapshot().ok);
         assert_eq!(readback.snapshot().started, previous.started);
+    }
+
+    #[tokio::test]
+    async fn empty_output_cannot_publish_zero_before_or_after_writes() {
+        for invalid in ["", " \n", "null", "{\"hidden\":null}"] {
+            let fixture = RoundFixture::new(RIB, invalid, false);
+            let db = fixture.db();
+            let readback = Readback::default();
+            readback.enable();
+            checked_round(&fixture.cli, &ips(&["198.51.100.7"]), &db, &readback)
+                .await
+                .unwrap();
+            let previous = readback.snapshot();
+            std::fs::write(fixture.dir.join("before.json"), invalid).unwrap();
+            std::fs::write(fixture.dir.join("calls"), "").unwrap();
+            assert!(
+                checked_round(&fixture.cli, &HashSet::new(), &db, &readback)
+                    .await
+                    .is_err(),
+                "invalid initial read became confirmed absence: {invalid:?}"
+            );
+            assert!(!fixture.dir.join("applied").exists());
+            let failed = readback.snapshot();
+            assert!(!failed.ok);
+            assert_eq!(failed.count, previous.count);
+            assert_eq!(failed.discard_count, previous.discard_count);
+            assert_eq!(failed.started, previous.started);
+            // A successful write followed by an unusable read must not publish zero either.
+            std::fs::write(fixture.dir.join("before.json"), RIB).unwrap();
+            assert!(
+                checked_round(&fixture.cli, &HashSet::new(), &db, &readback)
+                    .await
+                    .is_err(),
+                "invalid post-write read became confirmed absence"
+            );
+            assert!(fixture.dir.join("applied").exists());
+            let failed = readback.snapshot();
+            assert!(!failed.ok);
+            assert_eq!(failed.count, previous.count);
+            assert_eq!(failed.discard_count, previous.discard_count);
+            assert_eq!(failed.started, previous.started);
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_path_collections_cannot_hide_a_local_collision() {
+        for invalid in [
+            serde_json::json!(null),
+            serde_json::json!({}),
+            serde_json::json!(false),
+            serde_json::json!([null]),
+            serde_json::json!(["not a path"]),
+        ] {
+            let raw = serde_json::json!({"[source: 198.51.100.7/32]":invalid});
+            let fixture = RoundFixture::new(&raw.to_string(), RIB, false);
+            let db = fixture.db();
+            assert!(
+                round(&fixture.cli, &ips(&["198.51.100.7"]), &db)
+                    .await
+                    .is_err(),
+                "unclassifiable path was skipped"
+            );
+            assert!(
+                !fixture.dir.join("applied").exists(),
+                "unknown identity authorized a write"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_ownership_fields_cannot_authorize_withdrawal() {
+        let variants = [
+            ("/peer-address", serde_json::json!(null)),
+            ("/peer-address", serde_json::json!(5)),
+            ("/LocalID", serde_json::json!("0")),
+            ("/attrs", serde_json::json!({})),
+            ("/attrs/1/type", serde_json::json!("8")),
+            ("/attrs/1/communities", serde_json::json!(null)),
+            ("/attrs/1/communities/0", serde_json::json!("65001:6666")),
+            ("/nlri/value", serde_json::json!(null)),
+            ("/nlri/value/0/type", serde_json::json!("2")),
+            ("/nlri/value/0/value/prefix", serde_json::json!("invalid")),
+            ("/nlri/value/0/offset", serde_json::json!("0")),
+        ];
+        for (pointer, value) in variants {
+            let mut raw: serde_json::Value = serde_json::from_str(RIB).unwrap();
+            let path = &mut raw["[source: 198.51.100.7/32]"][0];
+            if pointer == "/peer-address" || pointer.ends_with("/offset") {
+                if pointer.ends_with("/offset") {
+                    path["nlri"]["value"][0]["offset"] = value;
+                } else {
+                    path["peer-address"] = value;
+                }
+            } else {
+                *path.pointer_mut(pointer).unwrap() = value;
+            }
+            let fixture = RoundFixture::new(&raw.to_string(), "{}", false);
+            let db = fixture.db();
+            assert!(
+                round(&fixture.cli, &HashSet::new(), &db).await.is_err(),
+                "invalid ownership field accepted: {pointer}"
+            );
+            assert!(
+                !fixture.dir.join("applied").exists(),
+                "invalid peer identity authorized withdrawal"
+            );
+        }
     }
 
     #[tokio::test]
