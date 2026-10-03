@@ -718,13 +718,16 @@ shutdown budget or production permission is introduced.
 ineffective adds/deletes and equal-count wrong-prefix results through the production
 CLI runner and worker-to-HTTP bridge. `round_convergence_tracks_prefix_sets_and_canonical_actions`
 checks successful effect, unchanged/empty targets, wrong actions, repairs and
-unwanted noncanonical paths. Both regressions failed against the base on metric
-assertions, with no import or compilation error. Existing pending/cancelled and
+unwanted noncanonical paths. Initial versions of both regressions used the base API and metric lookups only,
+and failed against the base on metric assertions, without compilation/import errors.
+The later stale-main-snapshot mirror uses the new field and cannot compile against
+the unchanged base; its semantic mutation is checked against the candidate. Existing pending/cancelled and
 failed-readback controls additionally check revocation through the public view.
 `convergence_requires_a_completed_enabled_observation` guards renderer inputs.
 
 The real-daemon test delegates reads to GoBGP but uses controlled exit-zero no-op
-write acknowledgements. For IPv4 and IPv6, healthy observations of missing desired
+write acknowledgements, recording and asserting each attempted add/delete per case.
+For IPv4 and IPv6, healthy observations of missing desired
 rules, retained unwanted rules and equal-count wrong prefixes remain non-converged.
 Actual writes then restore the target and convergence, while the foreign path's
 full raw response remains byte-identical after cleanup. Six direct-stdout positive

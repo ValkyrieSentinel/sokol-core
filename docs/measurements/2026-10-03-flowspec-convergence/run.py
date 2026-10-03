@@ -23,7 +23,7 @@ with tempfile.TemporaryDirectory(prefix='sokol-gobgp-id-') as temp:
     after=subprocess.run(cmd+['-j'],capture_output=True,timeout=5);assert after.returncode==0
     entries.append({'family':family,'prefix':prefix,'before':before.stdout.decode(),'delete_exit':delete.returncode,'delete_stderr':delete.stderr.decode(),'after':after.stdout.decode()})
    ids_after=subprocess.check_output([inject,f'127.0.0.1:{port}','read'],timeout=15,text=True)
-   assert all(json.loads(line)['identifier'] == 7 for line in ids_before.splitlines())
+   assert all(json.loads(line)['identifier'] == 7 and json.loads(line)['local_identifier'] == 1 for line in ids_before.splitlines())
    assert ids_before == ids_after and len(ids_before.splitlines()) == 2
    for case in entries:
     assert case['delete_exit'] == 0 and case['before'] == case['after']

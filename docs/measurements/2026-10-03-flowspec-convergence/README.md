@@ -13,15 +13,18 @@ LocalID 0. An ID-zero CLI withdrawal exits zero, with byte-identical RIB before
 and after. `results.json` preserves these raw observations. No other metadata or
 upstream enforcement is inferred from them.
 
-To reproduce, build `inject.go` in a temporary Go module requiring exactly
-`github.com/osrg/gobgp/v4 v4.9.0` (Go 1.27.1, matching module checksum), with
-`go build -mod=mod -o probe /absolute/path/to/inject.go`. Then invoke:
+To reproduce from this directory, use Go 1.27.1 and the committed module/checksums
+(which retain the dependencies used for the original injector), without updating them:
 
 ```sh
-python3 run.py /path/to/pinned-gobgp-bin /path/to/probe /tmp/fresh-hidden-id.json
+go build -mod=readonly -o /tmp/flowspec-convergence-probe .
+python3 run.py /path/to/pinned-gobgp-bin /tmp/flowspec-convergence-probe /tmp/fresh-hidden-id.json
 ```
 
-The runner asserts identifier retention, CLI zero ID, successful delete and
+The module checksum pins GoBGP to v4.9.0. This pins source dependencies, not cross-platform
+binary reproducibility.
+
+The runner asserts identifier/local-identifier retention, CLI zero ID, successful delete and
 byte-identical retained RIB for both families, and terminates its daemon.
 Fresh capture timestamps differ; compare predicates, not this dated JSON byte-for-byte.
 The exact producer/CLI sources should stay pinned. Canonical native CI separately

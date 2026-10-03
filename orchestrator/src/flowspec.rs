@@ -293,8 +293,9 @@ pub fn parse_rib(json: &[u8], community: u32) -> Result<Rib, String> {
                 }
             }
             if let (false, Some(net)) = (remote, source) {
-                // The CLI uses LocalID=0; it cannot safely select a tagged
-                // nonzero-ID path using only this prefix and community.
+                // CLI writes use identifier zero. Pinned JSON hides actual IDs;
+                // cli_id rejects only reported nonzero IDs. Reserve the tag for
+                // one writer: a hidden-ID path reusing it is counted as owned.
                 if tagged && cli_id {
                     own.owned.insert(net);
                     if has_canonical_discard(path) {
@@ -861,6 +862,10 @@ esac
             .await
             .unwrap();
         let old = readback.snapshot();
+        assert!(
+            old.ok && old.converged,
+            "revocation requires prior convergence"
+        );
         std::fs::write(fixture.dir.join("pause"), "").unwrap();
         let mut pending = Box::pin(checked_round(&fixture.cli, &wanted, &db, &readback));
         tokio::select! {
@@ -1176,13 +1181,15 @@ exec "$real" "$@"
             // Keep the real daemon's reads but acknowledge writes without forwarding.
             // Read health must remain separate from observed target equality.
             let wrapper = live.fixture.dir.join("no-effect-cli.sh");
+            let attempted = live.fixture.dir.join("no-effect-calls");
             std::fs::write(
                 &wrapper,
                 r#"#!/bin/sh
 real="$1"
-shift
+calls="$2"
+shift 2
 case "$*" in
-  *' add '*|*' del '*) exit 0 ;;
+  *' add '*|*' del '*) printf '%s\n' "$*" >> "$calls"; exit 0 ;;
 esac
 exec "$real" "$@"
 "#,
@@ -1191,6 +1198,7 @@ exec "$real" "$@"
             let mut args = vec![
                 wrapper.to_str().unwrap().to_string(),
                 live.fixture.cli.bin.to_str().unwrap().to_string(),
+                attempted.to_str().unwrap().to_string(),
             ];
             args.extend(live.fixture.cli.args.clone());
             let no_effect_cli = GobgpCli {
@@ -1211,9 +1219,28 @@ exec "$real" "$@"
                 if expected_count == 1 {
                     live.fixture.cli.apply(true, fresh).await.unwrap();
                 }
+                std::fs::write(&attempted, "").unwrap();
                 checked_round(&no_effect_cli, &target, &db, &readback)
                     .await
                     .unwrap();
+                let calls = std::fs::read_to_string(&attempted).unwrap();
+                let expected = if expected_count == 0 {
+                    vec![format!(" add match source {} then discard", fresh)]
+                } else if target.is_empty() {
+                    vec![format!(" del match source {} then discard", fresh)]
+                } else {
+                    vec![
+                        format!(" del match source {} then discard", fresh),
+                        format!(" add match source {} then discard", replacement),
+                    ]
+                };
+                assert_eq!(calls.lines().count(), expected.len());
+                for operation in expected {
+                    assert!(
+                        calls.contains(&operation),
+                        "no-op CLI did not accept {operation}"
+                    );
+                }
                 let view = readback.snapshot();
                 assert!(view.ok);
                 assert_eq!(view.count, expected_count);
