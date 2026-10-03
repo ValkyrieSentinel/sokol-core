@@ -565,7 +565,12 @@ most 64 changes per round). So rules left behind by a crashed run are withdrawn 
 rules a restarted gobgpd lost are announced again, a gobgp call that timed out (it is killed) is
 settled by the next read, and other systems' rules or rules learned from peers are never
 touched. A slow or hung gobgpd never delays the main loop. `sokol_flowspec_announced` is the
-number of the node's rules last seen in the RIB.
+number of the node's source-prefix rules last seen in the local RIB. After a round
+changes rules, the worker reads both families again before publishing that count;
+a successful CLI write alone cannot update it. Failed readback retains the last
+successful observation, which may be stale. This count does not validate the discard
+action or prove that an upstream router applied it. `FLOWSPEC_ANNOUNCE`/`WITHDRAW`
+audit records acknowledge successful CLI operations, not the subsequent observation.
 
 Run gobgpd with a neighbor for each upstream router and the `ipv4-flowspec` / `ipv6-flowspec`
 address families enabled, then point the orchestrator at its API:

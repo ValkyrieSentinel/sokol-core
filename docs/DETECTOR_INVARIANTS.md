@@ -464,3 +464,37 @@ or an atomic snapshot of attachment/policy state. Equal before/after identities 
 not detect a transient change that returns to the original identity. The fixture has
 no concurrent attachment changes or competing routes; the checks never extend into
 production authority. No kernel/producer behavior, detector policy or proof-core changes.
+
+
+## FLOWSPEC-R1: acknowledged writes cannot fabricate observed RIB counts
+
+Owner: `round` / `run_worker` in [flowspec.rs](../orchestrator/src/flowspec.rs).
+
+A round that changes rules reads both local RIB families again before returning a
+count to `sokol_flowspec_announced`. Accepted add/delete commands that have no RIB
+effect cannot manufacture presence/absence. A failed post-write command, even with
+valid partial stdout, or malformed JSON is an error; the worker retains its prior
+successful count. An unchanged round returns its initial observation without two
+extra queries. The existing ownership predicate, withdrawal-first order and
+64-operation cap remain unchanged. A changed round adds at most two CLI calls;
+with 5-second per-call timeouts the configured call-wait allowance is
+`(2 + 64 + 2) × 5 s`, not a hard round deadline. Scheduling, process teardown and
+other work remain outside it; shutdown retains its separate attempt budget.
+The worker notices shutdown between rounds; the outer task timeout can cancel a
+slow in-flight round before the inner withdrawal attempt begins.
+
+Six native Rust regressions execute the production round and CLI subprocess runner
+against controlled child executables: no-effect add/delete, failed/malformed
+readback, successful observed changes and unchanged rounds. Five failed on the old
+implementation's behavioral assertions. Local extraction executes the unchanged
+FlowSpec module with audit/target-format stand-ins; canonical x86/ARM CI additionally
+uses the actual audit owner and GoBGP/XDP smoke. Four compiled semantic controls
+reject optimistic arithmetic, reuse of the old observation, swallowed readback
+errors and treating failed CLI stdout as success.
+
+This count is a retained observation of local owned source-prefix paths, not a
+freshness guarantee, coherent snapshot across IPv4/IPv6 reads, validation of discard
+actions, convergence certificate or upstream-router enforcement. The CLI-operation
+audit records retain their existing meaning and bytes; a later failed read does not
+rewrite a prior operation. Actual GoBGP is not alleged to acknowledge no-effect
+writes; the controlled executable exposes the consumer's former unsupported inference.

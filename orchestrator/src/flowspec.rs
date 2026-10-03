@@ -19,7 +19,7 @@ use crate::SentinelDb;
 
 /// Rule changes per round; the rest wait for the next round. An operation count, not a time
 /// budget: each change is a CLI call of up to CALL_TIMEOUT, after reading two RIB families, so
-/// a slow gobgpd can stretch a round to (2 + 64) × 5 s. The worker runs apart from the main
+/// a slow gobgpd can stretch a round to (2 + 64 + 2) × 5 s. The worker runs apart from the main
 /// tick (numerical review N06).
 pub const MAX_OPS_PER_ROUND: usize = 64;
 /// One gobgp call; a call that takes longer is killed, and its outcome is read back next round.
@@ -227,7 +227,7 @@ pub async fn run_worker(
 async fn round(cli: &GobgpCli, wanted: &HashSet<IpNet>, db: &SentinelDb) -> Result<usize, String> {
     let observed = cli.observed().await?;
     let (announce, withdraw) = plan(wanted, &observed);
-    let mut count = observed.len();
+    let changed = !announce.is_empty() || !withdraw.is_empty();
     for (is_announce, net) in withdraw
         .into_iter()
         .map(|n| (false, n))
@@ -242,17 +242,18 @@ async fn round(cli: &GobgpCli, wanted: &HashSet<IpNet>, db: &SentinelDb) -> Resu
                     if is_announce { "ANNOUNCE" } else { "WITHDRAW" },
                     show(&net)
                 ));
-                if is_announce {
-                    count += 1
-                } else {
-                    count -= 1
-                }
             }
             // Unknown outcome: the next round reads the RIB again.
             Err(e) => return Err(format!("gobgp failed for {}: {}", show(&net), e)),
         }
     }
-    Ok(count)
+    // A successful write acknowledges the CLI operation, not the resulting RIB.
+    // Keep unknown readback as an error, never replace it with arithmetic guesses.
+    if changed {
+        Ok(cli.observed().await?.len())
+    } else {
+        Ok(observed.len())
+    }
 }
 
 #[cfg(test)]
@@ -363,5 +364,149 @@ mod tests {
         assert!(slow.apply(true, one("203.0.113.1")).await.is_err());
         tokio::time::sleep(Duration::from_secs(2)).await;
         assert!(!marker.exists(), "the timed-out gobgp call still acted");
+    }
+
+    struct RoundFixture {
+        dir: PathBuf,
+        cli: GobgpCli,
+    }
+
+    impl RoundFixture {
+        fn new(before: &str, after: &str, fail_after: bool) -> Self {
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            let dir = std::env::temp_dir().join(format!(
+                "sokol-flowspec-round-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("before.json"), before).unwrap();
+            std::fs::write(dir.join("after.json"), after).unwrap();
+            let script = dir.join("gobgp");
+            // Actual child processes: successful writes may have no effect, and a
+            // post-write read may fail even after printing well-formed JSON.
+            std::fs::write(
+                &script,
+                format!(
+                    r#"#!/bin/sh
+cd "$(dirname "$0")" || exit 9
+printf '%s\n' "$*" >> calls
+case "$*" in
+  *' -j')
+    if [ -f applied ] && [ {fail_after} = true ]; then
+      cat after.json
+      exit 7
+    fi
+    case "$*" in
+      *ipv4-flowspec*)
+        if [ -f applied ]; then cat after.json; else cat before.json; fi ;;
+      *ipv6-flowspec*) printf '{{}}\n' ;;
+      *) exit 8 ;;
+    esac ;;
+  *' add '*|*' del '*) touch applied ;;
+  *) exit 8 ;;
+esac
+"#
+                ),
+            )
+            .unwrap();
+            Self {
+                dir,
+                cli: GobgpCli {
+                    // Reading via sh avoids ETXTBSY when another test's fork
+                    // briefly inherits the newly written script's descriptor.
+                    bin: "/bin/sh".into(),
+                    args: vec![script.to_str().unwrap().to_string()],
+                    community: (65001, 6666),
+                },
+            }
+        }
+
+        fn db(&self) -> SentinelDb {
+            SentinelDb::init(self.dir.join("audit.log").to_str().unwrap(), None).unwrap()
+        }
+
+        fn reads(&self) -> usize {
+            std::fs::read_to_string(self.dir.join("calls"))
+                .unwrap()
+                .lines()
+                .filter(|line| line.ends_with(" -j"))
+                .count()
+        }
+    }
+
+    impl Drop for RoundFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[tokio::test]
+    async fn an_accepted_announce_without_a_rib_effect_is_not_counted() {
+        let fixture = RoundFixture::new("{}", "{}", false);
+        let db = fixture.db();
+        let wanted = ips(&["198.51.100.7"]);
+        assert_eq!(round(&fixture.cli, &wanted, &db).await.unwrap(), 0);
+        assert_eq!(fixture.reads(), 4);
+        assert_eq!(
+            plan(&wanted, &fixture.cli.observed().await.unwrap()).0,
+            vec![one("198.51.100.7")]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_accepted_withdraw_without_a_rib_effect_is_still_counted() {
+        let fixture = RoundFixture::new(RIB, RIB, false);
+        let db = fixture.db();
+        assert_eq!(round(&fixture.cli, &HashSet::new(), &db).await.unwrap(), 1);
+        assert_eq!(fixture.reads(), 4);
+        assert_eq!(
+            plan(&HashSet::new(), &fixture.cli.observed().await.unwrap()).1,
+            vec![one("198.51.100.7")]
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_post_write_readback_is_not_an_observed_count() {
+        let fixture = RoundFixture::new("{}", RIB, true);
+        let db = fixture.db();
+        assert!(round(&fixture.cli, &ips(&["198.51.100.7"]), &db)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn malformed_post_write_readback_is_not_an_observed_count() {
+        let fixture = RoundFixture::new("{}", "not json", false);
+        let db = fixture.db();
+        assert!(round(&fixture.cli, &ips(&["198.51.100.7"]), &db)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn successful_changes_return_the_readback_count() {
+        for (before, after, wanted, count) in [
+            ("{}", RIB, ips(&["198.51.100.7"]), 1),
+            (RIB, "{}", HashSet::new(), 0),
+        ] {
+            let fixture = RoundFixture::new(before, after, false);
+            let db = fixture.db();
+            assert_eq!(round(&fixture.cli, &wanted, &db).await.unwrap(), count);
+            assert_eq!(fixture.reads(), 4);
+        }
+    }
+
+    #[tokio::test]
+    async fn unchanged_round_uses_the_initial_observation_without_extra_reads() {
+        let fixture = RoundFixture::new(RIB, "not json", false);
+        let db = fixture.db();
+        assert_eq!(
+            round(&fixture.cli, &ips(&["198.51.100.7"]), &db)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(fixture.reads(), 2);
     }
 }

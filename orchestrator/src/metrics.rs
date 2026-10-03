@@ -516,7 +516,7 @@ pub fn render(s: &Snapshot) -> String {
         &mut out,
         "sokol_flowspec_announced",
         "gauge",
-        "Blocks announced upstream as BGP Flowspec discard rules.",
+        "Owned source-prefix rules in the last successful local GoBGP RIB read; not router enforcement.",
     );
     let _ = writeln!(out, "sokol_flowspec_announced {}", s.flowspec_announced);
     family(
