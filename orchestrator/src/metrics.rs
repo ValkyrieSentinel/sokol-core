@@ -1,5 +1,6 @@
 //! Prometheus text exposition of the node's counters (served on `--metrics-bind`).
 use std::fmt::Write;
+use std::time::Instant;
 
 use common::{drop_reason, DROP_REASON_SLOTS};
 
@@ -69,6 +70,9 @@ pub struct Snapshot {
     pub audit_lost: u64,
     pub audit_sync_age_ms: u64,
     pub flowspec_announced: usize,
+    pub flowspec_enabled: bool,
+    pub flowspec_readback_ok: bool,
+    pub flowspec_read_started: Option<Instant>,
     pub external_attacks: usize,
     pub cluster_status: u8,
     pub cluster_nodes: usize,
@@ -81,7 +85,22 @@ fn family(out: &mut String, name: &str, kind: &str, help: &str) {
     let _ = writeln!(out, "# TYPE {} {}", name, kind);
 }
 
+/// Sample the worker at request time, independently of the main loop's last tick.
+pub fn render_with_flowspec(s: &Snapshot, readback: &crate::flowspec::Readback) -> String {
+    let view = readback.snapshot();
+    let mut snapshot = s.clone();
+    snapshot.flowspec_announced = view.count;
+    snapshot.flowspec_enabled = view.enabled;
+    snapshot.flowspec_readback_ok = view.ok;
+    snapshot.flowspec_read_started = view.started;
+    render(&snapshot)
+}
+
 pub fn render(s: &Snapshot) -> String {
+    render_at(s, Instant::now())
+}
+
+fn render_at(s: &Snapshot, now: Instant) -> String {
     let mut out = String::new();
     family(
         &mut out,
@@ -521,6 +540,35 @@ pub fn render(s: &Snapshot) -> String {
     let _ = writeln!(out, "sokol_flowspec_announced {}", s.flowspec_announced);
     family(
         &mut out,
+        "sokol_flowspec_enabled",
+        "gauge",
+        "1 when the local FlowSpec worker is enabled; 0 when disabled or in observe mode.",
+    );
+    let _ = writeln!(out, "sokol_flowspec_enabled {}", s.flowspec_enabled as u8);
+    family(
+        &mut out,
+        "sokol_flowspec_readback_ok",
+        "gauge",
+        "1 after a successful full round; 0 before any success, during a round or after failure. Not convergence or router enforcement.",
+    );
+    let _ = writeln!(
+        out,
+        "sokol_flowspec_readback_ok {}",
+        s.flowspec_readback_ok as u8
+    );
+    family(
+        &mut out,
+        "sokol_flowspec_readback_age_seconds",
+        "gauge",
+        "Monotonic age since the start of the last successful two-family RIB read, computed at scrape; -1 if none.",
+    );
+    let age = s
+        .flowspec_read_started
+        .map(|started| now.saturating_duration_since(started).as_secs_f64())
+        .unwrap_or(-1.0);
+    let _ = writeln!(out, "sokol_flowspec_readback_age_seconds {:.3}", age);
+    family(
+        &mut out,
         "sokol_external_attacks_active",
         "gauge",
         "Attack reports from flow detectors (FastNetMon) currently in force for this node.",
@@ -569,6 +617,35 @@ pub fn render(s: &Snapshot) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn readback_age_advances_without_another_publication() {
+        let started = Instant::now();
+        for ok in [true, false] {
+            let snapshot = Snapshot {
+                flowspec_enabled: true,
+                flowspec_readback_ok: ok,
+                flowspec_announced: 1,
+                flowspec_read_started: Some(started),
+                ..Default::default()
+            };
+            let first = render_at(&snapshot, started + std::time::Duration::from_secs(2));
+            let later = render_at(&snapshot, started + std::time::Duration::from_secs(12));
+            assert!(first.contains("sokol_flowspec_readback_age_seconds 2.000\n"));
+            assert!(later.contains("sokol_flowspec_readback_age_seconds 12.000\n"));
+            assert!(later.contains("sokol_flowspec_announced 1\n"));
+        }
+    }
+
+    #[test]
+    fn an_unverified_count_has_explicit_unknown_readback() {
+        // The existing count cannot distinguish startup or failed readback from
+        // an observed empty RIB. Unknown must not masquerade as verified zero.
+        let text = render(&Snapshot::default());
+        assert!(text.contains("sokol_flowspec_announced 0\n"));
+        assert!(text.contains("sokol_flowspec_readback_ok 0\n"));
+        assert!(text.contains("sokol_flowspec_readback_age_seconds -1.000\n"));
+    }
 
     #[test]
     fn renders_every_family_with_reason_labels() {

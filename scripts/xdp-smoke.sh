@@ -17,6 +17,7 @@ ALLOWED_IP=10.231.0.2
 BLOCKED_IP=10.231.0.3
 PROBE_CONTROL_IP=10.231.0.250
 XDP_PROBE="$(dirname "${BASH_SOURCE[0]}")/xdp_probe.py"
+FLOWSPEC_METRICS="$(dirname "${BASH_SOURCE[0]}")/flowspec-metrics.py"
 WORK="$(mktemp -d)"
 LOG="$WORK/orchestrator.log"
 ORCH_PID=""
@@ -149,6 +150,10 @@ check "traffic from blocked $BLOCKED_IP is dropped" xdp_drop "$BLOCKED_IP" 2
 metric() {
     curl -s http://127.0.0.1:9469/metrics | awk -v m="$1" '$1 == m { print $2 }'
 }
+flowspec_metrics() {  # state, count, minimum age; all sampled in one HTTP response
+    python3 "$FLOWSPEC_METRICS" http://127.0.0.1:9469/metrics "$@"
+}
+check "Flowspec metrics: disabled is explicitly unverified" flowspec_metrics disabled 0 0
 sleep 1.2
 check "metrics: static block counted in the IPv4 blocklist gauge" \
     test "$(metric 'sokol_blocks_active{family="ipv4"}')" -ge 1
@@ -836,7 +841,23 @@ stop_orchestrator
 FLOWSPEC_ARGS=()
 if command -v gobgpd >/dev/null; then
     check "BGP session between node gobgpd and upstream gobgpd is established" start_gobgp_pair
-    FLOWSPEC_ARGS=(--flowspec-gobgp "$(command -v gobgp)" --flowspec-gobgp-arg=-p --flowspec-gobgp-arg=50051)
+    # Forward to the real pinned CLI until the fault marker exists. Faults emit
+    # valid JSON but exit nonzero; the worker must keep its old observation.
+    GOBGP_REAL=$(command -v gobgp)
+    cat >"$WORK/gobgp-wrapper.sh" <<'SH'
+#!/bin/sh
+if [ -f "$1/readback-fail" ]; then
+    touch "$1/readback-failed"
+    printf '{}\n'
+    exit 7
+fi
+real=$2
+shift 2
+exec "$real" "$@"
+SH
+    FLOWSPEC_ARGS=(--flowspec-gobgp /bin/sh --flowspec-gobgp-arg="$WORK/gobgp-wrapper.sh"
+        --flowspec-gobgp-arg="$WORK" --flowspec-gobgp-arg="$GOBGP_REAL"
+        --flowspec-gobgp-arg=-p --flowspec-gobgp-arg=50051 --flowspec-community=65001:6666)
     # Another system's rule on the same gobgpd (no Sokol community): Sokol must never touch it.
     FOREIGN_RULE=192.0.2.99/32
     gobgp -p 50051 global rib -a ipv4-flowspec add match source "$FOREIGN_RULE" then discard
@@ -873,6 +894,19 @@ check "monitor --verify detects an edited segment" audit_verdict broken "$WORK/e
 cp "$WORK/segment.bak" "$FIRST_SEGMENT"
 if [ ${#FLOWSPEC_ARGS[@]} -gt 0 ]; then
     check "Flowspec: expired block is withdrawn upstream" flowspec_rule absent "$ALLOWED_IP/32"
+    check "Flowspec metrics: completed read reports the static rule" flowspec_metrics ok 1 0
+    touch "$WORK/readback-fail"
+    # Change the actual local RIB behind the failed reader, independently of the worker.
+    gobgp -p 50051 global rib -a ipv4-flowspec del match source "$BLOCKED_IP/32" then discard community 65001:6666
+    sleep 3
+    check "Flowspec metrics: fault actually reached the CLI" test -f "$WORK/readback-failed"
+    check "Flowspec: removed static rule is absent upstream during the fault" flowspec_rule absent "$BLOCKED_IP/32"
+    check "Flowspec metrics: failed read keeps count but revokes health" flowspec_metrics failed 1 2
+    sleep 1
+    check "Flowspec metrics: retained observation continues to age" flowspec_metrics failed 1 3
+    rm "$WORK/readback-fail"
+    check "Flowspec metrics: successful read restores health" flowspec_metrics ok 1 0
+    check "Flowspec: recovered worker restores the wanted static rule" flowspec_rule present "$BLOCKED_IP/32"
 fi
 check "TTL: static --block stays in force" xdp_drop "$BLOCKED_IP" 1
 
@@ -883,6 +917,7 @@ if [ ${#FLOWSPEC_ARGS[@]} -gt 0 ]; then
     ipc "DROP_IMMEDIATE:$ALLOWED_IP"
     sleep 2.5
     check "observe mode: no Flowspec rule reaches upstream for a new block" flowspec_rule absent "$ALLOWED_IP/32"
+    check "Flowspec metrics: observe mode is explicitly disabled" flowspec_metrics disabled 0 0
     check "observe mode: the audit says Flowspec is disabled" grep -aq 'FLOWSPEC_DISABLED|Why:observe' "$WORK/events.sntl"
     check "observe mode: another system's upstream rule is untouched" flowspec_rule present "$FOREIGN_RULE"
     stop_orchestrator

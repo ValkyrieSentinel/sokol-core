@@ -9,9 +9,8 @@
 use ipnet::IpNet;
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tokio::sync::watch;
 
 use crate::block_table::show;
@@ -27,6 +26,49 @@ pub const CALL_TIMEOUT: Duration = Duration::from_secs(5);
 /// Deadline for the attempt to withdraw the node's rules on shutdown: not a guarantee that any
 /// number of rules is withdrawn in it.
 pub const SHUTDOWN_BUDGET: Duration = Duration::from_secs(10);
+
+/// One completed read of both local RIB families. Age starts before the first CLI
+/// read, so a slow or sequential read never appears younger than its oldest part.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Observation {
+    count: usize,
+    started: Instant,
+}
+
+/// A coherent copy for one scrape; no lock is held during CLI calls or rendering.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ReadbackView {
+    pub enabled: bool,
+    pub ok: bool,
+    pub count: usize,
+    pub started: Option<Instant>,
+}
+
+#[derive(Default)]
+pub struct Readback(Mutex<ReadbackView>);
+
+impl Readback {
+    /// Called only for an enabled worker (never for observe mode).
+    pub fn enable(&self) {
+        self.0.lock().unwrap_or_else(|p| p.into_inner()).enabled = true;
+    }
+
+    pub fn snapshot(&self) -> ReadbackView {
+        *self.0.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn begin_round(&self) {
+        // Revoke before the first await, including shutdown reconciliation.
+        self.0.lock().unwrap_or_else(|p| p.into_inner()).ok = false;
+    }
+
+    fn completed(&self, observation: Observation) {
+        let mut view = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        view.count = observation.count;
+        view.started = Some(observation.started);
+        view.ok = true;
+    }
+}
 
 pub struct GobgpCli {
     pub bin: PathBuf,
@@ -171,13 +213,13 @@ pub fn plan(wanted: &HashSet<IpNet>, observed: &HashSet<IpNet>) -> (Vec<IpNet>, 
 
 /// Keeps gobgpd's rules for this node equal to `wanted` until shutdown, then withdraws them.
 /// Runs on its own task, so a slow or hung gobgpd never delays expiry, metrics or shutdown of
-/// the main loop. `announced` reports the node's rules last observed in the RIB.
+/// the main loop. `readback` retains the last observation and marks pending/failed rounds.
 pub async fn run_worker(
     cli: GobgpCli,
     mut wanted: watch::Receiver<HashSet<IpNet>>,
     mut shutdown: watch::Receiver<bool>,
     db: Arc<SentinelDb>,
-    announced: Arc<AtomicUsize>,
+    readback: Arc<Readback>,
 ) {
     let mut ticker = tokio::time::interval(Duration::from_secs(1));
     let mut reported_error = false;
@@ -187,9 +229,8 @@ pub async fn run_worker(
             _ = ticker.tick() => {}
         }
         let target = wanted.borrow_and_update().clone();
-        match round(&cli, &target, &db).await {
-            Ok(count) => {
-                announced.store(count, Ordering::Relaxed);
+        match checked_round(&cli, &target, &db, &readback).await {
+            Ok(_) => {
                 reported_error = false;
             }
             Err(e) => {
@@ -204,8 +245,8 @@ pub async fn run_worker(
     let empty = HashSet::new();
     let done = tokio::time::timeout(SHUTDOWN_BUDGET, async {
         loop {
-            match round(&cli, &empty, &db).await {
-                Ok(0) => return true,
+            match checked_round(&cli, &empty, &db, &readback).await {
+                Ok(observation) if observation.count == 0 => return true,
                 Ok(_) => continue,
                 Err(e) => {
                     log::error!("[Flowspec] Withdrawing on shutdown: {}", e);
@@ -223,8 +264,27 @@ pub async fn run_worker(
     }
 }
 
-/// One reconciliation round; returns how many of the node's rules the RIB holds afterwards.
-async fn round(cli: &GobgpCli, wanted: &HashSet<IpNet>, db: &SentinelDb) -> Result<usize, String> {
+/// Same publication path for ordinary and shutdown rounds. Errors and cancelled
+/// futures retain the previous count/time, with ok already revoked.
+async fn checked_round(
+    cli: &GobgpCli,
+    wanted: &HashSet<IpNet>,
+    db: &SentinelDb,
+    readback: &Readback,
+) -> Result<Observation, String> {
+    readback.begin_round();
+    let observation = round(cli, wanted, db).await?;
+    readback.completed(observation);
+    Ok(observation)
+}
+
+/// One reconciliation round; returns the final successful two-family observation.
+async fn round(
+    cli: &GobgpCli,
+    wanted: &HashSet<IpNet>,
+    db: &SentinelDb,
+) -> Result<Observation, String> {
+    let started = Instant::now();
     let observed = cli.observed().await?;
     let (announce, withdraw) = plan(wanted, &observed);
     let changed = !announce.is_empty() || !withdraw.is_empty();
@@ -250,15 +310,23 @@ async fn round(cli: &GobgpCli, wanted: &HashSet<IpNet>, db: &SentinelDb) -> Resu
     // A successful write acknowledges the CLI operation, not the resulting RIB.
     // Keep unknown readback as an error, never replace it with arithmetic guesses.
     if changed {
-        Ok(cli.observed().await?.len())
+        let started = Instant::now();
+        Ok(Observation {
+            count: cli.observed().await?.len(),
+            started,
+        })
     } else {
-        Ok(observed.len())
+        Ok(Observation {
+            count: observed.len(),
+            started,
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn ips(list: &[&str]) -> HashSet<IpNet> {
         list.iter()
@@ -393,6 +461,11 @@ cd "$(dirname "$0")" || exit 9
 printf '%s\n' "$*" >> calls
 case "$*" in
   *' -j')
+    if [ -f pause ]; then
+      touch entered
+      while [ -f pause ]; do sleep 0.01; done
+    fi
+    if [ -f fail ]; then cat before.json; exit 7; fi
     if [ -f applied ] && [ {fail_after} = true ]; then
       cat after.json
       exit 7
@@ -442,11 +515,135 @@ esac
     }
 
     #[tokio::test]
+    async fn failed_readback_retains_count_and_age_until_recovery() {
+        let fixture = RoundFixture::new(RIB, "{}", false);
+        let db = fixture.db();
+        let readback = Readback::default();
+        assert_eq!(readback.snapshot(), ReadbackView::default());
+        readback.enable();
+        assert!(!readback.snapshot().ok);
+        assert!(readback.snapshot().started.is_none());
+        checked_round(&fixture.cli, &ips(&["198.51.100.7"]), &db, &readback)
+            .await
+            .unwrap();
+        let old = readback.snapshot();
+        assert!(old.enabled && old.ok);
+        assert_eq!(old.count, 1);
+        assert!(old.started.is_some());
+
+        // The actual RIB no longer contains our rule. Even plausible JSON on
+        // stdout with a nonzero CLI status cannot count as an observation.
+        std::fs::write(fixture.dir.join("before.json"), "{}").unwrap();
+        std::fs::write(fixture.dir.join("fail"), "").unwrap();
+        assert!(checked_round(&fixture.cli, &HashSet::new(), &db, &readback)
+            .await
+            .is_err());
+        let failed = readback.snapshot();
+        assert!(failed.enabled && !failed.ok);
+        assert_eq!(failed.count, old.count);
+        assert_eq!(failed.started, old.started);
+
+        std::fs::remove_file(fixture.dir.join("fail")).unwrap();
+        checked_round(&fixture.cli, &HashSet::new(), &db, &readback)
+            .await
+            .unwrap();
+        let recovered = readback.snapshot();
+        assert!(recovered.enabled && recovered.ok);
+        assert_eq!(recovered.count, 0);
+        assert!(recovered.started.unwrap() > old.started.unwrap());
+    }
+
+    #[tokio::test]
+    async fn pending_and_cancelled_rounds_revoke_readback_before_waiting() {
+        let fixture = RoundFixture::new(RIB, "{}", false);
+        let db = fixture.db();
+        let readback = Readback::default();
+        readback.enable();
+        let wanted = ips(&["198.51.100.7"]);
+        checked_round(&fixture.cli, &wanted, &db, &readback)
+            .await
+            .unwrap();
+        let old = readback.snapshot();
+        std::fs::write(fixture.dir.join("pause"), "").unwrap();
+        let mut pending = Box::pin(checked_round(&fixture.cli, &wanted, &db, &readback));
+        tokio::select! {
+            result = &mut pending => panic!("paused CLI completed: {result:?}"),
+            result = tokio::time::timeout(Duration::from_secs(2), async {
+                while !fixture.dir.join("entered").exists() {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            }) => result.unwrap(),
+        }
+        let during = readback.snapshot();
+        assert!(!during.ok);
+        assert_eq!(during.count, old.count);
+        assert_eq!(during.started, old.started);
+        drop(pending);
+        assert_eq!(
+            readback.snapshot(),
+            during,
+            "cancellation cannot publish success"
+        );
+    }
+
+    #[tokio::test]
+    async fn observation_age_includes_the_time_spent_reading() {
+        let fixture = RoundFixture::new("{}", "{}", false);
+        let db = fixture.db();
+        let readback = Readback::default();
+        readback.enable();
+        let wanted = HashSet::new();
+        std::fs::write(fixture.dir.join("pause"), "").unwrap();
+        let mut pending = Box::pin(checked_round(&fixture.cli, &wanted, &db, &readback));
+        tokio::select! {
+            result = &mut pending => panic!("paused CLI completed: {result:?}"),
+            result = tokio::time::timeout(Duration::from_secs(2), async {
+                while !fixture.dir.join("entered").exists() {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            }) => result.unwrap(),
+        }
+        let already_reading = Instant::now();
+        std::fs::remove_file(fixture.dir.join("pause")).unwrap();
+        let observation = pending.await.unwrap();
+        assert!(
+            observation.started <= already_reading,
+            "completion time hides slow reads"
+        );
+        assert_eq!(readback.snapshot().started, Some(observation.started));
+    }
+
+    #[tokio::test]
+    async fn scraping_samples_the_worker_without_a_main_tick() {
+        let fixture = RoundFixture::new(RIB, "{}", false);
+        let db = fixture.db();
+        let readback = Readback::default();
+        readback.enable();
+        let old_main_tick = crate::metrics::Snapshot::default();
+        let wanted = ips(&["198.51.100.7"]);
+        checked_round(&fixture.cli, &wanted, &db, &readback)
+            .await
+            .unwrap();
+        let good = crate::metrics::render_with_flowspec(&old_main_tick, &readback);
+        assert!(good.contains("sokol_flowspec_enabled 1\n"));
+        assert!(good.contains("sokol_flowspec_readback_ok 1\n"));
+        assert!(good.contains("sokol_flowspec_announced 1\n"));
+        std::fs::write(fixture.dir.join("fail"), "").unwrap();
+        assert!(checked_round(&fixture.cli, &wanted, &db, &readback)
+            .await
+            .is_err());
+        let failed = crate::metrics::render_with_flowspec(&old_main_tick, &readback);
+        assert!(failed.contains("sokol_flowspec_readback_ok 0\n"));
+        assert!(failed.contains("sokol_flowspec_announced 1\n"));
+        assert!(!failed.contains("sokol_flowspec_readback_age_seconds -1.000\n"));
+    }
+
+    #[tokio::test]
     async fn an_accepted_announce_without_a_rib_effect_is_not_counted() {
         let fixture = RoundFixture::new("{}", "{}", false);
         let db = fixture.db();
         let wanted = ips(&["198.51.100.7"]);
-        assert_eq!(round(&fixture.cli, &wanted, &db).await.unwrap(), 0);
+        assert_eq!(round(&fixture.cli, &wanted, &db).await.unwrap().count, 0);
         assert_eq!(fixture.reads(), 4);
         assert_eq!(
             plan(&wanted, &fixture.cli.observed().await.unwrap()).0,
@@ -458,7 +655,13 @@ esac
     async fn an_accepted_withdraw_without_a_rib_effect_is_still_counted() {
         let fixture = RoundFixture::new(RIB, RIB, false);
         let db = fixture.db();
-        assert_eq!(round(&fixture.cli, &HashSet::new(), &db).await.unwrap(), 1);
+        assert_eq!(
+            round(&fixture.cli, &HashSet::new(), &db)
+                .await
+                .unwrap()
+                .count,
+            1
+        );
         assert_eq!(fixture.reads(), 4);
         assert_eq!(
             plan(&HashSet::new(), &fixture.cli.observed().await.unwrap()).1,
@@ -492,7 +695,10 @@ esac
         ] {
             let fixture = RoundFixture::new(before, after, false);
             let db = fixture.db();
-            assert_eq!(round(&fixture.cli, &wanted, &db).await.unwrap(), count);
+            assert_eq!(
+                round(&fixture.cli, &wanted, &db).await.unwrap().count,
+                count
+            );
             assert_eq!(fixture.reads(), 4);
         }
     }
@@ -504,7 +710,8 @@ esac
         assert_eq!(
             round(&fixture.cli, &ips(&["198.51.100.7"]), &db)
                 .await
-                .unwrap(),
+                .unwrap()
+                .count,
             1
         );
         assert_eq!(fixture.reads(), 2);
