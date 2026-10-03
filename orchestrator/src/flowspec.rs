@@ -406,22 +406,17 @@ pub async fn run_worker(
             _ = ticker.tick() => {}
         }
         loop {
-            let target = wanted.borrow_and_update().clone();
-            // Dropping a pending CLI future kills that child, but does not undo
-            // effects it may already have had. Re-read before planning new work.
+            let mut closed = wanted.clone();
+            // Intent changes are handled at command boundaries inside the round.
+            // Read-only work and still-valid writes retain their original future.
             tokio::select! {
                 biased;
-                result = shutdown.changed() => {
-                    if result.is_err() || *shutdown.borrow() { break 'worker }
-                    continue;
-                },
-                result = wanted.changed() => {
-                    if result.is_err() { break 'worker }
-                    continue;
-                },
-                result = checked_round(&cli, &target, &db, &readback) => {
+                _ = stopping(&mut shutdown) => break 'worker,
+                _ = intent_closed(&mut closed) => break 'worker,
+                result = live_round(&cli, &mut wanted, &db, &readback) => {
                     match result {
-                        Ok(_) => reported_error = false,
+                        Ok(true) => continue,
+                        Ok(false) => reported_error = false,
                         Err(e) => {
                             if !reported_error {
                                 log::error!("[Flowspec] {}; retrying every second", e);
@@ -434,6 +429,7 @@ pub async fn run_worker(
             }
         }
     }
+
     // The node's blocks vanish with it; do not leave its rules behind upstream.
     let empty = HashSet::new();
     let done = tokio::time::timeout(SHUTDOWN_BUDGET, async {
@@ -457,6 +453,88 @@ pub async fn run_worker(
     }
 }
 
+/// Ignore false shutdown notifications without cancelling useful work. A true
+/// value (including one already present) or a closed publisher ends normal work.
+async fn stopping(shutdown: &mut watch::Receiver<bool>) {
+    let _ = shutdown.wait_for(|stop| *stop).await;
+}
+
+async fn intent_closed(wanted: &mut watch::Receiver<HashSet<IpNet>>) {
+    while wanted.changed().await.is_ok() {}
+}
+
+enum Intent<'a> {
+    Fixed(&'a HashSet<IpNet>),
+    Live(&'a mut watch::Receiver<HashSet<IpNet>>),
+}
+
+impl Intent<'_> {
+    fn sample(&mut self) -> HashSet<IpNet> {
+        match self {
+            Self::Fixed(wanted) => (*wanted).clone(),
+            Self::Live(wanted) => wanted.borrow_and_update().clone(),
+        }
+    }
+
+    fn differs(&self, target: &HashSet<IpNet>) -> bool {
+        match self {
+            Self::Fixed(_) => false,
+            Self::Live(wanted) => *wanted.borrow() != *target,
+        }
+    }
+
+    /// False means the operation is obsolete, possibly after an unknown effect.
+    /// The caller must re-read the RIB before planning any replacement command.
+    async fn apply(&mut self, cli: &GobgpCli, announce: bool, net: IpNet) -> Result<bool, String> {
+        let Self::Live(wanted) = self else {
+            return cli.apply(announce, net).await.map(|_| true);
+        };
+        if wanted.borrow().contains(&net) != announce {
+            return Ok(false);
+        }
+        let command = cli.apply(announce, net);
+        tokio::pin!(command);
+        loop {
+            tokio::select! {
+                biased;
+                result = wanted.changed() => {
+                    if result.is_err() || wanted.borrow().contains(&net) != announce {
+                        return Ok(false);
+                    }
+                    // An unrelated update must not restart this CLI operation.
+                },
+                result = &mut command => return result.map(|_| true),
+            }
+        }
+    }
+}
+
+enum RoundOutcome {
+    Complete {
+        observation: Observation,
+        retry: bool,
+    },
+    Replan,
+}
+
+/// True asks the worker to start the next round immediately, after an obsolete
+/// operation or a completed observation whose sampled target has since changed.
+async fn live_round(
+    cli: &GobgpCli,
+    wanted: &mut watch::Receiver<HashSet<IpNet>>,
+    db: &SentinelDb,
+    readback: &Readback,
+) -> Result<bool, String> {
+    readback.begin_round();
+    match reconcile(cli, &mut Intent::Live(wanted), db).await? {
+        RoundOutcome::Complete { observation, retry } => {
+            readback.completed(observation);
+            Ok(retry)
+        }
+        RoundOutcome::Replan => Ok(true),
+    }
+}
+
 /// Same publication path for ordinary and shutdown rounds. Errors and cancelled
 /// futures retain the previous count/time, with ok already revoked.
 async fn checked_round(
@@ -477,13 +555,26 @@ async fn round(
     wanted: &HashSet<IpNet>,
     db: &SentinelDb,
 ) -> Result<Observation, String> {
+    match reconcile(cli, &mut Intent::Fixed(wanted), db).await? {
+        RoundOutcome::Complete { observation, .. } => Ok(observation),
+        RoundOutcome::Replan => unreachable!("fixed intent cannot invalidate an operation"),
+    }
+}
+
+/// Reads survive intent churn; planning samples intent only after both reads.
+async fn reconcile(
+    cli: &GobgpCli,
+    intent: &mut Intent<'_>,
+    db: &SentinelDb,
+) -> Result<RoundOutcome, String> {
     let started = Instant::now();
     let observed = cli.observed().await?;
+    let wanted = intent.sample();
     // CLI writes address NLRI rather than ownership. Exclude known collisions
     // before applying the work quota, so they cannot starve unrelated unblocking.
     let mut collisions: Vec<_> = wanted
         .difference(&observed.discard)
-        .chain(observed.owned.difference(wanted))
+        .chain(observed.owned.difference(&wanted))
         .filter(|n| observed.foreign_local.contains(n))
         .copied()
         .collect();
@@ -505,8 +596,9 @@ async fn round(
         .map(|n| (false, n))
         .chain(announce.into_iter().map(|n| (true, n)))
     {
-        match cli.apply(is_announce, net).await {
-            Ok(()) => {
+        match intent.apply(cli, is_announce, net).await {
+            Ok(false) => return Ok(RoundOutcome::Replan),
+            Ok(true) => {
                 let verb = if is_announce { "announced" } else { "withdrew" };
                 log::info!("[Flowspec] {} discard rule for {}", verb, show(&net));
                 db.append(format!(
@@ -523,9 +615,9 @@ async fn round(
     // Keep unknown readback as an error, never replace it with arithmetic guesses.
     let observation = if changed {
         let started = Instant::now();
-        cli.observed().await?.observation(wanted, started)
+        cli.observed().await?.observation(&wanted, started)
     } else {
-        observed.observation(wanted, started)
+        observed.observation(&wanted, started)
     };
     if let Some(net) = collisions.first() {
         // Non-colliding work has progressed, but the full round is incomplete.
@@ -536,7 +628,10 @@ async fn round(
             collisions.len()
         ));
     }
-    Ok(observation)
+    Ok(RoundOutcome::Complete {
+        observation,
+        retry: intent.differs(&wanted),
+    })
 }
 
 #[cfg(test)]
@@ -876,7 +971,8 @@ esac
         ));
         assert!(eventually(|| fixture.dir.join("entered").exists()).await);
         wanted_tx.send(latest.clone()).unwrap();
-        let restarted = eventually(|| fixture.reads() >= 2).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let pending_reads = fixture.reads();
         std::fs::remove_file(fixture.dir.join("pause")).unwrap();
         let recovered = eventually(|| {
             let view = readback.snapshot();
@@ -899,7 +995,7 @@ esac
                 .any(|line| line.contains(" add ") || line.contains(" del ")),
             "superseded read led to an obsolete write: {calls}"
         );
-        assert!(restarted, "intent did not interrupt the paused read");
+        assert_eq!(pending_reads, 1, "intent restarted a useful read");
     }
 
     #[tokio::test]
@@ -910,6 +1006,93 @@ esac
     #[tokio::test]
     async fn superseded_read_cannot_withdraw_a_restored_target() {
         superseded_read(RIB, HashSet::new(), ips(&["198.51.100.7"])).await;
+    }
+
+    #[tokio::test]
+    async fn changing_intent_keeps_the_pending_read_and_samples_latest_before_planning() {
+        let fixture = RoundFixture::new("{}", RIB, false);
+        std::fs::write(fixture.dir.join("pause"), "").unwrap();
+        let (wanted_tx, wanted_rx) = watch::channel(HashSet::new());
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let readback = Arc::new(Readback::default());
+        let worker = tokio::spawn(run_worker(
+            copy_cli(&fixture.cli),
+            wanted_rx,
+            shutdown_rx,
+            Arc::new(fixture.db()),
+            readback.clone(),
+        ));
+        assert!(eventually(|| fixture.dir.join("entered").exists()).await);
+        for i in 0..12 {
+            update_wanted(
+                &wanted_tx,
+                if i % 2 == 0 {
+                    HashSet::new()
+                } else {
+                    ips(&["198.51.100.7"])
+                },
+            );
+            shutdown_tx.send(false).unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let pending_reads = fixture.reads();
+        std::fs::remove_file(fixture.dir.join("pause")).unwrap();
+        let completed = eventually(|| readback.snapshot().converged).await;
+        std::fs::write(fixture.dir.join("before.json"), "{}").unwrap();
+        std::fs::write(fixture.dir.join("after.json"), "{}").unwrap();
+        shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), worker)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            pending_reads, 1,
+            "actual intent changes cancelled a useful RIB read"
+        );
+        assert!(
+            completed,
+            "latest target was not sampled after the retained read"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_write_observation_keeps_sampled_target_and_requests_replan() {
+        let fixture = RoundFixture::new("{}", RIB, false);
+        // The write holds only its subsequent read, not the initial observation.
+        let script = fixture.dir.join("gobgp");
+        let text = std::fs::read_to_string(&script).unwrap();
+        std::fs::write(
+            &script,
+            text.replace("touch applied ;;", "touch applied pause ;;"),
+        )
+        .unwrap();
+        let (wanted_tx, mut wanted_rx) = watch::channel(ips(&["198.51.100.7"]));
+        let readback = Arc::new(Readback::default());
+        readback.enable();
+        let view = readback.clone();
+        let cli = copy_cli(&fixture.cli);
+        let db = fixture.db();
+        let task = tokio::spawn(async move { live_round(&cli, &mut wanted_rx, &db, &view).await });
+        assert!(eventually(|| fixture.dir.join("entered").exists()).await);
+        wanted_tx.send(HashSet::new()).unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let reads = fixture.reads();
+        std::fs::remove_file(fixture.dir.join("pause")).unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(3), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+            "changed target must request immediate replanning"
+        );
+        let observation = readback.snapshot();
+        assert!(
+            observation.ok && observation.converged,
+            "post-write RIB matches sampled target, though latest intent is empty"
+        );
+        assert_eq!(observation.count, 1);
+        assert_eq!(reads, 3, "post-write read was cancelled by intent change");
     }
 
     #[tokio::test]
@@ -1364,7 +1547,12 @@ exec "$real" "$@"
                 } else {
                     assert!(update_wanted(&wanted_tx, before.clone()));
                 }
-                let restarted = eventually(|| reads() > old_reads).await;
+                let restarted = if stop || hold_op != "read" {
+                    eventually(|| reads() > old_reads).await
+                } else {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    reads() == old_reads
+                };
                 std::fs::remove_file(&hold).unwrap();
                 let recovered = eventually(|| {
                     let view = readback.snapshot();
@@ -1403,6 +1591,172 @@ exec "$real" "$@"
                 );
             }
             writeln!(std::io::stdout(), "PASS live intent preemption {}: obsolete add/delete refused, accepted unknown writes reconciled, shutdown starts cleanup, foreign path preserved", family(&net)).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn live_gobgp_worker_retains_useful_reads_and_valid_writes_under_intent_changes() {
+        use std::io::Write as _;
+        let Some(bin_dir) = std::env::var_os("SOKOL_GOBGP_TEST_BIN") else {
+            eprintln!("SKIP live GoBGP: SOKOL_GOBGP_TEST_BIN is unset (required in canonical CI)");
+            return;
+        };
+        let live = LiveGobgp::start(std::path::Path::new(&bin_dir)).await;
+        let db = Arc::new(live.fixture.db());
+        for (net, foreign_net, other) in [
+            (
+                one("198.51.100.7"),
+                one("198.51.100.8"),
+                one("198.51.100.9"),
+            ),
+            (one("2001:db8::7"), one("2001:db8::8"), one("2001:db8::9")),
+        ] {
+            live.put(foreign_net, "discard", "65001:9999").await;
+            let foreign = live.raw(foreign_net).await;
+            for (case, hold_op, queued) in [
+                ("read", "read", false),
+                ("compatible_add", "add", false),
+                ("compatible_delete", "del", false),
+                ("queued_add_revoked", "add", true),
+                ("queued_delete_restored", "del", true),
+                ("post_write_read", "post_read", false),
+            ] {
+                let deleting = hold_op == "del";
+                if deleting {
+                    live.fixture.cli.apply(true, net).await.unwrap();
+                    if queued {
+                        live.fixture.cli.apply(true, other).await.unwrap();
+                    }
+                }
+                let initial = if deleting || case == "read" {
+                    HashSet::new()
+                } else if queued {
+                    HashSet::from([net, other])
+                } else {
+                    HashSet::from([net])
+                };
+                let latest = if case == "post_write_read" || deleting && !queued {
+                    HashSet::new()
+                } else if deleting {
+                    HashSet::from([other])
+                } else {
+                    HashSet::from([net])
+                };
+                let dir = live
+                    .fixture
+                    .dir
+                    .join(format!("progress-{}-{case}", family(&net)));
+                std::fs::create_dir(&dir).unwrap();
+                std::fs::write(dir.join("hold"), "").unwrap();
+                std::fs::write(dir.join("calls"), "").unwrap();
+                let wrapper = dir.join("cli.sh");
+                std::fs::write(&wrapper, r#"#!/bin/sh
+real="$1"; dir="$2"; hold_op="$3"; shift 3
+printf '%s\n' "$*" >> "$dir/calls"
+op=read
+case "$*" in *' add '*) op=add ;; *' del '*) op=del ;; esac
+if { [ "$op" = "$hold_op" ] || { [ "$hold_op" = post_read ] && [ "$op" = read ] && [ -f "$dir/written" ]; }; } && [ -f "$dir/hold" ]; then
+  if [ "$op" != read ]; then "$real" "$@" || exit $?; fi
+  touch "$dir/entered"
+  while [ -f "$dir/hold" ]; do sleep 0.01; done
+  touch "$dir/completed"
+  if [ "$op" != read ]; then exit 0; fi
+fi
+if [ "$op" != read ]; then touch "$dir/written"; fi
+exec "$real" "$@"
+"#).unwrap();
+                let mut args = vec![
+                    wrapper.to_str().unwrap().into(),
+                    live.fixture.cli.bin.to_str().unwrap().into(),
+                    dir.to_str().unwrap().into(),
+                    hold_op.into(),
+                ];
+                args.extend(live.fixture.cli.args.clone());
+                let cli = GobgpCli {
+                    bin: "/bin/sh".into(),
+                    args,
+                    community: live.fixture.cli.community,
+                };
+                let (wanted_tx, wanted_rx) = watch::channel(initial.clone());
+                let (shutdown_tx, shutdown_rx) = watch::channel(false);
+                let readback = Arc::new(Readback::default());
+                let worker = tokio::spawn(run_worker(
+                    cli,
+                    wanted_rx,
+                    shutdown_rx,
+                    db.clone(),
+                    readback.clone(),
+                ));
+                assert!(eventually(|| dir.join("entered").exists()).await);
+                let pending_calls = std::fs::read_to_string(dir.join("calls")).unwrap();
+                if hold_op != "read" {
+                    let actual = live.fixture.cli.observed().await.unwrap();
+                    assert_eq!(actual.owned.contains(&net), !deleting);
+                }
+                for i in 0..12 {
+                    let mut target = initial.clone();
+                    if i % 2 == 0 {
+                        target.insert(other);
+                    } else {
+                        target.remove(&other);
+                    }
+                    update_wanted(&wanted_tx, target);
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                update_wanted(&wanted_tx, latest.clone());
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                let retained_calls = std::fs::read_to_string(dir.join("calls")).unwrap();
+                std::fs::remove_file(dir.join("hold")).unwrap();
+                let recovered = eventually(|| {
+                    let view = readback.snapshot();
+                    view.ok && view.converged && view.count == latest.len()
+                })
+                .await;
+                let completed = dir.join("completed").exists();
+                let calls = std::fs::read_to_string(dir.join("calls")).unwrap();
+                let actual = live.fixture.cli.observed().await.unwrap();
+                shutdown_tx.send(true).unwrap();
+                tokio::time::timeout(Duration::from_secs(3), worker)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    retained_calls, pending_calls,
+                    "{case}: compatible changes restarted useful work"
+                );
+                assert!(completed && recovered, "{case}: original future did not finish or latest intent did not recover: {calls}");
+                assert_eq!(actual.owned, latest);
+                assert_eq!(actual.discard, latest);
+                let writes: Vec<_> = calls
+                    .lines()
+                    .filter(|line| line.contains(" add ") || line.contains(" del "))
+                    .collect();
+                assert_eq!(
+                    writes.len(),
+                    if case == "post_write_read" { 2 } else { 1 },
+                    "{case}: duplicate or obsolete command: {calls}"
+                );
+                if case == "read" {
+                    let first_write = calls
+                        .lines()
+                        .position(|line| line.contains(" add "))
+                        .unwrap();
+                    assert_eq!(first_write, 2, "latest target must be planned directly from the retained two-family read: {calls}");
+                }
+                if queued {
+                    assert!(
+                        writes.iter().all(|line| !line.contains(&other.to_string())),
+                        "{case}: obsolete queued operation: {calls}"
+                    );
+                }
+                assert!(live.fixture.cli.observed().await.unwrap().owned.is_empty());
+                assert_eq!(
+                    live.raw(foreign_net).await,
+                    foreign,
+                    "{case}: foreign RIB changed"
+                );
+            }
+            writeln!(std::io::stdout(), "PASS live intent progress {}: initial/post-write reads retained, compatible add/delete retained once, obsolete queued writes refused, latest target recovered, foreign path preserved", family(&net)).unwrap();
         }
     }
 

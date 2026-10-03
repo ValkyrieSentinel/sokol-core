@@ -760,14 +760,15 @@ checker, frozen evidence or delivery-shadow pin is needed for this bounded predi
 
 ## FLOWSPEC-R6: superseded intent interrupts pending reconciliation
 
-At base `3d078ed`, the worker awaited a whole sampled-target round before looking
+Historical R6 implementation and evidence (#136); R7 below supersedes whole-round
+intent cancellation. At base `3d078ed`, the worker awaited a whole sampled-target round before looking
 for new intent or shutdown. Three regressions, initially using only the base API,
 failed on actual obsolete CLI commands after compilation: a revoked target still
 received an add, a restored target still received a delete, and shutdown still
 allowed an add before cleanup. Controlled child reads paused before planning;
 changing the desired set or shutdown then releasing the read exposed each write.
 
-The worker now selects shutdown and actual intent changes before polling the pending
+At #136, the worker selected shutdown and actual intent changes before polling the pending
 round, drops that round and starts fresh reconciliation or the existing shutdown
 cleanup. `update_wanted` compares full prefix sets before notifying the channel.
 Identical main ticks do not cancel slow reads. A pre-existing shutdown flag or closed
@@ -822,10 +823,78 @@ records are not a complete effect history. Ongoing intent churn with slow GoBGP 
 prevent every write as well as completed observations. Progress needs a stable
 window; even normally fast calls with a large backlog and per-tick changes can
 keep observation health revoked throughout an attack. Production shutdown sends
-true once; a false notification also conservatively interrupts the current round.
+true (possibly repeatedly); at #136 a false notification also interrupted a round.
 The window must allow the necessary calls; the 64-operation quota is per
 round, not a rate budget across restarts. Cleanup is a bounded attempt, not guaranteed
 withdrawal. Sampled-round convergence still does not prove latest intent, actual
 path IDs, best-path selection or upstream enforcement. Checker, frozen captures,
 results and delivery-shadow pins remain unchanged; ordinary regressions suffice
 for this concrete worker scheduling contract.
+
+
+## FLOWSPEC-R7: changing intent preserves useful reconciliation work
+
+At base `163a802`, actual desired-set changes cancelled even a pending read or
+still-valid operation. The new base-API regression
+`changing_intent_keeps_the_pending_read_and_samples_latest_before_planning` failed
+on an assertion: twelve publications launched twelve initial reads instead of one.
+The mirror R6 no-obsolete-add/delete tests retain their refusal checks; their old
+requirement to restart an initial read is replaced by retaining it and sampling the
+latest target after both family reads. Shutdown still interrupts the initial read.
+
+Fixed-target cleanup and live-intent work share `reconcile`: ownership/action
+classification, collision exclusion, withdrawal-first planning, the 64-operation
+quota and post-write readback stay in one implementation. Live rounds sample intent
+after the initial two-family read. Every queued command checks current membership
+before invocation. While its CLI future is pending, unrelated changes retain that
+same future; an add whose prefix is revoked or a delete whose prefix is restored
+cancels the command and requires a fresh RIB read before any replacement plan.
+Initial and post-write reads survive desired-set changes. A completed observation
+still compares with the round's sampled target, never with an invented latest-intent
+postcondition. A changed target triggers another round immediately. True shutdown
+or closed publishers still preempt all normal work; false shutdown notifications
+leave the pending future intact.
+
+`live_gobgp_worker_retains_useful_reads_and_valid_writes_under_intent_changes`
+checks six controlled cases per family against actual GoBGP 4.9.0: retained initial
+read, compatible add and delete replies, revoked queued add, restored queued delete,
+and retained post-write read. Twelve publications alternate another prefix while
+work is held. Exact call logs and original-child completion reject restart/duplicate
+commands; the first retained read must directly plan the latest target without an
+extra read. Queued mirror cases refuse obsolete commands even after a compatible
+first command completes. Readback and an independent real CLI verify the final
+owned and canonical-discard sets; shutdown removes owned paths and foreign raw RIB
+bytes remain unchanged. Existing real R6 accepted-unknown-write reversals and shutdown
+cases remain. Canonical x86/ARM CI now requires ten family-specific positive markers.
+The full orchestrator smoke also changes the actual block table during a second
+held read, witnesses main publication through its following block-count snapshot,
+and checks original-child completion, new discard propagation upstream,
+HTTP convergence and subsequent withdrawal. Existing refusal controls include both
+new upstream assertions; CLI failure/partial stdout cannot pass them.
+
+The post-write publication regression separately verifies that a changed latest
+intent does not alter the sampled-target comparison, and requests immediate
+replanning. False shutdown notifications are included during the held-read churn.
+Both the useful-read regression and an isolated compatible-write case fail on base
+`163a802` after compilation. Six compiled semantic controls reject cancelling a
+compatible command, retaining an invalidated pending write, launching an obsolete
+queued write, sampling before the initial RIB read, ignoring pending shutdown and
+comparing post-write RIB with latest rather than sampled intent. Marker controls
+accept all ten positives and reject each missing marker, actual optional-test skip
+and loss of a failing test exit through tee. Local extraction passes 44 Rust tests;
+14 Python tests cover refusal at actual smoke call sites.
+
+Local extraction uses actual production FlowSpec/metrics/common code with declared
+audit/target/label stand-ins; full native Linux x86/ARM owners, XDP smoke, demo,
+systemd runbook, independent exact-head static review and pinned Stargate shadow
+remain separate gates before merge. No checker/model/frozen capture or pin changes.
+
+Limits: compatible work can complete across changes; this is not unconditional
+progress or eventual convergence under arbitrary churn. Changing the same prefix
+can still invalidate every write; CLI failures, collisions and backlog still matter.
+Completed counts/time can advance while immediate replanning has already revoked
+health. Watch notifications can coalesce, so no intermediate-intent history or
+atomic publication/CLI authorization is claimed. Cancellation is not rollback;
+a fresh read is not a fence for a late remote RPC, and empty cleanup does not prove
+absence after exit. Direct-child kill, sampled convergence, incomplete CLI-ACK audit
+and bounded cleanup retain the R6 limits. No new authority or enforcement guarantee.

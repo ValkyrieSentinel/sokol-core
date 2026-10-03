@@ -114,6 +114,7 @@ jobs:
             grep -Fq "PASS live RIB refusal ${family}:" /tmp/sokol-cargo-test.log
             grep -Fq "PASS live convergence ${family}:" /tmp/sokol-cargo-test.log
             grep -Fq "PASS live intent preemption ${family}:" /tmp/sokol-cargo-test.log
+            grep -Fq "PASS live intent progress ${family}:" /tmp/sokol-cargo-test.log
           done
 
       - name: Clippy

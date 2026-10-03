@@ -856,6 +856,11 @@ if [ -f "$1/readback-slow" ] && [ ! -f "$1/readback-slow-started" ]; then
     sleep 2
     touch "$1/readback-slow-completed"
 fi
+if [ -f "$1/readback-changing-slow" ] && [ ! -f "$1/readback-changing-started" ]; then
+    touch "$1/readback-changing-started"
+    while [ -f "$1/readback-changing-slow" ]; do sleep 0.01; done
+    touch "$1/readback-changing-completed"
+fi
 real=$2
 shift 2
 exec "$real" "$@"
@@ -910,6 +915,26 @@ if [ ${#FLOWSPEC_ARGS[@]} -gt 0 ]; then
     check "Flowspec worker: unchanged main ticks let the slow read complete" test -f "$WORK/readback-slow-completed"
     check "Flowspec metrics: slow read restores convergence" flowspec_metrics converged 1 0
     rm "$WORK/readback-slow"
+    # Change the real block table while another original child is still reading.
+    # R6 killed this read on the next main tick, even though its result was useful.
+    touch "$WORK/readback-changing-slow"
+    check "Flowspec worker: changing-intent slow read reached the CLI" bash -c "
+        for _ in \$(seq 1 80); do [ -f '$WORK/readback-changing-started' ] && exit 0; sleep 0.1; done
+        exit 1"
+    ipc "DROP_IMMEDIATE:$ALLOWED_IP"
+    # main publishes wanted before its block-count metrics snapshot; this is an
+    # observed caller witness, not an assumed delay across the one-second tick.
+    check "Flowspec worker: main publishes changed intent while the read is held" wait_metric 'sokol_blocks_active{family="ipv4"}' 2
+    check "Flowspec worker: changing read has not completed before release" test ! -f "$WORK/readback-changing-completed"
+    rm "$WORK/readback-changing-slow"
+    check "Flowspec worker: changed main intent lets the original read complete" bash -c "
+        for _ in \$(seq 1 30); do [ -f '$WORK/readback-changing-completed' ] && exit 0; sleep 0.1; done
+        exit 1"
+    check "Flowspec: retained read leads to the new dynamic discard upstream" wait_flowspec_rule present "$ALLOWED_IP/32"
+    check "Flowspec metrics: retained read recovers the changed target" flowspec_metrics converged 2 0
+    ipc "UNBAN_IP:$ALLOWED_IP"
+    check "Flowspec: dynamic rule after retained read is withdrawn upstream" wait_flowspec_rule absent "$ALLOWED_IP/32"
+    check "Flowspec metrics: changed target returns to the static rule" flowspec_metrics converged 1 0
     touch "$WORK/readback-fail"
     # Change the actual local RIB behind the failed reader, independently of the worker.
     gobgp -p 50051 global rib -a ipv4-flowspec del match source "$BLOCKED_IP/32" then discard community 65001:6666
