@@ -1,0 +1,14 @@
+[
+  {
+    "family": "ipv4-flowspec",
+    "prefix": "198.51.100.7/32",
+    "stdout": "{\"[source: 198.51.100.7/32]\":[{\"Family\":0,\"nlri\":{\"value\":[{\"type\":2,\"value\":{\"prefix\":\"198.51.100.7/32\"}}]},\"age\":1791045026,\"best\":true,\"attrs\":[{\"type\":1,\"value\":2},{\"type\":8,\"communities\":null},{\"type\":16,\"value\":[{\"type\":128,\"subtype\":6,\"as\":0,\"rate\":0}]},{\"type\":14,\"nexthop\":\"0.0.0.0\",\"afi\":1,\"safi\":133,\"value\":[{\"NLRI\":{\"value\":[{\"type\":2,\"value\":{\"prefix\":\"198.51.100.7/32\"}}]},\"ID\":0}]}],\"stale\":false,\"RemoteID\":0,\"LocalID\":0}]}\n",
+    "exit": 0
+  },
+  {
+    "family": "ipv6-flowspec",
+    "prefix": "2001:db8::7/128",
+    "stdout": "{\"[source: 2001:db8::7/128/0]\":[{\"Family\":0,\"nlri\":{\"value\":[{\"type\":2,\"value\":{\"prefix\":\"2001:db8::7/128\"},\"offset\":0}]},\"age\":1791045026,\"best\":true,\"attrs\":[{\"type\":1,\"value\":2},{\"type\":8,\"communities\":null},{\"type\":16,\"value\":[{\"type\":128,\"subtype\":6,\"as\":0,\"rate\":0}]},{\"type\":14,\"nexthop\":\"::\",\"afi\":2,\"safi\":133,\"value\":[{\"NLRI\":{\"value\":[{\"type\":2,\"value\":{\"prefix\":\"2001:db8::7/128\"},\"offset\":0}]},\"ID\":0}]}],\"stale\":false,\"RemoteID\":0,\"LocalID\":0}]}\n",
+    "exit": 0
+  }
+]

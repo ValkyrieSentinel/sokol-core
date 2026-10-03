@@ -551,7 +551,7 @@ select its own acceptable age. No new permission or detector policy is introduce
 ## FLOWSPEC-R3: ownership does not establish discard or conditional-write authority
 
 Owner: `flowspec.rs::parse_rib`, `plan`, `round` and the coherent worker-to-HTTP
-bridge in `metrics.rs`. Managed scope is local ID-zero paths with the configured
+bridge in `metrics.rs`. Managed scope is local paths reported as ID-zero with the configured
 standard community and exactly one full source-prefix component (IPv6 offset 0).
 Ownership is independent of action: a wrong-action owned path still gets withdrawn
 when unwanted; a wanted prefix missing canonical discard is re-announced. The
@@ -574,7 +574,12 @@ replaces an existing foreign local path despite distinct ownership communities.
 Before applying the operation quota, the production round excludes required
 operations that collide with observed foreign local paths. Non-colliding withdrawals
 and announcements still progress, including shutdown reconciliation. Peer paths are not local CLI targets;
-nonzero local IDs are outside the managed scope and fence overlapping operations.
+reported nonzero local IDs are outside the managed scope and fence overlapping operations.
+The pinned CLI's NewDestination does not copy the actual identifier into its JSON
+path, so its `LocalID: 0` does not establish actual ID-zero identity. This exclusion
+only works when a nonzero ID is reported. Reserve the ownership community for one
+writer: a hidden nonzero-ID path reusing our tag may be counted as owned while the
+ID-zero CLI withdrawal leaves it present. Health is not withdrawal convergence.
 Any skipped operation leaves health revoked and retains the previous successful
 counts/time, even after safe writes and a full post-write read. This prevents known
 collisions, not races: CLI AddPath/DeletePath has no atomic ownership compare-and-swap.
@@ -619,3 +624,73 @@ validation of the entire JSON schema, a best-path decision, desired-set equality
 atomic two-family snapshot, upstream enforcement, crash-complete withdrawal or
 concurrent-writer isolation. No Stargate checker, frozen source/results or delivery
 shadow pins change.
+
+## FLOWSPEC-R4: an unusable read cannot establish absence or write authority
+
+Owner: `flowspec.rs::parse_rib`, consumed by the existing `round`/`checked_round`.
+The pinned GoBGP 4.9.0 emits an empty JSON object for an empty RIB in both families.
+Previously, exit-zero empty/whitespace stdout and JSON null became an empty RIB;
+malformed destination values were silently skipped. Mistyped identity fields could
+classify an unknown origin as local, authorize withdrawal or hide a collision.
+
+A read now requires strict UTF-8/JSON with an object root and an array of path
+objects per destination. After a valid nonempty peer-address excludes a peer path, each local path
+has an attributes array and a nonempty NLRI component array. Attribute/component types, standard community values, any present
+peer-address/LocalID, and source prefix/offset must be usable for classification.
+Absent peer-address/LocalID remain compatible with the pinned local captures.
+The pinned producer’s `communities: null` means an empty list, not an unknown
+ownership tag. Other malformed local classification data rejects the entire read,
+rather than silently omitting paths. A genuine empty object remains a successful empty observation.
+Unknown or malformed action payloads do not certify discard; otherwise classifiable
+owned paths retain R3 repair/withdrawal behavior. This is not full-schema validation.
+
+`empty_output_cannot_publish_zero_before_or_after_writes` checks rejected initial
+and post-write reads through the production CLI runner, retention of count/discard
+count/time and revoked health. `malformed_path_collections_cannot_hide_a_local_collision`
+rejects omitted collisions. `malformed_ownership_fields_cannot_authorize_withdrawal`
+rejects mistyped origin, local ID, community and source data. All three tests failed
+on assertions against the previous implementation before the parser change.
+The existing parser regression also rejects invalid UTF-8 in an unrelated string
+and accepts whitespace surrounding a real empty object.
+
+The existing live GoBGP test retains a real foreign path and corrupts only its
+family's CLI read through a controlled wrapper, with exit zero. Empty/whitespace,
+null and malformed collections cannot forward any write; the daemon's full raw RIB
+remains byte-identical and prior counts/time are retained with health zero. This is
+fault injection at the CLI boundary, not a claim that GoBGP normally emits corrupt
+JSON. Canonical x86/ARM CI requires positive execution markers for these refusals
+and the existing action/collision checks in each family; a skipped test is no proof.
+
+Local checks passed 32 production-module Rust tests including the actual daemon
+for IPv4/IPv6, 13 Python smoke/health refusal tests, and Clippy. The portable Rust
+harness retains audit/target/label stand-ins and actual common code; native CI
+uses the actual owners. Eleven compiling semantic controls were rejected on test
+assertions: normalizing missing output, skipping malformed destination collections,
+accepting unknown peer identity, defaulting malformed LocalID to zero, skipping
+malformed community/source data, defaulting malformed source offset and lossy
+UTF-8 decoding, rejecting a legitimate null community, validating irrelevant remote
+metadata, and treating an empty community as an ownership tag.
+
+Independent Claude review held the initial candidate because pinned GoBGP accepts
+a zero-length COMMUNITIES attribute and marshals it as null. An actual isolated
+daemon confirmed this for both families through gRPC AddPath and CLI readback;
+new raw captures record it without changing the original action captures.
+`captured_empty_communities_do_not_establish_ownership` checks both captures.
+`empty_community_is_foreign_and_does_not_block_other_withdrawals` failed on the
+held candidate, then checks that valid null/empty community data remains foreign
+while unrelated owned withdrawal progresses. Missing communities on a local type-8
+attribute remain unknown and rejected; the pinned producer always emits the field.
+`remote_metadata_does_not_block_local_reconciliation` also failed behaviorally on
+the held parser using an existing peer path. It confirms
+that known peer metadata cannot stall local withdrawal or become a local target.
+These are producer-compatibility and consumer-boundary regressions, not a new
+full-schema validator.
+
+An invalid initial read permits no writes. An invalid post-write read does not
+undo accepted CLI operations; it withholds a new observation. R1/R2 stale-count
+and age semantics remain. This does not establish desired-set equality, atomic
+IPv4/IPv6 reads, upstream enforcement or protection from concurrent writers.
+GoBGP may accept foreign local metadata outside this parser's contract (for example
+an IPv6 source offset above 128). Such local data stops the whole read/reconciliation,
+including unblocking and shutdown attempts, until removed; peer metadata is excluded.
+No checker, frozen fixtures/results or delivery-shadow pins change.

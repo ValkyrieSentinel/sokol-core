@@ -561,7 +561,7 @@ until their shared-daemon ownership is resolved.
 
 Every rule carries the node's ownership community (`--flowspec-community`, default
 `64512:<node-id>`; give each node that shares a gobgpd its own). Every second a separate worker
-reconciles the active blocks with local, tagged, ID-zero paths matching one full source prefix
+reconciles the active blocks with local, tagged paths reported as ID-zero and matching one full source prefix
 (IPv6 offset zero), at most 64 changes per round. Unwanted owned paths are withdrawn even if
 their action is wrong; missing or non-discard wanted paths are announced with `discard`.
 The pinned GoBGP represents canonical discard as exactly one traffic-rate extended community
@@ -576,13 +576,23 @@ health remains 0 and the last successful counts/time are retained while work is 
 writers: GoBGP's CLI can replace another local path at the same NLRI. Serialize shared-daemon
 writers or give them exclusive source-prefix namespaces. The CLI has no atomic compare-and-swap;
 a writer racing between read and apply remains outside this guarantee.
+GoBGP 4.9.0 CLI JSON reports `LocalID: 0` without copying the actual path identifier.
+A reported nonzero ID is excluded if supplied, but this CLI cannot reveal hidden IDs.
+Writers must also reserve the ownership community: reusing our tag on a nonzero-ID
+path can make it count as owned while ID-zero CLI withdrawal fails to remove it.
 
 A slow or hung gobgpd runs apart from the main loop. `sokol_flowspec_announced` counts owned
 paths in this scope last seen in the local RIB, regardless of action.
 `sokol_flowspec_discard_rules` counts the subset satisfying the canonical discard contract.
 After writes, both families are read again before either count is published; CLI success
-alone cannot update them. Failed rounds retain the last successful counts and time, which
-may be stale. Read them together with:
+alone cannot update them. The pinned CLI represents an empty RIB as `{}`. Missing stdout,
+`null`, invalid UTF-8/JSON, malformed path collections or unclassifiable ownership/source
+fields on local paths fail the read, even when the CLI exits zero. A known peer path
+is excluded before checking its other metadata. GoBGP’s `communities: null` is a
+valid empty standard community list and establishes no ownership tag. An invalid initial read authorizes no
+writes; an invalid post-write read cannot confirm their result. This validates the fields
+used for local identity and source selection, not the whole GoBGP JSON schema.
+Failed rounds retain the last successful counts and time, which may be stale. Read them together with:
 
 - `sokol_flowspec_enabled`: 1 when the worker is configured; 0 when disabled or in observe mode.
 - `sokol_flowspec_readback_ok`: 1 after the latest round completed successfully;
