@@ -21,6 +21,39 @@ model-family evidence, not a required mathematical check or proof of arbitrary P
 correctness. Sokol observe-mode code suppresses mesh claims and FlowSpec publication
 (ADR-0018); this review does not resurrect the earlier corrected observe-mode concern.
 
+## Live repository-control readback
+
+On 2026-10-03, Stargate ruleset `protect-main` (23849266) was active: strict base
+freshness, four Python checks, model-gate bound to App 5041755 and shadow bound to
+App 15368; zero mandatory approvals and no bypass actors. This is mutable GitHub
+configuration, not a proof of arbitrary source correctness.
+
+Sokol's branch endpoint reported `main.protected=false`, empty required checks
+and enforcement off; its ruleset listing was empty. The current account has WRITE,
+not ADMIN. Thus required CI/review in this task is an agent merge criterion, not a
+GitHub-enforced Sokol admission rule. No configuration mutation was attempted.
+All three existing check runs identify GitHub Actions App 15368.
+
+[Prepared protection request](ci-protection-proposal.json) requires those three
+checks with strict freshness, zero approvals, enforcement for admins and no force
+push/deletion. This is a proposal, not active protection. An owner/admin must first
+re-read the branch configuration; if another policy has since appeared, adapt the
+request instead of overwriting it. Private-repository plan eligibility is unknown;
+GitHub documents the permission and availability requirements in its
+[branch protection API](https://docs.github.com/en/rest/branches/branch-protection#update-branch-protection).
+With those prerequisites established, the owner can apply from the repo root:
+
+```sh
+gh api --method PUT repos/ValkyrieSentinel/sokol-core/branches/main/protection \
+  --input docs/ci-protection-proposal.json
+gh api repos/ValkyrieSentinel/sokol-core/branches/main/protection
+```
+
+Readback must confirm every requested check/App pair, strict freshness, zero
+approvals, admin enforcement and disabled force pushes/deletion. A refused request
+or unreadable response never establishes activation. These checks improve repository
+admission; their CI code and platform remain trust assumptions.
+
 ## Allocation decision
 
 Keep the Stargate proof core and working integrations. Generic agent-adapter expansion
@@ -52,6 +85,7 @@ nor that count proves discard action, upstream enforcement or freshness forever.
 
 | Priority | Next concrete question | Acceptance / stop |
 | --- | --- | --- |
+| 0 | Will the owner enable the prepared Sokol required-CI policy? | Owner/admin activation and exact live readback; do not claim protection from agent-side merge discipline. No human approval gate is requested. |
 | 1 | Can an agent distinguish a fresh FlowSpec observation from a retained stale count after read failure? | First reproduce the ambiguous consumer decision. Expose bounded freshness/health only if a real consumer needs it; do not convert unknown into zero or success. |
 | 2 | Does a local owned source rule have the intended discard action, and can a conflicting action be reconciled safely? | Use actual pinned GoBGP JSON and add/remove behavior. Preserve foreign/peer paths and exact ownership. No inference from source-prefix presence alone. |
 | 3 | Which interruption loses useful detector intent rather than deliberately skipping it? | Trace one actual adapter cursor/outbox/ACK path and its documented skip/expiry policy; test a process exit and repair only an unintended loss. Do not impose toy SQLite receipt semantics on the production socket. |
