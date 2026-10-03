@@ -108,6 +108,9 @@ jobs:
       - name: Clippy
         run: cargo clippy --release --locked --all-targets -- -D warnings
 
+      - name: Audit verification smoke refusal regressions
+        run: python3 scripts/test_audit_smoke.py
+
       - name: FlowSpec smoke readback refusal regressions
         run: python3 scripts/test_flowspec_smoke.py
 

@@ -376,7 +376,7 @@ fn decide(
 /// Replays the audit log at `path` (its rotated segments first). The whole chain is verified
 /// first: a log that does not verify is not replayed at all.
 pub fn replay_file(path: &Path, this_build: &str) -> Result<Report, String> {
-    verify_chain(path)?;
+    verify_chain(path).map_err(|e| e.to_string())?;
     let mut files: Vec<std::path::PathBuf> = rotated_segments(path)
         .map_err(|e| e.to_string())?
         .into_iter()

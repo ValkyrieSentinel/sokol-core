@@ -390,3 +390,39 @@ successful output represents an empty displayed RIB. Source-prefix matching alon
 does not prove discard action, ownership/community, a coherent snapshot across
 queries, or global network state. It does not change the runtime's JSON-based
 reconciliation or its withdrawal guarantees.
+
+
+## AUDIT-V1: unavailable verification cannot establish corruption
+
+Owners: typed `ChainVerifyError` in [audit_log.rs](../common/src/audit_log.rs),
+[monitor.rs](../orchestrator/src/bin/monitor.rs), and the three audit assertions
+in [xdp-smoke.sh](../scripts/xdp-smoke.sh) through
+[audit-verdict.sh](../scripts/audit-verdict.sh).
+
+`monitor --verify` distinguishes 0 / `OK` (verified retained chain), 1 / `BROKEN`
+(observed corruption, segment discontinuity or rotated trailing bytes), and
+2 / `UNVERIFIED` (enumeration, open, read or metadata failure). Classification
+uses structured errors rather than diagnostic-string matching. A file observed
+shorter than the reader's verified offset is unverified, avoiding subtraction
+underflow. Replay keeps rejecting either error before consuming any decisions.
+
+Smoke requires both the exit code and a matching path-bound label for its explicit
+intact/broken expectation. The path label binds the verdict to the invocation
+argument, not an authenticated or canonical file identity. Failed execution,
+inconsistent or missing output and
+a verdict about another path cannot confirm either expectation. The real smoke
+wrapper rejects a contradiction and an unverified result alike.
+
+`orchestrator/tests/audit_verify.rs` executes the real monitor CLI with real
+common-library fixtures: intact chain, edited hash, segment gap, rotated trailing
+bytes, missing active/parent paths and actual read failures in active/rotated
+files. `scripts/test_audit_smoke.py` executes the three actual caller commands
+and wrapper with fallible CLI stand-ins. These tests also retain the active
+torn-tail policy: `OK` covers complete readable records; an incomplete suffix
+in the active file is permitted and is not rewritten by verification.
+
+This does not establish complete audit history, recover lost records, authenticate
+an externally unanchored head, or provide an atomic snapshot while files change.
+Pruned older segments and the active incomplete suffix retain their existing
+limits. Verification remains read-only; no writer, record format, hash algorithm
+or retention policy changes.
