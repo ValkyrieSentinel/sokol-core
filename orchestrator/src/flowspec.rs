@@ -410,13 +410,13 @@ esac
                 ),
             )
             .unwrap();
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
             Self {
                 dir,
                 cli: GobgpCli {
-                    bin: script,
-                    args: vec![],
+                    // Reading via sh avoids ETXTBSY when another test's fork
+                    // briefly inherits the newly written script's descriptor.
+                    bin: "/bin/sh".into(),
+                    args: vec![script.to_str().unwrap().to_string()],
                     community: (65001, 6666),
                 },
             }

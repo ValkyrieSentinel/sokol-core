@@ -480,6 +480,8 @@ extra queries. The existing ownership predicate, withdrawal-first order and
 with 5-second per-call timeouts the configured call-wait allowance is
 `(2 + 64 + 2) × 5 s`, not a hard round deadline. Scheduling, process teardown and
 other work remain outside it; shutdown retains its separate attempt budget.
+The worker notices shutdown between rounds; the outer task timeout can cancel a
+slow in-flight round before the inner withdrawal attempt begins.
 
 Six native Rust regressions execute the production round and CLI subprocess runner
 against controlled child executables: no-effect add/delete, failed/malformed
