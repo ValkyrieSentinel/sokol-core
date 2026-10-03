@@ -1251,6 +1251,9 @@ esac
             return;
         };
         let live = LiveGobgp::start(std::path::Path::new(&bin_dir)).await;
+        // Keep one actual audit writer across cases; reopening while its previous
+        // detached thread drains could otherwise race appends on the same file.
+        let db = Arc::new(live.fixture.db());
         for (net, foreign_net) in [
             (one("198.51.100.7"), one("198.51.100.8")),
             (one("2001:db8::7"), one("2001:db8::8")),
@@ -1318,7 +1321,6 @@ exec "$real" "$@"
                 };
                 let readback = Arc::new(Readback::default());
                 readback.enable();
-                let db = Arc::new(live.fixture.db());
                 checked_round(&live.fixture.cli, &before, &db, &readback)
                     .await
                     .unwrap();
@@ -1330,7 +1332,7 @@ exec "$real" "$@"
                     cli,
                     wanted_rx,
                     shutdown_rx,
-                    db,
+                    db.clone(),
                     readback.clone(),
                 ));
                 assert!(eventually(|| entered.exists()).await);
