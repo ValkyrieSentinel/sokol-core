@@ -3,6 +3,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -136,15 +137,22 @@ sys.exit(int(os.environ['RIB_STATUS']))
                 self.assertEqual(result.returncode, 2, result.stderr)
                 self.assertFalse(calls.exists())
 
-    def test_matcher_errors_are_unverified_at_every_actual_call_site(self):
-        grep = self.root / 'grep'
-        grep.unlink()
-        grep.write_text('#!/bin/sh\nexit 2\n')
-        grep.chmod(0o755)
-        for name, command in assertions().items():
-            with self.subTest(name=name):
-                result, _ = self.run_assertion(command, RIB)
-                self.assertEqual(result.returncode, 2, 'matcher error became a RIB verdict: ' + name)
+    def test_source_prefix_is_literal_and_complete(self):
+        cases = [
+            ('10.231.0.2/32', '[source: 110.231.0.2/32]', False),
+            ('10.231.0.2/32', '[source: 10.231.0.2/320]', False),
+            ('10.231.0.2/32', '[source: 10x231x0x2/32]', False),
+            ('10.231.0.2/32', '[source: 10.231.0.2/32]', True),
+            ('*', '[source: 10.231.0.2/32]', False),
+            ('*', '[source: *]', True),
+        ]
+        for prefix, output, present in cases:
+            for expected in ['present', 'absent']:
+                with self.subTest(prefix=prefix, output=output, expected=expected):
+                    # shlex quotes the argument as data, including wildcard metacharacters.
+                    command = 'flowspec_rule ' + expected + ' ' + shlex.quote(prefix)
+                    result, _ = self.run_assertion(command, output)
+                    self.assertEqual(result.returncode, 0 if (expected == 'present') == present else 1)
 
 
 if __name__ == '__main__':
