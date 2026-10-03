@@ -551,7 +551,7 @@ select its own acceptable age. No new permission or detector policy is introduce
 ## FLOWSPEC-R3: ownership does not establish discard or conditional-write authority
 
 Owner: `flowspec.rs::parse_rib`, `plan`, `round` and the coherent worker-to-HTTP
-bridge in `metrics.rs`. Managed scope is local ID-zero paths with the configured
+bridge in `metrics.rs`. Managed scope is local paths reported as ID-zero with the configured
 standard community and exactly one full source-prefix component (IPv6 offset 0).
 Ownership is independent of action: a wrong-action owned path still gets withdrawn
 when unwanted; a wanted prefix missing canonical discard is re-announced. The
@@ -574,7 +574,12 @@ replaces an existing foreign local path despite distinct ownership communities.
 Before applying the operation quota, the production round excludes required
 operations that collide with observed foreign local paths. Non-colliding withdrawals
 and announcements still progress, including shutdown reconciliation. Peer paths are not local CLI targets;
-nonzero local IDs are outside the managed scope and fence overlapping operations.
+reported nonzero local IDs are outside the managed scope and fence overlapping operations.
+The pinned CLI's NewDestination does not copy the actual identifier into its JSON
+path, so its `LocalID: 0` does not establish actual ID-zero identity. This exclusion
+only works when a nonzero ID is reported. Reserve the ownership community for one
+writer: a hidden nonzero-ID path reusing our tag may be counted as owned while the
+ID-zero CLI withdrawal leaves it present. Health is not withdrawal convergence.
 Any skipped operation leaves health revoked and retains the previous successful
 counts/time, even after safe writes and a full post-write read. This prevents known
 collisions, not races: CLI AddPath/DeletePath has no atomic ownership compare-and-swap.
@@ -685,4 +690,7 @@ An invalid initial read permits no writes. An invalid post-write read does not
 undo accepted CLI operations; it withholds a new observation. R1/R2 stale-count
 and age semantics remain. This does not establish desired-set equality, atomic
 IPv4/IPv6 reads, upstream enforcement or protection from concurrent writers.
+GoBGP may accept foreign local metadata outside this parser's contract (for example
+an IPv6 source offset above 128). Such local data stops the whole read/reconciliation,
+including unblocking and shutdown attempts, until removed; peer metadata is excluded.
 No checker, frozen fixtures/results or delivery-shadow pins change.

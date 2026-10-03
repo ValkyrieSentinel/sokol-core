@@ -561,7 +561,7 @@ until their shared-daemon ownership is resolved.
 
 Every rule carries the node's ownership community (`--flowspec-community`, default
 `64512:<node-id>`; give each node that shares a gobgpd its own). Every second a separate worker
-reconciles the active blocks with local, tagged, ID-zero paths matching one full source prefix
+reconciles the active blocks with local, tagged paths reported as ID-zero and matching one full source prefix
 (IPv6 offset zero), at most 64 changes per round. Unwanted owned paths are withdrawn even if
 their action is wrong; missing or non-discard wanted paths are announced with `discard`.
 The pinned GoBGP represents canonical discard as exactly one traffic-rate extended community
@@ -576,6 +576,10 @@ health remains 0 and the last successful counts/time are retained while work is 
 writers: GoBGP's CLI can replace another local path at the same NLRI. Serialize shared-daemon
 writers or give them exclusive source-prefix namespaces. The CLI has no atomic compare-and-swap;
 a writer racing between read and apply remains outside this guarantee.
+GoBGP 4.9.0 CLI JSON reports `LocalID: 0` without copying the actual path identifier.
+A reported nonzero ID is excluded if supplied, but this CLI cannot reveal hidden IDs.
+Writers must also reserve the ownership community: reusing our tag on a nonzero-ID
+path can make it count as owned while ID-zero CLI withdrawal fails to remove it.
 
 A slow or hung gobgpd runs apart from the main loop. `sokol_flowspec_announced` counts owned
 paths in this scope last seen in the local RIB, regardless of action.
