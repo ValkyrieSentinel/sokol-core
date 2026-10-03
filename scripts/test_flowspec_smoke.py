@@ -1,0 +1,159 @@
+"""Exercise the actual XDP smoke assertions with a fallible GoBGP CLI."""
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import subprocess
+import sys
+import tempfile
+import unittest
+
+ROOT = Path(__file__).resolve().parent.parent
+# The expectation is independent of the command implementation under test.
+ABSENT = {
+    "Flowspec: expired block is withdrawn upstream",
+    "observe mode: no Flowspec rule reaches upstream for a new block",
+    "Flowspec: shutdown withdraws the node's rules upstream",
+    "Flowspec: the next run withdraws the crashed run's stale rule",
+}
+PRESENT = {
+    "Flowspec: upstream receives a discard rule for the dynamic block",
+    "Flowspec: upstream receives a discard rule for the static block",
+    "observe mode: another system's upstream rule is untouched",
+    "Flowspec: another system's rule is left alone",
+    "Flowspec: a crashed node's rule stays upstream",
+    "Flowspec: the next run keeps announcing its wanted rules",
+}
+RIB = """   Network                 Next Hop             AS_PATH              Age        Attrs
+*> [source: 10.231.0.2/32] fictitious 00:00:01 [{Extcomms: [discard]}]
+*> [source: 10.231.0.3/32] fictitious 00:00:01 [{Extcomms: [discard]}]
+*> [source: 192.0.2.99/32] fictitious 00:00:01 [{Extcomms: [discard]}]
+"""
+
+
+def assertions():
+    # Run the actual commands at the actual ten call sites, including Bash children.
+    # A helper-only test would miss a caller still using `!` to invert its error.
+    text = (ROOT / 'scripts/xdp-smoke.sh').read_text().replace('\\\n', ' ')
+    matches = re.findall(r'^\s*check "([^"\n]+)"\s+([^\n]+)$', text, re.MULTILINE)
+    relevant = [(name, command) for name, command in matches if name in ABSENT | PRESENT]
+    if len(relevant) != len(ABSENT | PRESENT):
+        raise AssertionError('duplicate or missing FlowSpec smoke assertion')
+    selected = dict(relevant)
+    if set(selected) != ABSENT | PRESENT:
+        raise AssertionError('missing or renamed FlowSpec smoke assertions')
+    return selected
+
+
+class FlowSpecSmoke(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory(prefix='sokol-rib-gate-')
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+        for name, target in [('python3', sys.executable), ('bash', '/bin/bash'), ('grep', '/usr/bin/grep')]:
+            (self.root / name).symlink_to(target)
+        self.cli = self.root / 'gobgp'
+        self.cli.write_text('''#!/usr/bin/env python3
+import json, os, sys
+from pathlib import Path
+args = sys.argv[1:]
+with Path(os.environ['RIB_CALLS']).open('a') as calls:
+    calls.write(json.dumps(args) + '\\n')
+assert args == ['-p', '50052', 'global', 'rib', '-a', 'ipv4-flowspec'], args
+sys.stdout.write(os.environ['RIB_OUTPUT'])
+if int(os.environ['RIB_STATUS']):
+    sys.stderr.write('rpc unavailable (probe)\\n')
+sys.exit(int(os.environ['RIB_STATUS']))
+''')
+        self.cli.chmod(0o755)
+
+    def run_assertion(self, command, output, status=0, through_check=False):
+        calls = self.root / 'calls.jsonl'
+        calls.unlink(missing_ok=True)
+        helper = ROOT / 'scripts/flowspec-rib.sh'
+        setup = 'ALLOWED_IP=10.231.0.2; BLOCKED_IP=10.231.0.3; FOREIGN_RULE=192.0.2.99/32\n'
+        if helper.exists():
+            setup = 'source "$RIB_HELPER"\n' + setup
+        if through_check:
+            smoke = (ROOT / 'scripts/xdp-smoke.sh').read_text()
+            wrapper = re.search(r'^check\(\) \{\n.*?^\}', smoke, re.MULTILINE | re.DOTALL)
+            if wrapper is None:
+                raise AssertionError('missing smoke check wrapper')
+            setup += wrapper.group() + '\nFAILED=0\n'
+            command = 'check probe ' + command + '\nexit "$FAILED"'
+        result = subprocess.run(
+            ['bash', '-euo', 'pipefail', '-c', setup + command],
+            env={**os.environ, 'PATH': str(self.root),
+                 'RIB_HELPER': str(helper), 'RIB_CALLS': str(calls),
+                 'RIB_OUTPUT': output, 'RIB_STATUS': str(status)},
+            capture_output=True, text=True, timeout=3,
+        )
+        return result, calls
+
+    def test_successful_reads_distinguish_presence_and_absence(self):
+        for name, command in assertions().items():
+            for output, present in [(RIB, True), ('', False)]:
+                with self.subTest(name=name, present=present):
+                    result, calls = self.run_assertion(command, output)
+                    expected = 0 if (name in PRESENT) == present else 1
+                    self.assertEqual(result.returncode, expected, result.stderr)
+                    self.assertTrue(calls.exists(), 'assertion skipped the readback')
+                    self.assertEqual(len(calls.read_text().splitlines()), 1)
+
+    def test_unavailable_api_is_unverified_at_every_actual_call_site(self):
+        for name, command in assertions().items():
+            with self.subTest(name=name):
+                result, _ = self.run_assertion(command, '', 7)
+                self.assertEqual(result.returncode, 2, 'API error became a RIB verdict: ' + name)
+
+    def test_partial_output_before_cli_failure_cannot_authorize_either_verdict(self):
+        for name, command in assertions().items():
+            with self.subTest(name=name):
+                result, _ = self.run_assertion(command, RIB, 7)
+                self.assertEqual(result.returncode, 2, 'failed CLI output was trusted: ' + name)
+
+    def test_a_missing_cli_is_unverified_at_every_actual_call_site(self):
+        self.cli.unlink()
+        for name, command in assertions().items():
+            with self.subTest(name=name):
+                result, _ = self.run_assertion(command, '')
+                self.assertEqual(result.returncode, 2, 'missing CLI became a RIB verdict: ' + name)
+
+    def test_failed_reads_make_the_actual_smoke_wrapper_fail(self):
+        for name, command in assertions().items():
+            for output in ['', RIB]:
+                with self.subTest(name=name, partial=bool(output)):
+                    result, _ = self.run_assertion(command, output, 7, through_check=True)
+                    self.assertEqual(result.returncode, 1, result.stderr)
+                    self.assertIn('FAIL  probe', result.stdout)
+                    self.assertNotIn('PASS', result.stdout)
+                    self.assertIn('UNVERIFIED FlowSpec', result.stderr)
+
+    def test_invalid_expectations_do_not_read_the_rib(self):
+        for command in ['flowspec_rule unknown 10.231.0.2/32', 'flowspec_rule absent']:
+            with self.subTest(command=command):
+                result, calls = self.run_assertion(command, RIB)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertFalse(calls.exists())
+
+    def test_source_prefix_is_literal_and_complete(self):
+        cases = [
+            ('10.231.0.2/32', '[source: 110.231.0.2/32]', False),
+            ('10.231.0.2/32', '[source: 10.231.0.2/320]', False),
+            ('10.231.0.2/32', '[source: 10x231x0x2/32]', False),
+            ('10.231.0.2/32', '[source: 10.231.0.2/32]', True),
+            ('*', '[source: 10.231.0.2/32]', False),
+            ('*', '[source: *]', True),
+        ]
+        for prefix, output, present in cases:
+            for expected in ['present', 'absent']:
+                with self.subTest(prefix=prefix, output=output, expected=expected):
+                    # shlex quotes the argument as data, including wildcard metacharacters.
+                    command = 'flowspec_rule ' + expected + ' ' + shlex.quote(prefix)
+                    result, _ = self.run_assertion(command, output)
+                    self.assertEqual(result.returncode, 0 if (expected == 'present') == present else 1)
+
+
+if __name__ == '__main__':
+    unittest.main()
