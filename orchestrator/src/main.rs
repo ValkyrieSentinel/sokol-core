@@ -30,6 +30,7 @@ mod mesh_sync;
 mod metrics;
 mod p2p;
 mod replay;
+mod shutdown;
 mod signal;
 mod sokol;
 mod state_store;
@@ -770,7 +771,6 @@ async fn execute_control(cmd: control::ControlCommand, ctx: &ControlCtx) -> Stri
         ControlCommand::FlushDynamic => {
             let at = block_table::local_ms();
             let (released, lifted) = blocks.lock().await.flush_detector(at);
-            broadcast_retraction(ctx, lifted.retracted).await;
             log::warn!(
                 "[Control] Operator flushed {} dynamic blocks",
                 released.len()
@@ -780,12 +780,12 @@ async fn execute_control(cmd: control::ControlCommand, ctx: &ControlCtx) -> Stri
                 released.len(),
                 at
             ));
+            broadcast_retraction(ctx, lifted.retracted).await;
             format!("OK released {} dynamic blocks", released.len())
         }
         ControlCommand::FlushAll => {
             let at = block_table::local_ms();
             let (released, lifted) = blocks.lock().await.flush_all(at);
-            broadcast_retraction(ctx, lifted.retracted).await;
             log::warn!(
                 "[Control] Operator flushed {} blocks (operator and dynamic)",
                 released.len()
@@ -795,6 +795,7 @@ async fn execute_control(cmd: control::ControlCommand, ctx: &ControlCtx) -> Stri
                 released.len(),
                 at
             ));
+            broadcast_retraction(ctx, lifted.retracted).await;
             format!("OK released {} blocks", released.len())
         }
         ControlCommand::AcceptStateLoss => {
@@ -1089,7 +1090,7 @@ async fn push_telemetry(msg: &str) {
     }
 }
 
-type SharedBlockTable = Arc<tokio::sync::Mutex<BlockTable>>;
+type SharedBlockTable<B = block_table::KernelBlocklist> = Arc<tokio::sync::Mutex<BlockTable<B>>>;
 
 /// Open connections per local socket (F11): a local producer cannot make the node spawn tasks
 /// without bound, and idle connections are closed.
@@ -1236,10 +1237,10 @@ struct Detection<'a> {
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn enforce_block_local(
+async fn enforce_block_local<B: block_table::Blocklist>(
     target: IpNet,
     reason: &str,
-    blocks: &SharedBlockTable,
+    blocks: &SharedBlockTable<B>,
     sntl_db: &Arc<SentinelDb>,
     registry: &PeerRegistry,
     node_id: u64,
@@ -1316,13 +1317,7 @@ async fn enforce_block_local(
     // A new claim is shared either way: peers can enforce it even if this node's map is full.
     // A repeat merged into the running claim is not signed and sent again (peers have it).
     // Observe mode keeps own claims off the mesh (ADR-0018): peers in drop mode would enforce.
-    if added.new && shares_own {
-        let broadcast_cmd = MeshCommand::Claim { claim: added.claim };
-        let _ = registry
-            .broadcast(&broadcast_cmd, node_id, node_crypto)
-            .await;
-    }
-    match added.applied {
+    let outcome = match added.applied {
         Ok(()) => {
             log::warn!(
                 "[Local Security] Dynamic block enforced in XDP: {} for {} | Reason: {}",
@@ -1339,12 +1334,6 @@ async fn enforce_block_local(
                 claim,
                 context
             ));
-
-            let telemetry_msg = format!(
-                "DROP_IMMEDIATE:{}\nDB_LOG:NODE={}|TIER=Tier1BotTarpit|IP={}|VEC={}\n",
-                shown, node_id, shown, reason
-            );
-            push_telemetry(&telemetry_msg).await;
 
             Enforcement::Enforced
         }
@@ -1365,7 +1354,23 @@ async fn enforce_block_local(
             ));
             Enforcement::Pending
         }
+    };
+    // Mutation and audit submission share one poll. Shutdown may cancel publication or
+    // the reply afterwards; a missing ACK is not evidence that the decision was refused.
+    if added.new && shares_own {
+        let broadcast_cmd = MeshCommand::Claim { claim: added.claim };
+        let _ = registry
+            .broadcast(&broadcast_cmd, node_id, node_crypto)
+            .await;
     }
+    if outcome == Enforcement::Enforced {
+        let telemetry_msg = format!(
+            "DROP_IMMEDIATE:{}\nDB_LOG:NODE={}|TIER=Tier1BotTarpit|IP={}|VEC={}\n",
+            shown, node_id, shown, reason
+        );
+        push_telemetry(&telemetry_msg).await;
+    }
+    outcome
 }
 
 #[tokio::main]
@@ -1586,6 +1591,7 @@ async fn main() -> Result<(), anyhow::Error> {
         .clone()
         .unwrap_or_else(|| std::path::PathBuf::from(format!("{}.blocks.json", args.db_path)));
     let state_store = Arc::new(StateStore::new(state_file.clone()));
+    let mut producers = shutdown::Producers::new();
 
     let stats_map_data = bpf
         .take_map("STATS")
@@ -1598,7 +1604,7 @@ async fn main() -> Result<(), anyhow::Error> {
                 Ok(mut async_fd) => {
                     let db_events = sntl_db.clone();
                     let node_id_ev = args.node_id;
-                    tokio::spawn(async move {
+                    producers.spawn(async move {
                         log::info!(
                             "[eBPF RingBuf] Active consumer loop attached for kernel drop events."
                         );
@@ -1738,7 +1744,7 @@ async fn main() -> Result<(), anyhow::Error> {
         peer_registry.clone(),
     );
 
-    tokio::spawn(async move {
+    producers.spawn(async move {
         if let Err(e) = p2p_network.run().await {
             log::error!("[P2P] Network listener failed: {:?}", e);
         }
@@ -1752,7 +1758,7 @@ async fn main() -> Result<(), anyhow::Error> {
             let node_id = args.node_id;
 
             log::info!("[P2P] Maintaining connection to seed peer: {}", seed_addr);
-            tokio::spawn(maintain_peer_connection(
+            producers.spawn(maintain_peer_connection(
                 seed_addr,
                 node_id,
                 crypto_clone,
@@ -1777,7 +1783,7 @@ async fn main() -> Result<(), anyhow::Error> {
         let (blocks, registry, crypto) =
             (blocks.clone(), peer_registry.clone(), node_crypto.clone());
         let node_id = args.node_id;
-        tokio::spawn(async move {
+        producers.spawn(async move {
             while let Some(addr) = peer_up_rx.recv().await {
                 send_snapshot(addr, &blocks, &registry, node_id, &crypto).await;
             }
@@ -1791,7 +1797,7 @@ async fn main() -> Result<(), anyhow::Error> {
     let sync_throttled = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let sync_throttled_mesh = sync_throttled.clone();
 
-    tokio::spawn(async move {
+    producers.spawn(async move {
         // When each peer last got a snapshot (bounded by the pinned peers: a SyncRequest names
         // its authenticated sender).
         let mut snapshots = mesh_sync::Cooldown::new(SYNC_COOLDOWN);
@@ -2050,7 +2056,7 @@ async fn main() -> Result<(), anyhow::Error> {
     );
 
     let mut orchestrator_task = mesh_orchestrator;
-    tokio::spawn(async move {
+    producers.spawn(async move {
         if let Err(e) = orchestrator_task.run_telemetry_processor().await {
             log::error!("[Mesh] Orchestrator telemetry processor failed: {}", e);
         }
@@ -2067,7 +2073,7 @@ async fn main() -> Result<(), anyhow::Error> {
 
         let bind_addr = format!("0.0.0.0:{}", port);
 
-        tokio::spawn(async move {
+        producers.spawn(async move {
             match tokio::net::TcpListener::bind(&bind_addr).await {
                 Ok(listener) => {
                     log::info!("[TRAP] Decoy TCP trap listening on port {}", port);
@@ -2143,7 +2149,8 @@ async fn main() -> Result<(), anyhow::Error> {
         node_id: args.node_id,
         crypto: node_crypto.clone(),
     });
-    tokio::spawn(async move {
+    let control_tasks = producers.spawner();
+    producers.spawn(async move {
         loop {
             let (stream, _) = match control_listener.accept().await {
                 Ok(conn) => conn,
@@ -2161,7 +2168,7 @@ async fn main() -> Result<(), anyhow::Error> {
                 continue;
             };
             let ctx = ctl_ctx.clone();
-            tokio::spawn(async move {
+            control_tasks.spawn(async move {
                 let _permit = permit;
                 let (read_half, mut write_half) = stream.into_split();
                 let mut reader = BufReader::new(read_half);
@@ -2227,7 +2234,8 @@ async fn main() -> Result<(), anyhow::Error> {
     let reports_unix = attack_reports.clone();
 
     let socket_path_log = socket_path.to_string();
-    tokio::spawn(async move {
+    let ipc_tasks = producers.spawner();
+    producers.spawn(async move {
         log::info!(
             "[UNIX SOCKET] Listening for trap events on {}",
             socket_path_log
@@ -2263,7 +2271,7 @@ async fn main() -> Result<(), anyhow::Error> {
                         reports: reports_stream,
                     };
                     let (total, delayed) = (ipc_total.clone(), ipc_delayed.clone());
-                    tokio::spawn(async move {
+                    ipc_tasks.spawn(async move {
                         let _permit = permit;
                         let (read_half, mut writer) = stream.into_split();
                         let mut reader = BufReader::new(read_half);
@@ -2378,7 +2386,7 @@ async fn main() -> Result<(), anyhow::Error> {
             }),
         );
         log::info!("[Metrics] Prometheus endpoint on http://{}/metrics", addr);
-        tokio::spawn(async move {
+        producers.spawn(async move {
             if let Err(e) = axum::serve(listener, app).await {
                 log::error!("[Metrics] server stopped: {}", e);
             }
@@ -2398,7 +2406,7 @@ async fn main() -> Result<(), anyhow::Error> {
             host_read_ok.clone(),
         );
         let mut last = host_view.clone();
-        tokio::spawn(async move {
+        producers.spawn(async move {
             use std::sync::atomic::Ordering;
             let mut interval = tokio::time::interval(PROTECTED_REFRESH);
             loop {
@@ -2424,6 +2432,7 @@ async fn main() -> Result<(), anyhow::Error> {
                     continue;
                 }
                 let (added, removed) = view.diff(&last);
+                let mut table = blocks.lock().await;
                 policy.replace(base_policy.with_host(&view));
                 log::warn!(
                     "[BlockPolicy] Protected host addresses changed: +{:?} -{:?}",
@@ -2435,7 +2444,7 @@ async fn main() -> Result<(), anyhow::Error> {
                     added, removed
                 ));
                 let current = policy.current();
-                let released = blocks.lock().await.recheck(
+                let released = table.recheck(
                     |net| current.check_net(net).is_ok(),
                     block_table::local_ms(),
                 );
@@ -2446,6 +2455,7 @@ async fn main() -> Result<(), anyhow::Error> {
                     );
                     db.append(format!("BLOCK_RELEASED_PROTECTED|IP:{}", show(&net)));
                 }
+                drop(table);
                 last = view;
             }
         });
@@ -2791,11 +2801,14 @@ async fn main() -> Result<(), anyhow::Error> {
     }
 
     log::info!("Sokol-Core main loop terminated gracefully. Cleaning up resources...");
+    // Stop decision/audit producers and accepted local handlers before taking the final
+    // snapshot. No socket reader, trap, mesh consumer or host refresh can mutate it later.
+    producers.quiesce().await;
+    log::info!("[Shutdown] Decision and audit producers quiesced");
     if let Some(worker) = flowspec_worker {
-        // The worker withdraws this node's rules on shutdown, within its own budget.
-        if tokio::time::timeout(flowspec::SHUTDOWN_BUDGET + Duration::from_secs(2), worker)
+        // Withdrawal may emit audit records too: a timeout must abort AND join the worker.
+        if !shutdown::finish_within(worker, flowspec::SHUTDOWN_BUDGET + Duration::from_secs(2))
             .await
-            .is_err()
         {
             log::error!("[Flowspec] Worker did not finish withdrawing in time");
         }
@@ -2808,8 +2821,8 @@ async fn main() -> Result<(), anyhow::Error> {
         );
     }
     sntl_db.append("NODE_SHUTDOWN".to_string());
-    // This barrier covers preceding submissions, not a producer stop: IPC/mesh tasks
-    // can still append afterwards. Quiescing all producers is a separate shutdown limit.
+    // All audit producers have joined; the terminal record and sampled losses precede
+    // this final fsync. A false flush remains a reported failure, never a completeness claim.
     if !sntl_db.flush(Duration::from_secs(2)) {
         log::error!("[Audit] Shutdown without a confirmed final fsync");
     }
@@ -2835,6 +2848,120 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("sokol-db-{}-{}", name, std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         dir.join("audit.log").to_string_lossy().into_owned()
+    }
+
+    // No kernel writes in this owner test; the actual table and decision helper run.
+    struct AcceptLists;
+    impl block_table::Blocklist for AcceptLists {
+        fn add(&mut self, _: IpNet) -> Result<(), aya::maps::MapError> {
+            Ok(())
+        }
+        fn delete(&mut self, _: IpNet) -> Result<(), aya::maps::MapError> {
+            Ok(())
+        }
+        fn hits(&self, _: IpNet) -> Option<u64> {
+            Some(0)
+        }
+    }
+
+    #[tokio::test]
+    async fn local_decision_is_audited_before_cancellable_mesh_publication() {
+        let path = temp_log("shutdown-decision");
+        let db = Arc::new(SentinelDb::init(&path, None).unwrap());
+        let blocks = Arc::new(tokio::sync::Mutex::new(BlockTable::with_lists(
+            AcceptLists,
+            TtlPolicy {
+                base: Duration::from_secs(60),
+                max: Duration::from_secs(600),
+            },
+            1,
+        )));
+        let registry = PeerRegistry::new(TrustStore::default());
+        // Hold the actual registry write lock, so its broadcast read lock suspends.
+        let peers = registry.peers_for_test();
+        let guard = peers.write().await;
+        let crypto = Arc::new(NodeCrypto::generate());
+        let policy = BlockPolicy::builtin();
+        let target = parse_target("198.51.100.77").unwrap();
+        let (b, d) = (blocks.clone(), db.clone());
+        let mut producers = shutdown::Producers::new();
+        producers.spawn(async move {
+            enforce_block_local(
+                target,
+                "shutdown test",
+                &b,
+                &d,
+                &registry,
+                1,
+                &crypto,
+                &policy,
+                Detection::default(),
+            )
+            .await;
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !blocks.lock().await.is_blocked(target) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        // The mutation has happened, while broadcast still cannot complete.
+        assert!(db.flush(Duration::from_secs(2)));
+        let records = read_audit(&path);
+        assert_eq!(
+            records.len(),
+            1,
+            "accepted decision has no audit before network await"
+        );
+        assert!(records[0].starts_with("DYNAMIC_BLOCK_V4|IP:198.51.100.77|"));
+        producers.quiesce().await;
+        drop(guard);
+        assert!(blocks.lock().await.is_blocked(target));
+        db.append("NODE_SHUTDOWN".into());
+        assert!(db.flush(Duration::from_secs(2)));
+        assert_eq!(read_audit(&path).last().unwrap(), "NODE_SHUTDOWN");
+        drop(db);
+        std::fs::remove_dir_all(std::path::Path::new(&path).parent().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn producer_quiescence_keeps_shutdown_record_last() {
+        let path = temp_log("shutdown-final");
+        let db = Arc::new(SentinelDb::init(&path, None).unwrap());
+        let mut producers = shutdown::Producers::new();
+        let children = producers.spawner();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let (release, blocked) = tokio::sync::oneshot::channel::<()>();
+        let producer_db = db.clone();
+        producers.spawn(async move {
+            children.spawn(async move {
+                producer_db.append_client_log("accepted before shutdown");
+                let _ = started.send(());
+                let _ = blocked.await;
+                producer_db.append_client_log("late after shutdown");
+            });
+            std::future::pending::<()>().await;
+        });
+        ready.await.unwrap();
+        producers.quiesce().await;
+        db.append("NODE_SHUTDOWN".into());
+        assert!(db.flush(Duration::from_secs(2)));
+        assert!(
+            release.send(()).is_err(),
+            "child receiver must be dropped before final fsync"
+        );
+        let records = read_audit(&path);
+        assert_eq!(
+            records,
+            [
+                "CLIENT_LOG|Message:accepted before shutdown",
+                "NODE_SHUTDOWN"
+            ]
+        );
+        assert_eq!(db.status().lost, 0);
+        drop(db);
+        std::fs::remove_dir_all(std::path::Path::new(&path).parent().unwrap()).unwrap();
     }
 
     #[test]

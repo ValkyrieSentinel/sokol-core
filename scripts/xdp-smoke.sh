@@ -890,6 +890,65 @@ if [ ${#FLOWSPEC_ARGS[@]} -gt 0 ]; then
 fi
 check "SIGINT/SIGTERM shutdown is graceful" grep -q "terminated gracefully" "$LOG"
 
+# Real shutdown boundary: one active signal client plus an idle accepted control client.
+# ACK establishes the decision before the signal; keep submitting audit text until EOF.
+start_orchestrator --block-ttl 3600
+shutdown_connections() {
+    python3 - "$ORCH_PID" "$WORK/control.sock" <<'SHUTDOWN_PY'
+import os, signal, socket, sys, threading
+active = socket.socket(socket.AF_UNIX); active.settimeout(4); active.connect("/run/sokol.sock")
+f = active.makefile("rw")
+for line, wanted in [("ACK", "OK ack"), ("DROP_IMMEDIATE:198.51.100.199", "OK applied")]:
+    f.write(line + "\n"); f.flush(); assert f.readline().strip() == wanted
+idle = socket.socket(socket.AF_UNIX); idle.settimeout(4); idle.connect(sys.argv[2])
+# An answered read-only command proves that the idle connection has a live handler.
+idle.sendall(b"LIST_BANS\n"); assert idle.recv(65536).startswith(b"OK ")
+started = threading.Event(); closed = threading.Event(); failures = []
+def submit_until_closed():
+    try:
+        for i in range(500):
+            f.write("DB_LOG:shutdown-active-%d\n" % i); f.flush()
+            reply = f.readline()
+            if not reply:
+                closed.set(); return
+            assert reply.strip() == "OK recorded"
+            started.set()
+            closed.wait(0.01)
+        failures.append("active socket never closed")
+    except (BrokenPipeError, ConnectionResetError):
+        closed.set()
+    except Exception as error:
+        failures.append(str(error))
+thread = threading.Thread(target=submit_until_closed); thread.start()
+assert started.wait(2), "producer did not become active"
+os.kill(int(sys.argv[1]), signal.SIGINT)
+assert closed.wait(4), "shutdown left active handler open"
+thread.join(1); assert not thread.is_alive() and not failures, failures
+try:
+    assert idle.recv(1) == b"", "shutdown left idle handler open"
+except ConnectionResetError:
+    pass
+idle.close(); f.close(); active.close()
+SHUTDOWN_PY
+}
+check "shutdown closes active IPC and idle control handlers" shutdown_connections
+for _ in $(seq 1 50); do
+    kill -0 "$ORCH_PID" 2>/dev/null || break
+    sleep 0.1
+done
+check "shutdown exits without forced kill after producers quiesce" bash -c '! kill -0 "$1" 2>/dev/null' _ "$ORCH_PID"
+stop_orchestrator
+check "shutdown confirms producer quiescence" grep -q 'Decision and audit producers quiesced' "$LOG"
+"$(dirname "$BIN")/monitor" --dump "$WORK/events.sntl" | cut -f3 >"$WORK/shutdown-audit.txt"
+check "shutdown terminal audit record is last after active submissions" \
+    test "$(tail -n1 "$WORK/shutdown-audit.txt")" = NODE_SHUTDOWN
+check "shutdown final snapshot retains the accepted decision" python3 - "$LAST_STATE" <<'SHUTDOWN_STATE_PY'
+import json, sys
+with open(sys.argv[1]) as file:
+    state = json.load(file)
+assert any(c["target"] == "198.51.100.199/32" for c in state["claims"]), state
+SHUTDOWN_STATE_PY
+
 # Unprivileged run: only the capabilities the systemd unit grants.
 NONROOT="$WORK/nonroot"
 mkdir -p "$NONROOT"
