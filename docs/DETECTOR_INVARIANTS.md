@@ -426,3 +426,41 @@ an externally unanchored head, or provide an atomic snapshot while files change.
 Pruned older segments and the active incomplete suffix retain their existing
 limits. Verification remains read-only; no writer, record format, hash algorithm
 or retention policy changes.
+
+
+## XDP-S1: failed tools or a broken path cannot prove a kernel drop
+
+Owner: [xdp_probe.py](../scripts/xdp_probe.py), used by all sixteen IPv4 drop
+assertions in [xdp-smoke.sh](../scripts/xdp-smoke.sh).
+
+A successful drop assertion requires a healthy separate source on the same isolated
+veth route, one unambiguous XDP attachment for the expected interface, and a successful
+`bpftool` kernel test-run returning the integer XDP_DROP verdict for the requested
+source/destination Ethernet/IPv4/ICMP frame. The live namespace ping must then report
+exactly the requested transmissions and zero responses with its no-reply exit code,
+without reported network errors.
+The control route must still work and the observed program ID, ifindex and mode must
+match the initial attachment. A valid XDP_PASS or live reply contradicts the requested
+drop; missing tools, timeouts, failed commands (even with valid partial JSON), malformed
+or ambiguous readback, inconsistent ping summaries and attachment changes are unverified.
+Neither nonzero result passes the real smoke wrapper.
+
+`scripts/test_xdp_probe.py` executes the sixteen actual caller commands with independent
+source/count/fragment expectations and fallible CLI stand-ins. It independently decodes
+frame fields and checks both checksums, live probe arguments and the ordering of controls,
+readback and kernel execution. Refusal controls cover wrong interface, changed identity,
+unsupported attachments, duplicate JSON fields, boolean/floating verdicts, failed partial
+stdout, control-path failure, command errors and missing tools. Both Linux CI architectures
+then run the helper with actual bpftool, kernel programs and veth traffic; optional tools
+are never used to skip these assertions.
+
+This is a controlled laboratory check. Ordinary kernel test-run returns a verdict
+without delivering that frame through the network; the live probe remains separate.
+See [Linux BPF_PROG_RUN](https://www.kernel.org/doc/html/latest/bpf/bpf_prog_run.html).
+Test execution can update program maps/events; smoke totals include these synthetic
+frames. The checks establish the observed program decision and live no-reply condition,
+not causal attribution for every individual wire packet, a physical-NIC qualification
+or an atomic snapshot of attachment/policy state. Equal before/after identities do
+not detect a transient change that returns to the original identity. The fixture has
+no concurrent attachment changes or competing routes; the checks never extend into
+production authority. No kernel/producer behavior, detector policy or proof-core changes.

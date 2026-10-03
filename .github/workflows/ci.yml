@@ -108,6 +108,9 @@ jobs:
       - name: Clippy
         run: cargo clippy --release --locked --all-targets -- -D warnings
 
+      - name: XDP verdict probe refusal regressions
+        run: python3 scripts/test_xdp_probe.py
+
       - name: Audit verification smoke refusal regressions
         run: python3 scripts/test_audit_smoke.py
 
@@ -128,7 +131,16 @@ jobs:
       - name: XDP smoke test (veth + netns)
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq netcat-openbsd wireguard-tools suricata crowdsec
+          sudo apt-get install -y -qq netcat-openbsd wireguard-tools suricata crowdsec linux-tools-generic
+          # Ubuntu bpftool is supplied by versioned linux-tools packages. Use the
+          # packaged binary directly, rather than the uname-selected wrapper.
+          shopt -s nullglob
+          bpftool_bins=(/usr/lib/linux-tools*/bpftool /usr/lib/linux-tools/*/bpftool)
+          test "${#bpftool_bins[@]}" -gt 0
+          bpftool_bin="$(printf '%s\n' "${bpftool_bins[@]}" | sort -V | tail -n 1)"
+          test -x "$bpftool_bin"
+          sudo install -m 755 "$bpftool_bin" /usr/local/bin/bpftool
+          sudo bpftool version
           sudo systemctl stop suricata 2>/dev/null || true
           sudo SMOKE_REQUIRE="suricata crowdsec gobgp wireguard" scripts/xdp-smoke.sh target/release/orchestrator
 
