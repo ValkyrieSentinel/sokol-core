@@ -946,7 +946,7 @@ check "shutdown final snapshot retains the accepted decision" python3 - "$LAST_S
 import json, sys
 with open(sys.argv[1]) as file:
     state = json.load(file)
-assert any(c["target"] == "198.51.100.199/32" for c in state["claims"]), state
+assert any(c["target"] == "198.51.100.199" for c in state["claims"]), state
 SHUTDOWN_STATE_PY
 
 # Unprivileged run: only the capabilities the systemd unit grants.
