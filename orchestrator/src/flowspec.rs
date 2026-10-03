@@ -249,6 +249,14 @@ fn has_canonical_discard(path: &serde_json::Value) -> bool {
     let Some(attrs) = path.get("attrs").and_then(|v| v.as_array()) else {
         return false;
     };
+    // IPv6-specific redirects use a separate extended-community attribute.
+    // A zero traffic-rate action combined with type 25 is not canonical discard.
+    if attrs
+        .iter()
+        .any(|a| a.get("type").and_then(|v| v.as_u64()) == Some(25))
+    {
+        return false;
+    }
     let mut extended = attrs
         .iter()
         .filter(|a| a.get("type").and_then(|v| v.as_u64()) == Some(16));
@@ -531,6 +539,29 @@ mod tests {
             let rib = parse_rib(raw.to_string().as_bytes(), 4259912202).unwrap();
             assert_eq!(rib.owned, ips(&["198.51.100.7"]));
             assert!(rib.discard.is_empty());
+        }
+        // IPv6 redirect is carried by a separate type-25 attribute, not type 16.
+        // Reject it alongside traffic-rate zero in both family observations.
+        let captures: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/gobgp-4.9.0-actions.json"))
+                .unwrap();
+        for entry in captures
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["label"] == "owned-replaced-by-discard")
+        {
+            let mut raw = entry["rib"].clone();
+            let path = &mut raw.as_object_mut().unwrap().values_mut().next().unwrap()[0];
+            path["attrs"]
+                .as_array_mut()
+                .unwrap()
+                .push(serde_json::json!({
+                    "type":25,"value":[{"type":128,"subtype":11,"value":"2001:db8::1:1"}]
+                }));
+            let rib = parse_rib(raw.to_string().as_bytes(), 4259912202).unwrap();
+            assert_eq!(rib.owned.len(), 1);
+            assert!(rib.discard.is_empty(), "IPv6-specific action was ignored");
         }
         let mut raw: serde_json::Value = serde_json::from_str(RIB).unwrap();
         let attrs = raw["[source: 198.51.100.7/32]"][0]["attrs"]
@@ -923,6 +954,19 @@ esac
             assert_eq!(fixed.count, 1);
             assert_eq!(fixed.discard_count, 1);
             assert!(fixed.ok);
+            assert_eq!(live.fixture.cli.observed().await.unwrap().discard, wanted);
+
+            live.put(net, "discard redirect 2001:db8::1:1", "65001:6666")
+                .await;
+            let combined = live.fixture.cli.observed().await.unwrap();
+            assert_eq!(combined.owned, wanted);
+            assert!(
+                combined.discard.is_empty(),
+                "separate IPv6 redirect counted as discard"
+            );
+            checked_round(&live.fixture.cli, &wanted, &db, &readback)
+                .await
+                .unwrap();
             assert_eq!(live.fixture.cli.observed().await.unwrap().discard, wanted);
 
             live.put(net, "rate-limit 100", "65001:6666").await;

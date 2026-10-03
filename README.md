@@ -556,7 +556,8 @@ With `--flowspec-gobgp /usr/local/bin/gobgp` every active block is announced as 
 Flowspec rule `match source <ip>/32 then discard` through a local
 [GoBGP](https://github.com/osrg/gobgp) daemon, so routers that accept Flowspec drop the traffic
 before it reaches this node's link. Expired or lifted blocks are withdrawn, and all of the node's
-rules are withdrawn when it shuts down.
+withdrawal is attempted within the shutdown budget. Colliding owned paths can remain upstream
+until their shared-daemon ownership is resolved.
 
 Every rule carries the node's ownership community (`--flowspec-community`, default
 `64512:<node-id>`; give each node that shares a gobgpd its own). Every second a separate worker
@@ -564,7 +565,8 @@ reconciles the active blocks with local, tagged, ID-zero paths matching one full
 (IPv6 offset zero), at most 64 changes per round. Unwanted owned paths are withdrawn even if
 their action is wrong; missing or non-discard wanted paths are announced with `discard`.
 The pinned GoBGP represents canonical discard as exactly one traffic-rate extended community
-(type 128, subtype 6), numeric rate zero. Missing, unknown, nonzero or combined actions do
+(type 128, subtype 6), numeric rate zero and no type-25 IPv6-specific extended-community attribute.
+Missing, unknown, nonzero or combined actions do
 not satisfy that contract. A restarted gobgpd's missing rules are announced again.
 
 Peer paths and foreign local paths are not selected for removal. If a planned operation

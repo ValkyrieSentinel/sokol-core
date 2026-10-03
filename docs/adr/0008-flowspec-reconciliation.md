@@ -22,7 +22,8 @@
   Споживач сам визначає допустимий вік. Запис `FLOWSPEC_ANNOUNCE`/`WITHDRAW` підтверджує CLI,
   не застосування маршрутизатором. Ownership і canonical discard рахуються окремо:
   `sokol_flowspec_discard_rules` — підмножина власних правил з рівно однією traffic-rate
-  extended community (type 128, subtype 6) та числовим rate 0. Інші дії перевидаються як
+  extended community (type 128, subtype 6) та числовим rate 0, без окремого
+  IPv6-specific extended-community атрибуту type 25. Інші дії перевидаються як
   discard, якщо prefix бажаний, і відкликаються, якщо вже не потрібний.
 - Власні правила позначаються community `64512:<node-id>` (`--flowspec-community`). Власним
   вважається лише локальний ID-zero шлях з цією community та одним повним source prefix

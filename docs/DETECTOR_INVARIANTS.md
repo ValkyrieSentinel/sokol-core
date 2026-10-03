@@ -560,7 +560,8 @@ attempt budget remain unchanged.
 
 Canonical discard means exactly one extended-community attribute containing
 exactly one traffic-rate action (type 128, subtype 6), uint16 AS and numeric rate
-zero. Missing, nonzero, unknown, duplicate or combined actions do not satisfy this
+zero, with no type-25 IPv6-specific extended-community attribute. Missing, nonzero,
+unknown, duplicate or combined actions do not satisfy this
 contract. `sokol_flowspec_announced` retains its ownership count;
 `sokol_flowspec_discard_rules` reports the validated subset. Counts, health and time
 come from one worker snapshot. Post-write reads, failed-round retention and age
@@ -589,23 +590,26 @@ production read/plan/write/re-read flow against a real daemon for both families:
 repairs rate-limit 100 to discard, withdraws an unwanted wrong action, then refuses
 a foreign-only collision while its full raw RIB response remains byte-identical.
 It then checks unrelated withdrawal/announcement and shutdown cleanup while the
-foreign path remains present. An
+foreign path remains present. It also replaces traffic-rate zero combined with
+a type-25 IPv6 redirect for both families. An
 unset `SOKOL_GOBGP_TEST_BIN` skips that local test; canonical x86/ARM CI requires it
 and emits two positive execution markers. A framework PASS after skip is no proof.
 
 Local checks passed 26 production-module tests, including real GoBGP for both
 families, and 13 Python smoke/health refusal tests. The portable Rust harness uses
 actual common code with audit/target/label stand-ins; canonical Linux CI exercises
-the actual owners. Ten compiling semantic mutations were rejected by assertions:
+the actual owners. Eleven compiling semantic mutations were rejected by assertions:
 ownership treated as discard, dropping wrong-action owned paths, bypassed collision
 refusal, accepting a small positive rate, accepting combined actions, publishing
 ownership as discard, ignoring source offset, ignoring local ID, refusing the whole
-round and applying the quota before excluding collisions. Independent Claude review
+round, applying the quota before excluding collisions, and ignoring a separate
+IPv6-specific extended-community action. Independent Claude review
 found that the first all-or-nothing collision preflight starved unrelated unblocking.
 `collisions_do_not_starve_unrelated_withdrawals_or_announcements` failed on that
 head and now checks more collisions than the quota, safe withdrawal/announcement,
 retained health/counts/time and shutdown with an overlapping nonzero-ID path.
-Existing HTTP
+A separate IPv6 redirect regression failed on the accepted initial amendment
+head and now refuses that combination for both family captures. Existing HTTP
 smoke expectations now also require the known fixture count to be canonical discard.
 
 Limits: this is a conservative pinned-GoBGP action and local-NLRI contract, not
