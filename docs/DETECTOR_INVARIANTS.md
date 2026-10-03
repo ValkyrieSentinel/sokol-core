@@ -334,15 +334,18 @@ FlowSpec withdrawal worker within its existing budget (abort + join on timeout),
 persists the last table and submits `NODE_SHUTDOWN` followed by the audit flush. Local
 block and operator flush audit submissions precede mesh publication; host-policy replacement,
 table recheck and its audit submissions share one poll after acquiring the table lock.
-This avoids cancellation between the mutation and its audit submission; queue or disk
-loss still follows AUDIT-R1/R2. A command already applied can lose its network publication
+This avoids cancellation between the mutation and its decision audit submission; queue or
+disk loss still follows AUDIT-R1/R2. The trap's companion `TRAP_HIT` follows publication
+and can be cancelled after the decision record; it is not replay authority or promised
+as part of the terminal decision boundary. A command already applied can lose its network publication
 or ACK during shutdown, so a missing reply does not establish refusal. Adapters retain
 unanswered intent under their existing retry protocol.
 
 This is a boundary for completed local decisions, not a drain of every input: unread
 socket/mesh messages and kernel ring records may be discarded without becoming decisions.
-P2P transport children can outlive their listener briefly; they hold no table/audit handle
-and cannot act after the mesh consumer is joined. A host discovery `spawn_blocking` call
+P2P transport children, including the writer and ping tasks of seed connections, can
+outlive their parent; they hold no table/audit handle and cannot create local decisions
+after the mesh consumer is joined. Cancelling seed maintenance does not join these children. A host discovery `spawn_blocking` call
 already running cannot be cancelled by Tokio, but it holds no table/audit handle and its
 cancelled parent cannot publish its result. It can still delay runtime teardown. Cooperative
 cancellation is not a hard wall-clock deadline for non-yielding code or blocking OS calls.

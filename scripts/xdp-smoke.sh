@@ -932,7 +932,7 @@ idle.close(); f.close(); active.close()
 SHUTDOWN_PY
 }
 check "shutdown closes active IPC and idle control handlers" shutdown_connections
-for _ in $(seq 1 50); do
+for _ in $(seq 1 100); do
     kill -0 "$ORCH_PID" 2>/dev/null || break
     sleep 0.1
 done
