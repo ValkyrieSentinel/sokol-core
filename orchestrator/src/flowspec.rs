@@ -557,7 +557,7 @@ async fn round(
 ) -> Result<Observation, String> {
     match reconcile(cli, &mut Intent::Fixed(wanted), db).await? {
         RoundOutcome::Complete { observation, .. } => Ok(observation),
-        RoundOutcome::Replan => unreachable!("fixed intent cannot invalidate an operation"),
+        RoundOutcome::Replan => Err("fixed intent unexpectedly invalidated an operation".into()),
     }
 }
 
