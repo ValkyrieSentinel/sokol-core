@@ -262,6 +262,14 @@ ctl ACCEPT_STATE_LOSS             # "OK state loss accepted"; вузол вих�
 - `sokol_flowspec_readback_ok = 1`: останній раунд завершився успішно.
   Перевірте також вік за допустимою для вашого споживача межею; універсального
   production-порога немає. Цей стан не доводить збіг бажаних і фактичних правил.
+- `sokol_flowspec_round_converged = 1`: owned і canonical-discard prefix sets
+  збіглися з wanted, зчитаним на початку останнього завершеного раунду. Зміна
+  intent під час або після цього раунду може ще очікувати обробки; перевіряйте вік.
+  `0` означає невідповідність або непідтверджений стан, включно з pending/failure.
+  За health 1 і convergence 0 перевірте залишкові/відсутні правила та actions,
+  квоту 64, policy GoBGP і reuse ownership-community/hidden ID. Нуль після
+  вимкнення worker не доводить наявності розбіжності. Ця ознака не дає додаткових
+  прав і не підтверджує latest intent, справжні path IDs чи upstream enforcement.
 
 При тривалому невідомому стані перевірте доступність налаштованого GoBGP API,
 журнал `[Flowspec]` і обидва локальні RIB. `unreadable RIB` означає непридатне

@@ -73,6 +73,7 @@ pub struct Snapshot {
     pub flowspec_discard_rules: usize,
     pub flowspec_enabled: bool,
     pub flowspec_readback_ok: bool,
+    pub flowspec_round_converged: bool,
     pub flowspec_read_started: Option<Instant>,
     pub external_attacks: usize,
     pub cluster_status: u8,
@@ -94,6 +95,7 @@ pub fn render_with_flowspec(s: &Snapshot, readback: &crate::flowspec::Readback) 
     snapshot.flowspec_discard_rules = view.discard_count;
     snapshot.flowspec_enabled = view.enabled;
     snapshot.flowspec_readback_ok = view.ok;
+    snapshot.flowspec_round_converged = view.converged;
     snapshot.flowspec_read_started = view.started;
     render(&snapshot)
 }
@@ -571,6 +573,17 @@ fn render_at(s: &Snapshot, now: Instant) -> String {
     );
     family(
         &mut out,
+        "sokol_flowspec_round_converged",
+        "gauge",
+        "1 if the latest completed round observed owned and canonical-discard prefix sets equal to its sampled wanted set; 0 if not or unverified. Not latest-intent equality or upstream enforcement; check age.",
+    );
+    let converged = s.flowspec_round_converged
+        && s.flowspec_enabled
+        && s.flowspec_readback_ok
+        && s.flowspec_read_started.is_some();
+    let _ = writeln!(out, "sokol_flowspec_round_converged {}", converged as u8);
+    family(
+        &mut out,
         "sokol_flowspec_readback_age_seconds",
         "gauge",
         "Monotonic age since the start of the last successful two-family RIB read, computed at scrape; -1 if none.",
@@ -658,6 +671,26 @@ mod tests {
         assert!(text.contains("sokol_flowspec_announced 0\n"));
         assert!(text.contains("sokol_flowspec_readback_ok 0\n"));
         assert!(text.contains("sokol_flowspec_readback_age_seconds -1.000\n"));
+    }
+
+    #[test]
+    fn convergence_requires_a_completed_enabled_observation() {
+        for (enabled, ok, observed, converged, expected) in [
+            (true, true, true, true, 1),
+            (true, true, true, false, 0),
+            (false, true, true, true, 0),
+            (true, false, true, true, 0),
+            (true, true, false, true, 0),
+        ] {
+            let snap = Snapshot {
+                flowspec_enabled: enabled,
+                flowspec_readback_ok: ok,
+                flowspec_round_converged: converged,
+                flowspec_read_started: observed.then(Instant::now),
+                ..Default::default()
+            };
+            assert!(render(&snap).contains(&format!("sokol_flowspec_round_converged {expected}\n")));
+        }
     }
 
     #[test]

@@ -601,7 +601,15 @@ Failed rounds retain the last successful counts and time, which may be stale. Re
   successful two-family read; -1 before any successful observation. It continues
   to grow after failure and is computed when scraped, independently of the main tick.
 
-These five values are sampled together from the worker for each HTTP response.
+- `sokol_flowspec_round_converged`: 1 when the latest completed round observed both
+  its owned-prefix set and canonical-discard-prefix set equal to the wanted set
+  sampled for that round. 0 after a non-converged successful read, or while disabled,
+  pending, failed or cancelled. Equal counts alone cannot establish prefix equality.
+
+These six values are sampled together from the worker for each HTTP response.
+Convergence is relative to that round's sampled target; a later intent change may
+already be pending. It is not a check of the latest intent, actual path identifiers,
+exclusive best-path selection or upstream enforcement. Check age as well.
 A consumer chooses its acceptable age; health alone gives no freshness guarantee.
 The two RIB families are read sequentially, not as an atomic network snapshot.
 Neither count proves selection or enforcement by an upstream router, or equality with the
@@ -630,7 +638,7 @@ instances.
 `sokol_xdp_dropped_packets_total{reason=...}` (`blocklist` for every blocked source, `malformed_header`, `invalid_tcp_flags`, `fragment_blocked`), `sokol_xdp_events_suppressed_total`,
 `sokol_blocks_active`, `sokol_p2p_active_peers`, `sokol_audit_queue_overflow_total`,
 `sokol_flowspec_announced`, `sokol_flowspec_enabled`, `sokol_flowspec_readback_ok`,
-`sokol_flowspec_readback_age_seconds`, `sokol_flowspec_discard_rules`, `sokol_cluster_status`, `sokol_cluster_nodes`,
+`sokol_flowspec_readback_age_seconds`, `sokol_flowspec_discard_rules`, `sokol_flowspec_round_converged`, `sokol_cluster_status`, `sokol_cluster_nodes`,
 `sokol_cluster_nodes_under_attack`, `sokol_cluster_storm_engaged`.
 
 Kernel drop events reach user space at most 64 times per second per CPU (trap-port events only

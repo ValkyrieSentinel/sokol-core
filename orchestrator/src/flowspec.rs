@@ -34,6 +34,7 @@ pub const SHUTDOWN_BUDGET: Duration = Duration::from_secs(10);
 struct Observation {
     count: usize,
     discard_count: usize,
+    converged: bool,
     started: Instant,
 }
 
@@ -44,6 +45,9 @@ pub struct ReadbackView {
     pub ok: bool,
     pub count: usize,
     pub discard_count: usize,
+    /// The completed round observed owned == discard == its sampled wanted set.
+    /// Revoked for pending/failed/cancelled rounds; not proof of latest intent.
+    pub converged: bool,
     pub started: Option<Instant>,
 }
 
@@ -62,13 +66,16 @@ impl Readback {
 
     fn begin_round(&self) {
         // Revoke before the first await, including shutdown reconciliation.
-        self.0.lock().unwrap_or_else(|p| p.into_inner()).ok = false;
+        let mut view = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        view.ok = false;
+        view.converged = false;
     }
 
     fn completed(&self, observation: Observation) {
         let mut view = self.0.lock().unwrap_or_else(|p| p.into_inner());
         view.count = observation.count;
         view.discard_count = observation.discard_count;
+        view.converged = observation.converged;
         view.started = Some(observation.started);
         view.ok = true;
     }
@@ -90,10 +97,11 @@ impl Rib {
         self.foreign_local.extend(other.foreign_local);
     }
 
-    fn observation(&self, started: Instant) -> Observation {
+    fn observation(&self, wanted: &HashSet<IpNet>, started: Instant) -> Observation {
         Observation {
             count: self.owned.len(),
             discard_count: self.discard.len(),
+            converged: &self.owned == wanted && &self.discard == wanted,
             started,
         }
     }
@@ -285,8 +293,9 @@ pub fn parse_rib(json: &[u8], community: u32) -> Result<Rib, String> {
                 }
             }
             if let (false, Some(net)) = (remote, source) {
-                // The CLI uses LocalID=0; it cannot safely select a tagged
-                // nonzero-ID path using only this prefix and community.
+                // CLI writes use identifier zero. Pinned JSON hides actual IDs;
+                // cli_id rejects only reported nonzero IDs. Reserve the tag for
+                // one writer: a hidden-ID path reusing it is counted as owned.
                 if tagged && cli_id {
                     own.owned.insert(net);
                     if has_canonical_discard(path) {
@@ -477,9 +486,9 @@ async fn round(
     // Keep unknown readback as an error, never replace it with arithmetic guesses.
     let observation = if changed {
         let started = Instant::now();
-        cli.observed().await?.observation(started)
+        cli.observed().await?.observation(wanted, started)
     } else {
-        observed.observation(started)
+        observed.observation(wanted, started)
     };
     if let Some(net) = collisions.first() {
         // Non-colliding work has progressed, but the full round is incomplete.
@@ -808,7 +817,7 @@ esac
             .await
             .unwrap();
         let old = readback.snapshot();
-        assert!(old.enabled && old.ok);
+        assert!(old.enabled && old.ok && old.converged);
         assert_eq!(old.count, 1);
         assert_eq!(old.discard_count, 1);
         assert!(old.started.is_some());
@@ -821,7 +830,12 @@ esac
             .await
             .is_err());
         let failed = readback.snapshot();
-        assert!(failed.enabled && !failed.ok);
+        assert!(failed.enabled && !failed.ok && !failed.converged);
+        assert!(crate::metrics::render_with_flowspec(
+            &crate::metrics::Snapshot::default(),
+            &readback
+        )
+        .contains("sokol_flowspec_round_converged 0\n"));
         assert_eq!(failed.count, old.count);
         assert_eq!(failed.discard_count, old.discard_count);
         assert_eq!(failed.started, old.started);
@@ -848,6 +862,10 @@ esac
             .await
             .unwrap();
         let old = readback.snapshot();
+        assert!(
+            old.ok && old.converged,
+            "revocation requires prior convergence"
+        );
         std::fs::write(fixture.dir.join("pause"), "").unwrap();
         let mut pending = Box::pin(checked_round(&fixture.cli, &wanted, &db, &readback));
         tokio::select! {
@@ -859,7 +877,12 @@ esac
             }) => result.unwrap(),
         }
         let during = readback.snapshot();
-        assert!(!during.ok);
+        assert!(!during.ok && !during.converged);
+        assert!(crate::metrics::render_with_flowspec(
+            &crate::metrics::Snapshot::default(),
+            &readback
+        )
+        .contains("sokol_flowspec_round_converged 0\n"));
         assert_eq!(during.count, old.count);
         assert_eq!(during.started, old.started);
         drop(pending);
@@ -1155,6 +1178,91 @@ exec "$real" "$@"
                 .unwrap()
                 .foreign_local
                 .contains(&net));
+            // Keep the real daemon's reads but acknowledge writes without forwarding.
+            // Read health must remain separate from observed target equality.
+            let wrapper = live.fixture.dir.join("no-effect-cli.sh");
+            let attempted = live.fixture.dir.join("no-effect-calls");
+            std::fs::write(
+                &wrapper,
+                r#"#!/bin/sh
+real="$1"
+calls="$2"
+shift 2
+case "$*" in
+  *' add '*|*' del '*) printf '%s\n' "$*" >> "$calls"; exit 0 ;;
+esac
+exec "$real" "$@"
+"#,
+            )
+            .unwrap();
+            let mut args = vec![
+                wrapper.to_str().unwrap().to_string(),
+                live.fixture.cli.bin.to_str().unwrap().to_string(),
+                attempted.to_str().unwrap().to_string(),
+            ];
+            args.extend(live.fixture.cli.args.clone());
+            let no_effect_cli = GobgpCli {
+                bin: "/bin/sh".into(),
+                args,
+                community: live.fixture.cli.community,
+            };
+            let replacement = one(if net.addr().is_ipv4() {
+                "198.51.100.10"
+            } else {
+                "2001:db8::10"
+            });
+            for (target, expected_count) in [
+                (HashSet::from([fresh]), 0),
+                (HashSet::new(), 1),
+                (HashSet::from([replacement]), 1),
+            ] {
+                if expected_count == 1 {
+                    live.fixture.cli.apply(true, fresh).await.unwrap();
+                }
+                std::fs::write(&attempted, "").unwrap();
+                checked_round(&no_effect_cli, &target, &db, &readback)
+                    .await
+                    .unwrap();
+                let calls = std::fs::read_to_string(&attempted).unwrap();
+                let expected = if expected_count == 0 {
+                    vec![format!(" add match source {} then discard", fresh)]
+                } else if target.is_empty() {
+                    vec![format!(" del match source {} then discard", fresh)]
+                } else {
+                    vec![
+                        format!(" del match source {} then discard", fresh),
+                        format!(" add match source {} then discard", replacement),
+                    ]
+                };
+                assert_eq!(calls.lines().count(), expected.len());
+                for operation in expected {
+                    assert!(
+                        calls.contains(&operation),
+                        "no-op CLI did not accept {operation}"
+                    );
+                }
+                let view = readback.snapshot();
+                assert!(view.ok);
+                assert_eq!(view.count, expected_count);
+                assert!(!view.converged);
+                let text = crate::metrics::render_with_flowspec(
+                    &crate::metrics::Snapshot::default(),
+                    &readback,
+                );
+                assert!(text.contains("sokol_flowspec_readback_ok 1\n"));
+                assert!(text.contains("sokol_flowspec_round_converged 0\n"));
+                // Restore actual writes: the same sampled target can now converge.
+                checked_round(&live.fixture.cli, &target, &db, &readback)
+                    .await
+                    .unwrap();
+                assert!(readback.snapshot().converged);
+                checked_round(&live.fixture.cli, &HashSet::new(), &db, &readback)
+                    .await
+                    .unwrap();
+                assert!(readback.snapshot().converged);
+                assert_eq!(live.raw(net).await, foreign);
+            }
+            writeln!(std::io::stdout(), "PASS live convergence {}: read success does not certify no-effect add/delete or equal-count wrong prefixes; recovery converges", family(&net)).unwrap();
             // Fixture owner cleanup, not an action of the Sokol reconciliation round.
             live.fixture.cli.apply(false, net).await.unwrap();
             // Direct stdout keeps the positive execution marker visible in CI even
@@ -1458,6 +1566,75 @@ exec "$real" "$@"
         assert!(calls.contains(" del match source 198.51.100.7/32 "));
         assert!(!calls.contains(" del match source 203.0.113.9/32 "));
         assert!(readback.snapshot().ok);
+    }
+
+    #[tokio::test]
+    async fn completed_reads_do_not_make_no_effect_writes_converged() {
+        for (before, after, target, count) in [
+            ("{}", "{}", ips(&["198.51.100.7"]), 0),
+            (RIB, RIB, HashSet::new(), 1),
+            // Same cardinality and canonical action, but the wrong prefix remains.
+            (RIB, RIB, ips(&["198.51.100.10"]), 1),
+        ] {
+            let fixture = RoundFixture::new(before, after, false);
+            let db = fixture.db();
+            let readback = Readback::default();
+            readback.enable();
+            checked_round(&fixture.cli, &target, &db, &readback)
+                .await
+                .unwrap();
+            assert!(fixture.dir.join("applied").exists());
+            let view = readback.snapshot();
+            assert!(view.ok);
+            assert_eq!(view.count, count);
+            let stale_main = crate::metrics::Snapshot {
+                flowspec_round_converged: true,
+                ..Default::default()
+            };
+            let text = crate::metrics::render_with_flowspec(&stale_main, &readback);
+            assert!(
+                text.contains("sokol_flowspec_round_converged 0\n"),
+                "a completed read certified an unachieved target"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn round_convergence_tracks_prefix_sets_and_canonical_actions() {
+        let wrong_action = RIB.replace("\"rate\":0", "\"rate\":100");
+        for (before, after, target, expected) in [
+            (RIB, RIB, ips(&["198.51.100.7"]), 1),
+            (RIB, "{}", HashSet::new(), 1),
+            ("{}", RIB, ips(&["198.51.100.7"]), 1),
+            ("{}", "{}", HashSet::new(), 1),
+            (
+                wrong_action.as_str(),
+                wrong_action.as_str(),
+                ips(&["198.51.100.7"]),
+                0,
+            ),
+            (
+                wrong_action.as_str(),
+                wrong_action.as_str(),
+                HashSet::new(),
+                0,
+            ),
+            (wrong_action.as_str(), RIB, ips(&["198.51.100.7"]), 1),
+        ] {
+            let fixture = RoundFixture::new(before, after, false);
+            let db = fixture.db();
+            let readback = Readback::default();
+            readback.enable();
+            checked_round(&fixture.cli, &target, &db, &readback)
+                .await
+                .unwrap();
+            assert!(readback.snapshot().ok);
+            let text = crate::metrics::render_with_flowspec(
+                &crate::metrics::Snapshot::default(),
+                &readback,
+            );
+            assert!(text.contains(&format!("sokol_flowspec_round_converged {expected}\n")));
+        }
     }
 
     #[tokio::test]

@@ -25,6 +25,11 @@
   extended community (type 128, subtype 6) та числовим rate 0, без окремого
   IPv6-specific extended-community атрибуту type 25. Інші дії перевидаються як
   discard, якщо prefix бажаний, і відкликаються, якщо вже не потрібний.
+  `sokol_flowspec_round_converged` перевіряє рівність обох повних prefix sets
+  (owned і canonical discard) з wanted snapshot цього раунду. Публікується разом
+  з observation; pending/failure/cancellation відкликають його до await. Health
+  може бути 1, коли convergence 0. Це не рівність із latest intent, що міг
+  змінитися під час раунду, не downstream enforcement і не нове право на дію.
 - Порожній RIB закріпленого CLI — JSON-об’єкт `{}`. Порожній stdout, `null`,
   невалідні UTF-8/JSON чи непридатна структура шляхів не підтверджують відсутність.
   Кожен destination містить масив об’єктів шляхів; attrs і NLRI components — масиви.

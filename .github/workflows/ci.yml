@@ -112,6 +112,7 @@ jobs:
           for family in ipv4-flowspec ipv6-flowspec; do
             grep -Fq "PASS live GoBGP ${family}:" /tmp/sokol-cargo-test.log
             grep -Fq "PASS live RIB refusal ${family}:" /tmp/sokol-cargo-test.log
+            grep -Fq "PASS live convergence ${family}:" /tmp/sokol-cargo-test.log
           done
 
       - name: Clippy

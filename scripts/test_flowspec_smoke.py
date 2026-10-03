@@ -56,9 +56,22 @@ class FlowSpecMetrics(unittest.TestCase):
         cls.helper = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(cls.helper)
 
-    def samples(self, enabled=1, ok=0, count=1, age=3, discard=None):
+    def samples(self, enabled=1, ok=0, count=1, age=3, discard=None, converged=0):
         return "\n".join(f"{name} {value}" for name, value in zip(
-            self.helper.NAMES, (enabled, ok, count, age, count if discard is None else discard))) + "\n"
+            self.helper.NAMES, (enabled, ok, count, age, count if discard is None else discard, converged))) + "\n"
+
+    def test_healthy_equal_counts_do_not_establish_round_convergence(self):
+        # A completed read of the wrong prefix set is still a healthy observation.
+        text = self.samples(ok=1)
+        self.assertTrue(self.helper.matches(text, "ok", 1, 0))
+        self.assertFalse(self.helper.matches(text, "converged", 1, 0))
+        self.assertTrue(self.helper.matches(self.samples(ok=1, converged=1), "converged", 1, 0))
+        for text in (self.samples(ok=0, converged=1), self.samples(ok=1, converged=2),
+                     self.samples(ok=1, converged="nan"), self.samples(ok=1, discard=0, converged=1),
+                     self.samples(ok=1).replace("sokol_flowspec_round_converged 0\n", ""),
+                     self.samples(ok=1) + "sokol_flowspec_round_converged 1\n"):
+            with self.assertRaises(ValueError):
+                self.helper.matches(text, "converged", 1, 0)
 
     def test_retained_count_only_passes_with_explicit_failure_and_age(self):
         self.assertTrue(self.helper.matches(self.samples(), "failed", 1, 2))
