@@ -498,3 +498,52 @@ actions, convergence certificate or upstream-router enforcement. The CLI-operati
 audit records retain their existing meaning and bytes; a later failed read does not
 rewrite a prior operation. Actual GoBGP is not alleged to acknowledge no-effect
 writes; the controlled executable exposes the consumer's former unsupported inference.
+
+
+## FLOWSPEC-R2: retained counts expose readback health and monotonic age
+
+The worker publishes count, enablement, success status and read-start instant as one
+locked record. A normal or shutdown round revokes success before its first await;
+a failed or cancelled round cannot change the retained count or time. A completed
+round replaces them together. Age begins before the successful two-family read,
+including time spent waiting for GoBGP, and is evaluated at each scrape. HTTP samples
+the worker directly, independent of the main loop's last published snapshot.
+
+`failed_readback_retains_count_and_age_until_recovery` executes the production
+CLI runner with a changed RIB and valid JSON plus a failing exit code, then recovers
+to observed zero. `pending_and_cancelled_rounds_revoke_readback_before_waiting`
+checks the state while the actual child is blocked and after cancelling the future.
+`observation_age_includes_the_time_spent_reading` rejects completion-time timestamps.
+`scraping_samples_the_worker_without_a_main_tick` checks the production rendering
+bridge against a fixed main snapshot. `readback_age_advances_without_another_publication`
+uses deterministic monotonic instants for both successful and failed observations.
+`an_unverified_count_has_explicit_unknown_readback` fails behaviorally on the prior
+renderer, distinguishing unknown zero from observed zero. Six compiled semantic
+controls reject retained success during a pending round, fabricated zero after failure,
+refreshing the timestamp on failure, completion-time timestamps, rendering the old
+main tick and a frozen age. Local extraction uses the unchanged production modules
+with audit/target/retraction/mesh-label stand-ins and the actual common crate;
+canonical native CI uses the actual owners.
+
+The Linux smoke uses the actual HTTP endpoint and pinned GoBGP: a wrapper forces
+CLI errors, the local RIB changes independently, the previous count remains with
+health zero and increasing age, and recovery re-announces the desired static rule.
+Disabled and observe mode expose enabled=0, ok=0, age=-1. Recovery waits for
+asynchronous upstream propagation with bounded attempts on known contradictions;
+an unverified read fails immediately. All twelve actual RIB smoke call sites are
+covered by the CLI-failure refusal regressions. The smoke's wait/age limits
+are test conditions, not production SLOs. Parsing rejects missing, duplicate,
+nonfinite or invalid samples; an HTTP error cannot satisfy an observation.
+
+Native end-to-end CI exposed an additional consumer: the runbook rehearsal assumed
+all `_ok` metrics must be 1, including a correctly disabled FlowSpec worker. The
+runbook and actual rehearsal now name the same four required node health series as
+the dashboard/alert. Tests execute that shell consumer: optional pending/disabled
+readback is allowed; each missing, zero, malformed or duplicate mandatory series
+and empty/failed HTTP are rejected. This does not change runtime MODE/authority;
+FlowSpec remains separately observable under its own contract.
+
+These gauges describe the latest round and retained local observation. They do not
+supply an atomic IPv4/IPv6 RIB snapshot, a universal freshness deadline, process
+liveness, convergence, action validation or upstream enforcement. A consumer must
+select its own acceptable age. No new permission or detector policy is introduced.

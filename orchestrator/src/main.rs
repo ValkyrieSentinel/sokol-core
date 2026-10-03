@@ -2363,18 +2363,22 @@ async fn main() -> Result<(), anyhow::Error> {
     // Counters are cumulative; the first tick only establishes the baseline.
     let mut have_baseline = false;
 
+    let flowspec_readback = Arc::new(flowspec::Readback::default());
     let metrics_snapshot = Arc::new(std::sync::RwLock::new(metrics::Snapshot::default()));
     if let Some(addr) = args.metrics_bind {
         let listener = tokio::net::TcpListener::bind(addr)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to bind metrics endpoint {}: {}", addr, e))?;
         let snapshot = metrics_snapshot.clone();
+        let readback = flowspec_readback.clone();
         let app = axum::Router::new().route(
             "/metrics",
             axum::routing::get(move || {
                 let snapshot = snapshot.clone();
+                let readback = readback.clone();
                 async move {
-                    let body = metrics::render(&snapshot.read().unwrap_or_else(|p| p.into_inner()));
+                    let snapshot = snapshot.read().unwrap_or_else(|p| p.into_inner()).clone();
+                    let body = metrics::render_with_flowspec(&snapshot, &readback);
                     (
                         [(
                             axum::http::header::CONTENT_TYPE,
@@ -2475,7 +2479,6 @@ async fn main() -> Result<(), anyhow::Error> {
     let mut telemetry_window_start = std::time::Instant::now();
     let mut window_rx = 0u64;
     let mut window_dropped = 0u64;
-    let flowspec_announced = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let (flowspec_tx, flowspec_rx) = watch::channel(std::collections::HashSet::<IpNet>::new());
     let flowspec_gobgp = match (args.flowspec_gobgp.clone(), args.enforce) {
         (Some(_), Enforce::Observe) => {
@@ -2512,12 +2515,13 @@ async fn main() -> Result<(), anyhow::Error> {
                 community.0,
                 community.1
             );
+            flowspec_readback.enable();
             Some(tokio::spawn(flowspec::run_worker(
                 cli,
                 flowspec_rx,
                 shutdown_rx.clone(),
                 sntl_db.clone(),
-                flowspec_announced.clone(),
+                flowspec_readback.clone(),
             )))
         }
         None => None,
@@ -2739,8 +2743,6 @@ async fn main() -> Result<(), anyhow::Error> {
 
                 if flowspec_worker.is_some() {
                     let _ = flowspec_tx.send(blocks.lock().await.active_ips());
-                    snapshot.flowspec_announced =
-                        flowspec_announced.load(std::sync::atomic::Ordering::Relaxed);
                 }
                 *metrics_snapshot.write().unwrap_or_else(|p| p.into_inner()) = snapshot;
 

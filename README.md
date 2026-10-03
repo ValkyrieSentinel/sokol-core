@@ -568,7 +568,19 @@ touched. A slow or hung gobgpd never delays the main loop. `sokol_flowspec_annou
 number of the node's source-prefix rules last seen in the local RIB. After a round
 changes rules, the worker reads both families again before publishing that count;
 a successful CLI write alone cannot update it. Failed readback retains the last
-successful observation, which may be stale. This count does not validate the discard
+successful observation, which may be stale. Read it together with:
+
+- `sokol_flowspec_enabled`: 1 when the worker is configured; 0 when disabled or in observe mode.
+- `sokol_flowspec_readback_ok`: 1 after the latest round completed successfully;
+  0 at startup, during a round, after failure or cancellation. This is not convergence.
+- `sokol_flowspec_readback_age_seconds`: monotonic age since the start of the last
+  successful two-family read; -1 before any successful observation. It continues
+  to grow after failure and is computed when scraped, independently of the main tick.
+
+These four values are sampled together from the worker for each HTTP response.
+A consumer chooses its acceptable age; health alone gives no freshness guarantee.
+The two RIB families are read sequentially, not as an atomic network snapshot.
+This count does not validate the discard
 action or prove that an upstream router applied it. `FLOWSPEC_ANNOUNCE`/`WITHDRAW`
 audit records acknowledge successful CLI operations, not the subsequent observation.
 
@@ -590,7 +602,8 @@ instances.
 `sokol_xdp_rx_packets_total`, `sokol_xdp_rx_bytes_total`,
 `sokol_xdp_dropped_packets_total{reason=...}` (`blocklist` for every blocked source, `malformed_header`, `invalid_tcp_flags`, `fragment_blocked`), `sokol_xdp_events_suppressed_total`,
 `sokol_blocks_active`, `sokol_p2p_active_peers`, `sokol_audit_queue_overflow_total`,
-`sokol_flowspec_announced`, `sokol_cluster_status`, `sokol_cluster_nodes`,
+`sokol_flowspec_announced`, `sokol_flowspec_enabled`, `sokol_flowspec_readback_ok`,
+`sokol_flowspec_readback_age_seconds`, `sokol_cluster_status`, `sokol_cluster_nodes`,
 `sokol_cluster_nodes_under_attack`, `sokol_cluster_storm_engaged`.
 
 Kernel drop events reach user space at most 64 times per second per CPU (trap-port events only
