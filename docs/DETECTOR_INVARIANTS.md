@@ -407,7 +407,9 @@ shorter than the reader's verified offset is unverified, avoiding subtraction
 underflow. Replay keeps rejecting either error before consuming any decisions.
 
 Smoke requires both the exit code and a matching path-bound label for its explicit
-intact/broken expectation. Failed execution, inconsistent or missing output and
+intact/broken expectation. The path label binds the verdict to the invocation
+argument, not an authenticated or canonical file identity. Failed execution,
+inconsistent or missing output and
 a verdict about another path cannot confirm either expectation. The real smoke
 wrapper rejects a contradiction and an unverified result alike.
 
