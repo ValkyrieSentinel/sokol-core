@@ -437,7 +437,8 @@ A successful drop assertion requires a healthy separate source on the same isola
 veth route, one unambiguous XDP attachment for the expected interface, and a successful
 `bpftool` kernel test-run returning the integer XDP_DROP verdict for the requested
 source/destination Ethernet/IPv4/ICMP frame. The live namespace ping must then report
-exactly the requested transmissions and zero responses with its no-reply exit code.
+exactly the requested transmissions and zero responses with its no-reply exit code,
+without reported network errors.
 The control route must still work and the observed program ID, ifindex and mode must
 match the initial attachment. A valid XDP_PASS or live reply contradicts the requested
 drop; missing tools, timeouts, failed commands (even with valid partial JSON), malformed

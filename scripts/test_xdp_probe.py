@@ -164,6 +164,7 @@ class XdpSmoke(unittest.TestCase):
             {'NET_AFTER':json.dumps([{'xdp':[dict(entry,mode='generic')]}])},
             {'CONTROL_STATUS':'1'}, {'POST_CONTROL_STATUS':'1'},
             {'TARGET_OUTPUT':''}, {'TARGET_RX':'1'}, {'TARGET_SENT':'0'},
+            {'TARGET_OUTPUT':'2 packets transmitted, 0 received, +1 errors, 100% packet loss, time 1000ms\n'},
         ]
         _, cmd = commands()[0]
         source = (ROOT/'scripts/xdp-smoke.sh').read_text()

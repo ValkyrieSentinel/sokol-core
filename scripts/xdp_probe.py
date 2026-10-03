@@ -78,10 +78,12 @@ def ping(namespace, source, destination, count, fragment=False):
         args += ['-s', '3000']
     args += ['-I', source, destination]
     result = run(args, timeout=count + 5)
-    summaries = re.findall(r'^(\d+) packets transmitted, (\d+) (?:packets )?received,', result.stdout, re.M)
+    summaries = re.findall(r'^(\d+) packets transmitted, (\d+) (?:packets )?received,([^\n]*)', result.stdout, re.M)
     if result.returncode not in [0, 1] or len(summaries) != 1:
         raise Unverified('ping failed or lacks one recognizable summary')
-    sent, received = map(int, summaries[0])
+    sent, received = map(int, summaries[0][:2])
+    if re.search(r'\berrors?\b', summaries[0][2]):
+        raise Unverified('ping reported network errors')
     if sent != count or not 0 <= received <= sent or (result.returncode == 0) != (received > 0):
         raise Unverified('inconsistent ping result')
     return received
