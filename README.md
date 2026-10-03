@@ -587,11 +587,15 @@ An actual change to the desired prefix set interrupts a pending round and starts
 new RIB read for the latest set. Identical main ticks send no notification, so they
 do not repeatedly cancel slow calls. Shutdown interrupts normal reconciliation and
 starts the existing ten-second withdrawal attempt; an already-set shutdown flag or
-a closed intent/shutdown channel also starts cleanup. Cancellation kills the CLI
-child but cannot undo a command already accepted by GoBGP: the next read establishes
+a closed intent/shutdown channel also starts cleanup. Cancellation kills the
+direct child but cannot undo a command already accepted by GoBGP: the next read establishes
 its effect before more writes. A publication and a CLI call are not atomic; this
 stops obsolete work once the worker observes the change, not at the publication instant.
-Continuous changes can prevent a completed observation. The 64-operation quota is
+CLI wrappers must `exec` the CLI; kill-on-drop does not kill a process tree. A
+non-exec descendant can outlive cancellation and act after the next RIB read.
+Continuous changes with slow GoBGP can prevent every write as well as completed
+observations; useful progress requires a stable intent window long enough for the
+necessary calls. The 64-operation quota is
 per round, not a rate limit across interrupted rounds.
 `sokol_flowspec_discard_rules` counts the subset satisfying the canonical discard contract.
 After writes, both families are read again before either count is published; CLI success
@@ -628,6 +632,8 @@ discard convergence, causing repeated announcements and audit records within the
 Use a compatible local policy; health alone does not detect this mismatch.
 `FLOWSPEC_ANNOUNCE`/`WITHDRAW` audit records acknowledge successful CLI operations,
 not the subsequent observation.
+An accepted command whose local reply is cancelled can have no acknowledgement
+record; those records are not a complete history of GoBGP effects.
 
 Run gobgpd with a neighbor for each upstream router and the `ipv4-flowspec` / `ipv6-flowspec`
 address families enabled, then point the orchestrator at its API:

@@ -810,8 +810,14 @@ separate required gates before merge.
 Limits: the select boundary is cooperative; publication and CLI invocation are not
 atomic. A command already accepted by GoBGP can take effect even when its local
 future/child is cancelled. Cancellation is not rollback or evidence of no effect.
-RIB readback, not arithmetic or a cancelled reply, determines the next plan. Ongoing
-intent churn can prevent completed observations; the 64-operation quota is per
+RIB readback, not arithmetic or a cancelled reply, determines the next plan.
+Kill-on-drop kills the direct subprocess, not its descendants. Wrappers must exec
+the CLI; a non-exec child can land a late effect after a fresh read. The live wrapper
+withholds its reply only after its real GoBGP subprocess has already completed.
+A cancelled accepted command can have no CLI-acknowledgement audit record; these
+records are not a complete effect history. Ongoing intent churn with slow GoBGP can
+prevent every write as well as completed observations. Progress needs a stable
+window long enough for the necessary calls; the 64-operation quota is per
 round, not a rate budget across restarts. Cleanup is a bounded attempt, not guaranteed
 withdrawal. Sampled-round convergence still does not prove latest intent, actual
 path IDs, best-path selection or upstream enforcement. Checker, frozen captures,
