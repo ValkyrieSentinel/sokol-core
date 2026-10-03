@@ -694,3 +694,63 @@ GoBGP may accept foreign local metadata outside this parser's contract (for exam
 an IPv6 source offset above 128). Such local data stops the whole read/reconciliation,
 including unblocking and shutdown attempts, until removed; peer metadata is excluded.
 No checker, frozen fixtures/results or delivery-shadow pins change.
+
+## FLOWSPEC-R5: read success is distinct from achieving the sampled target
+
+An actual pinned GoBGP 4.9.0 experiment in
+[the measurement record](measurements/2026-10-03-flowspec-convergence/README.md)
+confirms that an ID-zero CLI withdrawal can exit zero without removing a same-tag
+identifier-7 path. Both API and raw CLI observations are retained with a runnable
+injector/runner. Deliberately reusing the CLI writer's community violates the normal
+ownership assumption; it demonstrates the boundary, not a production incident.
+R1's retained observation already avoids phantom disappearance. A completed read
+can be healthy while the sampled target has not been reached.
+
+`Readback` now includes a round-convergence bit, published with the observed counts
+and read-start time. It is true exactly when owned == canonical-discard == the
+round's wanted snapshot as prefix sets. Cardinality equality is insufficient.
+Pending rounds revoke it before await; failure/cancellation cannot retain a true
+bit. The renderer also requires enabled, readback success and an observation time.
+Counts/time retain R1/R2 semantics. No new CLI call, operation, retry policy, quota,
+shutdown budget or production permission is introduced.
+
+`completed_reads_do_not_make_no_effect_writes_converged` checks acknowledged but
+ineffective adds/deletes and equal-count wrong-prefix results through the production
+CLI runner and worker-to-HTTP bridge. `round_convergence_tracks_prefix_sets_and_canonical_actions`
+checks successful effect, unchanged/empty targets, wrong actions, repairs and
+unwanted noncanonical paths. Both regressions failed against the base on metric
+assertions, with no import or compilation error. Existing pending/cancelled and
+failed-readback controls additionally check revocation through the public view.
+`convergence_requires_a_completed_enabled_observation` guards renderer inputs.
+
+The real-daemon test delegates reads to GoBGP but uses controlled exit-zero no-op
+write acknowledgements. For IPv4 and IPv6, healthy observations of missing desired
+rules, retained unwanted rules and equal-count wrong prefixes remain non-converged.
+Actual writes then restore the target and convergence, while the foreign path's
+full raw response remains byte-identical after cleanup. Six direct-stdout positive
+markers are required in canonical x86/ARM CI: existing action/refusal checks plus
+round-convergence checks for each family. A skipped test is no proof. Native CI
+uses the actual owners; local extraction retains audit/target/label stand-ins and
+actual common code. Local checks passed 35 production-module tests and 14 Python
+smoke/health refusal tests. Nine compiled Rust semantic mutants were rejected:
+cardinality substituted for prefix equality, ownership substituted for action,
+unwanted noncanonical paths ignored, unconditional CLI success/failure convergence,
+retaining convergence during pending work, reusing the main tick, ignoring renderer
+health and reusing the initial observation after writes. A tenth control bypassed
+the actual HTTP consumer's convergence predicate and failed on its expected assertion.
+The exact CI marker predicate accepts all six positive markers, refuses missing
+family-specific convergence/refusal markers and rejects framework PASS after skip;
+pipefail preserves nonzero cargo exit status through tee.
+
+The HTTP smoke consumer adds a separate convergence expectation; a healthy read
+alone remains a valid observation. Its live static-rule and recovery checkpoints
+now require convergence, while failed/disabled checks require no false convergence.
+Missing, duplicate, invalid or contradictory convergence samples are unverified.
+
+Limits: this is equality with the target sampled for the completed round, not the
+latest intent (which may have changed during/after its CLI calls), current freshness,
+actual ID-zero identity, atomic family reads, exclusive/best-path selection,
+downstream router enforcement or eventual progress. A consumer chooses an acceptable
+age. Unverified/disabled zero does not establish a divergent RIB. Existing audit
+records still acknowledge CLI operations, not observed postconditions. No new model,
+checker, frozen evidence or delivery-shadow pin is needed for this bounded predicate.

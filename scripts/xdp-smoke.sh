@@ -894,7 +894,7 @@ check "monitor --verify detects an edited segment" audit_verdict broken "$WORK/e
 cp "$WORK/segment.bak" "$FIRST_SEGMENT"
 if [ ${#FLOWSPEC_ARGS[@]} -gt 0 ]; then
     check "Flowspec: expired block is withdrawn upstream" flowspec_rule absent "$ALLOWED_IP/32"
-    check "Flowspec metrics: completed read reports the static rule" flowspec_metrics ok 1 0
+    check "Flowspec metrics: completed read reports the static rule" flowspec_metrics converged 1 0
     touch "$WORK/readback-fail"
     # Change the actual local RIB behind the failed reader, independently of the worker.
     gobgp -p 50051 global rib -a ipv4-flowspec del match source "$BLOCKED_IP/32" then discard community 65001:6666
@@ -905,7 +905,7 @@ if [ ${#FLOWSPEC_ARGS[@]} -gt 0 ]; then
     sleep 1
     check "Flowspec metrics: retained observation continues to age" flowspec_metrics failed 1 3
     rm "$WORK/readback-fail"
-    check "Flowspec metrics: successful read restores health" flowspec_metrics ok 1 0
+    check "Flowspec metrics: successful read restores health" flowspec_metrics converged 1 0
     check "Flowspec: recovered worker restores the wanted static rule" wait_flowspec_rule present "$BLOCKED_IP/32"
 fi
 check "TTL: static --block stays in force" xdp_drop "$BLOCKED_IP" 1
