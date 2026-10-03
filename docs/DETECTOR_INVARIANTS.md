@@ -363,3 +363,29 @@ that detaches. The actual chained-audit regression additionally rejects a surviv
 receiver at final fsync. The decision regression rejects moving mesh publication back ahead
 of the audit submission. Canonical Linux CI uses the actual policy, registry and kernel
 smoke; the portable owner extraction uses kernel/transport/policy stand-ins for local checks.
+
+
+## FLOWSPEC-S1: failed smoke readback cannot prove presence or absence
+
+Owner: [flowspec-rib.sh](../scripts/flowspec-rib.sh), used by all ten FlowSpec
+assertions in [xdp-smoke.sh](../scripts/xdp-smoke.sh).
+
+The pinned GoBGP text CLI must exit successfully before its stdout can support an
+assertion. A missing CLI, failed RPC (including matching partial stdout), or matcher
+error returns 2 (unverified). A successful read returns 0 when the requested
+presence/absence agrees with the displayed literal source prefix, otherwise 1.
+The smoke's check wrapper rejects both 1 and 2; absence is requested explicitly,
+never obtained by negating a presence check that can itself fail.
+
+The regressions in `scripts/test_flowspec_smoke.py` execute the actual ten caller
+commands with fallible CLI stand-ins and the actual check wrapper. Successful
+present and empty responses cover both expectations; failed reads, partial output,
+a missing executable and matcher errors cannot pass. CI runs these before the
+native XDP/BGP smoke on both Linux architectures.
+
+This is a readback refusal invariant, not validation of all successful CLI output.
+It relies on the pinned CLI's text format and successful-query completeness; empty
+successful output represents an empty displayed RIB. Source-prefix matching alone
+does not prove discard action, ownership/community, a coherent snapshot across
+queries, or global network state. It does not change the runtime's JSON-based
+reconciliation or its withdrawal guarantees.

@@ -5,6 +5,7 @@
 # Needs root (netns, XDP attach). Linux only.
 #   sudo scripts/xdp-smoke.sh [path/to/orchestrator]
 set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/flowspec-rib.sh"
 
 BIN="${1:-target/release/orchestrator}"
 NS=sokol-smoke-peer
@@ -836,8 +837,8 @@ ipc "DROP_IMMEDIATE:$ALLOWED_IP"
 sleep 0.5
 if [ ${#FLOWSPEC_ARGS[@]} -gt 0 ]; then
     sleep 1.2
-    check "Flowspec: upstream receives a discard rule for the dynamic block" bash -c "gobgp -p 50052 global rib -a ipv4-flowspec | grep -q 'source: $ALLOWED_IP/32'"
-    check "Flowspec: upstream receives a discard rule for the static block" bash -c "gobgp -p 50052 global rib -a ipv4-flowspec | grep -q 'source: $BLOCKED_IP/32'"
+    check "Flowspec: upstream receives a discard rule for the dynamic block" flowspec_rule present "$ALLOWED_IP/32"
+    check "Flowspec: upstream receives a discard rule for the static block" flowspec_rule present "$BLOCKED_IP/32"
     if ! gobgp -p 50052 global rib -a ipv4-flowspec | grep -q "source: $BLOCKED_IP/32"; then
         echo "--- Flowspec diagnostics: node gobgpd neighbors / RIB, upstream RIB, logs"
         gobgp -p 50051 neighbor || true
@@ -859,7 +860,7 @@ python3 -c "import sys; f = open(sys.argv[1], 'r+b'); f.seek(40); b = f.read(1)[
 check "monitor --verify detects an edited segment" bash -c "! '$MONITOR_BIN' --verify '$WORK/events.sntl' >/dev/null"
 cp "$WORK/segment.bak" "$FIRST_SEGMENT"
 if [ ${#FLOWSPEC_ARGS[@]} -gt 0 ]; then
-    check "Flowspec: expired block is withdrawn upstream" bash -c "! gobgp -p 50052 global rib -a ipv4-flowspec | grep -q 'source: $ALLOWED_IP/32'"
+    check "Flowspec: expired block is withdrawn upstream" flowspec_rule absent "$ALLOWED_IP/32"
 fi
 check "TTL: static --block stays in force" bash -c "! ip netns exec $NS ping -c 1 -W 1 -I $BLOCKED_IP $HOST_IP >/dev/null 2>&1"
 
@@ -869,28 +870,26 @@ if [ ${#FLOWSPEC_ARGS[@]} -gt 0 ]; then
     start_orchestrator --enforce observe "${FLOWSPEC_ARGS[@]}"
     ipc "DROP_IMMEDIATE:$ALLOWED_IP"
     sleep 2.5
-    check "observe mode: no Flowspec rule reaches upstream for a new block" bash -c \
-        "! gobgp -p 50052 global rib -a ipv4-flowspec | grep -q 'source: $ALLOWED_IP/32'"
+    check "observe mode: no Flowspec rule reaches upstream for a new block" flowspec_rule absent "$ALLOWED_IP/32"
     check "observe mode: the audit says Flowspec is disabled" grep -aq 'FLOWSPEC_DISABLED|Why:observe' "$WORK/events.sntl"
-    check "observe mode: another system's upstream rule is untouched" bash -c \
-        "gobgp -p 50052 global rib -a ipv4-flowspec | grep -q 'source: $FOREIGN_RULE'"
+    check "observe mode: another system's upstream rule is untouched" flowspec_rule present "$FOREIGN_RULE"
     stop_orchestrator
 fi
 if [ ${#FLOWSPEC_ARGS[@]} -gt 0 ]; then
     sleep 1
-    check "Flowspec: shutdown withdraws the node's rules upstream" bash -c "! gobgp -p 50052 global rib -a ipv4-flowspec | grep -q 'source: $BLOCKED_IP/32'"
-    check "Flowspec: another system's rule is left alone" bash -c "gobgp -p 50052 global rib -a ipv4-flowspec | grep -q 'source: $FOREIGN_RULE'"
+    check "Flowspec: shutdown withdraws the node's rules upstream" flowspec_rule absent "$BLOCKED_IP/32"
+    check "Flowspec: another system's rule is left alone" flowspec_rule present "$FOREIGN_RULE"
     # F03: a crashed orchestrator leaves its rules in gobgpd; the next run reads the RIB and
     # withdraws what it no longer wants (it remembers nothing of the previous run).
     start_orchestrator --block-ttl 3600 "${FLOWSPEC_ARGS[@]}"
     ipc "DROP_IMMEDIATE:$ALLOWED_IP"
     sleep 2
     kill -9 "$ORCH_PID"; wait "$ORCH_PID" 2>/dev/null || true; ORCH_PID=""
-    check "Flowspec: a crashed node's rule stays upstream" bash -c "gobgp -p 50052 global rib -a ipv4-flowspec | grep -q 'source: $ALLOWED_IP/32'"
+    check "Flowspec: a crashed node's rule stays upstream" flowspec_rule present "$ALLOWED_IP/32"
     start_orchestrator "${FLOWSPEC_ARGS[@]}"
     sleep 3
-    check "Flowspec: the next run withdraws the crashed run's stale rule" bash -c "! gobgp -p 50052 global rib -a ipv4-flowspec | grep -q 'source: $ALLOWED_IP/32'"
-    check "Flowspec: the next run keeps announcing its wanted rules" bash -c "gobgp -p 50052 global rib -a ipv4-flowspec | grep -q 'source: $BLOCKED_IP/32'"
+    check "Flowspec: the next run withdraws the crashed run's stale rule" flowspec_rule absent "$ALLOWED_IP/32"
+    check "Flowspec: the next run keeps announcing its wanted rules" flowspec_rule present "$BLOCKED_IP/32"
     stop_orchestrator
 fi
 check "SIGINT/SIGTERM shutdown is graceful" grep -q "terminated gracefully" "$LOG"
