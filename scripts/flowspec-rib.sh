@@ -24,3 +24,17 @@ flowspec_rule() {
         *) [ "$expected" = absent ] ;;
     esac
 }
+
+# BGP propagation is asynchronous. Retry a known contradictory RIB, never an
+# unverified read. Bounded attempts; CLI/scheduler time is outside the sleep sum.
+wait_flowspec_rule() {
+    local attempt status
+    for ((attempt = 0; attempt < 20; attempt++)); do
+        if flowspec_rule "$@"; then return 0; else status=$?; fi
+        [ "$status" -eq 1 ] || return "$status"
+        if [ "$attempt" -lt 19 ]; then
+            sleep 0.25 || return 2
+        fi
+    done
+    return 1
+}

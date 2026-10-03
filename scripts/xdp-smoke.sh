@@ -906,7 +906,7 @@ if [ ${#FLOWSPEC_ARGS[@]} -gt 0 ]; then
     check "Flowspec metrics: retained observation continues to age" flowspec_metrics failed 1 3
     rm "$WORK/readback-fail"
     check "Flowspec metrics: successful read restores health" flowspec_metrics ok 1 0
-    check "Flowspec: recovered worker restores the wanted static rule" flowspec_rule present "$BLOCKED_IP/32"
+    check "Flowspec: recovered worker restores the wanted static rule" wait_flowspec_rule present "$BLOCKED_IP/32"
 fi
 check "TTL: static --block stays in force" xdp_drop "$BLOCKED_IP" 1
 

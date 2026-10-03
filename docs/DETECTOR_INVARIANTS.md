@@ -528,7 +528,10 @@ canonical native CI uses the actual owners.
 The Linux smoke uses the actual HTTP endpoint and pinned GoBGP: a wrapper forces
 CLI errors, the local RIB changes independently, the previous count remains with
 health zero and increasing age, and recovery re-announces the desired static rule.
-Disabled and observe mode expose enabled=0, ok=0, age=-1. The smoke's wait/age limits
+Disabled and observe mode expose enabled=0, ok=0, age=-1. Recovery waits for
+asynchronous upstream propagation with bounded attempts on known contradictions;
+an unverified read fails immediately. All twelve actual RIB smoke call sites are
+covered by the CLI-failure refusal regressions. The smoke's wait/age limits
 are test conditions, not production SLOs. Parsing rejects missing, duplicate,
 nonfinite or invalid samples; an HTTP error cannot satisfy an observation.
 

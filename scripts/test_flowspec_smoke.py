@@ -17,6 +17,7 @@ ABSENT = {
     "observe mode: no Flowspec rule reaches upstream for a new block",
     "Flowspec: shutdown withdraws the node's rules upstream",
     "Flowspec: the next run withdraws the crashed run's stale rule",
+    "Flowspec: removed static rule is absent upstream during the fault",
 }
 PRESENT = {
     "Flowspec: upstream receives a discard rule for the dynamic block",
@@ -25,6 +26,7 @@ PRESENT = {
     "Flowspec: another system's rule is left alone",
     "Flowspec: a crashed node's rule stays upstream",
     "Flowspec: the next run keeps announcing its wanted rules",
+    "Flowspec: recovered worker restores the wanted static rule",
 }
 RIB = """   Network                 Next Hop             AS_PATH              Age        Attrs
 *> [source: 10.231.0.2/32] fictitious 00:00:01 [{Extcomms: [discard]}]
@@ -34,7 +36,7 @@ RIB = """   Network                 Next Hop             AS_PATH              Ag
 
 
 def assertions():
-    # Run the actual commands at the actual ten call sites, including Bash children.
+    # Run the actual commands at all actual call sites, including Bash children.
     # A helper-only test would miss a caller still using `!` to invert its error.
     text = (ROOT / 'scripts/xdp-smoke.sh').read_text().replace('\\\n', ' ')
     matches = re.findall(r'^\s*check "([^"\n]+)"\s+([^\n]+)$', text, re.MULTILINE)
@@ -83,7 +85,7 @@ class FlowSpecSmoke(unittest.TestCase):
         self.directory = tempfile.TemporaryDirectory(prefix='sokol-rib-gate-')
         self.addCleanup(self.directory.cleanup)
         self.root = Path(self.directory.name)
-        for name, target in [('python3', sys.executable), ('bash', '/bin/bash'), ('grep', '/usr/bin/grep')]:
+        for name, target in [('python3', sys.executable), ('bash', '/bin/bash'), ('grep', '/usr/bin/grep'), ('sleep', '/usr/bin/true')]:
             (self.root / name).symlink_to(target)
         self.cli = self.root / 'gobgp'
         self.cli.write_text('''#!/usr/bin/env python3
@@ -131,13 +133,16 @@ sys.exit(int(os.environ['RIB_STATUS']))
                     expected = 0 if (name in PRESENT) == present else 1
                     self.assertEqual(result.returncode, expected, result.stderr)
                     self.assertTrue(calls.exists(), 'assertion skipped the readback')
-                    self.assertEqual(len(calls.read_text().splitlines()), 1)
+                    # Only the propagation waiter retries a known mismatch.
+                    attempts = 20 if command.startswith('wait_flowspec_rule ') and expected == 1 else 1
+                    self.assertEqual(len(calls.read_text().splitlines()), attempts)
 
     def test_unavailable_api_is_unverified_at_every_actual_call_site(self):
         for name, command in assertions().items():
             with self.subTest(name=name):
-                result, _ = self.run_assertion(command, '', 7)
+                result, calls = self.run_assertion(command, '', 7)
                 self.assertEqual(result.returncode, 2, 'API error became a RIB verdict: ' + name)
+                self.assertEqual(len(calls.read_text().splitlines()), 1, 'unverified reads must not be retried')
 
     def test_partial_output_before_cli_failure_cannot_authorize_either_verdict(self):
         for name, command in assertions().items():
