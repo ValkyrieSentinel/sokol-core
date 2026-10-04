@@ -1007,3 +1007,56 @@ shutdown preempts normal work and bounds cleanup independently. Failed rounds us
 existing outer scheduling, not immediate internal retries; watch activity can still
 accelerate them. No new authority, atomic authorization, RPC fence, complete effect
 audit, unconditional fairness/convergence or proof-core/model/pin change.
+
+
+## FLOWSPEC-R10: pace failed rounds without delaying shutdown
+
+At base `078a630` (#139), the public worker's interval retains overdue ticks and
+intent notifications can immediately begin another failed round. The log's
+“retrying every second” therefore did not specify the actual behavior.
+`failed_rounds_wait_despite_intent_churn` and
+`failed_rounds_wait_despite_overdue_ticks` compile against that base and fail on
+actual child-call counts, not imports. The real GoBGP regression also fails its
+no-early-calls assertion on the base.
+
+After any failed normal round, `run_worker` now waits at least one second from
+completion before permitting another normal reconciliation. The same sleep future
+survives intent churn and false stop notifications, so neither can shorten or
+restart the deadline. No CLI call is started during the pause. The next round
+samples current intent through the existing live path; it never resumes a saved
+failed target. Successful rounds and immediate supersession replanning retain
+existing scheduling. Any true shutdown or closed shutdown/intent publisher wins
+the biased pause select and begins cleanup, without awaiting the retry deadline.
+Cleanup retains its separate ten-second budget and existing 500-ms error pauses.
+Health/convergence stay revoked and the last completed counts/time survive the
+pause. Logging reports the minimum pause accurately.
+
+The public-worker fixtures hold an actual failing read, optionally accumulate a
+1.2-second overdue tick, then keep publishing intent and false shutdown updates.
+They require one call during the early window, a retry after at least 900 ms
+(the one-second policy allows 100 ms observation tolerance), and progress within
+1.6 seconds while notifications continue. They abort their deliberately failing
+worker afterward; cleanup is checked independently with real GoBGP.
+`live_gobgp_retry_pause_keeps_latest_intent_and_preempts_for_cleanup` uses actual
+GoBGP 4.9, one shared native audit owner, and four cases per IPv4/IPv6 family:
+overdue ticks plus intent churn, true shutdown, closed shutdown publisher and
+closed intent publisher. It requires no early calls, recovery to the latest owned
+discard set without an obsolete add, previous failed-round counts/time, and real
+owned-rule withdrawal in less than 750 ms for all three stop cases. Foreign-only
+family bytes must remain unchanged. The first failing child marker precedes its
+exit; timing windows are runtime regression evidence with tolerance, not an
+exact real-time theorem. Scheduler load can lengthen waits; the implementation
+uses Tokio's monotonic sleep, not a bound on scheduling latency.
+
+Local extraction exercises 52 actual FlowSpec/metrics tests with actual common
+and audit-writer code; target parsing and mesh labels remain declared stand-ins.
+Compiled controls reject missing/shortened pauses, intent bypass, treating false
+notifications as shutdown, non-preemptible waiting and ignored publisher closure.
+Canonical CI requires sixteen family-specific positive markers; all previous
+native x86/ARM, 31 production smoke assertions, 14 Python refusal checks, XDP,
+demo/runbook, independent exact-head review and frozen Stargate gates remain.
+
+Limits: this is a failed-round retry floor, not a global CLI rate limit, fairness
+or convergence guarantee. Each failed round can still issue the bounded original
+plan plus recovery reads. No new backoff policy, write authority, remote RPC
+fence, complete effect audit, checker/model/capture/pin or cleanup guarantee.

@@ -24,11 +24,14 @@ use crate::SentinelDb;
 /// (2 + 64 + 2×64 + 2) × 5 s, including fixed-target cleanup failures. The worker
 /// runs apart from the main tick and shutdown preempts it (numerical review N06).
 pub const MAX_OPS_PER_ROUND: usize = 64;
-/// One gobgp call; a call that takes longer is killed, and its outcome is read back next round.
+/// One gobgp call; a call that takes longer is killed. Read both RIB families
+/// before continuing its plan or planning a later round; kill is not remote rollback.
 pub const CALL_TIMEOUT: Duration = Duration::from_secs(5);
 /// Deadline for the attempt to withdraw the node's rules on shutdown: not a guarantee that any
 /// number of rules is withdrawn in it.
 pub const SHUTDOWN_BUDGET: Duration = Duration::from_secs(10);
+/// Minimum pause after a failed normal round, measured from its completion.
+const FAILED_ROUND_PAUSE: Duration = Duration::from_secs(1);
 
 /// One completed read of both local RIB families. Age starts before the first CLI
 /// read, so a slow or sequential read never appears younger than its oldest part.
@@ -421,9 +424,18 @@ pub async fn run_worker(
                         Ok(false) => reported_error = false,
                         Err(e) => {
                             if !reported_error {
-                                log::error!("[Flowspec] {}; retrying every second", e);
+                                log::error!("[Flowspec] {}; retrying after at least one second", e);
                             }
                             reported_error = true;
+                            // Timer backlog and intent notifications cannot shorten
+                            // this pause. Keep the latest intent for the next round;
+                            // stopping still enters the separately bounded cleanup.
+                            tokio::select! {
+                                biased;
+                                _ = stopping(&mut shutdown) => break 'worker,
+                                _ = intent_closed(&mut closed) => break 'worker,
+                                _ = tokio::time::sleep(FAILED_ROUND_PAUSE) => {}
+                            }
                         }
                     }
                     break;
@@ -1173,6 +1185,88 @@ esac
             assert_eq!(failed.discard_count, old.discard_count);
             assert_eq!(failed.started, old.started);
         }
+    }
+
+    #[tokio::test]
+    async fn failed_rounds_wait_despite_intent_churn() {
+        failed_round_retry(false).await;
+    }
+
+    #[tokio::test]
+    async fn failed_rounds_wait_despite_overdue_ticks() {
+        failed_round_retry(true).await;
+    }
+
+    async fn failed_round_retry(overdue: bool) {
+        let fixture = RoundFixture::new("{}", "{}", false);
+        std::fs::write(fixture.dir.join("hold"), "").unwrap();
+        std::fs::write(
+            fixture.dir.join("gobgp"),
+            r#"#!/bin/sh
+cd "$(dirname "$0")" || exit 9
+printf '%s\n' "$*" >> calls
+if [ -f hold ]; then
+  touch entered
+  while [ -f hold ]; do sleep 0.01; done
+fi
+touch failed
+exit 7
+"#,
+        )
+        .unwrap();
+        let (wanted_tx, wanted_rx) = watch::channel(ips(&["198.51.100.7"]));
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let worker = tokio::spawn(run_worker(
+            copy_cli(&fixture.cli),
+            wanted_rx,
+            shutdown_rx,
+            Arc::new(fixture.db()),
+            Arc::new(Readback::default()),
+        ));
+        assert!(eventually(|| fixture.dir.join("entered").exists()).await);
+        if overdue {
+            tokio::time::sleep(Duration::from_millis(1200)).await;
+        }
+        std::fs::remove_file(fixture.dir.join("hold")).unwrap();
+        assert!(eventually(|| fixture.dir.join("failed").exists()).await);
+        let completed = Instant::now();
+        // Both normal intent churn and false stop notifications must leave
+        // the retry deadline alone. Closure/true shutdown is tested live.
+        for i in 0..10 {
+            wanted_tx
+                .send(ips(&[if i % 2 == 0 {
+                    "198.51.100.9"
+                } else {
+                    "198.51.100.7"
+                }]))
+                .unwrap();
+            shutdown_tx.send(false).unwrap();
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+        let early = fixture.reads();
+        while completed.elapsed() < Duration::from_millis(1600) && fixture.reads() < 2 {
+            wanted_tx.send(ips(&["198.51.100.9"])).unwrap();
+            shutdown_tx.send(false).unwrap();
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+        let retried = fixture.reads() >= 2;
+        let elapsed = completed.elapsed();
+        shutdown_tx.send(true).unwrap();
+        // Cleanup has its own existing bounded retries for this failing CLI.
+        worker.abort();
+        let _ = worker.await;
+        assert_eq!(
+            early, 1,
+            "failed round retried before its pause: overdue={overdue}"
+        );
+        assert!(
+            retried,
+            "intent churn restarted the retry deadline indefinitely"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(900),
+            "retry floor bypassed: {elapsed:?}"
+        );
     }
 
     fn superseding_fixture() -> RoundFixture {
@@ -1975,6 +2069,170 @@ exec "$real" "$@"
                 );
             }
             writeln!(std::io::stdout(), "PASS live intent progress {}: initial/post-write reads retained, compatible add/delete retained once, obsolete queued writes refused, latest target recovered, foreign path preserved", family(&net)).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn live_gobgp_retry_pause_keeps_latest_intent_and_preempts_for_cleanup() {
+        use std::io::Write as _;
+        let Some(bin_dir) = std::env::var_os("SOKOL_GOBGP_TEST_BIN") else {
+            eprintln!("SKIP live GoBGP: SOKOL_GOBGP_TEST_BIN is unset (required in canonical CI)");
+            return;
+        };
+        let live = LiveGobgp::start(std::path::Path::new(&bin_dir)).await;
+        let db = Arc::new(live.fixture.db());
+        for (obsolete, latest, foreign_net) in [
+            (
+                one("198.51.100.7"),
+                one("198.51.100.9"),
+                one("198.51.100.8"),
+            ),
+            (one("2001:db8::7"), one("2001:db8::9"), one("2001:db8::8")),
+        ] {
+            live.put(foreign_net, "discard", "65001:9999").await;
+            let foreign = live.raw(foreign_net).await;
+            for case in [
+                "timer_and_churn",
+                "shutdown",
+                "shutdown_closed",
+                "intent_closed",
+            ] {
+                let stopping_case = case != "timer_and_churn";
+                if stopping_case {
+                    live.fixture.cli.apply(true, latest).await.unwrap();
+                }
+                let dir = live
+                    .fixture
+                    .dir
+                    .join(format!("retry-{}-{case}", family(&obsolete)));
+                std::fs::create_dir(&dir).unwrap();
+                std::fs::write(dir.join("hold"), "").unwrap();
+                std::fs::write(dir.join("fail"), "").unwrap();
+                let wrapper = dir.join("cli.sh");
+                std::fs::write(
+                    &wrapper,
+                    r#"#!/bin/sh
+real="$1"; dir="$2"; shift 2
+printf '%s\n' "$*" >> "$dir/calls"
+if [ -f "$dir/fail" ]; then
+  touch "$dir/entered"
+  while [ -f "$dir/hold" ]; do sleep 0.01; done
+  touch "$dir/failed"
+  printf 'controlled RIB refusal\n' >&2
+  exit 7
+fi
+exec "$real" "$@"
+"#,
+                )
+                .unwrap();
+                let cli = GobgpCli {
+                    bin: "/bin/sh".into(),
+                    args: [
+                        vec![
+                            wrapper.to_str().unwrap().into(),
+                            live.fixture.cli.bin.to_str().unwrap().into(),
+                            dir.to_str().unwrap().into(),
+                        ],
+                        live.fixture.cli.args.clone(),
+                    ]
+                    .concat(),
+                    community: live.fixture.cli.community,
+                };
+                let readback = Arc::new(Readback::default());
+                readback.enable();
+                let before = live.fixture.cli.observed().await.unwrap().owned;
+                checked_round(&live.fixture.cli, &before, &db, &readback)
+                    .await
+                    .unwrap();
+                let old = readback.snapshot();
+                let (wanted_tx, wanted_rx) = watch::channel(HashSet::from([obsolete]));
+                let (shutdown_tx, shutdown_rx) = watch::channel(false);
+                let worker = tokio::spawn(run_worker(
+                    cli,
+                    wanted_rx,
+                    shutdown_rx,
+                    db.clone(),
+                    readback.clone(),
+                ));
+                assert!(eventually(|| dir.join("entered").exists()).await);
+                // Accumulate a real overdue periodic tick without timing out a CLI call.
+                if !stopping_case {
+                    tokio::time::sleep(Duration::from_millis(1200)).await;
+                }
+                std::fs::remove_file(dir.join("hold")).unwrap();
+                assert!(eventually(|| dir.join("failed").exists()).await);
+                let completed = Instant::now();
+                // Allow ordinary child teardown before sampling pending/failed health.
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                let failed = readback.snapshot();
+                assert!(!failed.ok && !failed.converged);
+                assert_eq!(failed.count, old.count);
+                assert_eq!(failed.discard_count, old.discard_count);
+                assert_eq!(failed.started, old.started);
+                std::fs::remove_file(dir.join("fail")).unwrap();
+                if !stopping_case {
+                    for i in 0..10 {
+                        wanted_tx
+                            .send(if i % 2 == 0 {
+                                HashSet::from([latest])
+                            } else {
+                                HashSet::new()
+                            })
+                            .unwrap();
+                        shutdown_tx.send(false).unwrap();
+                        tokio::time::sleep(Duration::from_millis(30)).await;
+                    }
+                    wanted_tx.send(HashSet::from([latest])).unwrap();
+                    let early = std::fs::read_to_string(dir.join("calls")).unwrap();
+                    assert_eq!(
+                        early.lines().count(),
+                        1,
+                        "failed round bypassed pause: {early}"
+                    );
+                    assert!(
+                        eventually(|| readback.snapshot().ok && readback.snapshot().converged)
+                            .await
+                    );
+                    assert!(completed.elapsed() >= Duration::from_millis(900));
+                    let observed = live.fixture.cli.observed().await.unwrap();
+                    assert_eq!(observed.owned, HashSet::from([latest]));
+                    assert_eq!(observed.discard, HashSet::from([latest]));
+                    let calls = std::fs::read_to_string(dir.join("calls")).unwrap();
+                    assert!(
+                        !calls
+                            .lines()
+                            .any(|l| l.contains(" add ") && l.contains(&obsolete.to_string())),
+                        "obsolete intent used after pause: {calls}"
+                    );
+                    shutdown_tx.send(true).unwrap();
+                    tokio::time::timeout(Duration::from_secs(3), worker)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                } else {
+                    let stop_started = Instant::now();
+                    match case {
+                        "shutdown" => {
+                            shutdown_tx.send(true).unwrap();
+                        }
+                        "shutdown_closed" => drop(shutdown_tx),
+                        "intent_closed" => drop(wanted_tx),
+                        _ => unreachable!(),
+                    }
+                    tokio::time::timeout(Duration::from_millis(750), worker)
+                        .await
+                        .expect("cleanup waited for the normal retry pause")
+                        .unwrap();
+                    assert!(stop_started.elapsed() < Duration::from_millis(750));
+                }
+                assert!(live.fixture.cli.observed().await.unwrap().owned.is_empty());
+                assert_eq!(
+                    live.raw(foreign_net).await,
+                    foreign,
+                    "foreign path changed in {case}"
+                );
+            }
+            writeln!(std::io::stdout(), "PASS live retry pacing {}: overdue ticks and intent churn wait, latest intent recovered, shutdown and both publisher closures clean up without waiting, foreign path preserved", family(&obsolete)).unwrap();
         }
     }
 
