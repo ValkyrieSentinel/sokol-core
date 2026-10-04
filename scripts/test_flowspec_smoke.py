@@ -58,9 +58,28 @@ class FlowSpecMetrics(unittest.TestCase):
         cls.helper = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(cls.helper)
 
-    def samples(self, enabled=1, ok=0, count=1, age=3, discard=None, converged=0):
+    def samples(self, enabled=1, ok=0, count=1, age=3, discard=None, converged=0, progress=None):
+        if progress is None:
+            progress = 0 if ok == 1 else -1
         return "\n".join(f"{name} {value}" for name, value in zip(
-            self.helper.NAMES, (enabled, ok, count, age, count if discard is None else discard, converged))) + "\n"
+            self.helper.NAMES, (enabled, ok, count, age, count if discard is None else discard, converged, progress))) + "\n"
+
+    def test_progress_is_independent_of_convergence_and_requires_verified_readback(self):
+        for progress in (0, 1):
+            text = self.samples(ok=1, progress=progress)
+            self.assertTrue(self.helper.matches(text, "ok", 1, 0))
+            self.assertFalse(self.helper.matches(text, "converged", 1, 0))
+        self.assertTrue(self.helper.matches(self.samples(ok=1, converged=1, progress=0), "converged", 1, 0))
+        self.assertTrue(self.helper.matches(self.samples(progress=-1), "failed", 1, 0))
+        for text in (self.samples(progress=0), self.samples(progress=1),
+                     self.samples(ok=1, progress=2), self.samples(ok=1, progress=-2),
+                     self.samples(ok=1, progress=-1),
+                     self.samples(ok=1, progress="nan"), self.samples(ok=1, progress=0.5),
+                     self.samples().replace("sokol_flowspec_round_progress -1\n", ""),
+                     self.samples() + "sokol_flowspec_round_progress -1\n",
+                     self.samples(enabled=0, ok=0, count=0, age=-1, progress=0)):
+            with self.assertRaises(ValueError):
+                self.helper.matches(text, "ok", 1, 0)
 
     def test_healthy_equal_counts_do_not_establish_round_convergence(self):
         # A completed read of the wrong prefix set is still a healthy observation.

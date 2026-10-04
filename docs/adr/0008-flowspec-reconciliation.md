@@ -100,7 +100,8 @@ RIB reads зберігаються, перед плануванням читає
 кожна queued/pending команда дозволена лише за актуальним membership її prefix.
 Несуперечливі зміни зберігають той самий CLI future; недоречна команда скасовується,
 перед наступним планом заново читається RIB. Post-write read також завершується;
-convergence стосується sampled target, зміна якого запускає наступний раунд одразу.
+convergence стосується sampled target; наступний раунд за зміненим intent починається
+після 1 s паузи FLOWSPEC-R12.
 FLOWSPEC-R8 зберігає решту початкової черги після скасування pending команди:
 перед продовженням читає обидва RIB, перевіряє актуальний membership, потребу в
 дії та нові чужі локальні колізії. Уже недоречна queued команда, яка ще не
@@ -121,7 +122,7 @@ add не гарантує відсутності правил після вих�
 kill-on-drop завершує прямий child, не process tree. Скасована відповідь прийнятої
 команди може не залишити ACK-аудиту. Збереження корисних calls не гарантує eventual
 convergence при безперервній зміні того самого prefix; counts/time можуть
-оновлюватись при негайному новому раунді з health 0. Квота 64 є per-round,
+зберігатись при початку наступного раунду з health 0. Квота 64 є per-round,
 не лімітом частоти між раундами. Ownership, policy і повноваження ті самі.
 
 
@@ -145,8 +146,8 @@ normal round, перш ніж знову дозволити reconciliation. На
 зміни наміру й false shutdown notifications не скорочують і не перезапускають
 паузу. Наступний раунд бере актуальний desired set. True shutdown або закриття
 будь-якого publisher перериває паузу й одразу починає окремий bounded cleanup;
-його 10-секундний бюджет і власні 500-мс error pauses не змінені. Успішні раунди
-й перепланування supersession не отримують нової затримки. Це мінімальна пауза
+його 10-секундний бюджет і власні 500-мс error pauses не змінені. До FLOWSPEC-R12 успішні раунди
+й перепланування supersession не отримували цієї затримки. Це мінімальна пауза
 між невдалим normal round і наступним, не ліміт calls/second: одна черга все ще
 може містити 64 записи та їх recovery reads. Remote RPC може мати пізній ефект;
 читання не є rollback чи fence, CLI-ACK audit не є повною історією ефектів.
@@ -166,6 +167,65 @@ FLOWSPEC-R11 ротує prefixes усередині withdrawal та announce м�
 не гарантія ефекту: якщо withdrawals постійно займають всю квоту, announces
 чекають. Непридатні reads, нескінченна зміна наборів, повільні calls і restart
 можуть перешкодити прогресу; cleanup має той самий 10-секундний бюджет.
+
+## FLOWSPEC-R12 — витрати роботи й спостережений поступ
+
+Worker більше не накопичує interval ticks: після кожного завершеного normal round
+витримує одну монотонну паузу 1 s. Успіх CLI, відсутність ефекту, помилка та
+supersession споживають той самий дозвіл на раунд. Зміни wanted і false shutdown
+не скорочують і не перезапускають паузу; наступне читання знову бере актуальний
+intent. Перша спроба не затримується. True shutdown та закриття будь-якого publisher
+одразу переривають normal work/паузу й починають cleanup. Cleanup зберігає власний
+deadline 10 s та cursor; після кожного непорожнього успішного раунду або помилки
+чекає 500 ms усередині deadline. Підтверджений порожній owned RIB завершує його
+без паузи. Так no-effect success не перетворюється на гарячий цикл. Ціна цього
+обмеження — менше withdrawal batches за ті самі 10 s, ніж при негайних повторах
+успішних раундів; залишкові правила потребують окремої перевірки RIB.
+
+Операційна ціна лишається конкретною: до 64 кандидатів за раунд, ліміти CLI calls
+і наведені вище read/recovery allowances. Це не універсальна ATP-валюта, не
+глобальний calls/second чи memory bound, не довічна квота daemon і не стійкий
+до restart облік. Worker-local паузи не обмежують іншого writer. Shutdown cleanup
+має незалежний дозвіл; припинення child process не відкликає прийнятого RPC.
+
+`sokol_flowspec_round_progress`: `1` — між initial/final reads раунду спостережено
+строге зменшення набору невиконаних вимог до sampled wanted без нових; `0` — такого
+поступу не спостережено; `-1` — немає придатного завершеного виміру. Вимоги
+розрізняють видалення owned prefix поза wanted та встановлення canonical discard
+для wanted prefix. Порівнюються ідентичності й типи дій, а не лише counts:
+перестановка однакової кількості prefixes або менша кількість із новою помилкою
+не є поступом. Pending/failure/cancellation відкликають значення до першого await;
+повні initial/final reads одного раунду визначають вимір. Ефект не приписується
+командам цього раунду: пізній раніший RPC або інший writer також можуть зменшити
+розбіжності. Failed CLI навіть після
+реального ефекту не публікує нового виміру. Уже досягнута ціль може мати progress 0
+і convergence 1. Інший sampled target, міжраундовий поступ, latest intent, причини
+застою, неминуче завершення та upstream enforcement цим не встановлюються.
+Перевіряйте health, convergence і age разом; універсального stall-порога немає.
+
+Перенесено дисципліну бюджету Sigma-Glyph (додатна ціна дії, перевірка допустимості
+перед дією, окрема причина завершення) і Black-Heart (накопичені витрати при resume,
+resource exhaustion не є semantic refutation, null measurement не є нулем).
+Це незалежна реалізація для мережевих спроб: на відміну від незарядженої невдалої
+редукції, мережеві помилки також витрачають роботу. Lean-теореми Sigma-Glyph про
+терми й ATP не доводять властивостей цього Rust worker. Джерела перенесення:
+Sigma-Glyph `f46a7460b4ca2731899a61725cb5cc15ff0bac46`, `impl/sigma_glyph.py`;
+Black-Heart `63649b8`, `glyph.py`, `scoped_admission.py`, `library_interaction.py`.
+
+Перевірки: `successful_no_effect_rounds_wait_despite_intent_churn`,
+`successful_no_effect_rounds_wait_despite_overdue_ticks`,
+`superseded_success_shares_the_work_pause`,
+`successful_no_effect_cleanup_waits_and_then_recovers`,
+`round_progress_requires_strict_identity_and_action_improvement`,
+`progress_distinguishes_unmeasured_from_zero_and_requires_health` і
+`live_gobgp_work_budget_paces_success_and_cleanup_with_truthful_progress`.
+Перші чотири виконувані регресії компілюються на base `c62437f` і падають на
+кількості ранніх спроб. Live test використовує pinned GoBGP 4.9.0 для обох сімейств:
+no-effect add/delete, supersession, справжнє відновлення, cleanup, true shutdown та
+обидва закриті publishers; foreign paths перевіряються окремо. Раннє завершення
+cleanup у stop-сценаріях є результатом контрольованого усунення no-effect fault,
+не гарантією виконання під постійною відмовою. CI вимагає positive marker кожної
+сім'ї, повні native x86/ARM jobs і незмінені frozen Stargate checks.
 
 ## Коли переглянути
 

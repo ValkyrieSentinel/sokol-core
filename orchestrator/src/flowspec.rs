@@ -30,8 +30,10 @@ pub const CALL_TIMEOUT: Duration = Duration::from_secs(5);
 /// Deadline for the attempt to withdraw the node's rules on shutdown: not a guarantee that any
 /// number of rules is withdrawn in it.
 pub const SHUTDOWN_BUDGET: Duration = Duration::from_secs(10);
-/// Minimum pause after a failed normal round, measured from its completion.
-const FAILED_ROUND_PAUSE: Duration = Duration::from_secs(1);
+/// Work renews only after a completed round and this monotonic pause, regardless
+/// of CLI success, effect or intent changes. It is not a global call-rate limit.
+const ROUND_PAUSE: Duration = Duration::from_secs(1);
+const CLEANUP_PAUSE: Duration = Duration::from_millis(500);
 
 /// One completed read of both local RIB families. Age starts before the first CLI
 /// read, so a slow or sequential read never appears younger than its oldest part.
@@ -40,6 +42,7 @@ struct Observation {
     count: usize,
     discard_count: usize,
     converged: bool,
+    progress: bool,
     started: Instant,
 }
 
@@ -53,6 +56,9 @@ pub struct ReadbackView {
     /// The completed round observed owned == discard == its sampled wanted set.
     /// Revoked for pending/failed/cancelled rounds; not proof of latest intent.
     pub converged: bool,
+    /// Strict reduction observed between a completed round's reads, for its
+    /// sampled target. Not attributed to its commands; None while pending/failed.
+    pub progress: Option<bool>,
     pub started: Option<Instant>,
 }
 
@@ -74,6 +80,7 @@ impl Readback {
         let mut view = self.0.lock().unwrap_or_else(|p| p.into_inner());
         view.ok = false;
         view.converged = false;
+        view.progress = None;
     }
 
     fn completed(&self, observation: Observation) {
@@ -81,6 +88,7 @@ impl Readback {
         view.count = observation.count;
         view.discard_count = observation.discard_count;
         view.converged = observation.converged;
+        view.progress = Some(observation.progress);
         view.started = Some(observation.started);
         view.ok = true;
     }
@@ -102,11 +110,26 @@ impl Rib {
         self.foreign_local.extend(other.foreign_local);
     }
 
+    /// Separate obligations: remove unwanted owned paths; establish wanted discard paths.
+    fn work(&self, wanted: &HashSet<IpNet>) -> HashSet<(bool, IpNet)> {
+        self.owned
+            .difference(wanted)
+            .map(|n| (false, *n))
+            .chain(wanted.difference(&self.discard).map(|n| (true, *n)))
+            .collect()
+    }
+
+    fn made_progress(&self, wanted: &HashSet<IpNet>, initial: &HashSet<(bool, IpNet)>) -> bool {
+        let remaining = self.work(wanted);
+        remaining.len() < initial.len() && remaining.is_subset(initial)
+    }
+
     fn observation(&self, wanted: &HashSet<IpNet>, started: Instant) -> Observation {
         Observation {
             count: self.owned.len(),
             discard_count: self.discard.len(),
             converged: &self.owned == wanted && &self.discard == wanted,
+            progress: false,
             started,
         }
     }
@@ -430,53 +453,36 @@ pub async fn run_worker(
     db: Arc<SentinelDb>,
     readback: Arc<Readback>,
 ) {
-    let mut ticker = tokio::time::interval(Duration::from_secs(1));
     let mut reported_error = false;
     let mut cursor = PlanCursor::default();
-    'worker: loop {
-        if *shutdown.borrow() {
-            break;
-        }
+    loop {
+        let mut closed = wanted.clone();
+        // Stop/closure always preempts normal work, including an already true stop.
+        // Useful reads and compatible commands survive intent changes within a round.
         tokio::select! {
             biased;
-            result = shutdown.changed() => {
-                if result.is_err() || *shutdown.borrow() { break }
-                continue;
-            },
-            result = wanted.changed() => if result.is_err() { break },
-            _ = ticker.tick() => {}
-        }
-        loop {
-            let mut closed = wanted.clone();
-            // Intent changes are handled at command boundaries inside the round.
-            // Read-only work and still-valid writes retain their original future.
-            tokio::select! {
-                biased;
-                _ = stopping(&mut shutdown) => break 'worker,
-                _ = intent_closed(&mut closed) => break 'worker,
-                result = live_round_with_cursor(&cli, &mut wanted, &db, &readback, &mut cursor) => {
-                    match result {
-                        Ok(true) => continue,
-                        Ok(false) => reported_error = false,
-                        Err(e) => {
-                            if !reported_error {
-                                log::error!("[Flowspec] {}; retrying after at least one second", e);
-                            }
-                            reported_error = true;
-                            // Timer backlog and intent notifications cannot shorten
-                            // this pause. Keep the latest intent for the next round;
-                            // stopping still enters the separately bounded cleanup.
-                            tokio::select! {
-                                biased;
-                                _ = stopping(&mut shutdown) => break 'worker,
-                                _ = intent_closed(&mut closed) => break 'worker,
-                                _ = tokio::time::sleep(FAILED_ROUND_PAUSE) => {}
-                            }
+            _ = stopping(&mut shutdown) => break,
+            _ = intent_closed(&mut closed) => break,
+            result = live_round_with_cursor(&cli, &mut wanted, &db, &readback, &mut cursor) => {
+                match result {
+                    Ok(_) => reported_error = false,
+                    Err(e) => {
+                        if !reported_error {
+                            log::error!("[Flowspec] {}; retrying after at least one second", e);
                         }
+                        reported_error = true;
                     }
-                    break;
                 }
             }
+        }
+        // A consumed round renews its work allowance only after this fixed pause.
+        // Success without effect and supersession spend the same allowance as error.
+        // Intent churn neither bypasses nor restarts it; the next round samples afresh.
+        tokio::select! {
+            biased;
+            _ = stopping(&mut shutdown) => break,
+            _ = intent_closed(&mut closed) => break,
+            _ = tokio::time::sleep(ROUND_PAUSE) => {}
         }
     }
 
@@ -486,12 +492,14 @@ pub async fn run_worker(
         loop {
             match checked_round_with_cursor(&cli, &empty, &db, &readback, &mut cursor).await {
                 Ok(observation) if observation.count == 0 => return true,
-                Ok(_) => continue,
+                Ok(_) => {}
                 Err(e) => {
                     log::error!("[Flowspec] Withdrawing on shutdown: {}", e);
-                    tokio::time::sleep(Duration::from_millis(500)).await;
                 }
             }
+            // Successful replies with remaining rules also consume cleanup work.
+            // This pause stays inside the existing independent ten-second deadline.
+            tokio::time::sleep(CLEANUP_PAUSE).await;
         }
     })
     .await;
@@ -571,7 +579,7 @@ struct RoundOutcome {
     retry: bool,
 }
 
-/// True asks the worker to start the next round immediately, after an obsolete
+/// True requests another round after the worker's work pause, after an obsolete
 /// operation or a completed observation whose sampled target has since changed.
 #[cfg(test)]
 async fn live_round(
@@ -650,6 +658,7 @@ async fn reconcile(
     let started = Instant::now();
     let mut observed = cli.observed().await?;
     let wanted = intent.sample();
+    let initial_work = observed.work(&wanted);
     // CLI writes address NLRI rather than ownership. Exclude known collisions
     // before applying the work quota, so they cannot starve unrelated unblocking.
     let mut collisions: Vec<_> = wanted
@@ -731,7 +740,12 @@ async fn reconcile(
     // Keep unknown readback as an error, never replace it with arithmetic guesses.
     let observation = if changed {
         let started = Instant::now();
-        cli.observed().await?.observation(&wanted, started)
+        let final_rib = cli.observed().await?;
+        let mut observation = final_rib.observation(&wanted, started);
+        // Identity/action obligations, not cardinality or successful command count.
+        // Reject a smaller mismatch count if it introduced any new obligation.
+        observation.progress = final_rib.made_progress(&wanted, &initial_work);
+        observation
     } else {
         observed.observation(&wanted, started)
     };
@@ -1621,6 +1635,348 @@ esac
         }
     }
 
+    #[tokio::test]
+    async fn round_progress_requires_strict_identity_and_action_improvement() {
+        let a = one("198.51.100.7");
+        let b = one("198.51.100.9");
+        let c = one("198.51.100.10");
+        let d = one("198.51.100.11");
+        let rib = |owned: &[IpNet], discard: &[IpNet]| {
+            let template: serde_json::Value = serde_json::from_str(RIB).unwrap();
+            let mut paths = serde_json::Map::new();
+            for net in owned {
+                let mut path = template["[source: 198.51.100.7/32]"][0].clone();
+                path["nlri"]["value"][0]["value"]["prefix"] = net.to_string().into();
+                if !discard.contains(net) {
+                    path["attrs"]
+                        .as_array_mut()
+                        .unwrap()
+                        .retain(|a| a["type"] != 16);
+                }
+                paths.insert(format!("[source: {net}]"), serde_json::json!([path]));
+            }
+            serde_json::Value::Object(paths).to_string()
+        };
+        for (name, before, after, target, progress, converged) in [
+            (
+                "no_effect_add",
+                rib(&[], &[]),
+                rib(&[], &[]),
+                HashSet::from([a]),
+                false,
+                false,
+            ),
+            (
+                "no_effect_delete",
+                rib(&[a], &[a]),
+                rib(&[a], &[a]),
+                HashSet::new(),
+                false,
+                false,
+            ),
+            (
+                "partial_add",
+                rib(&[], &[]),
+                rib(&[a], &[a]),
+                HashSet::from([a, b]),
+                true,
+                false,
+            ),
+            (
+                "partial_delete",
+                rib(&[a, b], &[a, b]),
+                rib(&[a], &[a]),
+                HashSet::new(),
+                true,
+                false,
+            ),
+            (
+                "action_repair",
+                rib(&[a], &[]),
+                rib(&[a], &[a]),
+                HashSet::from([a]),
+                true,
+                true,
+            ),
+            (
+                "equal_count_swap",
+                rib(&[a], &[a]),
+                rib(&[b], &[b]),
+                HashSet::from([a, b]),
+                false,
+                false,
+            ),
+            (
+                "smaller_with_new_error",
+                rib(&[c], &[c]),
+                rib(&[a, d], &[a, d]),
+                HashSet::from([a, b]),
+                false,
+                false,
+            ),
+            (
+                "already_converged",
+                rib(&[a], &[a]),
+                rib(&[a], &[a]),
+                HashSet::from([a]),
+                false,
+                true,
+            ),
+        ] {
+            let fixture = RoundFixture::new(&before, &after, false);
+            let db = fixture.db();
+            let readback = Readback::default();
+            readback.enable();
+            checked_round(&fixture.cli, &target, &db, &readback)
+                .await
+                .unwrap();
+            let view = readback.snapshot();
+            assert_eq!(
+                view.progress,
+                Some(progress),
+                "{name}: wrong measured progress"
+            );
+            assert_eq!(view.converged, converged, "{name}: wrong convergence");
+            assert!(crate::metrics::render_with_flowspec(
+                &crate::metrics::Snapshot::default(),
+                &readback
+            )
+            .contains(&format!(
+                "sokol_flowspec_round_progress {}\n",
+                progress as u8
+            )));
+            // Even a completed improvement cannot remain a verified current observation
+            // during pending, failed or cancelled work.
+            readback.begin_round();
+            assert!(readback.snapshot().progress.is_none());
+            assert!(crate::metrics::render_with_flowspec(
+                &crate::metrics::Snapshot::default(),
+                &readback
+            )
+            .contains("sokol_flowspec_round_progress -1\n"));
+        }
+    }
+
+    fn budget_fixture(deleting: bool) -> RoundFixture {
+        let fixture = RoundFixture::new("{}", "{}", false);
+        std::fs::write(
+            fixture.dir.join("current.json"),
+            if deleting { RIB } else { "{}" },
+        )
+        .unwrap();
+        std::fs::write(
+            fixture.dir.join("gobgp"),
+            r#"#!/bin/sh
+cd "$(dirname "$0")" || exit 9
+printf '%s\n' "$*" >> calls
+case "$*" in
+  *'ipv4-flowspec -j')
+    if [ -f hold ]; then
+      touch entered
+      while [ -f hold ]; do sleep 0.01; done
+    fi
+    cat current.json ;;
+  *'ipv6-flowspec -j')
+    n=0; if [ -f reads ]; then n=$(cat reads); fi
+    n=$((n + 1)); printf '%s\n' "$n" > reads
+    if [ "$n" = 2 ] && [ -f post_hold ]; then
+      touch post_entered
+      while [ -f post_hold ]; do sleep 0.01; done
+    fi
+    printf '{}\n'
+    if [ $((n % 2)) = 0 ]; then printf 'done\n' >> rounds; fi ;;
+  *' add '*|*' del '*)
+    if [ -f effect ]; then
+      cp effect.json replacement.json && mv replacement.json current.json
+    fi ;;
+  *) exit 8 ;;
+esac
+"#,
+        )
+        .unwrap();
+        fixture
+    }
+
+    fn budget_writes(fixture: &RoundFixture) -> usize {
+        std::fs::read_to_string(fixture.dir.join("calls"))
+            .unwrap()
+            .lines()
+            .filter(|l| l.contains(" add ") || l.contains(" del "))
+            .count()
+    }
+
+    #[tokio::test]
+    async fn successful_no_effect_rounds_wait_despite_intent_churn() {
+        successful_budget(false).await;
+    }
+
+    #[tokio::test]
+    async fn successful_no_effect_rounds_wait_despite_overdue_ticks() {
+        successful_budget(true).await;
+    }
+
+    async fn successful_budget(overdue: bool) {
+        for deleting in [false, true] {
+            let fixture = budget_fixture(deleting);
+            if overdue {
+                std::fs::write(fixture.dir.join("hold"), "").unwrap();
+            }
+            let target = if deleting {
+                HashSet::new()
+            } else {
+                ips(&["198.51.100.7"])
+            };
+            let (wanted_tx, wanted_rx) = watch::channel(target.clone());
+            let (shutdown_tx, shutdown_rx) = watch::channel(false);
+            let readback = Arc::new(Readback::default());
+            readback.enable();
+            let worker = tokio::spawn(run_worker(
+                copy_cli(&fixture.cli),
+                wanted_rx,
+                shutdown_rx,
+                Arc::new(fixture.db()),
+                readback.clone(),
+            ));
+            if overdue {
+                assert!(eventually(|| fixture.dir.join("entered").exists()).await);
+                tokio::time::sleep(Duration::from_millis(1200)).await;
+                std::fs::remove_file(fixture.dir.join("hold")).unwrap();
+            }
+            assert!(eventually(|| readback.snapshot().ok).await);
+            assert!(!readback.snapshot().converged);
+            let completed = Instant::now();
+            // The two sets remain genuinely different even for withdrawals.
+            for i in 0..10 {
+                wanted_tx
+                    .send(if i % 2 == 0 {
+                        ips(&["198.51.100.9"])
+                    } else {
+                        target.clone()
+                    })
+                    .unwrap();
+                shutdown_tx.send(false).unwrap();
+                tokio::time::sleep(Duration::from_millis(30)).await;
+            }
+            let early = budget_writes(&fixture);
+            // Restore the deleted prefix, or switch the announced prefix: both
+            // final targets differ from what the first round sampled.
+            let latest = ips(&[if deleting {
+                "198.51.100.7"
+            } else {
+                "198.51.100.9"
+            }]);
+            wanted_tx.send(latest.clone()).unwrap();
+            let resumed = || {
+                if deleting {
+                    readback.snapshot().ok && readback.snapshot().converged
+                } else {
+                    budget_writes(&fixture) >= 2
+                }
+            };
+            while completed.elapsed() < Duration::from_millis(1800) && !resumed() {
+                wanted_tx.send(latest.clone()).unwrap();
+                shutdown_tx.send(false).unwrap();
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            let retried = resumed();
+            let elapsed = completed.elapsed();
+            let calls = std::fs::read_to_string(fixture.dir.join("calls")).unwrap();
+            worker.abort();
+            let _ = worker.await;
+            assert_eq!(early, 1, "successful no-effect calls bypassed work pause: deleting={deleting}, overdue={overdue}");
+            assert!(retried, "intent churn restarted the work pause");
+            if deleting {
+                assert_eq!(
+                    budget_writes(&fixture),
+                    1,
+                    "restored latest intent was deleted after pause: {calls}"
+                );
+            } else {
+                let writes: Vec<_> = calls.lines().filter(|l| l.contains(" add ")).collect();
+                assert!(
+                    writes[1].contains("source 198.51.100.9/32"),
+                    "post-pause write used stale intent: {calls}"
+                );
+            }
+            assert!(
+                elapsed >= Duration::from_millis(900),
+                "work pause bypassed: {elapsed:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn superseded_success_shares_the_work_pause() {
+        let fixture = budget_fixture(false);
+        std::fs::write(fixture.dir.join("post_hold"), "").unwrap();
+        let (wanted_tx, wanted_rx) = watch::channel(ips(&["198.51.100.7"]));
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let readback = Arc::new(Readback::default());
+        readback.enable();
+        let worker = tokio::spawn(run_worker(
+            copy_cli(&fixture.cli),
+            wanted_rx,
+            shutdown_rx,
+            Arc::new(fixture.db()),
+            readback.clone(),
+        ));
+        assert!(eventually(|| fixture.dir.join("post_entered").exists()).await);
+        wanted_tx.send(ips(&["198.51.100.9"])).unwrap();
+        std::fs::remove_file(fixture.dir.join("post_hold")).unwrap();
+        assert!(eventually(|| readback.snapshot().ok).await);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let early = budget_writes(&fixture);
+        let retried = eventually(|| budget_writes(&fixture) >= 2).await;
+        let calls = std::fs::read_to_string(fixture.dir.join("calls")).unwrap();
+        worker.abort();
+        let _ = worker.await;
+        assert_eq!(early, 1, "superseded successful round bypassed work pause");
+        assert!(
+            retried && calls.contains("source 198.51.100.9/32"),
+            "latest intent did not recover after pause: {calls}"
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_no_effect_cleanup_waits_and_then_recovers() {
+        let fixture = budget_fixture(true);
+        let (_wanted_tx, wanted_rx) = watch::channel(HashSet::new());
+        let (_shutdown_tx, shutdown_rx) = watch::channel(true);
+        let readback = Arc::new(Readback::default());
+        readback.enable();
+        let worker = tokio::spawn(run_worker(
+            copy_cli(&fixture.cli),
+            wanted_rx,
+            shutdown_rx,
+            Arc::new(fixture.db()),
+            readback.clone(),
+        ));
+        assert!(eventually(|| fixture.dir.join("rounds").exists()).await);
+        assert!(!readback.snapshot().converged);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let early = budget_writes(&fixture);
+        let retried = eventually(|| budget_writes(&fixture) >= 2).await;
+        // Controlled fault removal; this is not guaranteed cleanup under persistent failure.
+        std::fs::write(fixture.dir.join("replacement.json"), "{}").unwrap();
+        std::fs::rename(
+            fixture.dir.join("replacement.json"),
+            fixture.dir.join("current.json"),
+        )
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), worker)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            early, 1,
+            "successful no-effect cleanup spun without its work pause"
+        );
+        assert!(
+            retried && readback.snapshot().converged,
+            "cleanup did not recover"
+        );
+    }
+
     fn superseding_fixture() -> RoundFixture {
         let fixture = RoundFixture::new("{}", "{}", false);
         let script = fixture.dir.join("gobgp");
@@ -1748,7 +2104,7 @@ esac
                 .unwrap()
                 .unwrap()
                 .unwrap(),
-            "changed target must request immediate replanning"
+            "changed target must request replanning after the work pause"
         );
         let observation = readback.snapshot();
         assert!(
@@ -2087,6 +2443,229 @@ esac
             let mut args = self.fixture.cli.args.clone();
             args.extend(["global", "rib", "-a", family(&net), "-j"].map(String::from));
             self.fixture.cli.run(args).await.unwrap()
+        }
+    }
+
+    #[tokio::test]
+    async fn live_gobgp_work_budget_paces_success_and_cleanup_with_truthful_progress() {
+        use std::io::Write as _;
+        let Some(bin_dir) = std::env::var_os("SOKOL_GOBGP_TEST_BIN") else {
+            eprintln!("SKIP live GoBGP: SOKOL_GOBGP_TEST_BIN is unset (required in canonical CI)");
+            return;
+        };
+        let live = LiveGobgp::start(std::path::Path::new(&bin_dir)).await;
+        let db = Arc::new(live.fixture.db());
+        for (net, latest, foreign_net) in [
+            (
+                one("198.51.100.7"),
+                one("198.51.100.9"),
+                one("198.51.100.8"),
+            ),
+            (one("2001:db8::7"), one("2001:db8::9"), one("2001:db8::8")),
+        ] {
+            live.put(foreign_net, "discard", "65001:9999").await;
+            let foreign = live.raw(foreign_net).await;
+            for (case, deleting, superseded, stop) in [
+                ("add", false, false, "none"),
+                ("delete", true, false, "none"),
+                ("superseded_add", false, true, "none"),
+                ("superseded_delete", true, true, "none"),
+                ("shutdown", true, false, "shutdown"),
+                ("intent_closed", true, false, "intent"),
+                ("shutdown_closed", true, false, "closed"),
+                ("cleanup", true, false, "cleanup"),
+            ] {
+                if deleting {
+                    live.fixture.cli.apply(true, net).await.unwrap();
+                }
+                let before = live.fixture.cli.observed().await.unwrap().owned;
+                let readback = Arc::new(Readback::default());
+                readback.enable();
+                checked_round(&live.fixture.cli, &before, &db, &readback)
+                    .await
+                    .unwrap();
+                let dir = live
+                    .fixture
+                    .dir
+                    .join(format!("budget-{}-{case}", family(&net)));
+                std::fs::create_dir(&dir).unwrap();
+                for file in ["calls", "no_effect"] {
+                    std::fs::write(dir.join(file), "").unwrap();
+                }
+                if superseded {
+                    std::fs::write(dir.join("post_hold"), "").unwrap();
+                }
+                let wrapper = dir.join("cli.sh");
+                std::fs::write(
+                    &wrapper,
+                    r#"#!/bin/sh
+real="$1"; dir="$2"; shift 2
+printf '%s\n' "$*" >> "$dir/calls"
+case "$*" in
+  *' add '*|*' del '*) if [ -f "$dir/no_effect" ]; then exit 0; fi ;;
+  *'ipv6-flowspec -j')
+    n=0; if [ -f "$dir/reads" ]; then n=$(cat "$dir/reads"); fi
+    n=$((n + 1)); printf '%s\n' "$n" > "$dir/reads"
+    if [ "$n" = 2 ] && [ -f "$dir/post_hold" ]; then
+      touch "$dir/post_entered"
+      while [ -f "$dir/post_hold" ]; do sleep 0.01; done
+    fi ;;
+esac
+exec "$real" "$@"
+"#,
+                )
+                .unwrap();
+                let mut args = vec![
+                    wrapper.to_str().unwrap().into(),
+                    live.fixture.cli.bin.to_str().unwrap().into(),
+                    dir.to_str().unwrap().into(),
+                ];
+                args.extend(live.fixture.cli.args.clone());
+                let cli = GobgpCli {
+                    bin: "/bin/sh".into(),
+                    args,
+                    community: live.fixture.cli.community,
+                };
+                let target = if deleting {
+                    HashSet::new()
+                } else {
+                    HashSet::from([net])
+                };
+                let (wanted_tx, wanted_rx) = watch::channel(target.clone());
+                let (shutdown_tx, shutdown_rx) = watch::channel(stop == "cleanup");
+                let mut wanted_tx = Some(wanted_tx);
+                let mut shutdown_tx = Some(shutdown_tx);
+                let worker = tokio::spawn(run_worker(
+                    cli,
+                    wanted_rx,
+                    shutdown_rx,
+                    db.clone(),
+                    readback.clone(),
+                ));
+                let final_target = if superseded {
+                    HashSet::from([latest])
+                } else {
+                    target.clone()
+                };
+                if superseded {
+                    assert!(eventually(|| dir.join("post_entered").exists()).await);
+                    wanted_tx
+                        .as_ref()
+                        .unwrap()
+                        .send(final_target.clone())
+                        .unwrap();
+                    std::fs::remove_file(dir.join("post_hold")).unwrap();
+                }
+                let writes = || {
+                    std::fs::read_to_string(dir.join("calls"))
+                        .unwrap()
+                        .lines()
+                        .filter(|l| l.contains(" add ") || l.contains(" del "))
+                        .count()
+                };
+                assert!(eventually(|| readback.snapshot().ok && writes() > 0).await);
+                let first = readback.snapshot();
+                assert!(
+                    !first.converged && first.progress == Some(false),
+                    "{case}: no-effect calls became progress or convergence"
+                );
+                assert!(crate::metrics::render_with_flowspec(
+                    &crate::metrics::Snapshot::default(),
+                    &readback
+                )
+                .contains("sokol_flowspec_round_progress 0\n"));
+                let completed = Instant::now();
+                if stop == "none" {
+                    // Genuine target churn and false stop notifications cannot buy more work.
+                    for i in 0..10 {
+                        wanted_tx
+                            .as_ref()
+                            .unwrap()
+                            .send(if i % 2 == 0 {
+                                HashSet::from([latest])
+                            } else {
+                                final_target.clone()
+                            })
+                            .unwrap();
+                        shutdown_tx.as_ref().unwrap().send(false).unwrap();
+                        tokio::time::sleep(Duration::from_millis(30)).await;
+                    }
+                    assert_eq!(
+                        writes(),
+                        1,
+                        "{case}: successful round bypassed normal work pause"
+                    );
+                    while completed.elapsed() < Duration::from_millis(1900) && writes() < 2 {
+                        wanted_tx
+                            .as_ref()
+                            .unwrap()
+                            .send(final_target.clone())
+                            .unwrap();
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                    assert!(
+                        writes() >= 2 && completed.elapsed() >= Duration::from_millis(900),
+                        "{case}: early or starved retry"
+                    );
+                    std::fs::remove_file(dir.join("no_effect")).unwrap();
+                    assert!(
+                        eventually(|| {
+                            let v = readback.snapshot();
+                            v.ok && v.converged && v.progress == Some(true)
+                        })
+                        .await,
+                        "{case}: effectful recovery not observed"
+                    );
+                    let actual = live.fixture.cli.observed().await.unwrap();
+                    assert_eq!(actual.owned, final_target, "{case}: wrong actual owned set");
+                    assert_eq!(
+                        actual.discard, final_target,
+                        "{case}: wrong actual discard set"
+                    );
+                    let recovered = readback.snapshot();
+                    assert!(recovered.started.unwrap() > first.started.unwrap());
+                    shutdown_tx.as_ref().unwrap().send(true).unwrap();
+                } else if stop == "cleanup" {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    assert_eq!(writes(), 1, "successful cleanup bypassed its work pause");
+                    assert!(eventually(|| writes() >= 2).await);
+                    std::fs::remove_file(dir.join("no_effect")).unwrap();
+                } else {
+                    // Fault removal permits cleanup; interruption must bypass normal work pause.
+                    std::fs::remove_file(dir.join("no_effect")).unwrap();
+                    match stop {
+                        "shutdown" => shutdown_tx.as_ref().unwrap().send(true).unwrap(),
+                        "intent" => drop(wanted_tx.take()),
+                        "closed" => drop(shutdown_tx.take()),
+                        _ => unreachable!(),
+                    }
+                    let finished = tokio::time::timeout(Duration::from_millis(750), worker).await;
+                    assert!(finished.is_ok(), "{case}: cleanup waited for normal pause");
+                    finished.unwrap().unwrap();
+                    let v = readback.snapshot();
+                    assert!(v.ok && v.converged && v.progress == Some(true));
+                    assert!(live.fixture.cli.observed().await.unwrap().owned.is_empty());
+                    assert_eq!(
+                        live.raw(foreign_net).await,
+                        foreign,
+                        "{case}: foreign path changed"
+                    );
+                    continue;
+                }
+                tokio::time::timeout(Duration::from_secs(3), worker)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let v = readback.snapshot();
+                assert!(v.ok && v.converged);
+                assert!(live.fixture.cli.observed().await.unwrap().owned.is_empty());
+                assert_eq!(
+                    live.raw(foreign_net).await,
+                    foreign,
+                    "{case}: foreign path changed"
+                );
+            }
+            writeln!(std::io::stdout(), "PASS live work budget {}: successful no-effect add/delete and supersession paced, measured progress after real recovery, cleanup paced, stop and both closures preempt normal pause, foreign paths preserved", family(&net)).unwrap();
         }
     }
 
