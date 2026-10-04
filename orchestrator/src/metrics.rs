@@ -74,6 +74,7 @@ pub struct Snapshot {
     pub flowspec_enabled: bool,
     pub flowspec_readback_ok: bool,
     pub flowspec_round_converged: bool,
+    pub flowspec_round_progress: Option<bool>,
     pub flowspec_read_started: Option<Instant>,
     pub external_attacks: usize,
     pub cluster_status: u8,
@@ -96,6 +97,7 @@ pub fn render_with_flowspec(s: &Snapshot, readback: &crate::flowspec::Readback) 
     snapshot.flowspec_enabled = view.enabled;
     snapshot.flowspec_readback_ok = view.ok;
     snapshot.flowspec_round_converged = view.converged;
+    snapshot.flowspec_round_progress = view.progress;
     snapshot.flowspec_read_started = view.started;
     render(&snapshot)
 }
@@ -584,6 +586,19 @@ fn render_at(s: &Snapshot, now: Instant) -> String {
     let _ = writeln!(out, "sokol_flowspec_round_converged {}", converged as u8);
     family(
         &mut out,
+        "sokol_flowspec_round_progress",
+        "gauge",
+        "1 if a completed round strictly reduced its sampled target's identity/action obligations without new ones; 0 if not; -1 if unverified. Not convergence, latest-intent equality or upstream enforcement; check age.",
+    );
+    let progress =
+        if s.flowspec_enabled && s.flowspec_readback_ok && s.flowspec_read_started.is_some() {
+            s.flowspec_round_progress.map(|p| p as i8).unwrap_or(-1)
+        } else {
+            -1
+        };
+    let _ = writeln!(out, "sokol_flowspec_round_progress {}", progress);
+    family(
+        &mut out,
         "sokol_flowspec_readback_age_seconds",
         "gauge",
         "Monotonic age since the start of the last successful two-family RIB read, computed at scrape; -1 if none.",
@@ -643,6 +658,27 @@ fn render_at(s: &Snapshot, now: Instant) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn progress_distinguishes_unmeasured_from_zero_and_requires_health() {
+        for (enabled, ok, observed, progress, expected) in [
+            (true, true, true, Some(true), 1),
+            (true, true, true, Some(false), 0),
+            (true, true, true, None, -1),
+            (false, true, true, Some(true), -1),
+            (true, false, true, Some(true), -1),
+            (true, true, false, Some(true), -1),
+        ] {
+            let snap = Snapshot {
+                flowspec_enabled: enabled,
+                flowspec_readback_ok: ok,
+                flowspec_read_started: observed.then(Instant::now),
+                flowspec_round_progress: progress,
+                ..Default::default()
+            };
+            assert!(render(&snap).contains(&format!("sokol_flowspec_round_progress {expected}\n")));
+        }
+    }
 
     #[test]
     fn readback_age_advances_without_another_publication() {
