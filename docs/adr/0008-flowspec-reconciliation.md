@@ -227,6 +227,38 @@ cleanup у stop-сценаріях є результатом контрольо�
 не гарантією виконання під постійною відмовою. CI вимагає positive marker кожної
 сім'ї, повні native x86/ARM jobs і незмінені frozen Stargate checks.
 
+## FLOWSPEC-R13 — початковий намір після відновлення
+
+Main створює FlowSpec watch-channel зі snapshot `BlockTable::active_ips()` під
+тим самим lock, до spawn worker. Static configuration та state restore вже
+застосовані. Попереднє початкове `{}` вигадувало відсутність блоків: worker міг
+прочитати RIB і відкликати ще потрібні owned правила до першого main tick,
+а пізніша публікація знову їх анонсувала. Це scheduling-dependent вікно відтворено
+на фактичному worker і GoBGP 4.9.0 без main-loop публікацій.
+
+Джерело залишається застосованим набором, як у наступних tick publications:
+не всі durable claims і не число успішних restore. Відхилені політикою,
+прострочені та pending kernel-map additions не анонсуються. Дійсно порожній
+applied set усе ще відкликає старі owned правила. Чужі локальні paths, shutdown,
+observe-mode заборона worker, quota/cursors та pacing не змінюються.
+
+Snapshot не є атомарною угодою між BlockTable, RIB і upstream. Зміни після його
+створення потрапляють у звичайну публікацію; цей крок не робить її миттєвою.
+Не гарантується відсутність усіх можливих флапів, новий durable intent, успішне
+state restore чи upstream enforcement. Failed restore лишає наявну DEGRADED
+семантику: старт із тим applied set, який вузол реально має.
+
+Регресії `startup_worker_keeps_restored_blocks_and_announces_static_before_any_tick`,
+`startup_worker_with_no_applied_blocks_withdraws_stale_owned_rules` та
+`live_gobgp_startup_preserves_applied_restoration_before_any_tick` використовують
+фактичні BlockTable serialization/restore, production channel initializer і worker;
+лише kernel-map operations у unit tests замінені. Live test перевіряє обидві
+сім'ї, retained/static, refused/expired/unapplied/stale, порожній applied set,
+наступний intent, cleanup та незмінний foreign RIB. CI вимагає обидва positive
+markers. Production XDP smoke додатково перезапускає справжній вузол із тим самим
+state file, перевіряє XDP/RIB/HTTP і записує worker CLI calls, щоб delete/re-add
+не приховався за пізнішим успіхом; fresh-state stale cleanup лишається окремим.
+
 ## Коли переглянути
 
 Коли знадобиться інший BGP-стек або спільна політика анонсів для кількох систем.

@@ -846,6 +846,9 @@ if command -v gobgpd >/dev/null; then
     GOBGP_REAL=$(command -v gobgp)
     cat >"$WORK/gobgp-wrapper.sh" <<'SH'
 #!/bin/sh
+if [ -f "$1/startup-trace" ]; then
+    printf '%s\n' "$*" >> "$1/startup-calls"
+fi
 if [ -f "$1/readback-fail" ]; then
     touch "$1/readback-failed"
     printf '{}\n'
@@ -974,6 +977,31 @@ if [ ${#FLOWSPEC_ARGS[@]} -gt 0 ]; then
     sleep 2
     kill -9 "$ORCH_PID"; wait "$ORCH_PID" 2>/dev/null || true; ORCH_PID=""
     check "Flowspec: a crashed node's rule stays upstream" flowspec_rule present "$ALLOWED_IP/32"
+    # Restart the actual node from the same state first. Record every worker CLI
+    # call so delete/re-add cannot hide behind a later converged observation.
+    STATE_FILE=$LAST_STATE
+    : >"$WORK/startup-calls"
+    touch "$WORK/startup-trace"
+    start_orchestrator --block-ttl 3600 "${FLOWSPEC_ARGS[@]}"
+    check "Flowspec startup: persisted state was restored" grep -q "Restored .* of this node's blocks" "$LOG"
+    check "Flowspec startup: restored block remains applied in XDP" xdp_drop "$ALLOWED_IP" 1
+    check "Flowspec startup: restored and static target converge" flowspec_metrics converged 2 0
+    check "Flowspec startup: restored discard remains upstream" flowspec_rule present "$ALLOWED_IP/32"
+    check "Flowspec startup: static discard remains upstream" flowspec_rule present "$BLOCKED_IP/32"
+    check "Flowspec startup: worker readback actually ran" grep -Fq 'global rib -a ipv6-flowspec -j' "$WORK/startup-calls"
+    check "Flowspec startup: no restored or static rule was withdrawn" bash -c '
+        for net in "$2" "$3"; do
+            if grep -F "global rib -a ipv4-flowspec del match source $net/32" "$1"; then
+                exit 1
+            else
+                [ "$?" -eq 1 ] || exit 2
+            fi
+        done
+    ' -- "$WORK/startup-calls" "$ALLOWED_IP" "$BLOCKED_IP"
+    rm "$WORK/startup-trace"
+    # Preserve the original fresh-state stale-rule test by crashing again.
+    kill -9 "$ORCH_PID"; wait "$ORCH_PID" 2>/dev/null || true; ORCH_PID=""
+    unset STATE_FILE
     start_orchestrator "${FLOWSPEC_ARGS[@]}"
     sleep 3
     check "Flowspec: the next run withdraws the crashed run's stale rule" flowspec_rule absent "$ALLOWED_IP/32"

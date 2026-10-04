@@ -39,11 +39,19 @@ FLOWSPEC-R10 реалізовано в #140: після невдалого norma
 щонайменше секунду паузи. Накопичені ticks і зміни наміру не обходять її;
 shutdown або закриття publisher одразу переходять до bounded cleanup.
 Наступний раунд читає актуальний намір. Це не загальний ліміт CLI calls.
-Поточний крок — FLOWSPEC-R11: ротуємо prefixes усередині withdrawal/announce
+FLOWSPEC-R11 реалізовано в #141: ротуємо prefixes усередині withdrawal/announce
 між раундами, щоб повторювані відмови або CLI успіх без ефекту не тримали
 65-й запис поза квотою назавжди. Два process-local курсори пам’ятають лише
 останній розглянутий prefix кожного класу; withdrawal зберігає пріоритет.
 Нова черга завжди виводиться з актуального RIB і наміру.
+FLOWSPEC-R12 реалізовано в #142: одна пауза після кожного normal round,
+незалежно від CLI success/error/supersession, і pacing непорожнього cleanup.
+Метрика progress вимірює строге зменшення sampled identity/action obligations,
+окремо від CLI success, convergence та unknown; без приписування причини.
+Поточний крок — FLOWSPEC-R13: initial wanted походить із applied BlockTable
+після static configuration та restore, до spawn worker. Порожній placeholder
+не має відкликати ще потрібні правила до першого tick. Це snapshot, не atomic
+startup між kernel/RIB/upstream і не нова durable authority.
 Загальну агентну інфраструктуру не розширюємо без задачі.
 Вимоги до фізичної NIC, власників пілоту та прийняття нових повноважень залишаються.
 Нижче збережено датовану базову стратегію; її старий CI не є перевіркою нового коду.
