@@ -963,8 +963,8 @@ The shared `reconcile` keeps the original withdrawal-first plan, still capped at
 families before considering the next command, then use the same current-membership,
 needed-effect and foreign-local checks as cancellation recovery. A failed or malformed
 refresh aborts all subsequent writes. Never retry the failed prefix inside this
-plan. Retain only the first diagnostic plus a count of failed calls (at most64),
-and preserve the terminal collision count when reads succeed. A failed recovery
+plan. When reads succeed, return only the first write diagnostic, a count of failed
+calls (at most 64) and the terminal collision count. A failed recovery
 or final read returns its own read error immediately. Even if the final read sees the complete
 sampled target, any failed call leaves the round in error. No completed publication,
 no replacement counts/time and no health/convergence; only a subsequent fully
@@ -973,7 +973,7 @@ audit records. Fixed-target cleanup shares this behavior but retains its ten-sec
 outer attempt budget and cannot claim complete withdrawal after exit.
 
 `live_gobgp_failed_commands_preserve_safe_queued_work_and_refusals` runs eleven
-cases per family on actual GoBGP4.9: no-effect add/delete, accepted-but-error
+cases per family on actual GoBGP 4.9: no-effect add/delete, accepted-but-error
 add/delete, fixed-target cleanup deletion, fresh collision, already-satisfied queued
 work, valid stdout with failed refresh status, malformed refresh, and obsolete
 queued add/delete. It holds the first recovery read after the error, changes real
@@ -985,8 +985,10 @@ with health and convergence revoked, even when accepted errors achieved the targ
 A separate real-CLI successful round publishes recovery. Cleanup removes owned paths;
 raw foreign-family bytes match the foreign-only snapshot afterward. Native CI uses
 actual worker/database owners; local extraction declares audit/target/label stand-ins.
+The worker fixture retains one shared audit owner for its baseline and running
+worker: reopening the log before its writer exits is refused by the native lock.
 
-Local extraction passes49 production FlowSpec/metrics tests. Compiled controls must
+Local extraction passes 49 production FlowSpec/metrics tests. Compiled controls must
 reject aborting the queue, omitting recovery reads, ignoring fresh collision or
 satisfied/obsolete predicates, hiding the failed-call result and ignoring read
 failure. Canonical CI requires fourteen family-specific positive markers, with
@@ -998,7 +1000,7 @@ static review and unchanged pinned Stargate shadow remain gates before merge.
 Limits: progress only for remaining work in the finite original plan, provided
 reads are valid and remaining CLI calls can finish. Invalid reads still abort;
 backlog outside the quota, no-effect successful commands, slow calls and concurrent
-writers retain their limits. At most64 combined failures/cancellations add128 reads:
+writers retain their limits. At most 64 combined failures/cancellations add 128 reads:
 `(2 + 64 + 128 + 2) × 5 s = 980 s` is a coarse call-wait allowance for live or fixed
 rounds with errors, not a deadline/rate limit. Scheduling/teardown are outside it;
 shutdown preempts normal work and bounds cleanup independently. Failed rounds use

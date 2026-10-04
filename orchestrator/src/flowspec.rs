@@ -1106,16 +1106,12 @@ esac
     async fn a_failed_command_does_not_abandon_stable_queued_work() {
         for timeout in [false, true] {
             let fixture = RoundFixture::new(RIB, RIB, false);
+            let db = Arc::new(fixture.db());
             let readback = Arc::new(Readback::default());
             readback.enable();
-            checked_round(
-                &fixture.cli,
-                &ips(&["198.51.100.7"]),
-                &fixture.db(),
-                &readback,
-            )
-            .await
-            .unwrap();
+            checked_round(&fixture.cli, &ips(&["198.51.100.7"]), &db, &readback)
+                .await
+                .unwrap();
             let old = readback.snapshot();
             std::fs::write(fixture.dir.join("calls"), "").unwrap();
             std::fs::write(
@@ -1143,7 +1139,7 @@ esac
                 copy_cli(&fixture.cli),
                 wanted_rx,
                 shutdown_rx,
-                Arc::new(fixture.db()),
+                db,
                 readback.clone(),
             ));
             let progressed =
