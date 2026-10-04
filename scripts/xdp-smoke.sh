@@ -733,6 +733,28 @@ printf 'UNBAN_IP:%s\n' "$KILL_BAN" | nc -U -q1 "$WORK/control.sock" >/dev/null
 printf 'UNBAN_IP:%s\n' "$PERSIST_IP" | nc -U -q1 "$WORK/control.sock" >/dev/null
 # R27-03: a hung state write (its temp file is a FIFO nobody reads) must not stall the node:
 # the operator gets an answer within the durable wait, the tick keeps running, health turns bad.
+# Dedicated addresses: earlier smoke sections already assigned .16 and .17.
+HANDOFF_OLD_IP=10.231.0.30
+HANDOFF_NEW_IP=10.231.0.31
+ip netns exec "$NS" ip addr add "$HANDOFF_OLD_IP/24" dev "$PEER_IF"
+ip netns exec "$NS" ip addr add "$HANDOFF_NEW_IP/24" dev "$PEER_IF"
+state_handoff_matches() {
+    # Claim::target uses show(): a host address is bare, not suffixed with /32.
+    python3 - "$LAST_STATE" "$1" "${2:-}" <<'PY_STATE'
+import json, sys
+with open(sys.argv[1]) as source:
+    state = json.load(source)
+assert state['schema'] == 1
+assert any(claim['target'] == sys.argv[2] for claim in state['claims'])
+if sys.argv[3]:
+    assert not any(claim['target'] == sys.argv[3] for claim in state['claims'])
+PY_STATE
+}
+# Make the old operator decision durable first: dropping it after recovery or
+# restore must demonstrate saved supersession, not a ban that was never saved.
+printf 'BAN_IP:%s\n' "$HANDOFF_OLD_IP" | timeout 10 nc -U -q1 "$WORK/control.sock" >/dev/null
+check "State handoff: predecessor ban is durable before the write is held" state_handoff_matches "$HANDOFF_OLD_IP"
+check "State handoff: predecessor ban is enforced before supersession" xdp_drop "$HANDOFF_OLD_IP" 1
 STATE_TMP="${LAST_STATE%.json}.tmp"
 sleep 1.5   # let the unbans reach the disk first
 rm -f "$STATE_TMP"; mkfifo "$STATE_TMP"
@@ -749,8 +771,30 @@ check "a hung state write makes the node DEGRADED" wait_metric sokol_state_healt
 PENDING1=$(metric sokol_state_pending_seconds); sleep 2.5; PENDING2=$(metric sokol_state_pending_seconds)
 check "the maintenance tick keeps running while the write hangs" \
     awk -v a="$PENDING1" -v b="$PENDING2" 'BEGIN { exit !(b > a + 1) }'
-(timeout 5 cat "$STATE_TMP" >/dev/null &) ; sleep 0.5; rm -f "$STATE_TMP"
+# Several authoritative snapshots must supersede while the first write is held.
+HANDOFF_REPLY=$(printf 'UNBAN_IP:%s\n' "$HANDOFF_OLD_IP" | timeout 10 nc -U -q1 "$WORK/control.sock")
+check "State handoff: superseding unban remains unverified while the disk hangs" \
+    grep -q '^OK .*WARNING: not yet durable' <<<"$HANDOFF_REPLY"
+ipc "DROP_IMMEDIATE:$HANDOFF_NEW_IP"
+sleep 1.2
+check "State handoff: newest decision is enforced while the writer is blocked" xdp_drop "$HANDOFF_NEW_IP" 1
+check "State handoff: superseded decision is lifted while the writer is blocked" ping_from "$HANDOFF_OLD_IP"
+# Keep a reader open through unlink. A queued wake can trigger an immediate
+# retry after Linux fsync(FIFO) fails; it must never reopen a readerless FIFO.
+(
+    exec 3<>"$STATE_TMP"
+    rm -f "$STATE_TMP"
+    timeout 5 cat <&3 >/dev/null
+) &
 check "health returns once the disk answers" wait_metric sokol_state_healthy 1
+
+check "State handoff: recovery persisted the latest decision rather than the held predecessor" state_handoff_matches "$HANDOFF_NEW_IP" "$HANDOFF_OLD_IP"
+# No graceful final persist may repair the recovered file before the restore check.
+kill -9 "$ORCH_PID"; wait "$ORCH_PID" 2>/dev/null || true; ORCH_PID=""
+STATE_FILE=$LAST_STATE start_orchestrator
+check "State handoff: superseding unban survives restore from the recovered file" ping_from "$HANDOFF_OLD_IP"
+check "State handoff: latest ban survives restore from the recovered file" xdp_drop "$HANDOFF_NEW_IP" 1
+printf 'UNBAN_IP:%s\n' "$HANDOFF_NEW_IP" | nc -U -q1 "$WORK/control.sock" >/dev/null
 printf 'UNBAN_IP:%s\n' "$HUNG_IP" | nc -U -q1 "$WORK/control.sock" >/dev/null
 stop_orchestrator
 # R27-04: a state file that does not parse is not a first start: its bytes are kept and the node
