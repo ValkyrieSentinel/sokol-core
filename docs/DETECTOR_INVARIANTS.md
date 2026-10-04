@@ -476,7 +476,7 @@ effect cannot manufacture presence/absence. A failed post-write command, even wi
 valid partial stdout, or malformed JSON is an error; the worker retains its prior
 successful count. An unchanged round returns its initial observation without two
 extra queries. The existing ownership predicate, withdrawal-first order and
-64-operation cap remain unchanged. A changed fixed-target round adds at most two CLI calls;
+64-operation cap remain unchanged. An error-free changed fixed-target round adds at most two CLI calls;
 with 5-second per-call timeouts the configured call-wait allowance is
 `(2 + 64 + 2) × 5 s`, not a hard round deadline. Scheduling, process teardown and
 other work remain outside it; shutdown retains its separate attempt budget.
@@ -934,18 +934,74 @@ that is test cleanup, not evidence of worker withdrawal for that prefix.
 A separate regression requires immediate retry after ABA. Local extraction passes
 47 production FlowSpec/metrics tests with declared audit/target/label stand-ins.
 Compiled controls must reject early abandonment, stale read reuse, ignoring fresh
-collisions, duplicate satisfied commands and omission of the ABA retry. Canonical
-CI requires twelve family-specific positive markers and rejects optional-test skip.
+collisions, duplicate satisfied commands and omission of the ABA retry. At #138, canonical
+CI required twelve family-specific positive markers and rejects optional-test skip.
 Full native Linux x86/ARM owners, 31 production smoke assertions, demo/runbook,
 independent exact-head static review and unchanged pinned Stargate shadow remain
 separate gates before merge. Existing 14 Python refusal checks remain.
 
 Limits: this is consideration of the remaining original plan under readable RIB
-and successful other CLI calls, not unconditional fairness or convergence. Errors
-still abort the queue; continuously failing prefixes or backlog beyond the quota
+and successful other CLI calls, not unconditional fairness or convergence. At #138, errors
+still aborted the queue; continuously failing prefixes or backlog beyond the quota
 can starve work. Each cancellation adds two reads; up to 64 cancellations give a
 coarse `(2 + 64 + 128 + 2) × 5 s = 980 s` call bound. It is not a rate or latency
 budget; shutdown still preempts the worker independently of main. Non-atomic RIB
 reads, serialized-writer assumptions, sampled-target publication, coalesced watch
 notifications, remote late RPC effects, direct-child kill, incomplete CLI-ACK audit
 and bounded cleanup retain R6/R7 limits. No checker/model/frozen capture/pin change.
+
+## FLOWSPEC-R9: isolate failed writes after readable recovery
+
+At base `298f808` (#138), a failed first CLI write aborts the plan; every later
+retry can fail on that same prefix without giving stable queued work a turn.
+`a_failed_command_does_not_abandon_stable_queued_work` compiled and failed its
+public-worker assertion on that base. The head tests both nonzero exit and actual
+five-second call timeout (the wrapper execs the sleeping direct child).
+
+The shared `reconcile` keeps the original withdrawal-first plan, still capped at
+64 distinct NLRIs. A failed call may have been accepted remotely: refresh both RIB
+families before considering the next command, then use the same current-membership,
+needed-effect and foreign-local checks as cancellation recovery. A failed or malformed
+refresh aborts all subsequent writes. Never retry the failed prefix inside this
+plan. Retain only the first diagnostic plus a count of failed calls (at most64),
+and preserve the terminal collision count when reads succeed. A failed recovery
+or final read returns its own read error immediately. Even if the final read sees the complete
+sampled target, any failed call leaves the round in error. No completed publication,
+no replacement counts/time and no health/convergence; only a subsequent fully
+successful round can publish recovery. Failed CLI replies do not submit success ACK
+audit records. Fixed-target cleanup shares this behavior but retains its ten-second
+outer attempt budget and cannot claim complete withdrawal after exit.
+
+`live_gobgp_failed_commands_preserve_safe_queued_work_and_refusals` runs eleven
+cases per family on actual GoBGP4.9: no-effect add/delete, accepted-but-error
+add/delete, fixed-target cleanup deletion, fresh collision, already-satisfied queued
+work, valid stdout with failed refresh status, malformed refresh, and obsolete
+queued add/delete. It holds the first recovery read after the error, changes real
+RIB or intent there, and awaits the actual live/fixed round result. Exact CLI logs
+require the original failed write once, two family reads before any next command,
+and no obsolete/duplicate/colliding write. Independent actual RIB owned/discard sets
+check effects; failed-round result and readback verify retained count/action-count/time
+with health and convergence revoked, even when accepted errors achieved the target.
+A separate real-CLI successful round publishes recovery. Cleanup removes owned paths;
+raw foreign-family bytes match the foreign-only snapshot afterward. Native CI uses
+actual worker/database owners; local extraction declares audit/target/label stand-ins.
+
+Local extraction passes49 production FlowSpec/metrics tests. Compiled controls must
+reject aborting the queue, omitting recovery reads, ignoring fresh collision or
+satisfied/obsolete predicates, hiding the failed-call result and ignoring read
+failure. Canonical CI requires fourteen family-specific positive markers, with
+missing-marker, actual optional-test skip and failing-exit-through-tee controls.
+Full native x86/ARM build/tests/Clippy, 31 production smoke assertions, 14 Python
+refusal checks, XDP smoke, three-node demo and systemd runbook, independent exact-head
+static review and unchanged pinned Stargate shadow remain gates before merge.
+
+Limits: progress only for remaining work in the finite original plan, provided
+reads are valid and remaining CLI calls can finish. Invalid reads still abort;
+backlog outside the quota, no-effect successful commands, slow calls and concurrent
+writers retain their limits. At most64 combined failures/cancellations add128 reads:
+`(2 + 64 + 128 + 2) × 5 s = 980 s` is a coarse call-wait allowance for live or fixed
+rounds with errors, not a deadline/rate limit. Scheduling/teardown are outside it;
+shutdown preempts normal work and bounds cleanup independently. Failed rounds use
+existing outer scheduling, not immediate internal retries; watch activity can still
+accelerate them. No new authority, atomic authorization, RPC fence, complete effect
+audit, unconditional fairness/convergence or proof-core/model/pin change.

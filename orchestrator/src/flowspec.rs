@@ -19,10 +19,10 @@ use crate::SentinelDb;
 
 /// Rule changes per round; the rest wait for the next round. An operation count, not a time
 /// budget: each change is a CLI call of up to CALL_TIMEOUT, after reading two RIB families, so
-/// a slow gobgpd can stretch an ordinary round to (2 + 64 + 2) × 5 s. A live round
-/// with every pending operation invalidated can add 64 two-family refreshes:
-/// (2 + 64 + 2×64 + 2) × 5 s. The worker runs apart from the main tick and shutdown
-/// preempts it (numerical review N06).
+/// a slow gobgpd can stretch an error-free round to (2 + 64 + 2) × 5 s. A live round
+/// with pending operations invalidated or failed can add 64 two-family refreshes:
+/// (2 + 64 + 2×64 + 2) × 5 s, including fixed-target cleanup failures. The worker
+/// runs apart from the main tick and shutdown preempts it (numerical review N06).
 pub const MAX_OPS_PER_ROUND: usize = 64;
 /// One gobgp call; a call that takes longer is killed, and its outcome is read back next round.
 pub const CALL_TIMEOUT: Duration = Duration::from_secs(5);
@@ -591,6 +591,8 @@ async fn reconcile(
     let (announce, withdraw) = plan(&writable_wanted, &writable_owned, &observed.discard);
     let changed = !announce.is_empty() || !withdraw.is_empty();
     let mut superseded = false;
+    let mut first_failure: Option<String> = None;
+    let mut failure_count = 0usize;
     for (is_announce, net) in withdraw
         .into_iter()
         .map(|n| (false, n))
@@ -632,8 +634,14 @@ async fn reconcile(
                     show(&net)
                 ));
             }
-            // Unknown outcome: the next round reads the RIB again.
-            Err(e) => return Err(format!("gobgp failed for {}: {}", show(&net), e)),
+            Err(e) => {
+                // An error may follow an accepted RPC. Keep the round incomplete,
+                // but refresh before giving another distinct NLRI its turn.
+                failure_count += 1;
+                first_failure
+                    .get_or_insert_with(|| format!("gobgp failed for {}: {}", show(&net), e));
+                observed = cli.observed().await?;
+            }
         }
     }
     // A successful write acknowledges the CLI operation, not the resulting RIB.
@@ -646,6 +654,14 @@ async fn reconcile(
     };
     collisions.sort();
     collisions.dedup();
+    if let Some(error) = first_failure {
+        // Readable recovery and later CLI successes do not erase a failed call.
+        // Publication retains previous counts/time with health revoked.
+        return Err(format!(
+            "{} ({} command failures, {} collisions skipped); remaining non-colliding operations attempted",
+            error, failure_count, collisions.len()
+        ));
+    }
     if let Some(net) = collisions.first() {
         // Non-colliding work has progressed, but the full round is incomplete.
         // Preserve the last successful counts/time with health already revoked.
@@ -1084,6 +1100,83 @@ esac
             completed,
             "latest target was not sampled after the retained read"
         );
+    }
+
+    #[tokio::test]
+    async fn a_failed_command_does_not_abandon_stable_queued_work() {
+        for timeout in [false, true] {
+            let fixture = RoundFixture::new(RIB, RIB, false);
+            let readback = Arc::new(Readback::default());
+            readback.enable();
+            checked_round(
+                &fixture.cli,
+                &ips(&["198.51.100.7"]),
+                &fixture.db(),
+                &readback,
+            )
+            .await
+            .unwrap();
+            let old = readback.snapshot();
+            std::fs::write(fixture.dir.join("calls"), "").unwrap();
+            std::fs::write(
+                fixture.dir.join("gobgp"),
+                r#"#!/bin/sh
+cd "$(dirname "$0")" || exit 9
+printf '%s\n' "$*" >> calls
+case "$*" in
+  *' -j') printf '{}\n' ;;
+  *' add '*'198.51.100.7/32'*)
+    if [ -f timeout ]; then exec sleep 30; fi
+    printf 'isolated command failure\n' >&2; exit 7 ;;
+  *' add '*'198.51.100.9/32'*) touch stable_done ;;
+  *) exit 8 ;;
+esac
+"#,
+            )
+            .unwrap();
+            if timeout {
+                std::fs::write(fixture.dir.join("timeout"), "").unwrap();
+            }
+            let (wanted_tx, wanted_rx) = watch::channel(ips(&["198.51.100.7", "198.51.100.9"]));
+            let (shutdown_tx, shutdown_rx) = watch::channel(false);
+            let worker = tokio::spawn(run_worker(
+                copy_cli(&fixture.cli),
+                wanted_rx,
+                shutdown_rx,
+                Arc::new(fixture.db()),
+                readback.clone(),
+            ));
+            let progressed =
+                tokio::time::timeout(Duration::from_secs(if timeout { 8 } else { 2 }), async {
+                    while !fixture.dir.join("stable_done").exists() {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .is_ok();
+            let calls = std::fs::read_to_string(fixture.dir.join("calls")).unwrap();
+            let failed = readback.snapshot();
+            shutdown_tx.send(true).unwrap();
+            tokio::time::timeout(Duration::from_secs(3), worker)
+                .await
+                .unwrap()
+                .unwrap();
+            drop(wanted_tx);
+            assert!(
+                progressed,
+                "one failed prefix abandoned stable queued work: {calls}"
+            );
+            let writes: Vec<_> = calls.lines().filter(|l| l.contains(" add ")).collect();
+            assert!(writes[0].contains("198.51.100.7/32"));
+            assert!(
+                writes[1].contains("198.51.100.9/32"),
+                "failed prefix retried ahead of stable work: {calls}"
+            );
+            assert!(!failed.ok && !failed.converged);
+            assert_eq!(failed.count, old.count);
+            assert_eq!(failed.discard_count, old.discard_count);
+            assert_eq!(failed.started, old.started);
+        }
     }
 
     fn superseding_fixture() -> RoundFixture {
@@ -1886,6 +1979,278 @@ exec "$real" "$@"
                 );
             }
             writeln!(std::io::stdout(), "PASS live intent progress {}: initial/post-write reads retained, compatible add/delete retained once, obsolete queued writes refused, latest target recovered, foreign path preserved", family(&net)).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn live_gobgp_failed_commands_preserve_safe_queued_work_and_refusals() {
+        use std::io::Write as _;
+        let Some(bin_dir) = std::env::var_os("SOKOL_GOBGP_TEST_BIN") else {
+            eprintln!("SKIP live GoBGP: SOKOL_GOBGP_TEST_BIN is unset (required in canonical CI)");
+            return;
+        };
+        let live = LiveGobgp::start(std::path::Path::new(&bin_dir)).await;
+        let db = Arc::new(live.fixture.db());
+        for (bad, foreign_net, stable, extra) in [
+            (
+                one("198.51.100.7"),
+                one("198.51.100.8"),
+                one("198.51.100.9"),
+                one("198.51.100.10"),
+            ),
+            (
+                one("2001:db8::7"),
+                one("2001:db8::8"),
+                one("2001:db8::9"),
+                one("2001:db8::10"),
+            ),
+        ] {
+            live.put(foreign_net, "discard", "65001:9999").await;
+            for (case, deleting) in [
+                ("no_effect_add", false),
+                ("no_effect_delete", true),
+                ("cleanup_delete", true),
+                ("accepted_add", false),
+                ("accepted_delete", true),
+                ("new_collision", false),
+                ("satisfied_queue", false),
+                ("unreadable_refresh", false),
+                ("malformed_refresh", false),
+                ("obsolete_queued_add", false),
+                ("obsolete_queued_delete", true),
+            ] {
+                let mut foreign = live.raw(foreign_net).await;
+                if deleting {
+                    live.fixture.cli.apply(true, bad).await.unwrap();
+                    live.fixture.cli.apply(true, stable).await.unwrap();
+                }
+                let before = live.fixture.cli.observed().await.unwrap().owned;
+                let mut target = if deleting {
+                    HashSet::new()
+                } else {
+                    HashSet::from([bad, stable])
+                };
+                if case == "new_collision" {
+                    target.insert(extra);
+                }
+                let readback = Arc::new(Readback::default());
+                readback.enable();
+                checked_round(&live.fixture.cli, &before, &db, &readback)
+                    .await
+                    .unwrap();
+                let old = readback.snapshot();
+                let dir = live
+                    .fixture
+                    .dir
+                    .join(format!("failed-{}-{case}", family(&bad)));
+                std::fs::create_dir(&dir).unwrap();
+                std::fs::write(dir.join("fresh_hold"), "").unwrap();
+                std::fs::write(dir.join("calls"), "").unwrap();
+                if case.starts_with("accepted_") {
+                    std::fs::write(dir.join("accepted"), "").unwrap();
+                }
+                let wrapper = dir.join("cli.sh");
+                std::fs::write(
+                    &wrapper,
+                    r#"#!/bin/sh
+real="$1"; dir="$2"; bad="$3"; bad_op="$4"; shift 4
+printf '%s\n' "$*" >> "$dir/calls"
+op=read
+case "$*" in *' add '*) op=add ;; *' del '*) op=del ;; esac
+case "$*" in *" source $bad "*)
+  if [ "$op" = "$bad_op" ]; then
+    if [ -f "$dir/accepted" ]; then "$real" "$@" || exit 9; fi
+    touch "$dir/failed"
+    printf 'isolated command failure\n' >&2
+    exit 7
+  fi ;;
+esac
+if [ "$op" = read ] && [ -f "$dir/failed" ] && [ ! -f "$dir/fresh_entered" ]; then
+  touch "$dir/fresh_entered"
+  while [ -f "$dir/fresh_hold" ]; do sleep 0.01; done
+  if [ -f "$dir/read_fail" ]; then printf '{}\n'; exit 7; fi
+  if [ -f "$dir/read_malformed" ]; then printf 'null\n'; exit 0; fi
+fi
+exec "$real" "$@"
+"#,
+                )
+                .unwrap();
+                let mut args = vec![
+                    wrapper.to_str().unwrap().into(),
+                    live.fixture.cli.bin.to_str().unwrap().into(),
+                    dir.to_str().unwrap().into(),
+                    bad.to_string(),
+                    if deleting { "del" } else { "add" }.into(),
+                ];
+                args.extend(live.fixture.cli.args.clone());
+                let cli = GobgpCli {
+                    bin: "/bin/sh".into(),
+                    args,
+                    community: live.fixture.cli.community,
+                };
+                let (wanted_tx, mut wanted_rx) = watch::channel(target.clone());
+                let task_db = db.clone();
+                let task_readback = readback.clone();
+                let task = tokio::spawn(async move {
+                    if case == "cleanup_delete" {
+                        checked_round(&cli, &HashSet::new(), &task_db, &task_readback)
+                            .await
+                            .map(|_| false)
+                    } else {
+                        live_round(&cli, &mut wanted_rx, &task_db, &task_readback).await
+                    }
+                });
+                assert!(
+                    eventually(|| dir.join("fresh_entered").exists()).await,
+                    "{case}: failed call abandoned the cohort without recovery read"
+                );
+                if case == "new_collision" {
+                    live.put(stable, "discard", "65001:9999").await;
+                    foreign = live.raw(foreign_net).await;
+                } else if case == "satisfied_queue" {
+                    live.fixture.cli.apply(true, stable).await.unwrap();
+                } else if case == "unreadable_refresh" {
+                    std::fs::write(dir.join("read_fail"), "").unwrap();
+                } else if case == "malformed_refresh" {
+                    std::fs::write(dir.join("read_malformed"), "").unwrap();
+                } else if case == "obsolete_queued_add" {
+                    target.remove(&stable);
+                    update_wanted(&wanted_tx, target.clone());
+                } else if case == "obsolete_queued_delete" {
+                    target.insert(stable);
+                    update_wanted(&wanted_tx, target.clone());
+                }
+                std::fs::remove_file(dir.join("fresh_hold")).unwrap();
+                let result = tokio::time::timeout(Duration::from_secs(3), task)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(
+                    result.is_err(),
+                    "{case}: failed command was published as a successful round"
+                );
+                let view = readback.snapshot();
+                assert!(
+                    !view.ok && !view.converged,
+                    "{case}: failed round published health"
+                );
+                assert_eq!(
+                    view.count, old.count,
+                    "{case}: failure changed published count"
+                );
+                assert_eq!(view.discard_count, old.discard_count);
+                assert_eq!(view.started, old.started);
+                let calls = std::fs::read_to_string(dir.join("calls")).unwrap();
+                let lines: Vec<_> = calls.lines().collect();
+                let writes: Vec<_> = lines
+                    .iter()
+                    .filter(|l| l.contains(" add ") || l.contains(" del "))
+                    .collect();
+                assert!(writes[0].contains(&format!(" source {bad} ")));
+                let refusal = matches!(
+                    case,
+                    "satisfied_queue"
+                        | "unreadable_refresh"
+                        | "malformed_refresh"
+                        | "obsolete_queued_add"
+                        | "obsolete_queued_delete"
+                );
+                if refusal {
+                    assert_eq!(
+                        writes.len(),
+                        1,
+                        "{case}: queued write must be refused: {calls}"
+                    );
+                } else {
+                    let next = if case == "new_collision" {
+                        extra
+                    } else {
+                        stable
+                    };
+                    assert_eq!(
+                        writes.len(),
+                        2,
+                        "{case}: finite original queue must continue once: {calls}"
+                    );
+                    assert!(writes[1].contains(&format!(" source {next} ")));
+                    let first_index = lines
+                        .iter()
+                        .position(|l| l.contains(&format!(" source {bad} ")))
+                        .unwrap();
+                    let next_index = lines
+                        .iter()
+                        .position(|l| l.contains(&format!(" source {next} ")))
+                        .unwrap();
+                    let reads: Vec<_> = lines[first_index + 1..next_index]
+                        .iter()
+                        .filter(|l| l.ends_with(" -j"))
+                        .collect();
+                    assert_eq!(
+                        reads.len(),
+                        2,
+                        "{case}: queued write lacked a full recovery read: {calls}"
+                    );
+                    assert!(
+                        reads[0].contains("ipv4-flowspec") && reads[1].contains("ipv6-flowspec")
+                    );
+                }
+                let actual = live.fixture.cli.observed().await.unwrap();
+                let expected = if deleting {
+                    if case == "accepted_delete" {
+                        HashSet::new()
+                    } else if case == "obsolete_queued_delete" {
+                        HashSet::from([bad, stable])
+                    } else {
+                        HashSet::from([bad])
+                    }
+                } else if matches!(
+                    case,
+                    "unreadable_refresh" | "malformed_refresh" | "obsolete_queued_add"
+                ) {
+                    HashSet::new()
+                } else if case == "new_collision" {
+                    HashSet::from([extra])
+                } else if case == "accepted_add" {
+                    HashSet::from([bad, stable])
+                } else {
+                    HashSet::from([stable])
+                };
+                assert_eq!(actual.owned, expected, "{case}: wrong actual owned RIB");
+                assert_eq!(actual.discard, expected, "{case}: wrong actual discard RIB");
+                assert!(actual.foreign_local.contains(&foreign_net));
+                if case == "new_collision" {
+                    assert!(actual.foreign_local.contains(&stable));
+                }
+                // A separate successful round on the real CLI can publish recovery.
+                // For collisions, recover only the noncolliding subset before cleanup.
+                let recovery_target = if case == "new_collision" {
+                    HashSet::from([bad, extra])
+                } else {
+                    target
+                };
+                checked_round(&live.fixture.cli, &recovery_target, &db, &readback)
+                    .await
+                    .unwrap();
+                assert!(readback.snapshot().ok && readback.snapshot().converged);
+                assert_eq!(readback.snapshot().count, recovery_target.len());
+                assert!(readback.snapshot().started.unwrap() > old.started.unwrap());
+                checked_round(&live.fixture.cli, &HashSet::new(), &db, &readback)
+                    .await
+                    .unwrap();
+                assert!(live.fixture.cli.observed().await.unwrap().owned.is_empty());
+                assert_eq!(
+                    live.raw(foreign_net).await,
+                    foreign,
+                    "{case}: cleanup changed foreign paths"
+                );
+                if case == "new_collision" {
+                    let mut args = live.fixture.cli.command_args(false, stable);
+                    let last = args.len() - 1;
+                    args[last] = "65001:9999".into();
+                    live.fixture.cli.run(args).await.unwrap();
+                }
+            }
+            writeln!(std::io::stdout(), "PASS live command failure {}: stable add/delete after failed replies, accepted unknown effects read back, fresh collision/satisfied/obsolete/refusal checks, health retained, recovery and foreign paths verified", family(&bad)).unwrap();
         }
     }
 
