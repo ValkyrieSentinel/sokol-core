@@ -271,9 +271,12 @@ ctl ACCEPT_STATE_LOSS             # "OK state loss accepted"; вузол вих�
   вимкнення worker не доводить наявності розбіжності. Ця ознака не дає додаткових
   прав і не підтверджує latest intent, справжні path IDs чи upstream enforcement.
 
-- `sokol_flowspec_round_progress = 1`: завершений раунд строго зменшив набір
+- `sokol_flowspec_round_progress = 1`: між initial/final reads раунду спостережено
+  строге зменшення набору
   невиконаних вимог для свого sampled wanted без нових розбіжностей. `0` — такого
   поступу не спостережено; `-1` — невиміряно, pending, failure або cancellation.
+  Вимір не приписує ефект командам цього раунду: його міг дати пізній раніший RPC
+  або інший writer.
   Health 1, convergence 0, progress 0 за свіжого age означає придатне спостереження
   без підтвердженого поступу цього раунду. Повторення такого стану варто зіставити
   з журналом і обома RIB; duration/alert-поріг задає ваш deployment. Не вважайте

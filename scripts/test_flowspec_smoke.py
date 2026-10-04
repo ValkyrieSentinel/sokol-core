@@ -73,6 +73,7 @@ class FlowSpecMetrics(unittest.TestCase):
         self.assertTrue(self.helper.matches(self.samples(progress=-1), "failed", 1, 0))
         for text in (self.samples(progress=0), self.samples(progress=1),
                      self.samples(ok=1, progress=2), self.samples(ok=1, progress=-2),
+                     self.samples(ok=1, progress=-1),
                      self.samples(ok=1, progress="nan"), self.samples(ok=1, progress=0.5),
                      self.samples().replace("sokol_flowspec_round_progress -1\n", ""),
                      self.samples() + "sokol_flowspec_round_progress -1\n",

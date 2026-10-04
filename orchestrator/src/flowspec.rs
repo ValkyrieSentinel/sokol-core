@@ -56,8 +56,8 @@ pub struct ReadbackView {
     /// The completed round observed owned == discard == its sampled wanted set.
     /// Revoked for pending/failed/cancelled rounds; not proof of latest intent.
     pub converged: bool,
-    /// Strict reduction of obligations within the completed round, for its
-    /// sampled target. None while pending/failed; not latest-intent progress.
+    /// Strict reduction observed between a completed round's reads, for its
+    /// sampled target. Not attributed to its commands; None while pending/failed.
     pub progress: Option<bool>,
     pub started: Option<Instant>,
 }
@@ -1858,25 +1858,40 @@ esac
                 tokio::time::sleep(Duration::from_millis(30)).await;
             }
             let early = budget_writes(&fixture);
-            let latest = if deleting {
-                target.clone()
+            // Restore the deleted prefix, or switch the announced prefix: both
+            // final targets differ from what the first round sampled.
+            let latest = ips(&[if deleting {
+                "198.51.100.7"
             } else {
-                ips(&["198.51.100.9"])
-            };
+                "198.51.100.9"
+            }]);
             wanted_tx.send(latest.clone()).unwrap();
-            while completed.elapsed() < Duration::from_millis(1800) && budget_writes(&fixture) < 2 {
+            let resumed = || {
+                if deleting {
+                    readback.snapshot().ok && readback.snapshot().converged
+                } else {
+                    budget_writes(&fixture) >= 2
+                }
+            };
+            while completed.elapsed() < Duration::from_millis(1800) && !resumed() {
                 wanted_tx.send(latest.clone()).unwrap();
                 shutdown_tx.send(false).unwrap();
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
-            let retried = budget_writes(&fixture) >= 2;
+            let retried = resumed();
             let elapsed = completed.elapsed();
             let calls = std::fs::read_to_string(fixture.dir.join("calls")).unwrap();
             worker.abort();
             let _ = worker.await;
             assert_eq!(early, 1, "successful no-effect calls bypassed work pause: deleting={deleting}, overdue={overdue}");
             assert!(retried, "intent churn restarted the work pause");
-            if !deleting {
+            if deleting {
+                assert_eq!(
+                    budget_writes(&fixture),
+                    1,
+                    "restored latest intent was deleted after pause: {calls}"
+                );
+            } else {
                 let writes: Vec<_> = calls.lines().filter(|l| l.contains(" add ")).collect();
                 assert!(
                     writes[1].contains("source 198.51.100.9/32"),
@@ -2089,7 +2104,7 @@ esac
                 .unwrap()
                 .unwrap()
                 .unwrap(),
-            "changed target must request immediate replanning"
+            "changed target must request replanning after the work pause"
         );
         let observation = readback.snapshot();
         assert!(

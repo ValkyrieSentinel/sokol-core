@@ -588,7 +588,7 @@ fn render_at(s: &Snapshot, now: Instant) -> String {
         &mut out,
         "sokol_flowspec_round_progress",
         "gauge",
-        "1 if a completed round strictly reduced its sampled target's identity/action obligations without new ones; 0 if not; -1 if unverified. Not convergence, latest-intent equality or upstream enforcement; check age.",
+        "1 if initial/final reads observed a strict reduction of sampled-target identity/action obligations without new ones; 0 if not; -1 if unverified. Not attributed to this round's commands, convergence, latest intent or upstream enforcement; check age.",
     );
     let progress =
         if s.flowspec_enabled && s.flowspec_readback_ok && s.flowspec_read_started.is_some() {

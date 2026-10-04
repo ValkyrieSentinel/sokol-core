@@ -34,6 +34,8 @@ def matches(text, state, count, minimum_age):
         raise ValueError("unverified FlowSpec convergence")
     if progress not in (-1, 0, 1):
         raise ValueError("invalid FlowSpec progress")
+    if ok == 1 and progress == -1:
+        raise ValueError("completed FlowSpec readback lacks progress measurement")
     if progress != -1 and (enabled != 1 or ok != 1 or age < 0):
         raise ValueError("unverified FlowSpec progress")
     if state == "disabled":
