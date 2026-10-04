@@ -754,6 +754,7 @@ PY_STATE
 # restore must demonstrate saved supersession, not a ban that was never saved.
 printf 'BAN_IP:%s\n' "$HANDOFF_OLD_IP" | timeout 10 nc -U -q1 "$WORK/control.sock" >/dev/null
 check "State handoff: predecessor ban is durable before the write is held" state_handoff_matches "$HANDOFF_OLD_IP"
+check "State handoff: predecessor ban is enforced before supersession" xdp_drop "$HANDOFF_OLD_IP" 1
 STATE_TMP="${LAST_STATE%.json}.tmp"
 sleep 1.5   # let the unbans reach the disk first
 rm -f "$STATE_TMP"; mkfifo "$STATE_TMP"
@@ -788,7 +789,8 @@ check "State handoff: superseded decision is lifted while the writer is blocked"
 check "health returns once the disk answers" wait_metric sokol_state_healthy 1
 
 check "State handoff: recovery persisted the latest decision rather than the held predecessor" state_handoff_matches "$HANDOFF_NEW_IP" "$HANDOFF_OLD_IP"
-stop_orchestrator
+# No graceful final persist may repair the recovered file before the restore check.
+kill -9 "$ORCH_PID"; wait "$ORCH_PID" 2>/dev/null || true; ORCH_PID=""
 STATE_FILE=$LAST_STATE start_orchestrator
 check "State handoff: superseding unban survives restore from the recovered file" ping_from "$HANDOFF_OLD_IP"
 check "State handoff: latest ban survives restore from the recovered file" xdp_drop "$HANDOFF_NEW_IP" 1
