@@ -363,10 +363,45 @@ pub fn plan(
     observed: &HashSet<IpNet>,
     discard: &HashSet<IpNet>,
 ) -> (Vec<IpNet>, Vec<IpNet>) {
+    plan_after(wanted, observed, discard, &PlanCursor::default())
+}
+
+/// Worker-local ordering only: never authority, a cached RIB, or proof of effect.
+/// Two last-considered prefixes bound memory independently of backlog size.
+#[derive(Default)]
+struct PlanCursor {
+    announce: Option<IpNet>,
+    withdraw: Option<IpNet>,
+}
+
+impl PlanCursor {
+    fn considered(&mut self, announce: bool, net: IpNet) {
+        if announce {
+            self.announce = Some(net);
+        } else {
+            self.withdraw = Some(net);
+        }
+    }
+}
+
+fn rotate_after(queue: &mut [IpNet], cursor: Option<IpNet>) {
+    queue.sort();
+    if let Some(after) = cursor {
+        let start = queue.partition_point(|net| *net <= after);
+        queue.rotate_left(start);
+    }
+}
+
+fn plan_after(
+    wanted: &HashSet<IpNet>,
+    observed: &HashSet<IpNet>,
+    discard: &HashSet<IpNet>,
+    cursor: &PlanCursor,
+) -> (Vec<IpNet>, Vec<IpNet>) {
     let mut withdraw: Vec<IpNet> = observed.difference(wanted).copied().collect();
     let mut announce: Vec<IpNet> = wanted.difference(discard).copied().collect();
-    withdraw.sort();
-    announce.sort();
+    rotate_after(&mut withdraw, cursor.withdraw);
+    rotate_after(&mut announce, cursor.announce);
     withdraw.truncate(MAX_OPS_PER_ROUND);
     announce.truncate(MAX_OPS_PER_ROUND - withdraw.len());
     (announce, withdraw)
@@ -397,6 +432,7 @@ pub async fn run_worker(
 ) {
     let mut ticker = tokio::time::interval(Duration::from_secs(1));
     let mut reported_error = false;
+    let mut cursor = PlanCursor::default();
     'worker: loop {
         if *shutdown.borrow() {
             break;
@@ -418,7 +454,7 @@ pub async fn run_worker(
                 biased;
                 _ = stopping(&mut shutdown) => break 'worker,
                 _ = intent_closed(&mut closed) => break 'worker,
-                result = live_round(&cli, &mut wanted, &db, &readback) => {
+                result = live_round_with_cursor(&cli, &mut wanted, &db, &readback, &mut cursor) => {
                     match result {
                         Ok(true) => continue,
                         Ok(false) => reported_error = false,
@@ -448,7 +484,7 @@ pub async fn run_worker(
     let empty = HashSet::new();
     let done = tokio::time::timeout(SHUTDOWN_BUDGET, async {
         loop {
-            match checked_round(&cli, &empty, &db, &readback).await {
+            match checked_round_with_cursor(&cli, &empty, &db, &readback, &mut cursor).await {
                 Ok(observation) if observation.count == 0 => return true,
                 Ok(_) => continue,
                 Err(e) => {
@@ -537,41 +573,71 @@ struct RoundOutcome {
 
 /// True asks the worker to start the next round immediately, after an obsolete
 /// operation or a completed observation whose sampled target has since changed.
+#[cfg(test)]
 async fn live_round(
     cli: &GobgpCli,
     wanted: &mut watch::Receiver<HashSet<IpNet>>,
     db: &SentinelDb,
     readback: &Readback,
 ) -> Result<bool, String> {
+    live_round_with_cursor(cli, wanted, db, readback, &mut PlanCursor::default()).await
+}
+
+async fn live_round_with_cursor(
+    cli: &GobgpCli,
+    wanted: &mut watch::Receiver<HashSet<IpNet>>,
+    db: &SentinelDb,
+    readback: &Readback,
+    cursor: &mut PlanCursor,
+) -> Result<bool, String> {
     readback.begin_round();
-    let outcome = reconcile(cli, &mut Intent::Live(wanted), db).await?;
+    let outcome = reconcile(cli, &mut Intent::Live(wanted), db, cursor).await?;
     readback.completed(outcome.observation);
     Ok(outcome.retry)
 }
 
 /// Same publication path for ordinary and shutdown rounds. Errors and cancelled
 /// futures retain the previous count/time, with ok already revoked.
+#[cfg(test)]
 async fn checked_round(
     cli: &GobgpCli,
     wanted: &HashSet<IpNet>,
     db: &SentinelDb,
     readback: &Readback,
 ) -> Result<Observation, String> {
+    checked_round_with_cursor(cli, wanted, db, readback, &mut PlanCursor::default()).await
+}
+
+async fn checked_round_with_cursor(
+    cli: &GobgpCli,
+    wanted: &HashSet<IpNet>,
+    db: &SentinelDb,
+    readback: &Readback,
+    cursor: &mut PlanCursor,
+) -> Result<Observation, String> {
     readback.begin_round();
-    let observation = round(cli, wanted, db).await?;
+    let observation = reconcile(cli, &mut Intent::Fixed(wanted), db, cursor)
+        .await?
+        .observation;
     readback.completed(observation);
     Ok(observation)
 }
 
 /// One reconciliation round; returns the final successful two-family observation.
+#[cfg(test)]
 async fn round(
     cli: &GobgpCli,
     wanted: &HashSet<IpNet>,
     db: &SentinelDb,
 ) -> Result<Observation, String> {
-    Ok(reconcile(cli, &mut Intent::Fixed(wanted), db)
-        .await?
-        .observation)
+    Ok(reconcile(
+        cli,
+        &mut Intent::Fixed(wanted),
+        db,
+        &mut PlanCursor::default(),
+    )
+    .await?
+    .observation)
 }
 
 /// Reads survive intent churn; planning samples intent only after both reads.
@@ -579,6 +645,7 @@ async fn reconcile(
     cli: &GobgpCli,
     intent: &mut Intent<'_>,
     db: &SentinelDb,
+    cursor: &mut PlanCursor,
 ) -> Result<RoundOutcome, String> {
     let started = Instant::now();
     let mut observed = cli.observed().await?;
@@ -600,7 +667,8 @@ async fn reconcile(
         .difference(&observed.foreign_local)
         .copied()
         .collect();
-    let (announce, withdraw) = plan(&writable_wanted, &writable_owned, &observed.discard);
+    let (announce, withdraw) =
+        plan_after(&writable_wanted, &writable_owned, &observed.discard, cursor);
     let changed = !announce.is_empty() || !withdraw.is_empty();
     let mut superseded = false;
     let mut first_failure: Option<String> = None;
@@ -610,6 +678,9 @@ async fn reconcile(
         .map(|n| (false, n))
         .chain(announce.into_iter().map(|n| (true, n)))
     {
+        // Advance only as each candidate is reached, before any cancellable
+        // work. A failed recovery must not skip the rest of an unvisited plan.
+        cursor.considered(is_announce, net);
         // An obsolete queued command has not started and has no unknown effect.
         // Keep the finite original queue; a later round plans any replacements.
         if !intent.permits(is_announce, net) {
@@ -1267,6 +1338,287 @@ exit 7
             elapsed >= Duration::from_millis(900),
             "retry floor bypassed: {elapsed:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn quota_rotation_serves_announces_after_no_effect_success() {
+        quota_worker(false, false, false).await;
+    }
+
+    #[tokio::test]
+    async fn quota_rotation_serves_withdrawals_after_no_effect_success() {
+        quota_worker(true, false, false).await;
+    }
+
+    #[tokio::test]
+    async fn quota_rotation_serves_announces_after_failed_calls() {
+        quota_worker(false, true, false).await;
+    }
+
+    #[tokio::test]
+    async fn quota_rotation_serves_withdrawals_after_failed_calls() {
+        quota_worker(true, true, false).await;
+    }
+
+    #[tokio::test]
+    async fn quota_rotation_serves_cleanup_within_its_existing_budget() {
+        quota_worker(true, true, true).await;
+    }
+
+    fn quota_nets(ipv6: bool) -> Vec<IpNet> {
+        (0..=MAX_OPS_PER_ROUND)
+            .map(|host| {
+                one(&if ipv6 {
+                    format!("2001:db8:1::{host:x}")
+                } else {
+                    format!("198.51.100.{host}")
+                })
+            })
+            .collect()
+    }
+
+    async fn quota_worker(deleting: bool, failing: bool, cleanup: bool) {
+        let nets = quota_nets(false);
+        let tail = *nets.last().unwrap();
+        let template: serde_json::Value = serde_json::from_str(RIB).unwrap();
+        let mut before = serde_json::Map::new();
+        if deleting {
+            for net in &nets {
+                let mut path = template["[source: 198.51.100.7/32]"][0].clone();
+                path["nlri"]["value"][0]["value"]["prefix"] = net.to_string().into();
+                before.insert(format!("[source: {net}]"), serde_json::json!([path]));
+            }
+        }
+        let mut after = before.clone();
+        if deleting {
+            after.remove(&format!("[source: {tail}]"));
+        } else {
+            let mut path = template["[source: 198.51.100.7/32]"][0].clone();
+            path["nlri"]["value"][0]["value"]["prefix"] = tail.to_string().into();
+            after.insert(format!("[source: {tail}]"), serde_json::json!([path]));
+        }
+        let fixture = RoundFixture::new(
+            &serde_json::Value::Object(before.clone()).to_string(),
+            "{}",
+            false,
+        );
+        std::fs::write(
+            fixture.dir.join("current.json"),
+            serde_json::Value::Object(before).to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            fixture.dir.join("effect.json"),
+            serde_json::Value::Object(after).to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            fixture.dir.join("gobgp"),
+            format!(
+                r#"#!/bin/sh
+cd "$(dirname "$0")" || exit 9
+printf '%s\n' "$*" >> calls
+case "$*" in
+  *'ipv4-flowspec -j') cat current.json ;;
+  *'ipv6-flowspec -j') printf '{{}}\n' ;;
+  *' add '*|*' del '*)
+    case "$*" in *' source {tail} '*) cp effect.json current.json; touch served; exit 0 ;; esac
+    if [ -f fail ]; then exit 7; fi ;;
+  *) exit 8 ;;
+esac
+"#
+            ),
+        )
+        .unwrap();
+        let db = Arc::new(fixture.db());
+        let readback = Arc::new(Readback::default());
+        readback.enable();
+        let initial = if deleting {
+            nets.iter().copied().collect()
+        } else {
+            HashSet::new()
+        };
+        checked_round(&fixture.cli, &initial, &db, &readback)
+            .await
+            .unwrap();
+        std::fs::write(fixture.dir.join("calls"), "").unwrap();
+        if failing {
+            std::fs::write(fixture.dir.join("fail"), "").unwrap();
+        }
+        let target = if deleting {
+            HashSet::new()
+        } else {
+            nets.iter().copied().collect()
+        };
+        let (_wanted_tx, wanted_rx) = watch::channel(target);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(cleanup);
+        let worker = tokio::spawn(run_worker(
+            copy_cli(&fixture.cli),
+            wanted_rx,
+            shutdown_rx,
+            db,
+            readback.clone(),
+        ));
+        let served = tokio::time::timeout(Duration::from_secs(6), async {
+            while !fixture.dir.join("served").exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .is_ok();
+        if cleanup {
+            // The fixture controller clears its stuck RIB after observing service;
+            // this is not an assertion that the worker can force failed effects.
+            std::fs::write(fixture.dir.join("current.json"), "{}").unwrap();
+            tokio::time::timeout(Duration::from_secs(3), worker)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(readback.snapshot().ok && readback.snapshot().converged);
+            assert_eq!(readback.snapshot().count, 0);
+        } else {
+            worker.abort();
+            let _ = worker.await;
+        }
+        let calls = std::fs::read_to_string(fixture.dir.join("calls")).unwrap();
+        assert!(
+            served,
+            "quota repeatedly selected the same prefixes: deleting={deleting} failing={failing}"
+        );
+        let writes: Vec<_> = calls
+            .lines()
+            .filter(|l| l.contains(" add ") || l.contains(" del "))
+            .collect();
+        let index = writes
+            .iter()
+            .position(|l| l.contains(&format!(" source {tail} ")))
+            .unwrap();
+        assert_eq!(
+            index, MAX_OPS_PER_ROUND,
+            "tail must be first in the next class plan: {calls}"
+        );
+        let actual = fixture.cli.observed().await.unwrap();
+        assert_eq!(actual.owned.contains(&tail), !deleting);
+        assert_eq!(actual.discard.contains(&tail), !deleting);
+    }
+
+    #[test]
+    fn rotating_plans_preserve_quota_priority_and_wrap_stale_cursors() {
+        let nets = quota_nets(false);
+        let observed: HashSet<_> = nets.iter().copied().collect();
+        let wanted: HashSet<_> = quota_nets(true).into_iter().collect();
+        let mut cursor = PlanCursor::default();
+        let mut served = HashSet::new();
+        for _ in 0..2 {
+            let (announce, withdraw) = plan_after(&wanted, &observed, &observed, &cursor);
+            assert!(announce.is_empty(), "withdrawals retain strict priority");
+            assert_eq!(withdraw.len(), MAX_OPS_PER_ROUND);
+            for net in withdraw {
+                served.insert(net);
+                cursor.considered(false, net);
+            }
+        }
+        assert_eq!(served, observed);
+        served.clear();
+        for _ in 0..2 {
+            let (announce, withdraw) =
+                plan_after(&wanted, &HashSet::new(), &HashSet::new(), &cursor);
+            assert!(withdraw.is_empty());
+            assert_eq!(announce.len(), MAX_OPS_PER_ROUND);
+            for net in announce {
+                served.insert(net);
+                cursor.considered(true, net);
+            }
+        }
+        assert_eq!(served, wanted);
+        // When only one announce slot remains, the withdrawal cursor must not
+        // repeatedly select the first announce of a different address family.
+        let observed: HashSet<_> = nets.iter().copied().take(MAX_OPS_PER_ROUND - 1).collect();
+        let wanted: HashSet<_> = quota_nets(true).into_iter().take(2).collect();
+        cursor = PlanCursor::default();
+        served.clear();
+        for _ in 0..2 {
+            let (announce, withdraw) = plan_after(&wanted, &observed, &observed, &cursor);
+            assert_eq!(withdraw.len(), MAX_OPS_PER_ROUND - 1);
+            assert_eq!(announce.len(), 1);
+            for net in withdraw {
+                cursor.considered(false, net);
+            }
+            for net in announce {
+                served.insert(net);
+                cursor.considered(true, net);
+            }
+        }
+        assert_eq!(
+            served, wanted,
+            "operation classes must have independent cursors"
+        );
+        // A removed cursor still denotes an ordering boundary, not a required member.
+        cursor.withdraw = Some(one("203.0.113.255"));
+        let (announce, withdraw) = plan_after(&HashSet::new(), &observed, &HashSet::new(), &cursor);
+        assert!(announce.is_empty());
+        assert_eq!(withdraw, nets[..MAX_OPS_PER_ROUND - 1]);
+        assert_eq!(
+            plan(&wanted, &observed, &observed),
+            plan_after(&wanted, &observed, &observed, &PlanCursor::default())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_recovery_advances_only_the_considered_prefix() {
+        let fixture = RoundFixture::new("{}", "{}", false);
+        std::fs::write(
+            fixture.dir.join("gobgp"),
+            r#"#!/bin/sh
+cd "$(dirname "$0")" || exit 9
+printf '%s\n' "$*" >> calls
+case "$*" in
+  *' -j') if [ -f refuse ]; then printf 'null\n'; else printf '{}\n'; fi ;;
+  *' add '*) touch refuse; exit 7 ;;
+  *) exit 8 ;;
+esac
+"#,
+        )
+        .unwrap();
+        let db = fixture.db();
+        let nets = quota_nets(false);
+        let (_wanted_tx, mut wanted_rx) = watch::channel(nets.iter().copied().collect());
+        let mut cursor = PlanCursor::default();
+        for net in nets.iter().take(3) {
+            let _ = std::fs::remove_file(fixture.dir.join("refuse"));
+            assert!(live_round_with_cursor(
+                &fixture.cli,
+                &mut wanted_rx,
+                &db,
+                &Readback::default(),
+                &mut cursor
+            )
+            .await
+            .is_err());
+            assert_eq!(
+                cursor.announce,
+                Some(*net),
+                "unvisited queued work skipped after failed recovery"
+            );
+            // Invalid initial reads authorize no plan and do not move either cursor.
+            assert!(live_round_with_cursor(
+                &fixture.cli,
+                &mut wanted_rx,
+                &db,
+                &Readback::default(),
+                &mut cursor
+            )
+            .await
+            .is_err());
+            assert_eq!(cursor.announce, Some(*net));
+            assert!(cursor.withdraw.is_none());
+        }
+        let calls = std::fs::read_to_string(fixture.dir.join("calls")).unwrap();
+        let writes: Vec<_> = calls.lines().filter(|l| l.contains(" add ")).collect();
+        assert_eq!(writes.len(), 3);
+        for (call, net) in writes.iter().zip(&nets) {
+            assert!(call.contains(&format!(" source {net} ")));
+        }
     }
 
     fn superseding_fixture() -> RoundFixture {
@@ -2069,6 +2421,227 @@ exec "$real" "$@"
                 );
             }
             writeln!(std::io::stdout(), "PASS live intent progress {}: initial/post-write reads retained, compatible add/delete retained once, obsolete queued writes refused, latest target recovered, foreign path preserved", family(&net)).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn live_gobgp_quota_rotation_serves_tails_and_revalidates_new_plans() {
+        use std::io::Write as _;
+        let Some(bin_dir) = std::env::var_os("SOKOL_GOBGP_TEST_BIN") else {
+            eprintln!("SKIP live GoBGP: SOKOL_GOBGP_TEST_BIN is unset (required in canonical CI)");
+            return;
+        };
+        let live = LiveGobgp::start(std::path::Path::new(&bin_dir)).await;
+        let db = live.fixture.db();
+        for ipv6 in [false, true] {
+            let nets = quota_nets(ipv6);
+            let tail = *nets.last().unwrap();
+            let foreign_net = one(if ipv6 {
+                "2001:db8:ffff::1"
+            } else {
+                "203.0.113.254"
+            });
+            live.put(foreign_net, "discard", "65001:9999").await;
+            let original_foreign = live.raw(foreign_net).await;
+            for (case, deleting, failing, fixed) in [
+                ("no_effect_add", false, false, false),
+                ("no_effect_delete", true, false, false),
+                ("failed_add", false, true, false),
+                ("failed_delete", true, true, false),
+                ("fixed_failed_delete", true, true, true),
+                ("fresh_foreign_tail", false, false, false),
+                ("obsolete_tail_add", false, false, false),
+                ("obsolete_tail_delete", true, false, false),
+            ] {
+                if deleting {
+                    for net in &nets {
+                        live.fixture.cli.apply(true, *net).await.unwrap();
+                    }
+                }
+                let dir = live
+                    .fixture
+                    .dir
+                    .join(format!("quota-{}-{case}", family(&tail)));
+                std::fs::create_dir(&dir).unwrap();
+                std::fs::write(dir.join("blocked"), "").unwrap();
+                if failing {
+                    std::fs::write(dir.join("error"), "").unwrap();
+                }
+                let script = dir.join("cli.sh");
+                std::fs::write(
+                    &script,
+                    r#"#!/bin/sh
+real="$1"; dir="$2"; tail="$3"; shift 3
+printf '%s\n' "$*" >> "$dir/calls"
+case "$*" in
+  *' add '*|*' del '*)
+    case "$*" in *" source $tail "*) ;; *)
+      if [ -f "$dir/blocked" ]; then
+        if [ -f "$dir/error" ]; then exit 7; fi
+        exit 0
+      fi ;;
+    esac ;;
+esac
+exec "$real" "$@"
+"#,
+                )
+                .unwrap();
+                let cli = GobgpCli {
+                    bin: "/bin/sh".into(),
+                    args: [
+                        vec![
+                            script.to_str().unwrap().into(),
+                            live.fixture.cli.bin.to_str().unwrap().into(),
+                            dir.to_str().unwrap().into(),
+                            tail.to_string(),
+                        ],
+                        live.fixture.cli.args.clone(),
+                    ]
+                    .concat(),
+                    community: live.fixture.cli.community,
+                };
+                let before = live.fixture.cli.observed().await.unwrap().owned;
+                let readback = Readback::default();
+                readback.enable();
+                checked_round(&live.fixture.cli, &before, &db, &readback)
+                    .await
+                    .unwrap();
+                let mut target = if deleting {
+                    HashSet::new()
+                } else {
+                    nets.iter().copied().collect()
+                };
+                let (wanted_tx, mut wanted_rx) = watch::channel(target.clone());
+                let mut cursor = PlanCursor::default();
+                for round_index in 0..2 {
+                    let previous = readback.snapshot();
+                    let failed = if fixed {
+                        checked_round_with_cursor(&cli, &target, &db, &readback, &mut cursor)
+                            .await
+                            .is_err()
+                    } else {
+                        live_round_with_cursor(&cli, &mut wanted_rx, &db, &readback, &mut cursor)
+                            .await
+                            .is_err()
+                    };
+                    assert_eq!(
+                        failed,
+                        failing || (case == "fresh_foreign_tail" && round_index == 1),
+                        "{case} round {round_index}"
+                    );
+                    let view = readback.snapshot();
+                    assert!(
+                        !view.converged,
+                        "partial progress must not certify the whole target"
+                    );
+                    if failed {
+                        assert!(!view.ok);
+                        assert_eq!(view.count, previous.count);
+                        assert_eq!(view.discard_count, previous.discard_count);
+                        assert_eq!(view.started, previous.started);
+                    } else {
+                        assert!(view.ok);
+                    }
+                    if round_index == 0 {
+                        let calls = std::fs::read_to_string(dir.join("calls")).unwrap();
+                        let writes: Vec<_> = calls
+                            .lines()
+                            .filter(|l| l.contains(" add ") || l.contains(" del "))
+                            .collect();
+                        assert_eq!(writes.len(), MAX_OPS_PER_ROUND);
+                        assert!(!writes
+                            .iter()
+                            .any(|l| l.contains(&format!(" source {tail} "))));
+                        if case == "fresh_foreign_tail" {
+                            live.put(tail, "discard", "65001:9999").await;
+                        } else if case.starts_with("obsolete_tail") {
+                            if deleting {
+                                target.insert(tail);
+                            } else {
+                                target.remove(&tail);
+                            }
+                            wanted_tx.send(target.clone()).unwrap();
+                        }
+                    }
+                }
+                let calls = std::fs::read_to_string(dir.join("calls")).unwrap();
+                let writes: Vec<_> = calls
+                    .lines()
+                    .filter(|l| l.contains(" add ") || l.contains(" del "))
+                    .collect();
+                assert_eq!(writes.len(), 2 * MAX_OPS_PER_ROUND);
+                for round_writes in writes.chunks(MAX_OPS_PER_ROUND) {
+                    let unique: HashSet<_> = round_writes.iter().copied().collect();
+                    assert_eq!(
+                        unique.len(),
+                        MAX_OPS_PER_ROUND,
+                        "{case}: duplicate command inside a plan"
+                    );
+                }
+                let refused_tail =
+                    case == "fresh_foreign_tail" || case.starts_with("obsolete_tail");
+                if refused_tail {
+                    assert!(
+                        !writes
+                            .iter()
+                            .any(|l| l.contains(&format!(" source {tail} "))),
+                        "{case}: rotated plan bypassed current authority"
+                    );
+                } else {
+                    assert!(
+                        writes[MAX_OPS_PER_ROUND].contains(&format!(" source {tail} ")),
+                        "{case}: tail not first in second plan"
+                    );
+                    assert_eq!(
+                        writes
+                            .iter()
+                            .filter(|l| l.contains(&format!(" source {tail} ")))
+                            .count(),
+                        1
+                    );
+                }
+                let actual = live.fixture.cli.observed().await.unwrap();
+                let mut expected: HashSet<_> = if deleting {
+                    nets.iter().copied().collect()
+                } else {
+                    HashSet::new()
+                };
+                if !refused_tail {
+                    if deleting {
+                        expected.remove(&tail);
+                    } else {
+                        expected.insert(tail);
+                    }
+                }
+                assert_eq!(actual.owned, expected, "{case}: actual owned effect");
+                assert_eq!(actual.discard, expected, "{case}: actual discard effect");
+                assert!(actual.foreign_local.contains(&foreign_net));
+                let foreign = if case == "fresh_foreign_tail" {
+                    assert!(actual.foreign_local.contains(&tail));
+                    live.raw(foreign_net).await
+                } else {
+                    original_foreign.clone()
+                };
+                // Independent real CLI cleanup: blocked prefixes are fixture faults,
+                // not evidence that a bounded worker can always withdraw them.
+                for _ in 0..2 {
+                    checked_round(&live.fixture.cli, &HashSet::new(), &db, &readback)
+                        .await
+                        .unwrap();
+                }
+                assert!(live.fixture.cli.observed().await.unwrap().owned.is_empty());
+                assert_eq!(
+                    live.raw(foreign_net).await,
+                    foreign,
+                    "{case}: foreign path changed"
+                );
+                if case == "fresh_foreign_tail" {
+                    // The test's daemon owner removes its injected foreign fixture.
+                    live.fixture.cli.apply(false, tail).await.unwrap();
+                    assert_eq!(live.raw(foreign_net).await, original_foreign);
+                }
+            }
+            writeln!(std::io::stdout(), "PASS live quota progress {}: 65th add/delete served after no-effect or failed calls, fixed cleanup cursor retained, obsolete and foreign tails refused, truthful readback and foreign paths preserved", family(&tail)).unwrap();
         }
     }
 
