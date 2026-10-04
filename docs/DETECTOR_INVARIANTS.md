@@ -1081,8 +1081,9 @@ calls do not reset it or skip an unvisited suffix. Invalid initial reads advance
 nothing. No per-prefix failure cache or queued target survives the round; the
 cursor grants no authorization and asserts no effect. Every command still checks
 current membership, needed effect and fresh foreign-local collisions. The worker
-shares its cursor with fixed-target shutdown retries. Public one-shot `plan` and
-standalone round helpers start with fresh cursors and preserve sorted behavior.
+shares its cursor with fixed-target shutdown retries. Public one-shot `plan` preserves sorted behavior. The standalone round helpers
+start with fresh cursors and are gated by `#[cfg(test)]`: production callers
+cannot accidentally choose a round path that discards persistent cursor state.
 
 For an unchanged finite eligible class with positive available quota and rounds
 that reach its candidates, circular ordering gives each prefix an opportunity.

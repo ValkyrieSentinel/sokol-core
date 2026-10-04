@@ -573,6 +573,7 @@ struct RoundOutcome {
 
 /// True asks the worker to start the next round immediately, after an obsolete
 /// operation or a completed observation whose sampled target has since changed.
+#[cfg(test)]
 async fn live_round(
     cli: &GobgpCli,
     wanted: &mut watch::Receiver<HashSet<IpNet>>,
@@ -597,6 +598,7 @@ async fn live_round_with_cursor(
 
 /// Same publication path for ordinary and shutdown rounds. Errors and cancelled
 /// futures retain the previous count/time, with ok already revoked.
+#[cfg(test)]
 async fn checked_round(
     cli: &GobgpCli,
     wanted: &HashSet<IpNet>,
@@ -622,6 +624,7 @@ async fn checked_round_with_cursor(
 }
 
 /// One reconciliation round; returns the final successful two-family observation.
+#[cfg(test)]
 async fn round(
     cli: &GobgpCli,
     wanted: &HashSet<IpNet>,
