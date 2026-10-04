@@ -1858,17 +1858,31 @@ esac
                 tokio::time::sleep(Duration::from_millis(30)).await;
             }
             let early = budget_writes(&fixture);
+            let latest = if deleting {
+                target.clone()
+            } else {
+                ips(&["198.51.100.9"])
+            };
+            wanted_tx.send(latest.clone()).unwrap();
             while completed.elapsed() < Duration::from_millis(1800) && budget_writes(&fixture) < 2 {
-                wanted_tx.send(target.clone()).unwrap();
+                wanted_tx.send(latest.clone()).unwrap();
                 shutdown_tx.send(false).unwrap();
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
             let retried = budget_writes(&fixture) >= 2;
             let elapsed = completed.elapsed();
+            let calls = std::fs::read_to_string(fixture.dir.join("calls")).unwrap();
             worker.abort();
             let _ = worker.await;
             assert_eq!(early, 1, "successful no-effect calls bypassed work pause: deleting={deleting}, overdue={overdue}");
             assert!(retried, "intent churn restarted the work pause");
+            if !deleting {
+                let writes: Vec<_> = calls.lines().filter(|l| l.contains(" add ")).collect();
+                assert!(
+                    writes[1].contains("source 198.51.100.9/32"),
+                    "post-pause write used stale intent: {calls}"
+                );
+            }
             assert!(
                 elapsed >= Duration::from_millis(900),
                 "work pause bypassed: {elapsed:?}"
