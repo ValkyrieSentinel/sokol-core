@@ -1373,6 +1373,17 @@ async fn enforce_block_local<B: block_table::Blocklist>(
     outcome
 }
 
+/// Build the first FlowSpec intent before its worker can run. Called after static
+/// blocks and state restoration; later publications use the same applied set.
+fn flowspec_channel<B: block_table::Blocklist>(
+    blocks: &BlockTable<B>,
+) -> (
+    watch::Sender<std::collections::HashSet<IpNet>>,
+    watch::Receiver<std::collections::HashSet<IpNet>>,
+) {
+    watch::channel(blocks.active_ips())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
@@ -2479,7 +2490,7 @@ async fn main() -> Result<(), anyhow::Error> {
     let mut telemetry_window_start = std::time::Instant::now();
     let mut window_rx = 0u64;
     let mut window_dropped = 0u64;
-    let (flowspec_tx, flowspec_rx) = watch::channel(std::collections::HashSet::<IpNet>::new());
+    let (flowspec_tx, flowspec_rx) = flowspec_channel(&*blocks.lock().await);
     let flowspec_gobgp = match (args.flowspec_gobgp.clone(), args.enforce) {
         (Some(_), Enforce::Observe) => {
             // Upstream rules would drop traffic elsewhere: not in observe mode (ADR-0018).

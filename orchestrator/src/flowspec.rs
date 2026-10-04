@@ -2446,6 +2446,295 @@ esac
         }
     }
 
+    // The actual table restores serialized decisions; only kernel map operations
+    // are substituted. A valid claim whose map add fails must not reach FlowSpec.
+    struct StartupLists(Option<IpNet>);
+
+    impl crate::block_table::Blocklist for StartupLists {
+        fn add(&mut self, net: IpNet) -> Result<(), aya::maps::MapError> {
+            if self.0 == Some(net) {
+                Err(aya::maps::MapError::ElementNotFound)
+            } else {
+                Ok(())
+            }
+        }
+        fn delete(&mut self, _: IpNet) -> Result<(), aya::maps::MapError> {
+            Ok(())
+        }
+        fn hits(&self, _: IpNet) -> Option<u64> {
+            None
+        }
+    }
+
+    fn startup_blocks(
+        nets: [IpNet; 5],
+        empty: bool,
+    ) -> crate::block_table::BlockTable<StartupLists> {
+        use crate::block_table::{BlockTable, ClaimKind, TtlPolicy};
+        let policy = TtlPolicy {
+            base: Duration::from_secs(60),
+            max: Duration::from_secs(600),
+        };
+        let [keep, static_net, refused, expired, pending] = nets;
+        let mut before = BlockTable::with_lists(StartupLists(None), policy, 1);
+        for net in [keep, refused, expired, pending] {
+            before
+                .add_local(net, ClaimKind::Detector, "startup", 100_000)
+                .unwrap();
+        }
+        let mut saved = before.take_persisted(100_001);
+        for claim in &mut saved.claims {
+            if claim.net() == Some(expired) {
+                claim.expires_ms = Some(101_000);
+            }
+        }
+        let saved = serde_json::from_slice(&serde_json::to_vec(&saved).unwrap()).unwrap();
+        let mut restored = BlockTable::with_lists(StartupLists(Some(pending)), policy, 1);
+        if !empty {
+            restored
+                .add_local(static_net, ClaimKind::Static, "configuration", 101_000)
+                .unwrap();
+        }
+        restored.restore(saved, |net| !empty && net != refused, 101_000);
+        assert_eq!(
+            restored.active_ips(),
+            if empty {
+                HashSet::new()
+            } else {
+                HashSet::from([keep, static_net])
+            }
+        );
+        assert_eq!(restored.pending(), usize::from(!empty));
+        restored
+    }
+
+    #[tokio::test]
+    async fn startup_worker_keeps_restored_blocks_and_announces_static_before_any_tick() {
+        let nets = [
+            one("198.51.100.7"),
+            one("198.51.100.9"),
+            one("198.51.100.10"),
+            one("198.51.100.11"),
+            one("198.51.100.12"),
+        ];
+        let blocks = startup_blocks(nets, false);
+        let mut after: serde_json::Value = serde_json::from_str(RIB).unwrap();
+        let mut static_path = after["[source: 198.51.100.7/32]"][0].clone();
+        static_path["nlri"]["value"][0]["value"]["prefix"] = serde_json::json!(nets[1].to_string());
+        after["[source: 198.51.100.9/32]"] = serde_json::json!([static_path]);
+        let fixture = RoundFixture::new(RIB, &after.to_string(), false);
+        let (wanted_tx, wanted_rx) = crate::flowspec_channel(&blocks);
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let readback = Arc::new(Readback::default());
+        readback.enable();
+        let worker = tokio::spawn(run_worker(
+            copy_cli(&fixture.cli),
+            wanted_rx,
+            stop_rx,
+            Arc::new(fixture.db()),
+            readback.clone(),
+        ));
+        // No main-loop publication: expose the startup scheduling window directly.
+        let completed = eventually(|| readback.snapshot().ok).await;
+        let first = readback.snapshot();
+        let calls = std::fs::read_to_string(fixture.dir.join("calls")).unwrap();
+        std::fs::write(fixture.dir.join("before.json"), "{}").unwrap();
+        std::fs::write(fixture.dir.join("after.json"), "{}").unwrap();
+        stop_tx.send(true).unwrap();
+        worker.await.unwrap();
+        assert!(
+            completed && first.converged && first.count == 2,
+            "first round used invented empty intent: {first:?}; {calls}"
+        );
+        let writes: Vec<_> = calls
+            .lines()
+            .filter(|l| l.contains(" add ") || l.contains(" del "))
+            .collect();
+        assert_eq!(
+            writes.len(),
+            1,
+            "restored block was withdrawn or unapplied claim mirrored: {calls}"
+        );
+        assert!(
+            writes[0].contains(" add ") && writes[0].contains(&nets[1].to_string()),
+            "static block missing at startup: {calls}"
+        );
+        assert_eq!(*wanted_tx.borrow(), blocks.active_ips());
+    }
+
+    #[tokio::test]
+    async fn startup_worker_with_no_applied_blocks_withdraws_stale_owned_rules() {
+        let nets = [
+            one("198.51.100.7"),
+            one("198.51.100.9"),
+            one("198.51.100.10"),
+            one("198.51.100.11"),
+            one("198.51.100.12"),
+        ];
+        let blocks = startup_blocks(nets, true);
+        let fixture = RoundFixture::new(RIB, "{}", false);
+        let (_wanted_tx, wanted_rx) = crate::flowspec_channel(&blocks);
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let readback = Arc::new(Readback::default());
+        readback.enable();
+        let worker = tokio::spawn(run_worker(
+            copy_cli(&fixture.cli),
+            wanted_rx,
+            stop_rx,
+            Arc::new(fixture.db()),
+            readback.clone(),
+        ));
+        let completed = eventually(|| readback.snapshot().ok).await;
+        let first = readback.snapshot();
+        stop_tx.send(true).unwrap();
+        worker.await.unwrap();
+        let calls = std::fs::read_to_string(fixture.dir.join("calls")).unwrap();
+        assert!(
+            completed && first.converged && first.count == 0,
+            "empty applied state did not clean stale rules: {first:?}; {calls}"
+        );
+        assert_eq!(calls.lines().filter(|l| l.contains(" del ")).count(), 1);
+        assert!(
+            !calls.lines().any(|l| l.contains(" add ")),
+            "refused/expired claim was mirrored: {calls}"
+        );
+    }
+
+    #[tokio::test]
+    async fn live_gobgp_startup_preserves_applied_restoration_before_any_tick() {
+        use std::io::Write as _;
+        let Some(bin_dir) = std::env::var_os("SOKOL_GOBGP_TEST_BIN") else {
+            eprintln!("SKIP live GoBGP: SOKOL_GOBGP_TEST_BIN is unset (required in canonical CI)");
+            return;
+        };
+        for addresses in [
+            [
+                "198.51.100.7",
+                "198.51.100.9",
+                "198.51.100.10",
+                "198.51.100.11",
+                "198.51.100.12",
+                "198.51.100.13",
+                "198.51.100.14",
+            ],
+            [
+                "2001:db8::7",
+                "2001:db8::9",
+                "2001:db8::10",
+                "2001:db8::11",
+                "2001:db8::12",
+                "2001:db8::13",
+                "2001:db8::14",
+            ],
+        ] {
+            let [keep, static_net, refused, expired, pending, stale, foreign] = addresses.map(one);
+            for empty in [false, true] {
+                let live = LiveGobgp::start(std::path::Path::new(&bin_dir)).await;
+                let blocks = startup_blocks([keep, static_net, refused, expired, pending], empty);
+                live.put(foreign, "rate-limit 100", "65002:77").await;
+                let foreign_before: serde_json::Value =
+                    serde_json::from_slice(&live.raw(foreign).await).unwrap();
+                // Owned stale and formerly valid paths persist in the separate daemon.
+                for net in [keep, refused, expired, pending, stale] {
+                    live.put(net, "discard", "65001:6666").await;
+                }
+                let wrapper = live.fixture.dir.join("startup-cli");
+                std::fs::write(
+                    &wrapper,
+                    format!(
+                        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nexec '{}' \"$@\"\n",
+                        live.fixture.dir.join("startup-calls").display(),
+                        live.fixture.cli.bin.display()
+                    ),
+                )
+                .unwrap();
+                let worker_cli = GobgpCli {
+                    bin: "/bin/sh".into(),
+                    args: std::iter::once(wrapper.to_string_lossy().into_owned())
+                        .chain(live.fixture.cli.args.clone())
+                        .collect(),
+                    community: live.fixture.cli.community,
+                };
+                let (wanted_tx, wanted_rx) = crate::flowspec_channel(&blocks);
+                let (stop_tx, stop_rx) = watch::channel(false);
+                let readback = Arc::new(Readback::default());
+                readback.enable();
+                let worker = tokio::spawn(run_worker(
+                    worker_cli,
+                    wanted_rx,
+                    stop_rx,
+                    Arc::new(live.fixture.db()),
+                    readback.clone(),
+                ));
+                let completed = eventually(|| readback.snapshot().ok).await;
+                let first = readback.snapshot();
+                let observed = live.fixture.cli.observed().await.unwrap();
+                let initial_calls =
+                    std::fs::read_to_string(live.fixture.dir.join("startup-calls")).unwrap();
+                // After the startup check, the ordinary publication/withdrawal and
+                // stop cleanup must still work. Capture startup writes separately.
+                update_wanted(&wanted_tx, HashSet::new());
+                let recovered = eventually(|| {
+                    let v = readback.snapshot();
+                    v.ok && v.converged && v.count == 0
+                })
+                .await;
+                stop_tx.send(true).unwrap();
+                tokio::time::timeout(Duration::from_secs(4), worker)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let final_rib = live.fixture.cli.observed().await.unwrap();
+                let foreign_after: serde_json::Value =
+                    serde_json::from_slice(&live.raw(foreign).await).unwrap();
+                let expected = blocks.active_ips();
+                assert!(
+                    completed && first.converged,
+                    "startup did not certify its applied target: {first:?}; {initial_calls}"
+                );
+                assert_eq!(
+                    observed.owned, expected,
+                    "first observation withdrew restored state or mirrored invalid claims"
+                );
+                assert_eq!(observed.discard, expected);
+                let writes: Vec<_> = initial_calls
+                    .lines()
+                    .filter(|l| l.contains(" add ") || l.contains(" del "))
+                    .collect();
+                if !empty {
+                    assert!(
+                        !writes
+                            .iter()
+                            .any(|l| l.contains(" del ") && l.contains(&keep.to_string())),
+                        "restored rule flapped before the first tick: {initial_calls}"
+                    );
+                    assert_eq!(
+                        writes
+                            .iter()
+                            .filter(|l| l.contains(" add ") && l.contains(&static_net.to_string()))
+                            .count(),
+                        1
+                    );
+                }
+                for net in [refused, expired, pending, stale, foreign] {
+                    assert!(
+                        !writes
+                            .iter()
+                            .any(|l| l.contains(" add ") && l.contains(&net.to_string())),
+                        "non-applied target was announced: {initial_calls}"
+                    );
+                }
+                assert!(recovered && final_rib.owned.is_empty() && final_rib.discard.is_empty());
+                assert_eq!(final_rib.foreign_local, HashSet::from([foreign]));
+                assert_eq!(
+                    foreign_after, foreign_before,
+                    "startup or cleanup changed foreign paths"
+                );
+            }
+            writeln!(std::io::stdout(), "PASS live startup intent {}: restored applied rules kept without a main tick, static rules announced, refused/expired/unapplied/stale rules withdrawn, empty applied state cleaned, later intent and cleanup recovered, foreign paths preserved", family(&keep)).unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn live_gobgp_work_budget_paces_success_and_cleanup_with_truthful_progress() {
         use std::io::Write as _;

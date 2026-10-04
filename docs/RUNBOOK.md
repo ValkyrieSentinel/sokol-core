@@ -391,6 +391,15 @@ FLOWSPEC-R11 ротує prefixes усередині withdrawal та announce м�
 чекають. Непридатні reads, нескінченна зміна наборів, повільні calls і restart
 можуть перешкодити прогресу; cleanup має той самий 10-секундний бюджет.
 
+FLOWSPEC-R13 передає worker початковий `active_ips()` до першого main tick,
+після static configuration і state restore. Потрібне відновлене правило не
+відкликається лише через початковий порожній watch-channel. Це snapshot applied
+state: refused/expired і failed kernel additions не є wanted upstream; справді
+порожній набір усе ще чистить owned RIB. Після snapshot зміни доходять звичайною
+публікацією. Перевіряйте `sokol_state_restore_ok`, XDP, FlowSpec health/convergence
+та RIB окремо; readback не доводить успіх відновлення чи upstream enforcement.
+При failed restore збережені bytes і DEGRADED/`ACCEPT_STATE_LOSS` лишаються чинними.
+
 ## 6. Ключі: ротація, відкликання, компрометація
 
 - **Ротація без простою.**
