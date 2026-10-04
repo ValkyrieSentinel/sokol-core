@@ -763,7 +763,13 @@ ipc "DROP_IMMEDIATE:$HANDOFF_NEW_IP"
 sleep 1.2
 check "State handoff: newest decision is enforced while the writer is blocked" xdp_drop "$HANDOFF_NEW_IP" 1
 check "State handoff: superseded decision is lifted while the writer is blocked" ping_from "$HANDOFF_OLD_IP"
-(timeout 5 cat "$STATE_TMP" >/dev/null &) ; sleep 0.5; rm -f "$STATE_TMP"
+# Keep a reader open through unlink. A queued wake can trigger an immediate
+# retry after Linux fsync(FIFO) fails; it must never reopen a readerless FIFO.
+(
+    exec 3<>"$STATE_TMP"
+    rm -f "$STATE_TMP"
+    timeout 5 cat <&3 >/dev/null
+) &
 check "health returns once the disk answers" wait_metric sokol_state_healthy 1
 state_handoff_latest() {
     python3 - "$LAST_STATE" "$HANDOFF_NEW_IP/32" <<'PY_STATE'
@@ -775,6 +781,10 @@ assert any(claim['target'] == sys.argv[2] for claim in state['claims'])
 PY_STATE
 }
 check "State handoff: recovery persisted the latest decision rather than the held predecessor" state_handoff_latest
+stop_orchestrator
+STATE_FILE=$LAST_STATE start_orchestrator
+check "State handoff: superseding unban survives restore from the recovered file" ping_from "$HANDOFF_OLD_IP"
+check "State handoff: latest ban survives restore from the recovered file" xdp_drop "$HANDOFF_NEW_IP" 1
 printf 'UNBAN_IP:%s\n' "$HANDOFF_NEW_IP" | nc -U -q1 "$WORK/control.sock" >/dev/null
 printf 'UNBAN_IP:%s\n' "$HUNG_IP" | nc -U -q1 "$WORK/control.sock" >/dev/null
 stop_orchestrator
