@@ -733,6 +733,27 @@ printf 'UNBAN_IP:%s\n' "$KILL_BAN" | nc -U -q1 "$WORK/control.sock" >/dev/null
 printf 'UNBAN_IP:%s\n' "$PERSIST_IP" | nc -U -q1 "$WORK/control.sock" >/dev/null
 # R27-03: a hung state write (its temp file is a FIFO nobody reads) must not stall the node:
 # the operator gets an answer within the durable wait, the tick keeps running, health turns bad.
+# Dedicated addresses: earlier smoke sections already assigned .16 and .17.
+HANDOFF_OLD_IP=10.231.0.30
+HANDOFF_NEW_IP=10.231.0.31
+ip netns exec "$NS" ip addr add "$HANDOFF_OLD_IP/24" dev "$PEER_IF"
+ip netns exec "$NS" ip addr add "$HANDOFF_NEW_IP/24" dev "$PEER_IF"
+state_handoff_matches() {
+    # Claim::target uses show(): a host address is bare, not suffixed with /32.
+    python3 - "$LAST_STATE" "$1" "${2:-}" <<'PY_STATE'
+import json, sys
+with open(sys.argv[1]) as source:
+    state = json.load(source)
+assert state['schema'] == 1
+assert any(claim['target'] == sys.argv[2] for claim in state['claims'])
+if sys.argv[3]:
+    assert not any(claim['target'] == sys.argv[3] for claim in state['claims'])
+PY_STATE
+}
+# Make the old operator decision durable first: dropping it after recovery or
+# restore must demonstrate saved supersession, not a ban that was never saved.
+printf 'BAN_IP:%s\n' "$HANDOFF_OLD_IP" | timeout 10 nc -U -q1 "$WORK/control.sock" >/dev/null
+check "State handoff: predecessor ban is durable before the write is held" state_handoff_matches "$HANDOFF_OLD_IP"
 STATE_TMP="${LAST_STATE%.json}.tmp"
 sleep 1.5   # let the unbans reach the disk first
 rm -f "$STATE_TMP"; mkfifo "$STATE_TMP"
@@ -750,12 +771,6 @@ PENDING1=$(metric sokol_state_pending_seconds); sleep 2.5; PENDING2=$(metric sok
 check "the maintenance tick keeps running while the write hangs" \
     awk -v a="$PENDING1" -v b="$PENDING2" 'BEGIN { exit !(b > a + 1) }'
 # Several authoritative snapshots must supersede while the first write is held.
-HANDOFF_OLD_IP=10.231.0.16
-HANDOFF_NEW_IP=10.231.0.17
-ip netns exec "$NS" ip addr add "$HANDOFF_OLD_IP/24" dev "$PEER_IF"
-ip netns exec "$NS" ip addr add "$HANDOFF_NEW_IP/24" dev "$PEER_IF"
-ipc "DROP_IMMEDIATE:$HANDOFF_OLD_IP"
-sleep 1.2
 HANDOFF_REPLY=$(printf 'UNBAN_IP:%s\n' "$HANDOFF_OLD_IP" | timeout 10 nc -U -q1 "$WORK/control.sock")
 check "State handoff: superseding unban remains unverified while the disk hangs" \
     grep -q '^OK .*WARNING: not yet durable' <<<"$HANDOFF_REPLY"
@@ -771,16 +786,8 @@ check "State handoff: superseded decision is lifted while the writer is blocked"
     timeout 5 cat <&3 >/dev/null
 ) &
 check "health returns once the disk answers" wait_metric sokol_state_healthy 1
-state_handoff_latest() {
-    python3 - "$LAST_STATE" "$HANDOFF_NEW_IP/32" <<'PY_STATE'
-import json, sys
-with open(sys.argv[1]) as source:
-    state = json.load(source)
-assert state['schema'] == 1
-assert any(claim['target'] == sys.argv[2] for claim in state['claims'])
-PY_STATE
-}
-check "State handoff: recovery persisted the latest decision rather than the held predecessor" state_handoff_latest
+
+check "State handoff: recovery persisted the latest decision rather than the held predecessor" state_handoff_matches "$HANDOFF_NEW_IP" "$HANDOFF_OLD_IP"
 stop_orchestrator
 STATE_FILE=$LAST_STATE start_orchestrator
 check "State handoff: superseding unban survives restore from the recovered file" ping_from "$HANDOFF_OLD_IP"

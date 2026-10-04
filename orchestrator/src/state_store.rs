@@ -23,7 +23,7 @@ use crate::block_table::Persisted;
 pub const DURABLE_WAIT: Duration = Duration::from_secs(2);
 /// A change not durable after this long makes the node DEGRADED.
 pub const STALE_AFTER: Duration = Duration::from_secs(5);
-/// Pause before retrying a failed write when nothing newer arrives.
+/// Retry timeout while no wake arrives; a buffered wake can cause an earlier retry.
 const RETRY_AFTER: Duration = Duration::from_secs(1);
 
 pub type WriteFn = dyn Fn(&Path, &Persisted) -> std::io::Result<()> + Send + Sync;
