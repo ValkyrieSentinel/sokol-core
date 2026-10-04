@@ -1060,3 +1060,69 @@ Limits: this is a failed-round retry floor, not a global CLI rate limit, fairnes
 or convergence guarantee. Each failed round can still issue the bounded original
 plan plus recovery reads. No new backoff policy, write authority, remote RPC
 fence, complete effect audit, checker/model/capture/pin or cleanup guarantee.
+
+
+## FLOWSPEC-R11: rotate finite quota opportunities across rounds
+
+Base `594e585` (#140) sorts every new plan and truncates at 64. When those first
+64 prefixes keep failing or acknowledge writes without changing the RIB, a 65th
+eligible prefix never gets a command. Five `quota_rotation_serves_*` public-worker
+regressions compile on that base and fail the actual tail-service assertion:
+announce/withdrawal, each with successful no-effect or failed CLI replies.
+
+The worker retains two `Option<IpNet>` ordering boundaries, one per operation
+class. Every new plan still derives from fresh two-family RIB reads and sampled
+intent, excluding known foreign-local collisions before quota. Sort each class,
+rotate to the first prefix greater than its cursor (wrapping at the end), and
+apply the same combined quota of 64 with strict withdrawal priority. Advance the
+relevant cursor only when a specific queued candidate is considered, before any
+cancellable work or skip predicate. Failed recovery, final reads and cancelled
+calls do not reset it or skip an unvisited suffix. Invalid initial reads advance
+nothing. No per-prefix failure cache or queued target survives the round; the
+cursor grants no authorization and asserts no effect. Every command still checks
+current membership, needed effect and fresh foreign-local collisions. The worker
+shares its cursor with fixed-target shutdown retries. Public one-shot `plan` and
+standalone round helpers start with fresh cursors and preserve sorted behavior.
+
+For an unchanged finite eligible class with positive available quota and rounds
+that reach its candidates, circular ordering gives each prefix an opportunity.
+The 65-prefix complete-plan case reaches its tail first in round two. This is
+conditional service, not unconditional fairness, success or a wall-clock bound:
+announcements get no slots while at least 64 eligible withdrawals persist;
+invalid reads, churn, restart, no-effect/slow calls and competing writers retain
+their limits. State resets on worker restart. Fixed-target cleanup retains its
+10-second budget, which may expire before useful progress. R10's failed-normal-
+round pause and all readback/ACK/ownership limits remain unchanged.
+
+`rotating_plans_preserve_quota_priority_and_wrap_stale_cursors` checks both
+classes over quota, strict withdrawal priority, removed-cursor wrapping and
+one-shot compatibility. `a_failed_recovery_advances_only_the_considered_prefix`
+uses actual child processes to reject jumping over an unvisited plan after a
+malformed recovery and to require no movement after invalid initial reads.
+The four normal public-worker fixtures independently verify the 65th command and its
+RIB effect, then abort their deliberately stuck workers; they make no cleanup
+claim. `quota_rotation_serves_cleanup_within_its_existing_budget` starts the
+actual worker with shutdown already true, requires tail service through fixed
+cleanup retries, then independently clears the deliberately stuck fixture RIB
+and requires the worker to finish. It checks cursor retention and bounded exit
+after controlled fault removal, not guaranteed cleanup under persistent failure.
+
+`live_gobgp_quota_rotation_serves_tails_and_revalidates_new_plans` runs eight cases
+per actual GoBGP 4.9 family: no-effect/failed add and delete, fixed-target failed
+delete, fresh foreign tail and obsolete tail add/delete. Two awaited rounds share
+one cursor and native audit owner. Exact logs require 64 distinct commands per
+round and the tail first in the second normal plan, or no tail command after a
+foreign/intent change. Independent owned/discard sets verify effects; failures
+retain the previous completed counts/time, and partial successful rounds never
+certify convergence. The real CLI separately removes fixture-owned rules; raw
+foreign-only family bytes must match. This does not claim that the deliberately
+blocked worker's bounded cleanup can always withdraw them.
+
+Local extraction runs 60 actual FlowSpec/metrics tests with actual common and
+audit-writer code and declared target/mesh-label stand-ins. Compiled controls
+must reject reset cursors, missing rotation, jumping unvisited work, reversed
+class priority and ignored authority predicates. CI requires eighteen positive
+family markers, with missing-marker/skip/tee controls, full native x86/ARM owners,
+31 production smoke assertions, 14 Python refusal checks, XDP, demo/runbook,
+independent exact-head review and unchanged pinned Stargate gates before merge.
+No checker/model/frozen capture/pin, durable authority or new concurrency fence.

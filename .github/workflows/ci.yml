@@ -118,6 +118,7 @@ jobs:
             grep -Fq "PASS live cohort progress ${family}:" /tmp/sokol-cargo-test.log
             grep -Fq "PASS live command failure ${family}:" /tmp/sokol-cargo-test.log
             grep -Fq "PASS live retry pacing ${family}:" /tmp/sokol-cargo-test.log
+            grep -Fq "PASS live quota progress ${family}:" /tmp/sokol-cargo-test.log
           done
 
       - name: Clippy
