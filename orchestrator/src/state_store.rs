@@ -2,9 +2,10 @@
 //!
 //! One writer thread owns the file: callers hand it snapshots numbered by generation and never
 //! wait for the disk, so a slow or hung filesystem cannot stall the maintenance tick (expiry,
-//! reconciliation, heartbeat). The writer always writes the newest snapshot it has (a burst of
-//! changes costs one write) and never an older one after a newer one; a failed write is retried
-//! until a newer snapshot replaces it.
+//! reconciliation, heartbeat). One replaceable handoff retains the newest submission while the
+//! writer owns one in-flight/retry snapshot; a burst cannot accumulate retained snapshots behind
+//! a hung write. The writer never writes an older generation after a newer one; a failed write
+//! is retried until a newer snapshot replaces it.
 //!
 //! Contract: an operator decision waits for its generation to be durable, up to
 //! [`DURABLE_WAIT`]; past that the answer says the outcome is not yet known. A detector decision
@@ -51,6 +52,13 @@ impl Restore {
     }
 }
 
+struct Snapshot {
+    generation: u64,
+    state: Persisted,
+    /// First handoff still queued, retained when newer snapshots replace it.
+    since_ms: u64,
+}
+
 struct Shared {
     /// Last generation handed to the writer, and the last one on disk.
     submitted: AtomicU64,
@@ -60,12 +68,15 @@ struct Shared {
     last_error: Mutex<Option<String>>,
     restore: Mutex<Restore>,
     durable_tx: tokio::sync::watch::Sender<u64>,
+    /// One replaceable snapshot, separate from the writer's in-flight/retry state.
+    /// This lock also orders generation assignment and completion accounting.
+    latest: Mutex<Option<Snapshot>>,
 }
 
 pub struct StateStore {
     path: PathBuf,
     shared: Arc<Shared>,
-    tx: Mutex<mpsc::Sender<(u64, Persisted)>>,
+    tx: mpsc::SyncSender<()>,
 }
 
 impl StateStore {
@@ -74,7 +85,9 @@ impl StateStore {
     }
 
     pub fn with_writer(path: PathBuf, write: Arc<WriteFn>) -> Self {
-        let (tx, rx) = mpsc::channel::<(u64, Persisted)>();
+        // Notifications carry no state; one outstanding wake is enough. Snapshots
+        // coalesce at submission, even while the writer is stuck in the filesystem.
+        let (tx, rx) = mpsc::sync_channel::<()>(1);
         let (durable_tx, _) = tokio::sync::watch::channel(0);
         let shared = Arc::new(Shared {
             submitted: AtomicU64::new(0),
@@ -83,6 +96,7 @@ impl StateStore {
             last_error: Mutex::new(None),
             restore: Mutex::new(Restore::Fresh),
             durable_tx,
+            latest: Mutex::new(None),
         });
         let (writer_shared, writer_path) = (shared.clone(), path.clone());
         std::thread::Builder::new()
@@ -90,28 +104,31 @@ impl StateStore {
             .spawn(move || writer_loop(&writer_path, &rx, &writer_shared, &*write))
             .map_err(|e| log::error!("[State] Cannot start the state writer: {}", e))
             .ok();
-        Self {
-            path,
-            shared,
-            tx: Mutex::new(tx),
-        }
+        Self { path, shared, tx }
     }
 
     /// Hands a snapshot to the writer and returns its generation. Never waits for the disk.
     pub fn submit(&self, state: Persisted, now_ms: u64) -> u64 {
-        let generation = self.shared.submitted.fetch_add(1, Ordering::SeqCst) + 1;
-        let _ = self.shared.pending_since_ms.compare_exchange(
-            0,
-            now_ms.max(1),
-            Ordering::SeqCst,
-            Ordering::SeqCst,
-        );
-        let sent = self
-            .tx
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .send((generation, state));
-        if sent.is_err() {
+        let generation = {
+            let mut latest = self.shared.latest.lock().unwrap_or_else(|p| p.into_inner());
+            let generation = self.shared.submitted.fetch_add(1, Ordering::SeqCst) + 1;
+            let _ = self.shared.pending_since_ms.compare_exchange(
+                0,
+                now_ms.max(1),
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            );
+            let since_ms = latest.as_ref().map_or(now_ms.max(1), |s| s.since_ms);
+            *latest = Some(Snapshot {
+                generation,
+                state,
+                since_ms,
+            });
+            generation
+        };
+        // A full notification channel already wakes the writer. Do not wait for
+        // it, and do not discard the latest snapshot just because the wake coalesced.
+        if let Err(mpsc::TrySendError::Disconnected(_)) = self.tx.try_send(()) {
             self.set_error("the state writer is gone".into());
         }
         generation
@@ -220,17 +237,12 @@ fn now() -> u64 {
     crate::p2p::now_ms()
 }
 
-fn writer_loop(
-    path: &Path,
-    rx: &mpsc::Receiver<(u64, Persisted)>,
-    shared: &Shared,
-    write: &WriteFn,
-) {
+fn writer_loop(path: &Path, rx: &mpsc::Receiver<()>, shared: &Shared, write: &WriteFn) {
     let mut pending: Option<(u64, Persisted)> = None;
     let mut written = 0u64;
     loop {
         // Wait for work; while a failed write is pending, wait at most RETRY_AFTER.
-        let next = match &pending {
+        let wake = match &pending {
             None => rx.recv().ok(),
             Some(_) => match rx.recv_timeout(RETRY_AFTER) {
                 Ok(item) => Some(item),
@@ -238,13 +250,20 @@ fn writer_loop(
                 Err(mpsc::RecvTimeoutError::Disconnected) => return,
             },
         };
-        if pending.is_none() && next.is_none() {
+        if pending.is_none() && wake.is_none() {
             return; // every sender is gone
         }
-        // Coalesce: only the newest snapshot matters.
-        for item in next.into_iter().chain(rx.try_iter()) {
-            if pending.as_ref().is_none_or(|(g, _)| item.0 > *g) {
-                pending = Some(item);
+        // Take one newest handoff. No backlog drain can grow or starve writes.
+        {
+            let mut latest = shared.latest.lock().unwrap_or_else(|p| p.into_inner());
+            if latest
+                .as_ref()
+                .is_some_and(|item| pending.as_ref().is_none_or(|(g, _)| item.generation > *g))
+            {
+                // Drop the failed predecessor before taking its replacement, while
+                // producers cannot refill the slot: retain at most two snapshots.
+                drop(pending.take());
+                pending = latest.take().map(|s| (s.generation, s.state));
             }
         }
         let Some((generation, state)) = pending.take() else {
@@ -256,12 +275,15 @@ fn writer_loop(
         match write(path, &state) {
             Ok(()) => {
                 written = generation;
+                // Serialize this reset with submit: a concurrently handed newer
+                // snapshot must not lose its pending-age marker after this write.
+                let latest = shared.latest.lock().unwrap_or_else(|p| p.into_inner());
                 shared.durable.store(generation, Ordering::SeqCst);
-                // Anything submitted after this snapshot is still pending, from now on.
-                let newer = shared.submitted.load(Ordering::SeqCst) > generation;
-                shared
-                    .pending_since_ms
-                    .store(if newer { now() } else { 0 }, Ordering::SeqCst);
+                // The queued work keeps its first submission time across coalescing.
+                // Completing an older write must not renew its health grace period.
+                let since_ms = latest.as_ref().map_or(0, |s| s.since_ms);
+                shared.pending_since_ms.store(since_ms, Ordering::SeqCst);
+                drop(latest);
                 let was = shared
                     .last_error
                     .lock()
@@ -452,6 +474,208 @@ mod tests {
             "coalesced, newest last"
         );
         assert_eq!(store.durable(), last);
+        assert!(store.healthy(now()));
+    }
+
+    #[tokio::test]
+    async fn finishing_an_older_write_does_not_refresh_pending_health() {
+        let gates = Arc::new([
+            (Mutex::new(false), std::sync::Condvar::new()),
+            (Mutex::new(false), std::sync::Condvar::new()),
+        ]);
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (g, c) = (gates.clone(), calls.clone());
+        let write: Arc<WriteFn> = Arc::new(move |path, snapshot| {
+            let call = c.fetch_add(1, Ordering::SeqCst);
+            entered_tx.send(call).unwrap();
+            if let Some(gate) = g.get(call) {
+                let mut open = gate.0.lock().unwrap();
+                while !*open {
+                    open = gate.1.wait(open).unwrap();
+                }
+            }
+            save_state(path, snapshot)
+        });
+        let store = StateStore::with_writer(temp("pending-age"), write);
+        // Synthetic old handoff times avoid sleeping through the health threshold.
+        let t0 = now().saturating_sub(20_000);
+        let first = store.submit(state(1), t0);
+        assert_eq!(entered_rx.recv_timeout(Duration::from_secs(2)).unwrap(), 0);
+        store.submit(state(2), t0 + 1000);
+        let last = store.submit(state(3), t0 + 2000);
+        release(&gates[0]);
+        assert_eq!(entered_rx.recv_timeout(Duration::from_secs(2)).unwrap(), 1);
+        let during_durable = store.durable();
+        let age = store.pending_for(now());
+        let healthy = store.healthy(now());
+        let unknown = store
+            .wait_durable(last, Duration::from_millis(30))
+            .await
+            .is_err();
+        release(&gates[1]);
+        store
+            .wait_durable(last, Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(
+            during_durable, first,
+            "queued snapshot was advertised durable before its write"
+        );
+        assert!(
+            age >= Duration::from_secs(19),
+            "older completion reset the queued snapshot's age: {age:?}"
+        );
+        assert!(
+            !healthy && unknown,
+            "unfinished old work acquired a fresh health grace period"
+        );
+        assert_eq!(read_state(store.path()).unwrap().unwrap(), state(3));
+        assert!(store.healthy(now()));
+    }
+
+    #[tokio::test]
+    async fn a_hung_writer_retains_only_the_latest_handoff_and_recovers_it() {
+        let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let (g, w) = (gate.clone(), written.clone());
+        let write: Arc<WriteFn> = Arc::new(move |path, snapshot| {
+            entered_tx.send(()).unwrap();
+            let mut open = g.0.lock().unwrap();
+            while !*open {
+                open = g.1.wait(open).unwrap();
+            }
+            w.lock().unwrap().push(snapshot.operator_lifts.len());
+            save_state(path, snapshot)
+        });
+        let store = StateStore::with_writer(temp("bounded-handoff"), write);
+        let t0 = now();
+        let first = store.submit(state(1), t0);
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let started = std::time::Instant::now();
+        let mut last = first;
+        for n in 2..=400 {
+            last = store.submit(state(n), t0 + n as u64);
+        }
+        let elapsed = started.elapsed();
+        {
+            let slot = store.shared.latest.lock().unwrap();
+            let latest = slot.as_ref().unwrap();
+            assert_eq!(latest.generation, last);
+            assert_eq!(latest.state, state(400));
+            assert_eq!(latest.since_ms, t0 + 2, "replacement renewed pending age");
+        }
+        let unknown = store
+            .wait_durable(last, Duration::from_millis(30))
+            .await
+            .is_err();
+        let before_durable = store.durable();
+        release(&gate);
+        store
+            .wait_durable(last, Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "handoff waited for the filesystem"
+        );
+        assert!(unknown && before_durable == 0);
+        assert_eq!(*written.lock().unwrap(), vec![1, 400]);
+        assert_eq!(read_state(store.path()).unwrap().unwrap(), state(400));
+        assert!(store.healthy(now()));
+    }
+
+    #[tokio::test]
+    async fn concurrent_submitters_preserve_the_latest_generation_and_snapshot_pair() {
+        let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (g, w) = (gate.clone(), written.clone());
+        let write: Arc<WriteFn> = Arc::new(move |_, snapshot| {
+            entered_tx.send(()).unwrap();
+            let mut open = g.0.lock().unwrap();
+            while !*open {
+                open = g.1.wait(open).unwrap();
+            }
+            w.lock().unwrap().push(snapshot.operator_lifts.len());
+            Ok(())
+        });
+        let store = Arc::new(StateStore::with_writer(temp("concurrent-handoff"), write));
+        store.submit(state(1), now());
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(9));
+        let mut senders = Vec::new();
+        for n in 2..=9 {
+            let (s, b) = (store.clone(), barrier.clone());
+            senders.push(std::thread::spawn(move || {
+                b.wait();
+                (s.submit(state(n), now()), n)
+            }));
+        }
+        barrier.wait();
+        let expected = senders
+            .into_iter()
+            .map(|t| t.join().unwrap())
+            .max_by_key(|(g, _)| *g)
+            .unwrap();
+        let recorded = {
+            let slot = store.shared.latest.lock().unwrap();
+            slot.as_ref()
+                .map(|s| (s.generation, s.state.operator_lifts.len()))
+        };
+        release(&gate);
+        store
+            .wait_durable(expected.0, Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(recorded, Some(expected));
+        assert_eq!(store.submitted(), expected.0);
+        assert_eq!(store.durable(), expected.0);
+        assert_eq!(written.lock().unwrap().last(), Some(&expected.1));
+    }
+
+    #[tokio::test]
+    async fn a_failed_write_is_replaced_by_the_newest_queued_snapshot() {
+        let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let attempts = Arc::new(Mutex::new(Vec::new()));
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (g, a) = (gate.clone(), attempts.clone());
+        let write: Arc<WriteFn> = Arc::new(move |path, snapshot| {
+            let n = snapshot.operator_lifts.len();
+            a.lock().unwrap().push(n);
+            if n == 1 {
+                entered_tx.send(()).unwrap();
+                let mut open = g.0.lock().unwrap();
+                while !*open {
+                    open = g.1.wait(open).unwrap();
+                }
+                return Err(std::io::Error::other("first write refused"));
+            }
+            save_state(path, snapshot)
+        });
+        let store = StateStore::with_writer(temp("replace-failure"), write);
+        let first = store.submit(state(1), now());
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        store.submit(state(2), now());
+        let last = store.submit(state(3), now());
+        let unknown = store
+            .wait_durable(first, Duration::from_millis(30))
+            .await
+            .is_err();
+        release(&gate);
+        store
+            .wait_durable(last, Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert!(unknown);
+        assert_eq!(
+            *attempts.lock().unwrap(),
+            vec![1, 3],
+            "failed predecessor or superseded snapshot was written again"
+        );
+        assert_eq!(store.durable(), last);
+        assert_eq!(read_state(store.path()).unwrap().unwrap(), state(3));
         assert!(store.healthy(now()));
     }
 

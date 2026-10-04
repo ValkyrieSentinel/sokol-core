@@ -749,8 +749,33 @@ check "a hung state write makes the node DEGRADED" wait_metric sokol_state_healt
 PENDING1=$(metric sokol_state_pending_seconds); sleep 2.5; PENDING2=$(metric sokol_state_pending_seconds)
 check "the maintenance tick keeps running while the write hangs" \
     awk -v a="$PENDING1" -v b="$PENDING2" 'BEGIN { exit !(b > a + 1) }'
+# Several authoritative snapshots must supersede while the first write is held.
+HANDOFF_OLD_IP=10.231.0.16
+HANDOFF_NEW_IP=10.231.0.17
+ip netns exec "$NS" ip addr add "$HANDOFF_OLD_IP/24" dev "$PEER_IF"
+ip netns exec "$NS" ip addr add "$HANDOFF_NEW_IP/24" dev "$PEER_IF"
+ipc "DROP_IMMEDIATE:$HANDOFF_OLD_IP"
+sleep 1.2
+HANDOFF_REPLY=$(printf 'UNBAN_IP:%s\n' "$HANDOFF_OLD_IP" | timeout 10 nc -U -q1 "$WORK/control.sock")
+check "State handoff: superseding unban remains unverified while the disk hangs" \
+    grep -q '^OK .*WARNING: not yet durable' <<<"$HANDOFF_REPLY"
+ipc "DROP_IMMEDIATE:$HANDOFF_NEW_IP"
+sleep 1.2
+check "State handoff: newest decision is enforced while the writer is blocked" xdp_drop "$HANDOFF_NEW_IP" 1
+check "State handoff: superseded decision is lifted while the writer is blocked" ping_from "$HANDOFF_OLD_IP"
 (timeout 5 cat "$STATE_TMP" >/dev/null &) ; sleep 0.5; rm -f "$STATE_TMP"
 check "health returns once the disk answers" wait_metric sokol_state_healthy 1
+state_handoff_latest() {
+    python3 - "$LAST_STATE" "$HANDOFF_NEW_IP/32" <<'PY_STATE'
+import json, sys
+with open(sys.argv[1]) as source:
+    state = json.load(source)
+assert state['schema'] == 1
+assert any(claim['target'] == sys.argv[2] for claim in state['claims'])
+PY_STATE
+}
+check "State handoff: recovery persisted the latest decision rather than the held predecessor" state_handoff_latest
+printf 'UNBAN_IP:%s\n' "$HANDOFF_NEW_IP" | nc -U -q1 "$WORK/control.sock" >/dev/null
 printf 'UNBAN_IP:%s\n' "$HUNG_IP" | nc -U -q1 "$WORK/control.sock" >/dev/null
 stop_orchestrator
 # R27-04: a state file that does not parse is not a first start: its bytes are kept and the node

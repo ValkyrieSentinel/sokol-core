@@ -48,10 +48,15 @@ FLOWSPEC-R12 реалізовано в #142: одна пауза після ко
 незалежно від CLI success/error/supersession, і pacing непорожнього cleanup.
 Метрика progress вимірює строге зменшення sampled identity/action obligations,
 окремо від CLI success, convergence та unknown; без приписування причини.
-Поточний крок — FLOWSPEC-R13: initial wanted походить із applied BlockTable
+FLOWSPEC-R13 реалізовано в #143: initial wanted походить із applied BlockTable
 після static configuration та restore, до spawn worker. Порожній placeholder
 не має відкликати ще потрібні правила до першого tick. Це snapshot, не atomic
 startup між kernel/RIB/upstream і не нова durable authority.
+Поточний крок — обмежена передача StateStore: один замінний очікуваний знімок
+і один знімок writer, навіть коли диск завис. Durable підтверджується після запису;
+вік очікування переживає заміни й завершення старого запису. Відновлення диска
+дозволяє зберегти останню передачу без накопиченої черги. Це межа кількості знімків,
+не загальної пам'яті чи часу syscall; формат стану й authority не змінюються.
 Загальну агентну інфраструктуру не розширюємо без задачі.
 Вимоги до фізичної NIC, власників пілоту та прийняття нових повноважень залишаються.
 Нижче збережено датовану базову стратегію; її старий CI не є перевіркою нового коду.
