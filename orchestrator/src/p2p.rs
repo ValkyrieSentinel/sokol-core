@@ -72,7 +72,8 @@ pub fn inbound_worst_case(peers: usize) -> (f64, f64, f64) {
 }
 
 /// How long a nonce is remembered after it arrived: a timestamp accepted then is at most
-/// MAX_CLOCK_SKEW_MS ahead, so it is stale this long after arrival.
+/// MAX_CLOCK_SKEW_MS ahead, so it is stale this long after arrival. Both bounds are inclusive:
+/// at exactly this age the frame is still acceptable, so its nonce is still remembered.
 const REPLAY_WINDOW_MS: u64 = 2 * MAX_CLOCK_SKEW_MS;
 pub const MAX_FRAME_BYTES: usize = 128 * 1024;
 
@@ -603,7 +604,10 @@ impl ReplayGuard {
     ) -> bool {
         let w = self.senders.entry(sender_id).or_default();
         while let Some(&(arrived, old)) = w.order.front() {
-            if arrived.saturating_add(REPLAY_WINDOW_MS) > now {
+            // Kept while the frame could still pass the timestamp check (`<=` skew, inclusive):
+            // dropping it at exactly REPLAY_WINDOW_MS let that frame through twice (review
+            // 2026-10-05 F4).
+            if arrived.saturating_add(REPLAY_WINDOW_MS) >= now {
                 break;
             }
             w.order.pop_front();
@@ -1591,12 +1595,7 @@ async fn handle_reader_loop(
                     }
                 }
                 // Only this node's own storm latch may switch its defense mode.
-                if matches!(
-                    command,
-                    MeshCommand::LocalDetection { .. }
-                        | MeshCommand::EngageDefense
-                        | MeshCommand::DisengageDefense
-                ) {
+                if !command.peer_may_send() {
                     bail!("node {} sent a local-only command", peer_id);
                 }
                 if let Err(e) = cmd_tx.send(command).await {
@@ -1719,6 +1718,14 @@ mod tests {
             (NetworkMessage::Command(MeshCommand::EngageDefense), false),
             (
                 NetworkMessage::Command(MeshCommand::DisengageDefense),
+                false,
+            ),
+            // A peer's LocalDetection would make this node issue its own claim (review F5).
+            (
+                NetworkMessage::Command(MeshCommand::LocalDetection {
+                    ip: "203.0.113.7".into(),
+                    reason: "forged".into(),
+                }),
                 false,
             ),
             (block_cmd("still heard"), true),
@@ -1936,6 +1943,29 @@ mod tests {
                 EnvelopeError::BadSignature
             );
         }
+    }
+
+    /// Review 2026-10-05 F4: the replay window and the timestamp window meet without a gap. A
+    /// frame accepted at the edge of the skew window (sender exactly MAX_CLOCK_SKEW_MS ahead)
+    /// is still refused as a replay when it is still acceptable, through the whole `open()`.
+    #[tokio::test]
+    async fn a_frame_at_the_edge_of_the_skew_window_is_not_accepted_twice() {
+        let peer = NodeCrypto::generate();
+        let trust = trust_with(7, &peer);
+        let env = seal(&peer, 7, &block_cmd("10.0.0.9")).unwrap();
+        let mut guard = ReplayGuard::default();
+        let first = env.timestamp_ms - MAX_CLOCK_SKEW_MS;
+        assert!(open(&trust, &mut guard, &env, first).is_ok());
+        let last_acceptable = env.timestamp_ms + MAX_CLOCK_SKEW_MS;
+        assert_eq!(last_acceptable - first, REPLAY_WINDOW_MS);
+        assert_eq!(
+            open(&trust, &mut guard, &env, last_acceptable).unwrap_err(),
+            EnvelopeError::Replay
+        );
+        assert_eq!(
+            open(&trust, &mut guard, &env, last_acceptable + 1).unwrap_err(),
+            EnvelopeError::StaleTimestamp
+        );
     }
 
     #[tokio::test]
@@ -2390,9 +2420,11 @@ mod tests {
             "a resend within the window"
         );
         assert!(guard.check_and_record(7, 2, t + 30_000, t + 30_000));
-        // 60 s after its arrival the first entry is gone; the second is not yet.
-        assert!(guard.check_and_record(7, 1, t + 60_000, t + 60_000));
-        assert!(!guard.check_and_record(7, 2, t + 60_000, t + 60_000));
+        // At exactly 60 s the first entry is still remembered (its frame could still be
+        // accepted); a millisecond later it is gone. The second is not yet.
+        assert!(!guard.check_and_record(7, 1, t + 60_000, t + 60_000));
+        assert!(guard.check_and_record(7, 1, t + 60_001, t + 60_001));
+        assert!(!guard.check_and_record(7, 2, t + 60_001, t + 60_001));
         assert!(guard.check_and_record(7, 9, t + 200_000, t + 200_000));
         assert_eq!(
             guard.remembered(),

@@ -160,6 +160,8 @@ impl MeshCommand {
         )
     }
 
+    /// Every variant is listed, with no default arm: a new command does not compile until it
+    /// is decided whether it names its sender (review 2026-10-05 F5).
     pub fn claimed_sender(&self) -> Option<u64> {
         match self {
             MeshCommand::Claim { claim } => Some(claim.issuer),
@@ -168,7 +170,28 @@ impl MeshCommand {
             | MeshCommand::Digest { issuer, .. }
             | MeshCommand::SyncRequest { issuer } => Some(*issuer),
             MeshCommand::Telemetry { node_id, .. } => Some(*node_id),
-            _ => None,
+            MeshCommand::Alert { .. }
+            | MeshCommand::LocalDetection { .. }
+            | MeshCommand::EngageDefense
+            | MeshCommand::DisengageDefense => None,
+        }
+    }
+
+    /// Whether a peer may send this command at all. Local-only commands (this node's own
+    /// detections and storm latch) are refused from the mesh. Exhaustive like
+    /// `claimed_sender`: an unclassified new command is a compile error, not an accepted one.
+    pub fn peer_may_send(&self) -> bool {
+        match self {
+            MeshCommand::Claim { .. }
+            | MeshCommand::Retract { .. }
+            | MeshCommand::BlockSync { .. }
+            | MeshCommand::Digest { .. }
+            | MeshCommand::SyncRequest { .. }
+            | MeshCommand::Telemetry { .. }
+            | MeshCommand::Alert { .. } => true,
+            MeshCommand::LocalDetection { .. }
+            | MeshCommand::EngageDefense
+            | MeshCommand::DisengageDefense => false,
         }
     }
 }
