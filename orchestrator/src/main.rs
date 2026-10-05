@@ -23,9 +23,12 @@ mod block_table;
 mod clock_watch;
 pub mod cluster_state;
 mod control;
+mod control_exec;
 mod defense;
 mod flowspec;
+mod ipc;
 mod kernel_events;
+mod mesh_dispatch;
 mod mesh_sync;
 mod metrics;
 mod p2p;
@@ -37,7 +40,7 @@ mod state_store;
 
 use aya::maps::{Array, LpmTrie, MapData, PerCpuArray, RingBuf};
 use aya::programs::{Xdp, XdpFlags};
-use aya::{include_bytes_aligned, Bpf, Pod};
+use aya::{Bpf, Pod};
 use clap::Parser;
 use sokol::SokolEngine;
 use std::net::IpAddr;
@@ -54,10 +57,12 @@ use common::NodeTelemetry;
 
 use crate::block_policy::{BlockPolicy, HostView, PolicyHandle};
 use crate::block_table::{
-    family_tag, host, parse_target, show, Adoption, BlockTable, ClaimKind, Envelope, LiftError,
-    Quorum, TtlPolicy, Watermark,
+    family_tag, host, parse_target, show, BlockTable, ClaimKind, Envelope, LiftError, Quorum,
+    TtlPolicy, Watermark,
 };
 use crate::cluster_state::BirdEyeView;
+use crate::control_exec::*;
+use crate::ipc::*;
 use crate::p2p::{
     maintain_peer_connection, now_ms, NodeCrypto, P2PNetwork, PeerRegistry, TrustStore,
 };
@@ -674,199 +679,6 @@ impl PeerLimits {
     }
 }
 
-struct ControlCtx {
-    state: Arc<StateStore>,
-    peer_limits: PeerLimits,
-    blocks: SharedBlockTable,
-    policy: PolicyHandle,
-    sntl_db: Arc<SentinelDb>,
-    registry: PeerRegistry,
-    peers_file: Option<std::path::PathBuf>,
-    node_id: u64,
-    crypto: Arc<NodeCrypto>,
-}
-
-/// Tells the mesh that this node takes back its own claims.
-async fn broadcast_retraction(ctx: &ControlCtx, ids: Vec<block_table::ClaimId>) {
-    if ids.is_empty() {
-        return;
-    }
-    let cmd = MeshCommand::Retract {
-        issuer: ctx.node_id,
-        claims: ids,
-    };
-    let _ = ctx.registry.broadcast(&cmd, ctx.node_id, &ctx.crypto).await;
-}
-
-async fn execute_control(cmd: control::ControlCommand, ctx: &ControlCtx) -> String {
-    use control::ControlCommand;
-    let (blocks, policy, sntl_db) = (&ctx.blocks, &ctx.policy.current(), &ctx.sntl_db);
-    match cmd {
-        ControlCommand::Ban(ip) => {
-            let shown = show(&ip);
-            if let Err(why) = policy.check_net(ip) {
-                return format!("ERR {} is protected ({})", shown, why);
-            }
-            let at = block_table::local_ms();
-            let added = match blocks
-                .lock()
-                .await
-                .add_local(ip, ClaimKind::Operator, "operator", at)
-            {
-                Ok(added) => added,
-                Err(why) => return format!("ERR {} not banned: {}", shown, why),
-            };
-            sntl_db.append(format!(
-                "OPERATOR_BAN_{}|IP:{}|At:{}",
-                ip_tag(ip),
-                shown,
-                at
-            ));
-            match added.applied {
-                Ok(()) => {
-                    log::warn!("[Control] Operator ban for {}", shown);
-                    format!("OK banned {}", shown)
-                }
-                Err(e) => format!(
-                    "ERR kernel map update failed: {:?}; the ban is kept and retried every second",
-                    e
-                ),
-            }
-        }
-        ControlCommand::Unban(ip) => {
-            let shown = show(&ip);
-            let at = block_table::local_ms();
-            let (result, still_blocked) = {
-                let mut table = blocks.lock().await;
-                let result = table.lift(ip, at);
-                (result, table.is_blocked(ip))
-            };
-            match result {
-                Ok(lifted) => {
-                    log::warn!("[Control] Operator unban for {}", shown);
-                    sntl_db.append(format!(
-                        "OPERATOR_UNBAN_{}|IP:{}|Claims:{}|At:{}",
-                        ip_tag(ip),
-                        shown,
-                        lifted.claims,
-                        at
-                    ));
-                    broadcast_retraction(ctx, lifted.retracted).await;
-                    if still_blocked {
-                        format!(
-                            "OK unbanned {} (kernel removal pending, retried every second)",
-                            shown
-                        )
-                    } else {
-                        format!("OK unbanned {}", shown)
-                    }
-                }
-                Err(LiftError::Static) => format!(
-                    "ERR {} is blocked by --block; change the configuration to lift it",
-                    shown
-                ),
-                Err(LiftError::NotBlocked) => format!("ERR {} was not blocked", shown),
-            }
-        }
-        ControlCommand::FlushDynamic => {
-            let at = block_table::local_ms();
-            let (released, lifted) = blocks.lock().await.flush_detector(at);
-            log::warn!(
-                "[Control] Operator flushed {} dynamic blocks",
-                released.len()
-            );
-            sntl_db.append(format!(
-                "OPERATOR_FLUSH|Released:{}|At:{}",
-                released.len(),
-                at
-            ));
-            broadcast_retraction(ctx, lifted.retracted).await;
-            format!("OK released {} dynamic blocks", released.len())
-        }
-        ControlCommand::FlushAll => {
-            let at = block_table::local_ms();
-            let (released, lifted) = blocks.lock().await.flush_all(at);
-            log::warn!(
-                "[Control] Operator flushed {} blocks (operator and dynamic)",
-                released.len()
-            );
-            sntl_db.append(format!(
-                "OPERATOR_FLUSH_ALL|Released:{}|At:{}",
-                released.len(),
-                at
-            ));
-            broadcast_retraction(ctx, lifted.retracted).await;
-            format!("OK released {} blocks", released.len())
-        }
-        ControlCommand::AcceptStateLoss => {
-            if ctx.state.accept_loss() {
-                log::warn!("[Control] Operator accepted running without the unrestored state");
-                sntl_db.append("STATE_LOSS_ACCEPTED".to_string());
-                "OK state loss accepted".to_string()
-            } else {
-                "ERR no failed state restore to accept".to_string()
-            }
-        }
-        ControlCommand::ListBans => {
-            let bans = blocks
-                .lock()
-                .await
-                .operator_targets(block_table::local_ms());
-            let shown: Vec<String> = bans.iter().take(LIST_BANS_MAX).map(show).collect();
-            // "OK <total> <target>..."; at most LIST_BANS_MAX targets on the line.
-            format!("OK {} {}", bans.len(), shown.join(" "))
-                .trim_end()
-                .to_string()
-        }
-        ControlCommand::ReloadPeers => match &ctx.peers_file {
-            None => "ERR no --peers-file configured".to_string(),
-            Some(path) => match TrustStore::load(path).and_then(|trust| {
-                ctx.registry.check_candidate(&trust)?;
-                Ok(trust)
-            }) {
-                Ok(trust) => {
-                    let per_peer = ctx.peer_limits.per_peer(&trust);
-                    let legacy = trust.legacy_peers().to_vec();
-                    {
-                        let mut table = ctx.blocks.lock().await;
-                        table.configure_peers(
-                            ctx.peer_limits.default,
-                            per_peer,
-                            ctx.peer_limits.quorum,
-                            block_table::local_ms(),
-                        );
-                        // A revoked node's claims stop counting here at once.
-                        table.set_pinned(trust.node_ids(), block_table::local_ms());
-                    }
-                    let pinned = ctx.registry.reload(trust);
-                    log_inbound_budget(pinned);
-                    log::warn!(
-                        "[Control] Reloaded {}: {} pinned peers",
-                        path.display(),
-                        pinned
-                    );
-                    sntl_db.append(format!(
-                        "PEERS_RELOADED|Pinned:{}|Legacy:{:?}",
-                        pinned, legacy
-                    ));
-                    if legacy.is_empty() {
-                        format!("OK {} pinned peers", pinned)
-                    } else {
-                        format!(
-                            "OK {} pinned peers; not trusted until their ML-DSA key is listed \
-                             (legacy key only): {:?}",
-                            pinned, legacy
-                        )
-                    }
-                }
-                // A broken file must not wipe the current trust: keep it and report.
-                Err(e) => format!("ERR {:#}; previous trust store kept", e),
-            },
-        },
-        ControlCommand::Unsupported(why) => format!("ERR {}", why),
-    }
-}
-
 fn resolve_group(name: &str) -> anyhow::Result<u32> {
     let c_name = std::ffi::CString::new(name)?;
     // SAFETY: getgrnam returns a pointer into static storage; we only read gr_gid before any
@@ -879,9 +691,9 @@ fn resolve_group(name: &str) -> anyhow::Result<u32> {
 }
 
 /// Sends this node's shared mesh state to one peer (catch-up on connect, anti-entropy).
-async fn send_snapshot(
+async fn send_snapshot<B: block_table::Blocklist>(
     addr: std::net::SocketAddr,
-    blocks: &SharedBlockTable,
+    blocks: &SharedBlockTable<B>,
     registry: &PeerRegistry,
     node_id: u64,
     crypto: &Arc<NodeCrypto>,
@@ -929,161 +741,6 @@ async fn persist_now<B: block_table::Blocklist>(
         return Ok(());
     }
     store.wait_durable(generation, wait).await
-}
-
-struct IpcCtx {
-    blocks: SharedBlockTable,
-    db: Arc<SentinelDb>,
-    registry: PeerRegistry,
-    node_id: u64,
-    crypto: Arc<NodeCrypto>,
-    policy: PolicyHandle,
-    reports: Arc<std::sync::Mutex<attack_reports::AttackReports>>,
-}
-
-/// One IPC command; returns the reply a client in ACK mode gets (F09): `OK applied`,
-/// `OK refused <why>` (final, do not retry), `OK pending` (recorded, kernel write retried by the
-/// node), `OK recorded`, or `ERR <why>` (malformed, do not retry).
-async fn handle_ipc_line(content: &str, c: &IpcCtx) -> String {
-    let outcome = |e: Enforcement| match e {
-        Enforcement::Enforced => "OK applied".to_string(),
-        Enforcement::Refused => "OK refused protected".to_string(),
-        Enforcement::Pending => "OK pending".to_string(),
-        Enforcement::Duplicate => "OK duplicate".to_string(),
-    };
-    if content.starts_with('{') {
-        if let Err(e) = CanonicalParser::validate_strict_json_object(content) {
-            log::error!("[CANONICAL FAULT] Rejected malformed IPC payload: {:?}", e);
-            return "ERR malformed JSON".to_string();
-        }
-    }
-    if let Some(raw_ip_str) = content.strip_prefix("DROP_IMMEDIATE:") {
-        match parse_target(raw_ip_str.trim()) {
-            Some(ip) => {
-                log::warn!("[XDP_ACTION] Trap triggered ban for IP: {}", show(&ip));
-                outcome(
-                    enforce_block_local(
-                        ip,
-                        "Unix IPC DROP_IMMEDIATE trigger",
-                        &c.blocks,
-                        &c.db,
-                        &c.registry,
-                        c.node_id,
-                        &c.crypto,
-                        &c.policy.current(),
-                        Detection::default(),
-                    )
-                    .await,
-                )
-            }
-            None => {
-                log::error!(
-                    "[UNIX IPC FAULT] Failed to parse IP from 'DROP_IMMEDIATE:{}'",
-                    raw_ip_str
-                );
-                "ERR not an IP address or CIDR prefix".to_string()
-            }
-        }
-    } else if let Some(payload) = content.strip_prefix("ATTACK:") {
-        match attack_reports::parse(payload) {
-            Ok(report) => {
-                c.reports
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .apply(&report, std::time::Instant::now());
-                let (tag, verb) = if report.active {
-                    ("ATTACK_REPORTED", "under attack")
-                } else {
-                    ("ATTACK_CLEARED", "attack cleared")
-                };
-                log::warn!(
-                    "[Attack] {} reports {} {} ({} pps, {})",
-                    report.source,
-                    report.victim,
-                    verb,
-                    report.pps,
-                    report.direction
-                );
-                c.db.append(format!(
-                    "{}|Source:{}|Victim:{}|Direction:{}|PPS:{}",
-                    tag, report.source, report.victim, report.direction, report.pps
-                ));
-                "OK recorded".to_string()
-            }
-            Err(e) => {
-                log::error!("[UNIX IPC FAULT] Bad ATTACK line: {}", e);
-                format!("ERR {}", e)
-            }
-        }
-    } else if let Some(retract) = signal::parse_retract(content) {
-        match retract {
-            Ok(r) => retract_detection(&r, c).await,
-            Err(e) => format!("ERR {}", e),
-        }
-    } else if let Some(verb) = signal::split_verb(content) {
-        let verb = match verb {
-            Ok(v) => v,
-            Err(e) => return format!("ERR {}", e),
-        };
-        let event_id = match verb.id.map(signal::event_id).transpose() {
-            Ok(id) => id,
-            Err(e) => return format!("ERR {}", e),
-        };
-        match signal::parse(verb.payload) {
-            Ok(sig) => match signal::target(&sig, &c.policy.current()) {
-                Ok(ip) => {
-                    c.db.append(format!(
-                        "SIGNAL|Source:{}|Src:{}|Dst:{}|Target:{}|Reason:{}",
-                        sig.source,
-                        show(&sig.src),
-                        sig.dst.map(|d| show(&d)).unwrap_or_else(|| "-".into()),
-                        show(&ip),
-                        sig.reason
-                    ));
-                    let reason = format!("{}: {}", sig.source, sig.reason);
-                    let event = event_id.map(|id| (sig.source.as_str(), id));
-                    outcome(
-                        enforce_block_local(
-                            ip,
-                            &reason,
-                            &c.blocks,
-                            &c.db,
-                            &c.registry,
-                            c.node_id,
-                            &c.crypto,
-                            &c.policy.current(),
-                            Detection {
-                                event,
-                                requested: verb.ttl,
-                            },
-                        )
-                        .await,
-                    )
-                }
-                Err(why) => {
-                    log::warn!("[Signal] {} signal not enforced: {}", sig.source, why);
-                    c.db.append(format!(
-                        "SIGNAL_REFUSED|Source:{}|Src:{}|Why:{}",
-                        sig.source,
-                        show(&sig.src),
-                        why
-                    ));
-                    format!("OK refused {}", why)
-                }
-            },
-            Err(e) => {
-                log::error!("[UNIX IPC FAULT] Bad SIGNAL line: {}", e);
-                format!("ERR {}", e)
-            }
-        }
-    } else if let Some(log_content) = content.strip_prefix("DB_LOG:") {
-        c.db.append_client_log(log_content);
-        let telemetry_msg = format!("DB_LOG:NODE={}|{}\n", c.node_id, log_content.trim());
-        push_telemetry(&telemetry_msg).await;
-        "OK recorded".to_string()
-    } else {
-        "ERR unknown command".to_string()
-    }
 }
 
 async fn push_telemetry(msg: &str) {
@@ -1160,75 +817,6 @@ fn log_inbound_budget(peers: usize) {
         bytes / (1024.0 * 1024.0),
         cpu
     );
-}
-
-fn detector_retraction_reply(out: &block_table::DetectorRetraction) -> String {
-    use block_table::DetectorRetraction as R;
-    match out {
-        R::Refused => "OK refused retraction state capacity",
-        R::Duplicate => "OK duplicate",
-        R::BeforeSignal => "OK recorded before its signal",
-        R::NotHolding => "OK nothing held",
-        R::StillHeld => "OK still held by other reasons",
-        R::Lifted { reissued: None, .. } => "OK lifted",
-        R::Lifted { .. } => "OK shortened",
-    }
-    .into()
-}
-
-/// A detector takes back one of its events (ADR-0019). The block ends, or gets shorter, only as
-/// far as no other reason holds it; this node's own claims are retracted mesh-wide.
-async fn retract_detection(r: &signal::Retract, c: &IpcCtx) -> String {
-    let shown = show(&r.target);
-    let now = block_table::local_ms();
-    let (out, shares_own) = {
-        let mut table = c.blocks.lock().await;
-        (
-            table.retract_detection(&r.source, &r.id, r.target, now),
-            table.shares_own(),
-        )
-    };
-    let label = out.label();
-    let reply = detector_retraction_reply(&out);
-    let claims = match &out {
-        block_table::DetectorRetraction::Lifted { retracted, .. } => retracted.len(),
-        _ => 0,
-    };
-    c.db.append(format!(
-        "DETECTOR_RETRACT|IP:{}|Result:{}|Claims:{}|At:{}|Event:{}/{}",
-        shown, label, claims, now, r.source, r.id
-    ));
-    if let block_table::DetectorRetraction::Lifted {
-        retracted,
-        reissued,
-        unblocked,
-    } = out
-    {
-        log::warn!(
-            "[Local Security] {} took back event {} for {}: {} own claims retracted{}",
-            r.source,
-            r.id,
-            shown,
-            retracted.len(),
-            if unblocked.is_empty() {
-                ""
-            } else {
-                ", unblocked"
-            }
-        );
-        if let Some(claim) = reissued.filter(|_| shares_own) {
-            let _ = c
-                .registry
-                .broadcast(&MeshCommand::Claim { claim }, c.node_id, &c.crypto)
-                .await;
-        }
-        let cmd = MeshCommand::Retract {
-            issuer: c.node_id,
-            claims: retracted,
-        };
-        let _ = c.registry.broadcast(&cmd, c.node_id, &c.crypto).await;
-    }
-    reply
 }
 
 /// What a detector said about its decision, beyond the target (ADR-0009, ADR-0019).
@@ -1463,14 +1051,19 @@ async fn main() -> Result<(), anyhow::Error> {
         .record(),
     );
 
-    #[cfg(debug_assertions)]
-    let mut bpf = Bpf::load(include_bytes_aligned!(concat!(
+    // The node embeds the compiled XDP object and cannot be built without it. Unit tests never
+    // load it, so they build without bpf-linker (`cargo test --bins`; review 2026-10-05 W4.3).
+    #[cfg(test)]
+    let mut bpf = Bpf::load(&[])?;
+
+    #[cfg(all(debug_assertions, not(test)))]
+    let mut bpf = Bpf::load(aya::include_bytes_aligned!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../target/bpfel-unknown-none/debug/ebpf-probe"
     )))?;
 
-    #[cfg(not(debug_assertions))]
-    let mut bpf = Bpf::load(include_bytes_aligned!(concat!(
+    #[cfg(all(not(debug_assertions), not(test)))]
+    let mut bpf = Bpf::load(aya::include_bytes_aligned!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../target/bpfel-unknown-none/release/ebpf-probe"
     )))?;
@@ -1742,7 +1335,9 @@ async fn main() -> Result<(), anyhow::Error> {
     })?;
 
     let peer_registry = PeerRegistry::new(trust_store);
-    let (mesh_cmd_tx, mut mesh_cmd_rx) = mpsc::channel::<MeshCommand>(1000);
+    let (mesh_cmd_tx, mesh_cmd_rx) = mpsc::channel::<MeshCommand>(1000);
+    // This node's own detections and storm latch; never on the wire (review 2026-10-05 W3.2).
+    let (local_cmd_tx, local_cmd_rx) = mpsc::channel::<mesh_sync::LocalCommand>(1000);
 
     let p2p_bind_addr: std::net::SocketAddr = args
         .p2p_bind
@@ -1812,244 +1407,21 @@ async fn main() -> Result<(), anyhow::Error> {
     let sync_throttled = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let sync_throttled_mesh = sync_throttled.clone();
 
-    producers.spawn(async move {
-        // When each peer last got a snapshot (bounded by the pinned peers: a SyncRequest names
-        // its authenticated sender).
-        let mut snapshots = mesh_sync::Cooldown::new(SYNC_COOLDOWN);
-        while let Some(cmd) = mesh_cmd_rx.recv().await {
-            match cmd {
-                MeshCommand::Claim { claim } => {
-                    let shown = claim.target.clone();
-                    let reason = claim.reason.clone();
-                    let issuer = claim.issuer;
-                    let expires = claim.expires_ms;
-                    let refusal = claim
-                        .net()
-                        .and_then(|n| policy_mesh.current().check_net(n).err());
-                    let (now, wall) = (block_table::local_ms(), now_ms());
-                    let result = blocks_mesh
-                        .lock()
-                        .await
-                        .adopt(claim, refusal.is_none(), now);
-                    match (result, refusal) {
-                        (Adoption::Enforced, _) => {
-                            let left =
-                                expires.map(|e| Duration::from_millis(e.saturating_sub(wall)));
-                            log::warn!(
-                                "[Mesh] Synchronized block for {} from node {} ({}): {}",
-                                shown,
-                                issuer,
-                                ttl_label(left),
-                                reason
-                            );
-                            let tag = parse_target(&shown).map(ip_tag).unwrap_or("V4");
-                            sntl_db_mesh.append(format!(
-                                "MESH_BLOCK_{}|IP:{}|TTL:{}|Reason:{}",
-                                tag,
-                                shown,
-                                ttl_label(left),
-                                reason
-                            ));
-                            let telemetry_msg = format!(
-                                "DB_LOG:NODE={}|TIER=MeshBlock|IP={}|VEC={}\n",
-                                node_id_mesh, shown, reason
-                            );
-                            push_telemetry(&telemetry_msg).await;
-                        }
-                        (Adoption::Held(held @ ("quorum" | "quota" | "envelope")), _) => {
-                            log::warn!(
-                                "[Mesh] Holding block for {} from node {} ({}): {}",
-                                shown,
-                                issuer,
-                                held,
-                                reason
-                            );
-                            sntl_db_mesh.append(format!(
-                                "MESH_BLOCK_HELD|IP:{}|Issuer:{}|Why:{}|Reason:{}",
-                                shown, issuer, held, reason
-                            ));
-                        }
-                        (Adoption::Held(_), Some(why)) => {
-                            log::error!(
-                                "[Mesh] Refusing mesh block for protected {} ({}): {}",
-                                shown,
-                                why,
-                                reason
-                            );
-                            sntl_db_mesh.append(format!(
-                                "MESH_BLOCK_REFUSED|IP:{}|Protected:{}|Reason:{}",
-                                shown, why, reason
-                            ));
-                        }
-                        (Adoption::Refused(why), _) => {
-                            log::warn!(
-                                "[Mesh] Ignoring claim for {} from node {}: {}",
-                                shown,
-                                issuer,
-                                why
-                            )
-                        }
-                        _ => {}
-                    }
-                }
-                MeshCommand::Retract { issuer, claims } => {
-                    let lifted =
-                        blocks_mesh
-                            .lock()
-                            .await
-                            .retract(issuer, &claims, block_table::local_ms());
-                    for net in lifted {
-                        log::info!(
-                            "[Mesh] Unblocked {}: node {} took back its block",
-                            show(&net),
-                            issuer
-                        );
-                        sntl_db_mesh.append(format!(
-                            "MESH_UNBLOCK|IP:{}|Issuer:{}",
-                            show(&net),
-                            issuer
-                        ));
-                    }
-                }
-                MeshCommand::BlockSync {
-                    issuer,
-                    claims,
-                    retracted,
-                } => {
-                    let (now, wall) = (block_table::local_ms(), now_ms());
-                    let mut adopted = 0;
-                    for claim in claims {
-                        let refusal = claim
-                            .net()
-                            .and_then(|n| policy_mesh.current().check_net(n).err());
-                        let (shown, secs) = (
-                            claim.target.clone(),
-                            claim.expires_ms.map(|e| e.saturating_sub(wall) / 1000),
-                        );
-                        let tag = parse_target(&shown).map(ip_tag).unwrap_or("V4");
-                        if blocks_mesh
-                            .lock()
-                            .await
-                            .adopt(claim, refusal.is_none(), now)
-                            == Adoption::Enforced
-                        {
-                            adopted += 1;
-                            sntl_db_mesh.append(format!(
-                                "MESH_BLOCK_{}|IP:{}|TTL:{}|Reason:sync from node {}",
-                                tag,
-                                shown,
-                                secs.map_or("permanent".into(), |s| format!("{}s", s)),
-                                issuer
-                            ));
-                        }
-                    }
-                    let lifted = blocks_mesh.lock().await.retract(issuer, &retracted, now);
-                    for net in &lifted {
-                        sntl_db_mesh.append(format!(
-                            "MESH_UNBLOCK|IP:{}|Issuer:{}",
-                            show(net),
-                            issuer
-                        ));
-                    }
-                    if adopted > 0 || !lifted.is_empty() {
-                        log::warn!(
-                            "[Mesh] Sync from node {}: adopted {} blocks missed while disconnected, {} taken back",
-                            issuer,
-                            adopted,
-                            lifted.len()
-                        );
-                    }
-                }
-                MeshCommand::Digest { issuer, digest } => {
-                    // Our view of the sender's own claims differs: ask the sender for them.
-                    let ours = blocks_mesh
-                        .lock()
-                        .await
-                        .digest_of(issuer, block_table::local_ms());
-                    if ours != digest {
-                        if let Some(addr) = registry_mesh.addr_of(issuer).await {
-                            log::info!(
-                                "[Mesh] Node {}'s claims differ from our view; asking it",
-                                issuer
-                            );
-                            let cmd = MeshCommand::SyncRequest {
-                                issuer: node_id_mesh,
-                            };
-                            let _ = registry_mesh
-                                .send_to(addr, &cmd, node_id_mesh, &crypto_mesh)
-                                .await;
-                        }
-                    }
-                }
-                MeshCommand::SyncRequest { issuer } => {
-                    // A snapshot is the most expensive answer (the whole table, signed frames):
-                    // at most one per peer per SYNC_COOLDOWN. A request dropped here is repeated
-                    // by the peer's next digest mismatch.
-                    if !snapshots.allow(issuer, std::time::Instant::now()) {
-                        sync_throttled_mesh.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        continue;
-                    }
-                    if let Some(addr) = registry_mesh.addr_of(issuer).await {
-                        send_snapshot(
-                            addr,
-                            &blocks_mesh,
-                            &registry_mesh,
-                            node_id_mesh,
-                            &crypto_mesh,
-                        )
-                        .await;
-                    }
-                }
-                MeshCommand::LocalDetection { ip, reason } => {
-                    // The telemetry processor's own detections: enforced here and shared like
-                    // any other local decision.
-                    if let Some(net) = parse_target(&ip) {
-                        enforce_block_local(
-                            net,
-                            &reason,
-                            &blocks_mesh,
-                            &sntl_db_mesh,
-                            &registry_mesh,
-                            node_id_mesh,
-                            &crypto_mesh,
-                            &policy_mesh.current(),
-                            Detection::default(),
-                        )
-                        .await;
-                    }
-                }
-                c @ (MeshCommand::EngageDefense | MeshCommand::DisengageDefense) => {
-                    let engaged = matches!(c, MeshCommand::EngageDefense);
-                    match defense_mesh.set(engaged) {
-                        Ok(flags) if defense_mesh.mode() == defense::StormMode::Strict => {
-                            let label = if engaged { "Strict" } else { "Normal" };
-                            log::warn!(
-                                "[Defense] Distributed storm {}: XDP mode {} (flags {:#x})",
-                                if engaged { "engaged" } else { "over" },
-                                label,
-                                flags
-                            );
-                            sntl_db_mesh
-                                .append(format!("DEFENSE_MODE|{}|Flags:{:#x}", label, flags));
-                        }
-                        Ok(_) => log::warn!(
-                            "[Defense] Distributed storm {} (--storm-mode observe: XDP unchanged)",
-                            if engaged { "engaged" } else { "over" }
-                        ),
-                        Err(e) => log::error!("[Defense] Cannot update the XDP config: {:?}", e),
-                    }
-                }
-                MeshCommand::Alert { level, message } => {
-                    log::info!("[MESH ALERT {:?}] {}", level, message);
-                }
-                telemetry @ MeshCommand::Telemetry { .. } => {
-                    if let Some(record) = telemetry.telemetry_record() {
-                        let _ = telemetry_tx_mesh.try_send(record);
-                    }
-                }
-            }
+    producers.spawn(
+        mesh_dispatch::MeshDispatch {
+            blocks: blocks_mesh,
+            policy: policy_mesh,
+            db: sntl_db_mesh,
+            registry: registry_mesh,
+            crypto: crypto_mesh,
+            node_id: node_id_mesh,
+            defense: defense_mesh,
+            snapshots: mesh_sync::Cooldown::new(SYNC_COOLDOWN),
+            sync_throttled: sync_throttled_mesh,
+            telemetry_tx: telemetry_tx_mesh,
         }
-    });
+        .run(mesh_cmd_rx, local_cmd_rx),
+    );
 
     let upstream_router_addr: std::net::SocketAddr = args.upstream_router.parse().map_err(|e| {
         anyhow::anyhow!(
@@ -2061,7 +1433,7 @@ async fn main() -> Result<(), anyhow::Error> {
     let mesh_orchestrator = MeshOrchestrator::new(
         bird_eye,
         telemetry_rx,
-        mesh_cmd_tx.clone(),
+        local_cmd_tx,
         sntl_db.clone(),
         shutdown_rx.clone(),
         upstream_router_addr,

@@ -472,14 +472,17 @@ fn observed_nodes(nodes: &[ClientNode]) -> Vec<ClientNode> {
 }
 
 async fn api_get_all_data(State(state): State<AppState>) -> Json<serde_json::Value> {
+    // One lock at a time, each released before the next: holding `alerts` while waiting for
+    // `metrics` deadlocked against telemetry, which takes `metrics` then `alerts` (review
+    // 2026-10-05, prompted by an external analysis of await points under locks).
     let nodes = observed_nodes(&state.nodes.read().await);
-    let alerts = state.alerts.read().await;
-    let metrics = state.metrics.read().await;
+    let alerts = state.alerts.read().await.clone();
+    let metrics = state.metrics.read().await.clone();
 
     Json(serde_json::json!({
         "nodes": nodes,
-        "alerts": *alerts,
-        "metrics": *metrics,
+        "alerts": alerts,
+        "metrics": metrics,
         "timestamp": Utc::now().to_rfc3339()
     }))
 }
@@ -1136,6 +1139,30 @@ mod tests {
         );
 
         let _ = app;
+    }
+
+    /// Review 2026-10-05: telemetry takes `metrics` then `alerts`; the data API took `alerts`
+    /// then `metrics`, so each could wait for the other forever (dashboard frozen). While the
+    /// API waits for `metrics`, it must hold no other lock telemetry needs.
+    #[tokio::test]
+    async fn the_data_api_holds_no_lock_while_it_waits_for_another() {
+        let st = state();
+        let telemetry_holds_metrics = st.metrics.write().await;
+        let api = tokio::spawn(api_get_all_data(State(st.clone())));
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!api.is_finished(), "the API must be waiting for metrics");
+        assert!(
+            st.alerts.try_write().is_ok(),
+            "telemetry's next lock (alerts) is held by the waiting API: deadlock"
+        );
+        drop(telemetry_holds_metrics);
+        let Json(body) = tokio::time::timeout(std::time::Duration::from_secs(2), api)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(body.get("metrics").is_some());
     }
 
     /// Review 2026-10-05 F2: the page offers only what a node carries out. Every API path the

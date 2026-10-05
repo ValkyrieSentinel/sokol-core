@@ -5,8 +5,8 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 LEDGER=docs/RETIRED.md
-TAG=archive/2026-09-29
-RETIRED_PATHS='docs/reviews/|docs/vision/|experiments/chromatic-boundaries'
+TAGS=(archive/2026-09-29 archive/2026-10-05)
+RETIRED_PATHS='docs/reviews/|docs/vision/|experiments/chromatic-boundaries|sokol-client|(^|[^A-Za-z0-9_])ai/|STRATEGY_REVIEW_2026-10-03|ci-protection-proposal'
 fail=0
 
 cited=$(git grep -hoEw 'F(0[1-9]|1[0-2])|R2[67]-0[1-9]|N0[1-6]|T[1-5]' -- . ":!$LEDGER" | sort -u)
@@ -22,9 +22,11 @@ else
     echo "ok   no live file points at a retired path"
 fi
 
-if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null || git ls-remote --exit-code --tags origin "$TAG" >/dev/null 2>&1; then
-    echo "ok   $TAG exists"
-else
-    echo "FAIL tag $TAG, which holds the retired bytes, is missing"; fail=1
-fi
+for TAG in "${TAGS[@]}"; do
+    if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null || git ls-remote --exit-code --tags origin "$TAG" >/dev/null 2>&1; then
+        echo "ok   $TAG exists"
+    else
+        echo "FAIL tag $TAG, which holds the retired bytes, is missing"; fail=1
+    fi
+done
 exit $fail
