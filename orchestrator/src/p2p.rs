@@ -1594,10 +1594,8 @@ async fn handle_reader_loop(
                         );
                     }
                 }
-                // Only this node's own storm latch may switch its defense mode.
-                if !command.peer_may_send() {
-                    bail!("node {} sent a local-only command", peer_id);
-                }
+                // Local-only decisions (this node's detections, its storm latch) are not
+                // MeshCommand variants at all (LocalCommand), so a peer cannot express them.
                 if let Err(e) = cmd_tx.send(command).await {
                     bail!("local orchestrator channel closed: {}", e);
                 }
@@ -1692,10 +1690,12 @@ mod tests {
         ));
     }
 
-    /// ADR-6: only this node's own storm latch may switch its defense mode; a pinned peer that
-    /// sends EngageDefense is disconnected before the command reaches the node.
+    /// ADR-6: only this node's own storm latch may switch its defense mode, and only its own
+    /// telemetry processor makes a local detection. Since the 2026-10-05 review (W3.2) those
+    /// are `LocalCommand`, not `MeshCommand`: a pinned peer that sends the old wire forms, signed
+    /// correctly, gets nothing delivered, while an ordinary command on the same path is heard.
     #[tokio::test]
-    async fn a_peer_cannot_switch_this_nodes_defense_mode() {
+    async fn a_peer_cannot_send_local_only_commands() {
         let server = Arc::new(NodeCrypto::generate());
         let friend = Arc::new(NodeCrypto::generate());
         let mut trust = TrustStore::default();
@@ -1714,25 +1714,41 @@ mod tests {
             PeerRegistry::new(trust),
         );
         tokio::spawn(async move { net.serve(listener).await });
-        for (msg, delivered) in [
-            (NetworkMessage::Command(MeshCommand::EngageDefense), false),
+        let signed = |payload: &[u8]| {
+            let (timestamp_ms, nonce) = (now_ms(), rand::random());
+            let signature = friend
+                .sign(&unsigned_bytes(
+                    WIRE_VERSION_MAX,
+                    2,
+                    timestamp_ms,
+                    nonce,
+                    payload,
+                ))
+                .unwrap();
+            SecureEnvelope {
+                version: WIRE_VERSION_MAX,
+                sender_id: 2,
+                timestamp_ms,
+                nonce,
+                payload: payload.to_vec(),
+                signature,
+            }
+        };
+        let heard = seal(&friend, 2, &block_cmd("still heard")).unwrap();
+        for (env, delivered) in [
+            (signed(br#"{"Command":"EngageDefense"}"#), false),
+            (signed(br#"{"Command":"DisengageDefense"}"#), false),
             (
-                NetworkMessage::Command(MeshCommand::DisengageDefense),
+                signed(br#"{"Command":{"LocalDetection":{"ip":"203.0.113.7","reason":"forged"}}}"#),
                 false,
             ),
-            // A peer's LocalDetection would make this node issue its own claim (review F5).
-            (
-                NetworkMessage::Command(MeshCommand::LocalDetection {
-                    ip: "203.0.113.7".into(),
-                    reason: "forged".into(),
-                }),
-                false,
-            ),
-            (block_cmd("still heard"), true),
+            (heard, true),
         ] {
             let mut stream = TcpStream::connect(addr).await.unwrap();
-            for m in [NetworkMessage::handshake(2), msg] {
-                let env = seal(&friend, 2, &m).unwrap();
+            for env in [
+                seal(&friend, 2, &NetworkMessage::handshake(2)).unwrap(),
+                env,
+            ] {
                 let bytes = env.encode();
                 let _ = stream.write_all(&(bytes.len() as u32).to_be_bytes()).await;
                 let _ = stream.write_all(&bytes).await;

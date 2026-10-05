@@ -441,12 +441,13 @@ issuer (вузол) · kind · target (канонічний) · issued_ms · exp
 - **Прив'язка з'єднання.** Перше повідомлення має бути рукостисканням. Після нього з'єднання
   говорить лише від імені того, хто в ньому назвався.
 - **Хто за кого говорить.** Телеметрія, заявки, відкликання і дайджести мусять описувати
-  відправника. `LocalDetection`, `EngageDefense` і `DisengageDefense` з мережі не приймаються
-  взагалі: режим оборони вмикає лише власний латч вузла.
+  відправника. Власні виявлення вузла й перемикання режиму оборони — це `LocalCommand`, а не
+  команди мешу: у мережевому протоколі їх немає, тож пір не може їх надіслати
+  (`mesh_sync.rs`, обробка — `mesh_dispatch.rs`). Режим оборони вмикає лише власний латч вузла.
 
 Перевірка (`p2p.rs`): `stranger_key_is_rejected_even_with_valid_signature`,
 `header_fields_are_covered_by_the_signature`, `replay_and_stale_envelopes_are_rejected`,
-`connection_is_bound_to_its_handshake_identity`, `a_peer_cannot_switch_this_nodes_defense_mode`,
+`connection_is_bound_to_its_handshake_identity`, `a_peer_cannot_send_local_only_commands`,
 `rotation_accepts_old_and_new_keys_then_revokes_the_old_one`,
 `every_byte_of_a_v2_envelope_is_covered` (кожен з ~3,4 тис. байтів кадру),
 `a_signature_made_for_another_context_does_not_verify`, `frames_of_other_protocol_versions_are_named`,

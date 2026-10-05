@@ -27,8 +27,6 @@ pub enum MeshCommand {
         issuer: u64,
         claims: Vec<ClaimId>,
     },
-    EngageDefense,
-    DisengageDefense,
     Alert {
         level: AlertLevel,
         message: String,
@@ -51,11 +49,6 @@ pub enum MeshCommand {
     SyncRequest {
         issuer: u64,
     },
-    /// A detection made on this node by the orchestrator itself; never accepted from a peer.
-    LocalDetection {
-        ip: String,
-        reason: String,
-    },
     /// Periodic load report of `node_id` (must be the authenticated sender).
     Telemetry {
         node_id: u64,
@@ -64,6 +57,21 @@ pub enum MeshCommand {
         under_attack: bool,
         blocks_active: u64,
     },
+}
+
+/// Decisions of this node's own telemetry processor. Not serializable: they cannot be sent to
+/// or received from a peer, so the transport needs no list of local-only mesh commands
+/// (review 2026-10-05 W3.2; they were `MeshCommand` variants refused by `p2p.rs`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LocalCommand {
+    /// A detection made on this node by the orchestrator itself.
+    Detection {
+        ip: String,
+        reason: String,
+    },
+    /// The cluster storm latch engaged: switch this node's XDP to strict mode.
+    EngageDefense,
+    DisengageDefense,
 }
 
 /// JSON bytes one BlockSync may take: the transport's frame limit is 128 KiB, and the signature,
@@ -170,28 +178,7 @@ impl MeshCommand {
             | MeshCommand::Digest { issuer, .. }
             | MeshCommand::SyncRequest { issuer } => Some(*issuer),
             MeshCommand::Telemetry { node_id, .. } => Some(*node_id),
-            MeshCommand::Alert { .. }
-            | MeshCommand::LocalDetection { .. }
-            | MeshCommand::EngageDefense
-            | MeshCommand::DisengageDefense => None,
-        }
-    }
-
-    /// Whether a peer may send this command at all. Local-only commands (this node's own
-    /// detections and storm latch) are refused from the mesh. Exhaustive like
-    /// `claimed_sender`: an unclassified new command is a compile error, not an accepted one.
-    pub fn peer_may_send(&self) -> bool {
-        match self {
-            MeshCommand::Claim { .. }
-            | MeshCommand::Retract { .. }
-            | MeshCommand::BlockSync { .. }
-            | MeshCommand::Digest { .. }
-            | MeshCommand::SyncRequest { .. }
-            | MeshCommand::Telemetry { .. }
-            | MeshCommand::Alert { .. } => true,
-            MeshCommand::LocalDetection { .. }
-            | MeshCommand::EngageDefense
-            | MeshCommand::DisengageDefense => false,
+            MeshCommand::Alert { .. } => None,
         }
     }
 }
@@ -277,7 +264,7 @@ impl UpstreamBgpIntegration {
 pub struct MeshOrchestrator {
     bird_eye: BirdEyeView,
     telemetry_rx: mpsc::Receiver<NodeTelemetry>,
-    cmd_tx: mpsc::Sender<MeshCommand>,
+    cmd_tx: mpsc::Sender<LocalCommand>,
     sntl_db: Arc<SentinelDb>,
     shutdown_rx: watch::Receiver<bool>,
     bgp_integration: UpstreamBgpIntegration,
@@ -291,7 +278,7 @@ impl MeshOrchestrator {
     pub fn new(
         bird_eye: BirdEyeView,
         telemetry_rx: mpsc::Receiver<NodeTelemetry>,
-        cmd_tx: mpsc::Sender<MeshCommand>,
+        cmd_tx: mpsc::Sender<LocalCommand>,
         sntl_db: Arc<SentinelDb>,
         shutdown_rx: watch::Receiver<bool>,
         upstream_router_addr: std::net::SocketAddr,
@@ -340,7 +327,7 @@ impl MeshOrchestrator {
 
                         self.sntl_db.append(format!("AUTO_BLOCK_IP: {}", ip_str));
 
-                        let block_cmd = MeshCommand::LocalDetection {
+                        let block_cmd = LocalCommand::Detection {
                             ip: ip_str,
                             reason: format!("eBPF XDP probe drop (score: {:.2})", telemetry.anomaly_score),
                         };
@@ -369,7 +356,7 @@ impl MeshOrchestrator {
                             if let Err(e) = self.bgp_integration.dispatch_flowspec_v6(&prefix, 64, true).await {
                                 error!("[MeshOrchestrator] Failed to dispatch BGP Flowspec drop: {:?}", e);
                             }
-                            let _ = self.cmd_tx.send(MeshCommand::EngageDefense).await;
+                            let _ = self.cmd_tx.send(LocalCommand::EngageDefense).await;
                         }
                         Some(StormTransition::Disengage) => {
                             info!(
@@ -380,7 +367,7 @@ impl MeshOrchestrator {
 
                             let prefix = self.local_node_ipv6_prefix.clone();
                             let _ = self.bgp_integration.dispatch_flowspec_v6(&prefix, 64, false).await;
-                            let _ = self.cmd_tx.send(MeshCommand::DisengageDefense).await;
+                            let _ = self.cmd_tx.send(LocalCommand::DisengageDefense).await;
                         }
                         None => {}
                     }
