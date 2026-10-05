@@ -1,7 +1,0 @@
-[package]
-name = "sokol_ai"
-version = "0.1.0"
-edition = "2021"
-publish = false
-
-[dependencies]
