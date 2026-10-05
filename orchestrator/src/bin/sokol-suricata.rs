@@ -375,15 +375,66 @@ struct QueuedCursor {
 }
 
 impl Cursor {
-    fn load(path: &Path) -> Option<Cursor> {
-        serde_json::from_slice(&std::fs::read(path).ok()?).ok()
+    /// `Ok(None)`: no cursor file (a first start). An unreadable or unparseable file is an
+    /// error, not a first start: treating it as absent would start at the end of the log and
+    /// silently skip what arrived before the crash (review 2026-10-05, detector path).
+    fn load(path: &Path) -> Result<Option<Cursor>, String> {
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(format!("cannot read {}: {}", path.display(), e)),
+        };
+        serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(|e| format!("{} is not a cursor: {}", path.display(), e))
     }
 
-    /// Atomic replace (temporary file, rename).
+    /// Atomic and durable replace, like the node's state file (R26-04): the temporary file is
+    /// synced before the rename and the directory after it, so a power loss leaves the old
+    /// cursor or the new one, never an empty file.
     fn save(&self, path: &Path) -> io::Result<()> {
+        use std::io::Write;
         let tmp = path.with_extension("tmp");
-        std::fs::write(&tmp, serde_json::to_vec(self).map_err(io::Error::other)?)?;
-        std::fs::rename(&tmp, path)
+        let mut file = File::create(&tmp)?;
+        file.write_all(&serde_json::to_vec(self).map_err(io::Error::other)?)?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, path)?;
+        if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+            File::open(dir)?.sync_all()?;
+        }
+        Ok(())
+    }
+}
+
+/// Where reading starts: the saved cursor; without one, the end (or the start with
+/// `--from-start`); with an unreadable one, the start of the current file. Re-reading is
+/// safe: alerts older than the forwarding age budget are skipped, and the node answers a
+/// resent event id as a duplicate. Skipping from the end would lose alerts silently.
+/// The flag is true when a cursor file existed but could not be used.
+fn initial_follower(
+    eve: &Path,
+    cursor_file: Option<&Path>,
+    from_start: bool,
+) -> (Follower, String, bool) {
+    match cursor_file.map(Cursor::load) {
+        Some(Ok(Some(cursor))) => {
+            let (f, how) = Follower::resume(eve, cursor);
+            (f, format!("{} ({:?})", how, cursor), false)
+        }
+        Some(Err(why)) => (
+            Follower::new(eve, true),
+            format!("{}; reading {} from its start", why, eve.display()),
+            true,
+        ),
+        Some(Ok(None)) | None => (
+            Follower::new(eve, from_start),
+            format!(
+                "no saved cursor; reading {} from its {}",
+                eve.display(),
+                if from_start { "start" } else { "end" }
+            ),
+            false,
+        ),
     }
 }
 
@@ -657,14 +708,13 @@ fn main() {
         args.max_signals_per_sec,
     );
     let mut diagnostics = AdmissionDiagnostics::default();
-    let mut follower = match args.cursor_file.as_deref().and_then(Cursor::load) {
-        Some(cursor) => {
-            let (f, how) = Follower::resume(&args.eve, cursor);
-            log::info!("[sokol-suricata] {} ({:?})", how, cursor);
-            f
-        }
-        None => Follower::new(&args.eve, args.from_start),
-    };
+    let (mut follower, how, damaged) =
+        initial_follower(&args.eve, args.cursor_file.as_deref(), args.from_start);
+    if damaged {
+        log::error!("[sokol-suricata] {}", how);
+    } else {
+        log::info!("[sokol-suricata] {}", how);
+    }
     // File-content identity and offset for each queued alert, oldest first.
     // Neither rotation nor detected copytruncate may transplant an old offset.
     let mut queued_at: std::collections::VecDeque<QueuedCursor> = std::collections::VecDeque::new();
@@ -1276,6 +1326,53 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// Review 2026-10-05 (detector path): a damaged cursor (here: the empty file a power loss
+    /// can leave after a rename without sync) was read as "no cursor" and reading started at
+    /// the end of the log, silently skipping what arrived before the crash. It now starts at
+    /// the beginning of the current file; a missing cursor still follows --from-start.
+    #[test]
+    fn a_damaged_cursor_rereads_the_log_instead_of_skipping_it() {
+        let dir =
+            std::env::temp_dir().join(format!("sokol-suricata-damaged-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let eve = dir.join("eve.json");
+        std::fs::write(&eve, "before-the-crash\n").unwrap();
+        let cursor = dir.join("cursor.json");
+        for damaged in ["", "{\"inode\":", "not json"] {
+            std::fs::write(&cursor, damaged).unwrap();
+            let (mut f, how, flagged) = initial_follower(&eve, Some(&cursor), false);
+            assert!(flagged, "{:?}: {}", damaged, how);
+            let batch = f.poll().unwrap();
+            assert_eq!(
+                batch
+                    .lines
+                    .iter()
+                    .map(|(_, l)| l.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["before-the-crash\n"],
+                "{:?} must not start at the end",
+                damaged
+            );
+        }
+        std::fs::remove_file(&cursor).unwrap();
+        let (mut f, _, flagged) = initial_follower(&eve, Some(&cursor), false);
+        assert!(!flagged);
+        assert!(
+            f.poll().unwrap().lines.is_empty(),
+            "no cursor, no --from-start: the end"
+        );
+        // A saved cursor round-trips and leaves no temporary file behind.
+        let at = Cursor {
+            inode: 7,
+            position: 3,
+        };
+        at.save(&cursor).unwrap();
+        assert_eq!(Cursor::load(&cursor), Ok(Some(at)));
+        assert!(!cursor.with_extension("tmp").exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn lines_carry_their_start_and_the_cursor_follows_complete_lines() {
         let dir = std::env::temp_dir().join(format!("sokol-suricata-pos-{}", std::process::id()));
@@ -1308,7 +1405,7 @@ mod tests {
             ..f.cursor()
         };
         cursor.save(&saved).unwrap();
-        assert_eq!(Cursor::load(&saved), Some(cursor));
+        assert_eq!(Cursor::load(&saved), Ok(Some(cursor)));
 
         // Written while the adapter was down.
         let mut w = std::fs::OpenOptions::new()
@@ -1471,7 +1568,7 @@ mod tests {
         let checkpoint = follower.checkpoint(Some(&old));
         let saved = dir.join("cursor");
         checkpoint.save(&saved).unwrap();
-        let (mut restarted, _) = Follower::resume(&path, Cursor::load(&saved).unwrap());
+        let (mut restarted, _) = Follower::resume(&path, Cursor::load(&saved).unwrap().unwrap());
         assert_eq!(
             lines(&mut restarted).concat(),
             new_content,
