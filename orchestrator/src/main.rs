@@ -901,20 +901,24 @@ async fn send_snapshot(
 use state_store::{Restore, StateStore};
 
 /// Hands the table's durable part to the state writer if it changed; never waits for the disk.
-async fn submit_state(store: &StateStore, blocks: &SharedBlockTable) -> Option<u64> {
-    let state = {
-        let mut table = blocks.lock().await;
-        table
-            .dirty()
-            .then(|| table.take_persisted(block_table::local_ms()))
-    }?;
+async fn submit_state<B: block_table::Blocklist>(
+    store: &StateStore,
+    blocks: &SharedBlockTable<B>,
+) -> Option<u64> {
+    let mut table = blocks.lock().await;
+    let state = table
+        .dirty()
+        .then(|| table.take_persisted(block_table::local_ms()))?;
+    // Clearing dirty, capturing the snapshot and assigning its generation are
+    // one ordered handoff. Neither a newer capture nor a clean caller may pass
+    // between them. submit does no filesystem work; wait_durable runs after unlock.
     Some(store.submit(state, now_ms()))
 }
 
 /// Submits the current state and waits (at most `wait`) until it, or anything newer, is on disk.
-async fn persist_now(
+async fn persist_now<B: block_table::Blocklist>(
     store: &StateStore,
-    blocks: &SharedBlockTable,
+    blocks: &SharedBlockTable<B>,
     wait: Duration,
 ) -> Result<(), String> {
     let generation = match submit_state(store, blocks).await {
@@ -2874,6 +2878,204 @@ mod tests {
         }
         fn hits(&self, _: IpNet) -> Option<u64> {
             Some(0)
+        }
+    }
+
+    mod persistence {
+        use super::*;
+        use std::future::Future;
+        use std::sync::{mpsc, Condvar, Mutex};
+        use std::task::{Context, Poll, Wake, Waker};
+
+        // Force a valid thread schedule at the table-unlock boundary. Tokio releases
+        // its semaphore bookkeeping before invoking this waker. The other caller
+        // completes its actual persist_now before the releasing caller resumes.
+        struct RunPeerAtUnlock {
+            run: mpsc::Sender<()>,
+            done: Arc<(Mutex<bool>, Condvar)>,
+        }
+        impl Wake for RunPeerAtUnlock {
+            fn wake(self: Arc<Self>) {
+                self.run.send(()).unwrap();
+                let (lock, cv) = &*self.done;
+                let ready = lock.lock().unwrap();
+                let (ready, timed) = cv
+                    .wait_timeout_while(ready, Duration::from_secs(5), |done| !*done)
+                    .unwrap();
+                assert!(
+                    *ready && !timed.timed_out(),
+                    "peer did not finish at unlock"
+                );
+            }
+        }
+
+        struct Receipt {
+            result: Result<(), String>,
+            submitted: u64,
+            durable: u64,
+            on_disk: Option<block_table::Persisted>,
+        }
+
+        fn ordered_capture_scenario(mutate: bool) -> (Receipt, block_table::Persisted) {
+            let path = temp_log(if mutate {
+                "capture-newer"
+            } else {
+                "capture-clean"
+            });
+            let path = std::path::PathBuf::from(path).with_extension("json");
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            // Disk cannot complete before the peer's first poll of persist_now.
+            // This also falsifies a clean caller that skips the durable wait.
+            let writable = Arc::new((Mutex::new(false), Condvar::new()));
+            let gate = writable.clone();
+            let write: Arc<state_store::WriteFn> = Arc::new(move |path, state| {
+                let ready = gate.0.lock().unwrap();
+                let (ready, _) = gate
+                    .1
+                    .wait_timeout_while(ready, Duration::from_secs(5), |open| !*open)
+                    .unwrap();
+                if !*ready {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "test disk gate",
+                    ));
+                }
+                drop(ready);
+                state_store::save_state(path, state)
+            });
+            let store = Arc::new(StateStore::with_writer(path.clone(), write));
+            let blocks = Arc::new(tokio::sync::Mutex::new(BlockTable::with_lists(
+                AcceptLists,
+                TtlPolicy {
+                    base: Duration::from_secs(60),
+                    max: Duration::from_secs(600),
+                },
+                1,
+            )));
+            let old = parse_target("198.51.100.110").unwrap();
+            let new = parse_target("198.51.100.111").unwrap();
+            let mut held = blocks.blocking_lock();
+            held.add_local(
+                old,
+                block_table::ClaimKind::Operator,
+                "before capture",
+                block_table::local_ms(),
+            )
+            .unwrap();
+            let mut first = Box::pin(submit_state(&store, &blocks));
+            let mut cx = Context::from_waker(Waker::noop());
+            assert!(first.as_mut().poll(&mut cx).is_pending());
+
+            let done = Arc::new((Mutex::new(false), Condvar::new()));
+            let (run_tx, run_rx) = mpsc::channel();
+            let (queued_tx, queued_rx) = mpsc::channel();
+            let (s, b, d) = (store.clone(), blocks.clone(), done.clone());
+            let peer = std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                let mut work = Box::pin(async {
+                    if mutate {
+                        let mut table = b.lock().await;
+                        table
+                            .add_local(
+                                new,
+                                block_table::ClaimKind::Operator,
+                                "newer operator",
+                                block_table::local_ms(),
+                            )
+                            .unwrap();
+                    }
+                    let result = persist_now(&s, &b, Duration::from_secs(2)).await;
+                    Receipt {
+                        result,
+                        submitted: s.submitted(),
+                        durable: s.durable(),
+                        on_disk: state_store::read_state(s.path()).unwrap(),
+                    }
+                });
+                let wake = Waker::from(Arc::new(RunPeerAtUnlock {
+                    run: run_tx,
+                    done: d.clone(),
+                }));
+                {
+                    let _entered = rt.enter();
+                    assert!(work
+                        .as_mut()
+                        .poll(&mut Context::from_waker(&wake))
+                        .is_pending());
+                }
+                queued_tx.send(()).unwrap();
+                run_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                let next = {
+                    let _entered = rt.enter();
+                    work.as_mut().poll(&mut Context::from_waker(Waker::noop()))
+                };
+                *writable.0.lock().unwrap() = true;
+                writable.1.notify_all();
+                let receipt = match next {
+                    Poll::Ready(receipt) => receipt,
+                    Poll::Pending => rt.block_on(work),
+                };
+                *d.0.lock().unwrap() = true;
+                d.1.notify_all();
+                receipt
+            });
+            queued_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            drop(held); // wakes the first caller; the peer is next in the actual mutex queue
+            let generation = match first.as_mut().poll(&mut cx) {
+                Poll::Ready(Some(g)) => g,
+                _ => panic!("first handoff did not complete"),
+            };
+            assert!(generation > 0);
+            drop(first);
+            let receipt = peer.join().unwrap();
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(store.wait_durable(store.submitted(), Duration::from_secs(2)))
+                .unwrap();
+            let final_state = state_store::read_state(&path).unwrap().unwrap();
+            drop(store);
+            std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+            (receipt, final_state)
+        }
+
+        #[test]
+        fn a_newer_operator_snapshot_cannot_be_overwritten_by_an_older_capture() {
+            let (receipt, final_state) = ordered_capture_scenario(true);
+            assert!(receipt.result.is_ok());
+            assert!(receipt.submitted > 0 && receipt.durable >= receipt.submitted);
+            assert!(receipt
+                .on_disk
+                .unwrap()
+                .claims
+                .iter()
+                .any(|c| c.target == "198.51.100.111"));
+            assert!(final_state.claims.iter().any(|c| c.target == "198.51.100.111"),
+                "older capture got a newer generation and erased a durably acknowledged operator ban");
+        }
+
+        #[test]
+        fn a_clean_caller_cannot_acknowledge_an_unsubmitted_capture() {
+            let (receipt, final_state) = ordered_capture_scenario(false);
+            assert!(receipt.result.is_ok());
+            assert!(
+                receipt.submitted > 0 && receipt.durable >= receipt.submitted,
+                "clean caller acknowledged before the captured state was handed to the writer"
+            );
+            assert!(receipt
+                .on_disk
+                .unwrap()
+                .claims
+                .iter()
+                .any(|c| c.target == "198.51.100.110"));
+            assert!(final_state
+                .claims
+                .iter()
+                .any(|c| c.target == "198.51.100.110"));
         }
     }
 
