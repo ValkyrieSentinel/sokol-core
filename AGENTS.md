@@ -53,15 +53,12 @@ ones.
 - Documentation claims only what a named test, metric, flag or path shows;
   `scripts/check-claims.sh` checks that what is cited exists, not that it proves the claim.
 
-## Agent review
+## Review
 
-Every pull request gets a shadow review by a separate model session
-(`.github/workflows/agent-review.yml`, `scripts/agent_review.py`, ported from Stargate). It
-reads only the diff and the head export, publishes `sokol/agent-review` on the exact head
-(`pass` → success, `hold`/`deny` → failure, anything else → error) and lists its findings in
-the run summary. It is not a required check and certifies nothing. Its findings are evidence
-for the author and the merger, recorded on the head they were about. It needs the repository
-secret `CLAUDE_CODE_OAUTH_TOKEN`.
+Each pull request is reviewed by an agent before merge, and the review's findings belong in
+the pull request (a comment), tied to the head it was about: a review that leaves no record
+cannot be checked or reused. Human read-through runs in parallel and may lag; it is not a
+merge gate. Required checks are the CI jobs of `protect-main`.
 
 ## Removing things
 
