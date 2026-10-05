@@ -552,6 +552,10 @@ drops a torn record) and, once it can write again, records how many records were
 
 ## BGP Flowspec (upstream drops)
 
+The supported writer/namespace profile and limits are defined in
+[ADR-0020](docs/adr/0020-flowspec-profile-and-backend.md). Confirm these deployment
+preconditions before enabling FlowSpec; ownership communities alone do not isolate writers.
+
 With `--flowspec-gobgp /usr/local/bin/gobgp` every active block is announced as an RFC 8955
 Flowspec rule `match source <ip>/32 then discard` through a local
 [GoBGP](https://github.com/osrg/gobgp) daemon, so routers that accept Flowspec drop the traffic
