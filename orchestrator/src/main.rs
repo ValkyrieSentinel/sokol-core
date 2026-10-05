@@ -18,6 +18,7 @@
 )]
 pub use mesh_sync::{AlertLevel, MeshCommand, MeshOrchestrator};
 mod attack_reports;
+mod audit_witness;
 mod block_policy;
 mod block_table;
 mod clock_watch;
@@ -90,6 +91,9 @@ pub struct AuditHealth {
     lost: std::sync::atomic::AtomicU64,
     last_sync_ok_ms: std::sync::atomic::AtomicU64,
     failing: std::sync::atomic::AtomicBool,
+    /// (records, chain head) as of the last successful fsync: what peers may witness
+    /// (ADR-0021). A head not yet synced could still be lost to a crash.
+    durable_head: std::sync::Mutex<Option<(u64, [u8; common::audit_log::CHAIN_LEN])>>,
 }
 
 /// A point-in-time view of [`AuditHealth`].
@@ -212,6 +216,13 @@ impl AuditWriter {
                 self.health
                     .last_sync_ok_ms
                     .store(now_ms(), Ordering::Relaxed);
+                if let Some(log) = self.log.as_ref() {
+                    *self
+                        .health
+                        .durable_head
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner()) = Some((log.len(), log.head()));
+                }
                 if self.lost_pending == 0 && self.health.failing.swap(false, Ordering::Relaxed) {
                     log::warn!("[Audit] Log writable again; node no longer DEGRADED");
                 }
@@ -299,6 +310,15 @@ impl SentinelDb {
     pub fn overflow_total(&self) -> u64 {
         self.overflow_total
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// (records, chain head) of the audit log as of its last successful fsync.
+    pub fn durable_head(&self) -> Option<(u64, [u8; common::audit_log::CHAIN_LEN])> {
+        *self
+            .health
+            .durable_head
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
     }
 
     pub fn status(&self) -> AuditStatus {
@@ -464,6 +484,13 @@ struct Args {
     /// 2 incomplete/empty replay or invalid audit chain. Protected-set refusals are excluded.
     #[arg(long, value_name = "AUDIT_LOG")]
     replay: Option<std::path::PathBuf>,
+
+    /// Check this node's audit log (--db-path) against the heads a peer recorded for it in the
+    /// peer's audit log (ADR-0021), then exit. Exit status: 0 every checkable witness confirmed
+    /// (at least one), 1 a witness contradicted or records missing, 2 nothing checkable or a
+    /// log that does not verify.
+    #[arg(long, value_name = "PEER_AUDIT_LOG")]
+    verify_witnesses: Option<std::path::PathBuf>,
 
     /// Address or CIDR that must never be blocked (operator/bastion networks, mesh peers).
     /// Loopback, this node's addresses, default gateways and seed peers are always protected.
@@ -980,6 +1007,13 @@ async fn main() -> Result<(), anyhow::Error> {
     if let Some(path) = &args.replay {
         std::process::exit(replay::print_report(path, env!("SOKOL_BUILD_ID")));
     }
+    if let Some(peer_log) = &args.verify_witnesses {
+        std::process::exit(audit_witness::print_report(
+            std::path::Path::new(&args.db_path),
+            peer_log,
+            args.node_id,
+        ));
+    }
 
     let node_crypto = Arc::new(NodeCrypto::load_or_create(&args.key_file)?);
     if args.print_public_key {
@@ -1401,6 +1435,7 @@ async fn main() -> Result<(), anyhow::Error> {
     let (registry_mesh, crypto_mesh) = (peer_registry.clone(), node_crypto.clone());
     let sync_throttled = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let sync_throttled_mesh = sync_throttled.clone();
+    let witness_stats = Arc::new(mesh_dispatch::WitnessStats::default());
 
     producers.spawn(
         mesh_dispatch::MeshDispatch {
@@ -1414,6 +1449,8 @@ async fn main() -> Result<(), anyhow::Error> {
             snapshots: mesh_sync::Cooldown::new(SYNC_COOLDOWN),
             sync_throttled: sync_throttled_mesh,
             telemetry_tx: telemetry_tx_mesh,
+            witnesses: mesh_sync::Cooldown::new(mesh_sync::WITNESS_MIN_INTERVAL),
+            witness_stats: witness_stats.clone(),
         }
         .run(mesh_cmd_rx, local_cmd_rx),
     );
@@ -1858,6 +1895,8 @@ async fn main() -> Result<(), anyhow::Error> {
     let (registry_tick, crypto_tick) = (peer_registry.clone(), node_crypto.clone());
     let node_id_tick = args.node_id;
     let mut last_digest = std::time::Instant::now();
+    let mut last_audit_head = std::time::Instant::now();
+    let mut audit_head_sent: Option<u64> = None;
     let mut telemetry_window_start = std::time::Instant::now();
     let mut window_rx = 0u64;
     let mut window_dropped = 0u64;
@@ -1984,6 +2023,23 @@ async fn main() -> Result<(), anyhow::Error> {
                     let _ = registry_tick.broadcast(&cmd, node_id_tick, &crypto_tick).await;
                 }
 
+                // ADR-0021: peers keep this node's durable audit head in their own logs, so a
+                // rewrite of this log is contradicted by records this node cannot change.
+                if last_audit_head.elapsed() >= mesh_sync::AUDIT_HEAD_INTERVAL {
+                    last_audit_head = std::time::Instant::now();
+                    if let Some((records, head)) = sntl_db.durable_head() {
+                        if audit_head_sent != Some(records) {
+                            audit_head_sent = Some(records);
+                            let cmd = MeshCommand::AuditHead {
+                                issuer: node_id_tick,
+                                records,
+                                head: p2p::to_hex(&head),
+                            };
+                            let _ = registry_tick.broadcast(&cmd, node_id_tick, &crypto_tick).await;
+                        }
+                    }
+                }
+
                 let mode = if sntl_db.status().healthy
                     && state_store.healthy(now_ms())
                     && host_read_ok.load(std::sync::atomic::Ordering::Relaxed)
@@ -2065,6 +2121,9 @@ async fn main() -> Result<(), anyhow::Error> {
                     snapshot.mesh_frames_delayed = stats.frames_delayed.load(Ordering::Relaxed);
                     snapshot.mesh_sync_requests_throttled =
                         sync_throttled.load(Ordering::Relaxed);
+                    snapshot.audit_witnesses_recorded = witness_stats.recorded.load(Ordering::Relaxed);
+                    snapshot.audit_witnesses_refused = witness_stats.throttled.load(Ordering::Relaxed)
+                        + witness_stats.malformed.load(Ordering::Relaxed);
                     snapshot.mesh_dropped_urgent = stats.dropped_urgent.load(Ordering::Relaxed);
                     for (out, counter) in snapshot.mesh_rejected.iter_mut().zip(&stats.rejected) {
                         *out = counter.load(Ordering::Relaxed);

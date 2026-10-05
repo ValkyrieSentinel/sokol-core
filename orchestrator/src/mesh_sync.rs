@@ -49,6 +49,15 @@ pub enum MeshCommand {
     SyncRequest {
         issuer: u64,
     },
+    /// The sender's audit chain head after `records` durable records (ADR-0021), as 64 hex
+    /// digits. A receiver keeps it in its own audit log, so a later rewrite of the sender's log
+    /// (even with the chain recomputed) contradicts a record the sender cannot change. Sent
+    /// only to peers that announced the `audit-head` feature.
+    AuditHead {
+        issuer: u64,
+        records: u64,
+        head: String,
+    },
     /// Periodic load report of `node_id` (must be the authenticated sender).
     Telemetry {
         node_id: u64,
@@ -124,6 +133,11 @@ pub fn pack_snapshot(issuer: u64, claims: Vec<Claim>, retracted: Vec<ClaimId>) -
 
 /// How often each node sends its digest to its peers.
 pub const DIGEST_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
+/// How often this node offers its audit head to peers, when it changed (ADR-0021).
+pub const AUDIT_HEAD_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+/// At most one witness record per peer this often: what a peer can add to this node's audit
+/// log is bounded by the trust store, not by the peer's sending rate.
+pub const WITNESS_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// At most one expensive answer (a snapshot) per peer per `every`; a refused request is
 /// repeated by the peer's next digest mismatch, so nothing is lost.
@@ -176,9 +190,25 @@ impl MeshCommand {
             MeshCommand::Retract { issuer, .. }
             | MeshCommand::BlockSync { issuer, .. }
             | MeshCommand::Digest { issuer, .. }
-            | MeshCommand::SyncRequest { issuer } => Some(*issuer),
+            | MeshCommand::SyncRequest { issuer }
+            | MeshCommand::AuditHead { issuer, .. } => Some(*issuer),
             MeshCommand::Telemetry { node_id, .. } => Some(*node_id),
             MeshCommand::Alert { .. } => None,
+        }
+    }
+
+    /// The handshake feature a peer must have announced to be sent this command; peers
+    /// without it would refuse the frame and drop the connection. Exhaustive on purpose.
+    pub fn feature(&self) -> Option<&'static str> {
+        match self {
+            MeshCommand::AuditHead { .. } => Some(crate::p2p::FEATURE_AUDIT_HEAD),
+            MeshCommand::Claim { .. }
+            | MeshCommand::Retract { .. }
+            | MeshCommand::Alert { .. }
+            | MeshCommand::BlockSync { .. }
+            | MeshCommand::Digest { .. }
+            | MeshCommand::SyncRequest { .. }
+            | MeshCommand::Telemetry { .. } => None,
         }
     }
 }

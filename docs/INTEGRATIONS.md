@@ -448,6 +448,22 @@ A missing, reordered or edited segment makes it print `BROKEN` and exit 1. Someo
 access could rebuild the whole chain; to detect that, record the printed head somewhere the node
 cannot write (another host, a ticket, a timestamping service).
 
+Mesh peers do this for each other ([ADR-0021](adr/0021-audit-witnesses.md)): every 60 s, when its
+log grew, a node sends its fsynced head to peers that announced the `audit-head` feature, and
+each records it in its own log as `AUDIT_WITNESS|Issuer:<id>|Records:<n>|Head:<hex>` (at most one
+per peer per 30 s; `sokol_audit_witnesses_recorded_total`, `sokol_audit_witnesses_refused_total`).
+Check a node's log against a peer's witnesses:
+
+```shell
+sokol-orchestrator --db-path /var/lib/sokol/audit.log --node-id 1 --verify-witnesses peer-audit.log
+# peer record 812: head after 4031 records confirmed
+# witnesses for node 1: 1 confirmed, 0 contradicted, 0 missing, 0 pruned
+```
+
+`CONTRADICTED` means the log was rewritten after a peer witnessed it, even if its own chain
+still verifies; `MISSING` means records were removed. Exit status 0/1/2 as in `--help`. This
+catches a rewrite unless every witnessing peer's log was rewritten too.
+
 Records are fsynced at most 100 ms after the last successful sync (or every 64 records), however
 steady the stream of events. One writer per log: a second process opening the same `--db-path`
 is refused (`<db-path>.lock`).

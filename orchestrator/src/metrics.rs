@@ -55,6 +55,8 @@ pub struct Snapshot {
     pub mesh_handshake_timeouts: u64,
     pub mesh_frames_delayed: u64,
     pub mesh_sync_requests_throttled: u64,
+    pub audit_witnesses_recorded: u64,
+    pub audit_witnesses_refused: u64,
     pub mesh_dropped_urgent: u64,
     /// Envelopes refused, in `p2p::EnvelopeError::LABELS` order.
     pub mesh_rejected: [u64; 5],
@@ -383,7 +385,7 @@ fn render_at(s: &Snapshot, now: Instant) -> String {
         family(&mut out, name, "gauge", help);
         let _ = writeln!(out, "{} {:.6}", name, value);
     }
-    let counters: [(&str, &str, u64); 4] = [
+    let counters: [(&str, &str, u64); 6] = [
         (
             "sokol_mesh_handshakes_refused_total",
             "Connections refused: too many not yet authenticated (in total or from one address).",
@@ -403,6 +405,16 @@ fn render_at(s: &Snapshot, now: Instant) -> String {
             "sokol_mesh_sync_requests_throttled_total",
             "Snapshot requests not answered because the peer got one less than 5 s ago.",
             s.mesh_sync_requests_throttled,
+        ),
+        (
+            "sokol_audit_witnesses_recorded_total",
+            "Peers' audit heads recorded in this node's audit log (ADR-0021).",
+            s.audit_witnesses_recorded,
+        ),
+        (
+            "sokol_audit_witnesses_refused_total",
+            "Peers' audit heads not recorded: more than one per peer per 30 s, or malformed.",
+            s.audit_witnesses_refused,
         ),
     ];
     for (name, help, value) in counters {

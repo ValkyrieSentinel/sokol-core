@@ -33,6 +33,25 @@ pub struct MeshDispatch<B: Blocklist, M: ConfigMap> {
     pub snapshots: mesh_sync::Cooldown,
     pub sync_throttled: Arc<AtomicU64>,
     pub telemetry_tx: mpsc::Sender<NodeTelemetry>,
+    /// At most one witness per peer per WITNESS_MIN_INTERVAL (ADR-0021).
+    pub witnesses: mesh_sync::Cooldown,
+    pub witness_stats: Arc<WitnessStats>,
+}
+
+/// Peers' audit heads recorded in this node's log, and those not recorded (ADR-0021).
+#[derive(Default)]
+pub struct WitnessStats {
+    pub recorded: AtomicU64,
+    pub throttled: AtomicU64,
+    pub malformed: AtomicU64,
+}
+
+/// A chain head as the mesh carries it: 64 lowercase hex digits.
+fn valid_head(head: &str) -> bool {
+    head.len() == 64
+        && head
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 impl<B: Blocklist + Send + 'static, M: ConfigMap + 'static> MeshDispatch<B, M> {
@@ -233,6 +252,31 @@ impl<B: Blocklist + Send + 'static, M: ConfigMap + 'static> MeshDispatch<B, M> {
                     .await;
                 }
             }
+            MeshCommand::AuditHead {
+                issuer,
+                records,
+                head,
+            } => {
+                // The transport bound `issuer` to the authenticated sender. The record is this node's
+                // statement of what that peer said; it is kept under this node's own chain.
+                if !valid_head(&head) {
+                    self.witness_stats.malformed.fetch_add(1, Ordering::Relaxed);
+                    log::warn!(
+                        "[Audit] Node {} sent a malformed audit head; not recorded",
+                        issuer
+                    );
+                    return;
+                }
+                if !self.witnesses.allow(issuer, std::time::Instant::now()) {
+                    self.witness_stats.throttled.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+                self.db.append(format!(
+                    "AUDIT_WITNESS|Issuer:{}|Records:{}|Head:{}",
+                    issuer, records, head
+                ));
+                self.witness_stats.recorded.fetch_add(1, Ordering::Relaxed);
+            }
             MeshCommand::Alert { level, message } => {
                 log::info!("[MESH ALERT {:?}] {}", level, message);
             }
@@ -366,6 +410,8 @@ mod tests {
             snapshots: mesh_sync::Cooldown::new(Duration::from_secs(10)),
             sync_throttled: Arc::default(),
             telemetry_tx,
+            witnesses: mesh_sync::Cooldown::new(mesh_sync::WITNESS_MIN_INTERVAL),
+            witness_stats: Arc::default(),
         };
         Node {
             dispatch,
@@ -497,6 +543,49 @@ mod tests {
         assert!(claims
             .iter()
             .any(|c| c.issuer == NODE && c.target == "198.51.100.24"));
+    }
+
+    /// ADR-0021: a peer's audit head is kept in this node's log, at most once per peer per
+    /// WITNESS_MIN_INTERVAL, and a malformed one is not kept at all.
+    #[tokio::test]
+    async fn a_peers_audit_head_is_witnessed_once_per_interval() {
+        let mut n = node("witness", None);
+        let head = |c: char| c.to_string().repeat(64);
+        for (issuer, h) in [
+            (PEER, head('a')),
+            (PEER, head('b')),
+            (3, head('c')),
+            (4, "XYZ".into()),
+        ] {
+            n.dispatch
+                .peer(MeshCommand::AuditHead {
+                    issuer,
+                    records: 42,
+                    head: h,
+                })
+                .await;
+        }
+        let witnessed: Vec<String> = n
+            .audit()
+            .into_iter()
+            .filter(|r| r.starts_with("AUDIT_WITNESS|"))
+            .collect();
+        assert_eq!(
+            witnessed,
+            vec![
+                format!("AUDIT_WITNESS|Issuer:2|Records:42|Head:{}", head('a')),
+                format!("AUDIT_WITNESS|Issuer:3|Records:42|Head:{}", head('c')),
+            ]
+        );
+        let s = &n.dispatch.witness_stats;
+        assert_eq!(
+            (
+                s.recorded.load(Ordering::Relaxed),
+                s.throttled.load(Ordering::Relaxed),
+                s.malformed.load(Ordering::Relaxed)
+            ),
+            (2, 1, 1)
+        );
     }
 
     #[tokio::test]

@@ -607,6 +607,75 @@ pub fn verify_chain(path: &Path) -> Result<ChainSummary, ChainVerifyError> {
     })
 }
 
+/// What this node's own log says about a head another node recorded for it (ADR-0021).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WitnessVerdict {
+    /// After the witnessed number of records the chain is the witnessed head.
+    Confirmed,
+    /// That record exists and its chain differs: the log was rewritten after it was witnessed
+    /// (the chain may still verify on its own, if every later record was recomputed).
+    Contradicted([u8; CHAIN_LEN]),
+    /// The log now has fewer records than were witnessed: records were removed.
+    Missing,
+    /// The record lies in a rotated segment that was pruned; nothing can be said.
+    Pruned,
+}
+
+/// Checks heads that peers witnessed for the log at `path`: each `(records, head)` says "after
+/// `records` records the chain was `head`". The log's own chain is verified first; a log that
+/// does not verify is not checked at all. A recomputed chain verifies on its own; only a head
+/// kept somewhere its writer could not change exposes it.
+pub fn check_witnesses(
+    path: &Path,
+    witnessed: &[(u64, [u8; CHAIN_LEN])],
+) -> Result<Vec<WitnessVerdict>, ChainVerifyError> {
+    let summary = verify_chain(path)?;
+    let wanted: std::collections::HashSet<u64> = witnessed
+        .iter()
+        .filter(|(n, _)| *n > 0 && *n <= summary.next_seq && *n > summary.first_seq)
+        .map(|(n, _)| n - 1)
+        .collect();
+    let mut found = std::collections::HashMap::new();
+    let mut files: Vec<PathBuf> = rotated_segments(path)
+        .map_err(|e| ChainVerifyError::unverified(path, e))?
+        .into_iter()
+        .map(|(_, p)| p)
+        .collect();
+    files.push(path.to_path_buf());
+    for file in &files {
+        let mut reader =
+            AuditReader::open(file).map_err(|e| ChainVerifyError::unverified(file, e))?;
+        while let Some(record) = reader
+            .next_record()
+            .map_err(|e| ChainVerifyError::record(file, e))?
+        {
+            if wanted.contains(&record.seq) {
+                found.insert(record.seq, record.chain);
+            }
+        }
+    }
+    Ok(witnessed
+        .iter()
+        .map(|&(n, head)| {
+            if n == 0 {
+                return if head == [0u8; CHAIN_LEN] {
+                    WitnessVerdict::Confirmed
+                } else {
+                    WitnessVerdict::Contradicted([0u8; CHAIN_LEN])
+                };
+            }
+            if n > summary.next_seq {
+                return WitnessVerdict::Missing;
+            }
+            match found.get(&(n - 1)) {
+                Some(chain) if *chain == head => WitnessVerdict::Confirmed,
+                Some(chain) => WitnessVerdict::Contradicted(*chain),
+                None => WitnessVerdict::Pruned,
+            }
+        })
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -624,6 +693,67 @@ mod tests {
             out.push(r);
         }
         Ok(out)
+    }
+
+    /// Writes `payloads` as a fresh log at `path` (a writer with full access rebuilding it).
+    fn write_log(path: &Path, payloads: &[&str]) -> (u64, [u8; CHAIN_LEN]) {
+        let _ = std::fs::remove_file(path);
+        let mut log = AuditLog::open(path).unwrap();
+        for p in payloads {
+            log.append(p.as_bytes()).unwrap();
+        }
+        log.sync().unwrap();
+        (log.len(), log.head())
+    }
+
+    /// ADR-0021: a writer who rewrites the log and recomputes every later record passes
+    /// `verify_chain` on its own; a head a peer kept from before the rewrite exposes it.
+    #[test]
+    fn a_witnessed_head_exposes_a_recomputed_rewrite_that_the_chain_alone_accepts() {
+        let path = temp_path("witness");
+        let original = [
+            "BLOCK|IP:198.51.100.1",
+            "BLOCK|IP:198.51.100.2",
+            "UNBLOCK|IP:198.51.100.1",
+        ];
+        let witnessed = write_log(&path, &original);
+        let early = (1, read_all(&path).unwrap()[0].chain);
+        assert_eq!(
+            check_witnesses(&path, &[witnessed, early, (0, [0; CHAIN_LEN])]).unwrap(),
+            vec![WitnessVerdict::Confirmed; 3]
+        );
+
+        // The second decision is erased and the whole chain recomputed.
+        write_log(
+            &path,
+            &[
+                "BLOCK|IP:198.51.100.1",
+                "BLOCK|IP:203.0.113.9",
+                "UNBLOCK|IP:198.51.100.1",
+            ],
+        );
+        assert!(
+            verify_chain(&path).is_ok(),
+            "the recomputed chain verifies on its own"
+        );
+        let verdicts = check_witnesses(&path, &[witnessed, early]).unwrap();
+        // Rebuilt records carry new timestamps, which the chain covers: even the first record,
+        // whose payload is unchanged, now has another chain value.
+        assert!(
+            verdicts
+                .iter()
+                .all(|v| matches!(v, WitnessVerdict::Contradicted(_))),
+            "{:?}",
+            verdicts
+        );
+
+        // Records removed after they were witnessed.
+        write_log(&path, &original[..2]);
+        assert_eq!(
+            check_witnesses(&path, &[witnessed]).unwrap(),
+            vec![WitnessVerdict::Missing]
+        );
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
     #[test]
