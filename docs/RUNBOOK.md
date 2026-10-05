@@ -46,6 +46,12 @@ SOKOL_ARGS=--interface eth0 --node-id 1 --peers-file /etc/sokol/peers.json \
 - Метрики вмикаються лише з `--metrics-bind`.
 - Синхронізація часу (chrony або NTP) обов'язкова.
 
+Якщо додаєте `--flowspec-gobgp`, до увімкнення перевірте deployment-передумови
+[ADR-0020](adr/0020-flowspec-profile-and-backend.md): власника community, фактичні
+IDs керованих шляхів і розподіл NLRI між writers або зовнішню серіалізацію з
+урахуванням RPC з невідомим результатом. Це перевірка оператора; Sokol не
+підтверджує ексклюзивне володіння зі значення health. Діагностика — у §5.7.
+
 ## 2. Ключі й піри
 
 ```shell
@@ -254,11 +260,6 @@ ctl ACCEPT_STATE_LOSS             # "OK state loss accepted"; вузол вих�
 - Повтори прийнятих подій безпечні: вузол відповідає `OK duplicate`.
 
 ### 5.7 FlowSpec: кількість правил є, свіжого читання немає
-
-До увімкнення перевірте deployment-передумови [ADR-0020](adr/0020-flowspec-profile-and-backend.md):
-власника community, фактичні IDs керованих шляхів і розподіл NLRI між writers або
-зовнішню серіалізацію з урахуванням RPC з невідомим результатом. Це перевірка
-оператора; Sokol не підтверджує ексклюзивне володіння зі значення health.
 
 Зчитайте одну HTTP-відповідь `/metrics`: `sokol_flowspec_announced` містить
 останню успішно спостережену кількість власних source-prefix правил у локальному RIB.

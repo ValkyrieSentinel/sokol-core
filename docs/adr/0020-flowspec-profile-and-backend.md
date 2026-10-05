@@ -54,12 +54,14 @@ Runtime-зміна потребує відтвореного порушення 
 
 ## gRPC як окремий кандидат
 
-У закріпленому [API GoBGP](https://github.com/osrg/gobgp/blob/01c5c4c27f9a1ac3b5927f433b5115f9b0eee791/proto/api/gobgp.proto#L280-L296)
-AddPath повертає UUID, DeletePath може адресувати його; Path також має identifiers.
+У закріпленому [API GoBGP](https://github.com/osrg/gobgp/blob/01c5c4c27f9a1ac3b5927f433b5115f9b0eee791/proto/api/gobgp.proto#L303-L321)
+AddPath повертає UUID, DeletePath може адресувати його;
+[Path](https://github.com/osrg/gobgp/blob/01c5c4c27f9a1ac3b5927f433b5115f9b0eee791/proto/api/gobgp.proto#L670-L692) також має identifiers.
 Проте AddPath не приймає очікуваної версії попереднього RIB. У
-[server](https://github.com/osrg/gobgp/blob/01c5c4c27f9a1ac3b5927f433b5115f9b0eee791/pkg/server/server.go#L2394-L2502)
+[server](https://github.com/osrg/gobgp/blob/01c5c4c27f9a1ac3b5927f433b5115f9b0eee791/pkg/server/server.go#L2533-L2645)
 це окремі операції, не CAS між ListPath і AddPath. Точніше адресування не усуває
-невідомого результату чи потреби readback. Не всі виправлення контролера були
+невідомого результату чи потреби readback; UUID сам не підтверджує ownership.
+Не всі виправлення контролера були
 спричинені CLI: актуальність наміру, health і бюджет потрібні з будь-яким backend.
 
 Експеримент відкриваємо, якщо конкретному deployment потрібні точні identifiers
