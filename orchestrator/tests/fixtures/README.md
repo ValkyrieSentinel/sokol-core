@@ -12,7 +12,7 @@ Local Darwin binaries were built with Go 1.27.1 from
 Canonical CI uses its existing checksum-pinned Linux 4.9.0 binaries instead and
 executes the production reconciliation against a real daemon for both families.
 Captures are parser fixtures; they do not establish upstream enforcement or a
-conditional-write guarantee. See FLOWSPEC-R3 in `docs/DETECTOR_INVARIANTS.md`.
+conditional-write guarantee. See FLOWSPEC-R3 in `docs/INVARIANTS.md`.
 
 ## Empty standard communities
 

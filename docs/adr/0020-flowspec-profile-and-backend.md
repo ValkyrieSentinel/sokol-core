@@ -84,9 +84,9 @@ IPv4/IPv6, чужі й hidden-ID paths, конкурентний запис, в�
 ## Перевірка рішення
 
 Чинний контракт реалізують `orchestrator/src/flowspec.rs`, ADR-0008 і сценарії
-[DETECTOR_INVARIANTS](../DETECTOR_INVARIANTS.md); обов'язкові native x86/ARM CI й
+[INVARIANTS](../INVARIANTS.md); обов'язкові native x86/ARM CI й
 Stargate shadow лишаються незмінними. Цей ADR не додає runtime чи нових повноважень.
 Відповідальний оператор має записати NIC/driver, навантаження, SLO/RPO/RTO,
 допустиму шкоду false positive та результати за [RUNBOOK](../RUNBOOK.md).
-Захист main потребує окремої активації власником/admin; агентне рев'ю не є
-GitHub enforcement ([поточне розмежування](../STRATEGY_REVIEW_2026-10-03.md)).
+`main` захищено ruleset `protect-main` (обов'язкові CI-перевірки, без approve);
+агентне рев'ю PR не є GitHub enforcement.
