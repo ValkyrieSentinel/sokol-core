@@ -35,9 +35,14 @@ scripts/check-claims.sh && scripts/check-retired.sh
 ```
 
 The full `cargo test`, clippy over all targets and the XDP smoke need the eBPF object first:
-`cd ebpf && cargo build --release --locked` (bpf-linker, see README). CI runs everything on
-x86_64 and arm64 in about 20 minutes, so prefer fewer, complete pull requests over many small
-ones.
+`cd ebpf && cargo build --release --locked` (bpf-linker, see README).
+
+**Run CI before pushing:** `scripts/local-ci.sh` runs the CI job on this host in the same order,
+with the pins and checksums read from `ci.yml` (bpf-linker, GoBGP, cargo-deny), including the
+XDP smoke, the demo and the runbook rehearsal (sudo). `--quick` stops after the Python
+regressions. The smoke greps log lines and audit records; a changed message is a failed check
+there, not in the unit tests. CI runs everything on x86_64 and arm64 in about 20 minutes, so
+prefer fewer, complete pull requests over many small ones.
 
 ## Changing code
 

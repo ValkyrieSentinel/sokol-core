@@ -1170,12 +1170,12 @@ if command -v wg >/dev/null && ip link add sokol-wgprobe type wireguard 2>/dev/n
     ip addr add "$ATTACK_SRC/24" dev "$HOST_IF"
 
     P2P_BIND=10.99.0.1:7946 start_orchestrator --node-id 1 --peers-file "$WORK/peers-n1.json" \
-        --storm-threshold 0.4 --never-block 10.99.0.2
+        --storm-threshold 0.4 --never-block 10.99.0.2 --audit-head-secs 2
     ip netns exec "$NS" "$BIN" --interface "$PEER_IF" --node-id 2 --block "$ATTACK_SRC" \
         --db-path "$WORK/n2/events.log" --key-file "$WORK/n2/node.key" \
         --ipc-socket "$WORK/n2/ipc.sock" --control-socket "$WORK/n2/control.sock" \
         --p2p-bind 10.99.0.2:7946 --seed-peer 10.99.0.1:7946 --peers-file "$WORK/n2/peers.json" \
-        --metrics-bind 127.0.0.1:9470 --attack-drops-per-sec 20 >"$WORK/n2/node.log" 2>&1 &
+        --metrics-bind 127.0.0.1:9470 --attack-drops-per-sec 20 --audit-head-secs 2 >"$WORK/n2/node.log" 2>&1 &
     NODE2_PID=$!
     n2_metric() {
         ip netns exec "$NS" curl -s http://127.0.0.1:9470/metrics | awk -v m="$1" '$1 == m { print $2 }'
@@ -1245,9 +1245,18 @@ PY
     check "storm over: node 1 returns to normal mode" grep -aq "DEFENSE_MODE|Normal" "$WORK/events.sntl"
     BEFORE=$(malformed); send_truncated_v6 10; sleep 1.2
     check "normal mode: unparsable headers pass to the stack again" test "$(malformed)" -eq "$BEFORE"
+    # ADR-0021: each node keeps the other's fsynced audit head in its own log.
+    check "audit witnesses: node 1 recorded node 2's heads" \
+        bash -c "test \"\$(curl -s http://127.0.0.1:9469/metrics | awk '\$1==\"sokol_audit_witnesses_recorded_total\"{print \$2}')\" -gt 0"
+    check "audit witnesses: node 2 keeps node 1's head in its own log" grep -aq "AUDIT_WITNESS|Issuer:1|" "$WORK/n2/events.log"
     kill "$NODE2_PID" 2>/dev/null || true
+    wait "$NODE2_PID" 2>/dev/null || true
     NODE2_PID=""
     stop_orchestrator
+    # Both logs closed: node 1's log checked against node 2's witnesses with the real CLI.
+    check "audit witnesses: node 1's log is confirmed by node 2's witnesses" \
+        bash -c "\"$BIN\" --db-path '$WORK/events.sntl' --node-id 1 --verify-witnesses '$WORK/n2/events.log' | tee '$WORK/witness.txt' | grep -Eq '[1-9][0-9]* confirmed, 0 contradicted, 0 missing'"
+    cat "$WORK/witness.txt" | tail -1 || true
 else
     skip wireguard "two-node WireGuard mesh checks (no wireguard support)"
 fi

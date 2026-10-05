@@ -65,3 +65,7 @@
   `a_handshake_without_features_still_parses`: сумісність зі старими вузлами.
 - Мутації «порівнювати без голови», «слати всім пірам», «без межі частоти» валять відповідні
   тести.
+- Живий меш у XDP smoke (два вузли через WireGuard, `--audit-head-secs 2`): кожен вузол
+  записує голови іншого («audit witnesses: node 1 recorded node 2's heads», «node 2 keeps node 1's
+  head in its own log»), а після зупинки обох справжній `--verify-witnesses` підтверджує журнал
+  вузла 1 свідченнями вузла 2 («node 1's log is confirmed by node 2's witnesses»).
