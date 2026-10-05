@@ -148,6 +148,22 @@ implementation called by the node (`enforce_block_local`) and by audit replay (A
 |---|---|---|
 | NODE-D1 | A detection checks its event id, adds or merges the claim, then records the event, under one table lock. A resend of an event acted on within EVENT_MEMORY is a duplicate. A refused detection (here: the known-claims cap) records no event and counts no strike: a resend after capacity frees is decided afresh, and the next block of that target gets the TTL of its first strike. | `a_detection_refused_at_capacity_leaves_no_event_and_no_strike` (mutations "remember the event first" and "count the strike first" each fail it). |
 
+## Audit witnesses (ADR-0021)
+
+Owners: `check_witnesses` in [audit_log.rs](../common/src/audit_log.rs),
+[audit_witness.rs](../orchestrator/src/audit_witness.rs), the `AuditHead` arm of
+[mesh_dispatch.rs](../orchestrator/src/mesh_dispatch.rs), `PeerRegistry::broadcast`.
+
+| ID | Invariant and enforcement point | Executable evidence |
+|---|---|---|
+| AUDIT-W1 | A head witnessed for "after N records" is compared with this log's record N-1 after both chains verify. A different chain value is a contradiction even when the rewritten chain verifies on its own; fewer records than witnessed is missing; a pruned record is unknown, never confirmed. | `a_witnessed_head_exposes_a_recomputed_rewrite_that_the_chain_alone_accepts`, `a_peers_witness_confirms_the_log_and_exposes_a_recomputed_rewrite` (mutation "compare without the head" fails both). |
+| AUDIT-W2 | Only a fsynced head is offered. A peer adds at most one witness record per WITNESS_MIN_INTERVAL to this log, and a head that is not 64 lowercase hex is not recorded; both refusals are counted. | `a_peers_audit_head_is_witnessed_once_per_interval` (mutation "no interval" fails it). |
+| AUDIT-W3 | `AuditHead` goes only to peers whose handshake announced `audit-head`; a handshake without `features` parses (older nodes). Other commands go to every peer as before. | `feature_commands_reach_only_peers_that_announced_the_feature`, `a_handshake_without_features_still_parses` (mutation "send to all" fails the first). |
+
+Not claimed: protection against rewriting every witness's log as well, the truth of a
+recorded decision, the unwitnessed tail (up to one interval plus fsync), pruned segments, or
+an anchor outside the operator's mesh.
+
 ## Node retraction admission
 
 Owner: [BlockTable::retract_detection](../orchestrator/src/block_table.rs),

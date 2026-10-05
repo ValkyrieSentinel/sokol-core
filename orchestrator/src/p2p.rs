@@ -757,13 +757,20 @@ pub enum NetworkMessage {
     Ping,
     Pong,
     /// First message on a connection; `wire_min..=wire_max` are the wire versions the sender
-    /// speaks.
+    /// speaks. `features` names optional commands it understands; a node that predates the field
+    /// sends none (serde default) and ignores it when received, so announcing one changes nothing
+    /// for older peers.
     Handshake {
         node_id: u64,
         wire_min: u8,
         wire_max: u8,
+        #[serde(default)]
+        features: Vec<String>,
     },
 }
+
+/// This node understands `MeshCommand::AuditHead` (ADR-0021).
+pub const FEATURE_AUDIT_HEAD: &str = "audit-head";
 
 impl NetworkMessage {
     pub fn handshake(node_id: u64) -> Self {
@@ -771,6 +778,7 @@ impl NetworkMessage {
             node_id,
             wire_min: WIRE_VERSION_MIN,
             wire_max: WIRE_VERSION_MAX,
+            features: vec![FEATURE_AUDIT_HEAD.to_string()],
         }
     }
 }
@@ -918,6 +926,8 @@ fn check_canonical(payload: &str) -> Result<(), common::canonical::CanonicalErro
 pub struct PeerLink {
     pub urgent: mpsc::Sender<SecureEnvelope>,
     pub bulk: mpsc::Sender<SecureEnvelope>,
+    /// Features the peer announced in its handshake (empty until then).
+    pub features: Arc<[String]>,
 }
 
 pub const URGENT_QUEUE: usize = 256;
@@ -1119,6 +1129,12 @@ impl PeerRegistry {
         let peers = self.peers.read().await;
         let mut by_node: HashMap<u64, Vec<(u64, &SocketAddr, &PeerLink)>> = HashMap::new();
         for (addr, (link, id, conn)) in peers.iter() {
+            // A peer that did not announce the command's feature would drop the connection.
+            if let Some(feature) = command.feature() {
+                if !link.features.iter().any(|f| f == feature) {
+                    continue;
+                }
+            }
             by_node.entry(*id).or_default().push((*conn, addr, link));
         }
         let urgent = command.urgent();
@@ -1326,6 +1342,7 @@ async fn run_connection(
     let link = PeerLink {
         urgent: tx.clone(),
         bulk: bulk_tx,
+        features: Arc::from(Vec::new()),
     };
 
     let handshake = seal(&crypto, node_id, &NetworkMessage::handshake(node_id))?;
@@ -1536,6 +1553,7 @@ async fn handle_reader_loop(
                     node_id,
                     wire_min,
                     wire_max,
+                    features,
                 },
             ) => {
                 let version = match negotiate(wire_min, wire_max) {
@@ -1565,9 +1583,11 @@ async fn handle_reader_loop(
                     bail!("peer presented this node's own identity");
                 }
                 authenticated_peer = Some(node_id);
-                registry
-                    .add_peer(peer_addr, link.clone(), node_id, conn_id)
-                    .await;
+                let link = PeerLink {
+                    features: features.into(),
+                    ..link.clone()
+                };
+                registry.add_peer(peer_addr, link, node_id, conn_id).await;
                 spawn_ping_loop(writer_tx.clone(), local_node_id, crypto.clone());
             }
             (None, _) => bail!("first message was not a handshake"),
@@ -1631,6 +1651,7 @@ mod tests {
         PeerLink {
             urgent: tx.clone(),
             bulk: tx,
+            features: Arc::from(vec![FEATURE_AUDIT_HEAD.to_string()]),
         }
     }
 
@@ -1760,6 +1781,52 @@ mod tests {
                 (other, _) => panic!("unexpected delivery: {:?}", other.is_ok()),
             }
         }
+    }
+
+    /// ADR-0021: a command that needs a handshake feature goes only to peers that announced it;
+    /// an older peer would refuse the frame and drop the connection. Others still go to all.
+    #[tokio::test]
+    async fn feature_commands_reach_only_peers_that_announced_the_feature() {
+        let me = NodeCrypto::generate();
+        let registry = PeerRegistry::new(TrustStore::default());
+        let (new_tx, mut new_rx) = mpsc::channel(4);
+        let (old_tx, mut old_rx) = mpsc::channel(4);
+        registry
+            .add_peer("127.0.0.1:1".parse().unwrap(), one_queue(new_tx), 2, 1)
+            .await;
+        let old = PeerLink {
+            features: Arc::from(Vec::new()),
+            ..one_queue(old_tx)
+        };
+        registry
+            .add_peer("127.0.0.1:2".parse().unwrap(), old, 3, 2)
+            .await;
+        let head = MeshCommand::AuditHead {
+            issuer: 1,
+            records: 7,
+            head: "0".repeat(64),
+        };
+        registry.broadcast(&head, 1, &me).await.unwrap();
+        assert!(
+            new_rx.try_recv().is_ok(),
+            "the peer that announced audit-head gets it"
+        );
+        assert!(old_rx.try_recv().is_err(), "an older peer does not");
+        let alert = MeshCommand::Alert {
+            level: crate::mesh_sync::AlertLevel::Info,
+            message: "x".into(),
+        };
+        registry.broadcast(&alert, 1, &me).await.unwrap();
+        assert!(new_rx.try_recv().is_ok() && old_rx.try_recv().is_ok());
+    }
+
+    /// An older node's handshake has no `features` field and still parses (serde default).
+    #[test]
+    fn a_handshake_without_features_still_parses() {
+        let old: NetworkMessage =
+            serde_json::from_str(r#"{"Handshake":{"node_id":5,"wire_min":2,"wire_max":2}}"#)
+                .unwrap();
+        assert!(matches!(old, NetworkMessage::Handshake { features, .. } if features.is_empty()));
     }
 
     /// R26-02: every snapshot message, sealed and framed for real, fits the receiver's frame
@@ -2775,6 +2842,7 @@ mod tests {
             node_id: 2,
             wire_min: WIRE_VERSION_MAX + 1,
             wire_max: WIRE_VERSION_MAX + 2,
+            features: vec![],
         };
         let mut stream = TcpStream::connect(addr).await.unwrap();
         for msg in [future, NetworkMessage::Ping] {
@@ -3313,7 +3381,11 @@ mod tests {
         registry
             .add_peer(
                 "127.0.0.1:9".parse().unwrap(),
-                PeerLink { urgent, bulk },
+                PeerLink {
+                    urgent,
+                    bulk,
+                    features: Arc::from(vec![]),
+                },
                 2,
                 1,
             )
