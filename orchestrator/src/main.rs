@@ -869,33 +869,28 @@ async fn enforce_block_local<B: block_table::Blocklist>(
     if let Some(r) = requested {
         context.push_str(&format!("|Ttl:{}", r.as_secs()));
     }
-    let added = {
+    // One step under the table lock (event, strike and claim together, so no state save sees
+    // one without the others); the same step audit replay takes (ADR-0016).
+    let (detected, shares_own) = {
         let mut table = blocks.lock().await;
-        // Checked and recorded under the same lock as the strike, so no state save sees one
-        // without the other.
-        if let Some((source, id)) = event {
-            if !table.first_sighting(source, id, now) {
-                log::info!(
-                    "[Local Security] {} event {} for {} already handled",
-                    source,
-                    id,
-                    shown
-                );
-                drop(table);
-                sntl_db.append(format!("SIGNAL_DUPLICATE|IP:{}|{}", shown, context));
-                return Enforcement::Duplicate;
-            }
-        }
-        let key = event.map(|(source, id)| block_table::event_key(source, id));
-        (
-            table.add_detection(ip, reason, now, key, requested),
-            table.shares_own(),
-        )
+        let detected = table.detect(ip, reason, now, event, requested);
+        (detected, table.shares_own())
     };
-    let (added, shares_own) = added;
-    let added = match added {
-        Ok(added) => added,
-        Err(why) => {
+    let added = match detected {
+        block_table::Detected::Duplicate => {
+            // The exact wording is an operator-facing contract (xdp-smoke greps it).
+            let (source, id) = event.unwrap_or_default();
+            log::info!(
+                "[Local Security] {} event {} for {} already handled",
+                source,
+                id,
+                shown
+            );
+            sntl_db.append(format!("SIGNAL_DUPLICATE|IP:{}|{}", shown, context));
+            return Enforcement::Duplicate;
+        }
+        block_table::Detected::Added(added) => added,
+        block_table::Detected::Refused(why) => {
             log::error!("[Local Security] Not blocking {}: {}", shown, why);
             sntl_db.append(format!(
                 "BLOCK_REFUSED|IP:{}|Why:{}|Reason:{}|{}",

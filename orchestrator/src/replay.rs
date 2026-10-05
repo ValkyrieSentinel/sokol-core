@@ -357,19 +357,14 @@ fn decide(
 ) -> String {
     table.tick(at);
     let event = event.and_then(|e| e.split_once('/'));
-    if let Some((source, id)) = event {
-        if !table.first_sighting(source, id, at) {
-            return "duplicate".into();
-        }
-    }
-    let key = event.map(|(source, id)| crate::block_table::event_key(source, id));
-    match table.add_detection(net, reason, at, key, requested) {
-        Ok(added) => format!(
+    match table.detect(net, reason, at, event, requested) {
+        crate::block_table::Detected::Duplicate => "duplicate".into(),
+        crate::block_table::Detected::Added(added) => format!(
             "{} {}",
             ttl_label(added.ttl),
             if added.new { "new" } else { "merged" }
         ),
-        Err(why) => format!("refused {}", why),
+        crate::block_table::Detected::Refused(why) => format!("refused {}", why),
     }
 }
 

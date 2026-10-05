@@ -378,6 +378,15 @@ pub struct Added {
     pub new: bool,
 }
 
+/// What a detector's signal did under the table lock (`BlockTable::detect`).
+pub enum Detected {
+    /// The same (source, event id) was acted on within EVENT_MEMORY; nothing changed.
+    Duplicate,
+    Added(Added),
+    /// Refused before any state changed: no event remembered, no strike counted.
+    Refused(&'static str),
+}
+
 /// Result of offering a peer's claim.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Adoption {
@@ -775,10 +784,9 @@ impl<B: Blocklist> BlockTable<B> {
         result
     }
 
-    /// Remembers a detector event; false if the same (source, event id) was seen within
-    /// EVENT_MEMORY. The caller checks this and adds the claim under one lock, so a replay
-    /// after a lost ACK or an adapter restart adds no strike.
-    pub fn first_sighting(&mut self, source: &str, event: &str, now_ms: u64) -> bool {
+    /// Whether this (source, event id) was recorded within EVENT_MEMORY. Forgets older events
+    /// first; records nothing.
+    fn event_seen(&mut self, source: &str, event: &str, now_ms: u64) -> bool {
         while let Some(&(key, seen)) = self.event_order.front() {
             if now_ms.saturating_sub(seen) <= ms(EVENT_MEMORY) {
                 break;
@@ -788,10 +796,12 @@ impl<B: Blocklist> BlockTable<B> {
                 self.events.remove(&key);
             }
         }
+        self.events.contains_key(&event_key(source, event))
+    }
+
+    /// Records an event the table acted on, making room in MAX_EVENTS by forgetting the oldest.
+    fn record_event(&mut self, source: &str, event: &str, now_ms: u64) {
         let key = event_key(source, event);
-        if self.events.contains_key(&key) {
-            return false;
-        }
         while self.events.len() >= MAX_EVENTS {
             let Some((old, seen)) = self.event_order.pop_front() else {
                 break;
@@ -804,7 +814,48 @@ impl<B: Blocklist> BlockTable<B> {
         self.events.insert(key, now_ms);
         self.event_order.push_back((key, now_ms));
         self.dirty = true;
+    }
+
+    /// Remembers a detector event; false if the same (source, event id) was seen within
+    /// EVENT_MEMORY. Used where seeing the event is itself the effect (retractions); a
+    /// detection goes through `detect`, which records the event only if it was acted on.
+    pub fn first_sighting(&mut self, source: &str, event: &str, now_ms: u64) -> bool {
+        if self.event_seen(source, event, now_ms) {
+            return false;
+        }
+        self.record_event(source, event, now_ms);
         true
+    }
+
+    /// A detector's signal, as one step under the table lock: the single implementation used
+    /// by the node (`enforce_block_local`) and by audit replay (ADR-0016), so the two cannot
+    /// drift. A resend of an event already acted on is a duplicate (a lost ACK, an adapter
+    /// restart). A refusal changes nothing: the event is not remembered, so a resend once
+    /// capacity frees is decided afresh, and no strike is counted for a block that did not
+    /// happen (review 2026-10-05, detector path).
+    pub fn detect(
+        &mut self,
+        net: IpNet,
+        reason: &str,
+        now_ms: u64,
+        event: Option<(&str, &str)>,
+        requested: Option<Duration>,
+    ) -> Detected {
+        if let Some((source, id)) = event {
+            if self.event_seen(source, id, now_ms) {
+                return Detected::Duplicate;
+            }
+        }
+        let key = event.map(|(source, id)| event_key(source, id));
+        match self.add_detection(net, reason, now_ms, key, requested) {
+            Ok(added) => {
+                if let Some((source, id)) = event {
+                    self.record_event(source, id, now_ms);
+                }
+                Detected::Added(added)
+            }
+            Err(why) => Detected::Refused(why),
+        }
     }
 
     /// Peers' claims that are valid but wait for a slot in their issuer's envelope
@@ -836,6 +887,16 @@ impl<B: Blocklist> BlockTable<B> {
     /// (targets with remembered strikes, targets forgotten early because the memory was full)
     pub fn strike_memory(&self) -> (usize, u64) {
         (self.strikes.len(), self.strikes_evicted)
+    }
+
+    /// The count `strike` would return now, without recording it.
+    fn next_strike(&self, net: IpNet, now_ms: u64) -> u32 {
+        match self.strikes.get(&net) {
+            Some(&(count, last)) if now_ms.saturating_sub(last) <= ms(STRIKE_MEMORY) => {
+                count.saturating_add(1)
+            }
+            _ => 1,
+        }
     }
 
     /// Records a strike on `net` and returns its count (at least 1). A new target over
@@ -1232,13 +1293,17 @@ impl<B: Blocklist> BlockTable<B> {
         requested: Option<Duration>,
     ) -> Result<Added, &'static str> {
         let net = canonical(net);
+        // The strike that sets this TTL is recorded only once the claim stands (a refusal
+        // below must not escalate the next block's TTL).
+        let mut strike_due = false;
         let ttl = match kind {
             ClaimKind::Static | ClaimKind::Operator => None,
             ClaimKind::Detector if self.policy.base.is_zero() => None,
             ClaimKind::Detector => match requested {
                 Some(r) => Some(r.min(self.policy.max)),
                 None => {
-                    let strikes = self.strike(net, now_ms);
+                    strike_due = true;
+                    let strikes = self.next_strike(net, now_ms);
                     let factor = 1u32.checked_shl(strikes - 1).unwrap_or(u32::MAX);
                     Some(self.policy.base.saturating_mul(factor).min(self.policy.max))
                 }
@@ -1270,6 +1335,9 @@ impl<B: Blocklist> BlockTable<B> {
                 if kind == ClaimKind::Detector {
                     self.note_support(net, event, new_end);
                 }
+                if strike_due {
+                    self.strike(net, now_ms);
+                }
                 let applied = self.reconcile(net, now_ms);
                 let left = end.map(|e| Duration::from_millis(e.saturating_sub(now_ms)));
                 return Ok(Added {
@@ -1282,6 +1350,9 @@ impl<B: Blocklist> BlockTable<B> {
         }
         if self.claims.len() >= MAX_KNOWN_CLAIMS {
             return Err("too many known claims");
+        }
+        if strike_due {
+            self.strike(net, now_ms);
         }
         let claim = self.issue_own(net, kind, reason, now_ms, new_end);
         if kind == ClaimKind::Detector {
@@ -2232,20 +2303,17 @@ mod tests {
         now: u64,
         ttl_secs: Option<u64>,
     ) -> Option<Added> {
-        if !t.first_sighting(source, id, now) {
-            return None;
+        match t.detect(
+            ip(target),
+            "test",
+            now,
+            Some((source, id)),
+            ttl_secs.map(Duration::from_secs),
+        ) {
+            Detected::Duplicate => None,
+            Detected::Added(added) => Some(added),
+            Detected::Refused(why) => panic!("refused: {}", why),
         }
-        let key = Some(event_key(source, id));
-        Some(
-            t.add_detection(
-                ip(target),
-                "test",
-                now,
-                key,
-                ttl_secs.map(Duration::from_secs),
-            )
-            .unwrap(),
-        )
     }
 
     fn lifted(out: &DetectorRetraction) -> bool {
@@ -3602,9 +3670,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn local_claims_respect_the_known_claims_cap() {
-        let mut t = table(1, 64);
+    /// Fills the table's known claims to MAX_KNOWN_CLAIMS (live own detector claims).
+    fn fill_known_claims(t: &mut BlockTable<FakeLists>) {
         for i in 0..MAX_KNOWN_CLAIMS as u32 {
             let target = format!("10.{}.{}.{}", i >> 16, (i >> 8) & 255, i & 255);
             t.claims.insert(
@@ -3627,11 +3694,56 @@ mod tests {
                 },
             );
         }
+    }
+
+    #[test]
+    fn local_claims_respect_the_known_claims_cap() {
+        let mut t = table(1, 64);
+        fill_known_claims(&mut t);
         assert_eq!(
             t.add_local(ip("203.0.113.96"), ClaimKind::Detector, "x", T0)
                 .err(),
             Some("too many known claims")
         );
+    }
+
+    /// Review 2026-10-05 (detector path): a detection refused at the known-claims cap left the
+    /// event remembered (a resend after capacity freed was answered as a duplicate and never
+    /// acted on) and a strike counted (the next real block of that target got an escalated
+    /// TTL). A refusal changes no state.
+    #[test]
+    fn a_detection_refused_at_capacity_leaves_no_event_and_no_strike() {
+        let mut t = table(1, 64);
+        fill_known_claims(&mut t);
+        let target = ip("203.0.113.97");
+        assert!(matches!(
+            t.detect(target, "ids", T0, Some(("ids", "e1")), None),
+            Detected::Refused("too many known claims")
+        ));
+        assert_eq!(
+            t.strike_memory().0,
+            0,
+            "no strike for a block that did not happen"
+        );
+        // Capacity frees; the resend of the same event is decided afresh.
+        let freed = t.claims.keys().next().cloned().unwrap();
+        t.claims.remove(&freed);
+        let added = match t.detect(target, "ids", T0 + S, Some(("ids", "e1")), None) {
+            Detected::Added(added) => added,
+            Detected::Duplicate => panic!("the refused event was remembered as handled"),
+            Detected::Refused(why) => panic!("still refused: {}", why),
+        };
+        assert!(added.new);
+        assert_eq!(
+            added.ttl,
+            Some(Duration::from_secs(60)),
+            "the first strike's TTL, not the second's"
+        );
+        // Acted on now: the same event again is a duplicate.
+        assert!(matches!(
+            t.detect(target, "ids", T0 + 2 * S, Some(("ids", "e1")), None),
+            Detected::Duplicate
+        ));
     }
 
     #[test]

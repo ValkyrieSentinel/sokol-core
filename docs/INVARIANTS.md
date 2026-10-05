@@ -122,6 +122,7 @@ Owners: [Follower and adapter loop](../orchestrator/src/bin/sokol-suricata.rs),
 | SUR-R1 | Complete records read before a later I/O error are returned alongside the error; unfinished bytes and their starting position survive for retry. Byte/line quotas still apply. | `a_read_error_preserves_completed_alerts_and_unfinished_bytes`, `read_errors_before_a_complete_line_preserve_the_cursor_and_retry_bytes` (fault injected through the actual buffered scanner). |
 | SUR-C1 | A queued offset is usable only for the same observed content token and inode. Otherwise checkpoint position is zero in the current file. A loaded resume anchor survives failed source open/seek until successful installation. | `detected_truncation_fences_offsets_from_previous_contents`, `resume_retains_its_anchor_while_the_source_is_missing`, `failed_install_does_not_erase_the_selected_resume_anchor`; process cases below. |
 | SUR-Q1 | At checkpoint time, queued positions correspond to the remaining FIFO outbox entries. Only successful push adds a position; overflow removes the oldest pair; forwarding expiry drops its request/deadline pair; after flush the loop trims positions to remaining pending length. Outbox request/deadline entries are likewise paired. | `invalid_input_cannot_evict_a_queued_signal`, `a_full_queue_drops_the_oldest_and_counts_it`; actual process restart/ACK cases below exercise cursor alignment. |
+| SUR-C2 | The saved cursor is replaced durably (temporary file synced, renamed, directory synced). A cursor file that exists but cannot be read or parsed starts reading the current file from its start, never its end; a missing cursor follows `--from-start`. Re-read alerts are bounded by the forwarding age and deduplicated by event id at the node. | `a_damaged_cursor_rereads_the_log_instead_of_skipping_it` (empty, truncated and non-JSON cursors; mutation "damaged = missing" fails it). |
 | IPC-A1 | Transport failure, unknown reply or missing terminating LF retains an unexpired obligation. A complete recognized final reply removes it; bounded overflow and an opt-in forwarding deadline are explicit, separately counted local loss paths. ACK outcome is node acceptance/refusal, not proof of durable storage or completed kernel enforcement. | `unknown_reply_keeps_the_obligation_and_a_later_ack_retires_it`, `an_unterminated_ack_does_not_retire_the_signal`, overflow test above. |
 
 [Process regressions](../scripts/test_suricata_recovery.py) run the actual adapter against
@@ -137,6 +138,15 @@ regrowth between observations. Cooldown, age/severity/signature/UTF-8/size filte
 overflow, periodic checkpoints and bounded node event memory remain operational limits.
 These identity/time/cardinality properties are checked on their Rust owners, not encoded
 as a Boolean certificate claiming to cover the full adapter.
+
+## Node detection: one step, refusals change nothing
+
+Owner: `BlockTable::detect` in [block_table.rs](../orchestrator/src/block_table.rs), the single
+implementation called by the node (`enforce_block_local`) and by audit replay (ADR-0016).
+
+| ID | Invariant and enforcement point | Executable evidence |
+|---|---|---|
+| NODE-D1 | A detection checks its event id, adds or merges the claim, then records the event, under one table lock. A resend of an event acted on within EVENT_MEMORY is a duplicate. A refused detection (here: the known-claims cap) records no event and counts no strike: a resend after capacity frees is decided afresh, and the next block of that target gets the TTL of its first strike. | `a_detection_refused_at_capacity_leaves_no_event_and_no_strike` (mutations "remember the event first" and "count the strike first" each fail it). |
 
 ## Node retraction admission
 
