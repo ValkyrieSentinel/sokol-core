@@ -878,11 +878,12 @@ async fn enforce_block_local<B: block_table::Blocklist>(
     };
     let added = match detected {
         block_table::Detected::Duplicate => {
+            // The exact wording is an operator-facing contract (xdp-smoke greps it).
+            let (source, id) = event.unwrap_or_default();
             log::info!(
-                "[Local Security] event {} for {} already handled",
-                event
-                    .map(|(source, id)| format!("{}/{}", source, id))
-                    .unwrap_or_default(),
+                "[Local Security] {} event {} for {} already handled",
+                source,
+                id,
                 shown
             );
             sntl_db.append(format!("SIGNAL_DUPLICATE|IP:{}|{}", shown, context));
