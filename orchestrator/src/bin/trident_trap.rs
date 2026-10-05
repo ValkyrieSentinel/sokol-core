@@ -18,14 +18,146 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError};
+use std::sync::{Arc, OnceLock};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 use tokio::time::{sleep, timeout, Duration};
 
+#[path = "../delivery.rs"]
+mod delivery;
+
 fn ipc_socket_path() -> String {
     std::env::var("SOKOL_IPC_SOCKET").unwrap_or_else(|_| "/run/sokol.sock".to_string())
+}
+
+/// Lines waiting for the delivery thread, and signals the node has not answered yet.
+const SUBMIT_QUEUE: usize = 1024;
+const OUTBOX_CAP: usize = 1024;
+
+/// The trap's only path to the node. Connection handlers hand lines to one thread that owns
+/// the IPC outbox (`delivery.rs`, ACK mode, as the Suricata and CrowdSec adapters use): a line
+/// counts as delivered only when the node answered it, and a refusal or error is reported as
+/// such. Writing to the socket is not delivery (review 2026-10-05 F1).
+struct NodeLink {
+    tx: SyncSender<String>,
+    /// Lines refused because the hand-off queue was full: lost before the outbox saw them.
+    overflow: AtomicU64,
+}
+
+static NODE: OnceLock<NodeLink> = OnceLock::new();
+
+/// What happened to a line, as the delivery thread learned it.
+#[derive(Debug, PartialEq, Eq)]
+enum Report {
+    /// The node answered; the line left the outbox.
+    Answered(String, delivery::Outcome),
+    /// The outbox would not take the line (framing or size); it was never sent.
+    Rejected(String, String),
+    /// Delivery failed for now; the line stays queued and is retried with backoff.
+    Retrying(String),
+    /// The outbox was full and dropped its oldest line(s); `lost` is the running total.
+    Lost(u64),
+}
+
+/// Queues `line` for the node; false if it was lost before reaching the outbox.
+fn submit(line: String) -> bool {
+    let Some(node) = NODE.get() else {
+        eprintln!("[!] node link not started; dropped: {}", line);
+        return false;
+    };
+    match node.tx.try_send(line) {
+        Ok(()) => true,
+        Err(TrySendError::Full(line)) | Err(TrySendError::Disconnected(line)) => {
+            let n = node.overflow.fetch_add(1, Ordering::Relaxed) + 1;
+            eprintln!(
+                "[!] node hand-off queue full ({} lost so far); dropped: {}",
+                n, line
+            );
+            false
+        }
+    }
+}
+
+/// Owns the outbox until every sender is gone and nothing is pending.
+fn run_delivery(
+    rx: Receiver<String>,
+    mut outbox: delivery::Outbox,
+    mut report: impl FnMut(Report),
+) {
+    let mut lost_seen = 0;
+    loop {
+        let first = if outbox.pending() == 0 {
+            match rx.recv() {
+                Ok(line) => Some(line),
+                Err(_) => return,
+            }
+        } else {
+            match rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(line) => Some(line),
+                Err(RecvTimeoutError::Timeout) => None,
+                Err(RecvTimeoutError::Disconnected) => None,
+            }
+        };
+        for line in first.into_iter().chain(rx.try_iter()) {
+            if let Err(e) = outbox.push(&line) {
+                report(Report::Rejected(line, e.to_string()));
+            }
+        }
+        if outbox.lost > lost_seen {
+            lost_seen = outbox.lost;
+            report(Report::Lost(lost_seen));
+        }
+        while outbox.pending() > 0 {
+            let (done, err) = outbox.flush(16);
+            let answered = !done.is_empty();
+            for (line, outcome) in done {
+                report(Report::Answered(line, outcome));
+            }
+            if let Some(e) = err {
+                report(Report::Retrying(e));
+                break;
+            }
+            if !answered {
+                break; // backoff: wait for new lines or the retry time
+            }
+        }
+    }
+}
+
+fn log_report(r: Report) {
+    match r {
+        Report::Answered(line, delivery::Outcome::Refused(why)) => {
+            eprintln!("[!] node refused {}: {}", line, why)
+        }
+        Report::Answered(line, delivery::Outcome::Rejected(why)) => {
+            eprintln!("[!] node rejected {}: {}", line, why)
+        }
+        Report::Answered(line, outcome) => {
+            println!("[XDP_ACTION] node answered {} ({:?})", line, outcome)
+        }
+        Report::Rejected(line, why) => eprintln!("[!] not sent (invalid line: {}): {}", why, line),
+        Report::Retrying(e) => eprintln!("[!] node unreachable, retrying: {}", e),
+        Report::Lost(n) => eprintln!("[!] outbox full: {} oldest lines dropped so far", n),
+    }
+}
+
+/// Starts the delivery thread for `socket`; later calls keep the first link.
+fn start_node_link(socket: PathBuf) {
+    let (tx, rx) = std::sync::mpsc::sync_channel(SUBMIT_QUEUE);
+    if NODE
+        .set(NodeLink {
+            tx,
+            overflow: AtomicU64::new(0),
+        })
+        .is_ok()
+    {
+        let outbox = delivery::Outbox::new(&socket, OUTBOX_CAP);
+        std::thread::spawn(move || run_delivery(rx, outbox, log_report));
+    }
 }
 
 /// Ports that decoy services listen on. 8080 is left out: local services such as the CrowdSec
@@ -213,7 +345,7 @@ async fn handle_trident_connection(
         Ok(Ok(n)) if n > 0 => n,
         _ => {
             let reason = format!("trap port {}: connected without sending data", port);
-            let _ = trigger_xdp_drop(&ip, &reason).await;
+            let _ = trigger_xdp_drop(&ip, &reason);
             let _ = stream.shutdown().await;
             return Ok(());
         }
@@ -235,7 +367,7 @@ async fn handle_trident_connection(
         fingerprint.snippet
     );
 
-    let _ = send_log_to_orchestrator(&unique_log_record).await;
+    let _ = send_log_to_orchestrator(&unique_log_record);
 
     match tier {
         TridentTier::Tier1BotTarpit => {
@@ -269,7 +401,7 @@ async fn handle_trident_connection(
     }
 
     let reason = format!("trap port {}: {}", port, tier.describe());
-    let _ = trigger_xdp_drop(&ip, &reason).await;
+    let _ = trigger_xdp_drop(&ip, &reason);
 
     Ok(())
 }
@@ -428,7 +560,7 @@ async fn run_tier2_payload_capture(
                 captured.extend_from_slice(buf.get(..n).unwrap_or_default());
 
                 let chunk_log = format!("CAPTURE_CHUNK|IP={}|BYTES={}", ip, n);
-                let _ = send_log_to_orchestrator(&chunk_log).await;
+                let _ = send_log_to_orchestrator(&chunk_log);
 
                 if captured.len() > 2 * 1024 * 1024 {
                     break;
@@ -485,7 +617,7 @@ async fn run_tier3_interactive_jail(
                         "JAIL_SESSION_END|IP={}|IN={}|OUT={}",
                         ip, from_attacker, from_jail
                     );
-                    let _ = send_log_to_orchestrator(&session_log).await;
+                    let _ = send_log_to_orchestrator(&session_log);
                 }
             }
         }
@@ -536,7 +668,7 @@ async fn run_embedded_mock_jail(
                     "EMBEDDED_JAIL_INPUT|IP={}|BYTES={}|SNIPPET={}",
                     ip, n, snippet
                 );
-                let _ = send_log_to_orchestrator(&chunk_log).await;
+                let _ = send_log_to_orchestrator(&chunk_log);
 
                 if stream
                     .write_all(b"Permission denied (publickey,password).\r\nlogin: ")
@@ -560,7 +692,7 @@ async fn run_embedded_mock_jail(
         ip,
         captured_data.len()
     );
-    let _ = send_log_to_orchestrator(&final_log).await;
+    let _ = send_log_to_orchestrator(&final_log);
     println!(
         "[TIER-3 EMBEDDED TRAP] Recorded {} bytes of interactive input from {}.",
         captured_data.len(),
@@ -570,79 +702,15 @@ async fn run_embedded_mock_jail(
     Ok(())
 }
 
-async fn send_log_to_orchestrator(
-    log_msg: &str,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let socket_path = ipc_socket_path();
-    let msg = format!("DB_LOG:{}\n", log_msg);
-
-    match tokio::net::UnixStream::connect(&socket_path).await {
-        Ok(mut socket) => {
-            socket.write_all(msg.as_bytes()).await?;
-            socket.flush().await?;
-            let _ = socket.shutdown().await;
-            Ok(())
-        }
-        Err(e) => {
-            eprintln!("[WARN] Failed to write audit log to IPC: {}", e);
-            Err(e.into())
-        }
-    }
+/// Records a trap observation in the node's audit log (`DB_LOG:`), acknowledged like a signal.
+fn send_log_to_orchestrator(log_msg: &str) -> bool {
+    submit(format!("DB_LOG:{}", log_msg))
 }
 
-/// Asks the node to block `ip`, with the trap's reason recorded in its audit log.
-async fn trigger_xdp_drop(
-    ip: &str,
-    reason: &str,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let socket_path = ipc_socket_path();
-    let msg = format!("SIGNAL:trident|{}|-|{}\n", ip, reason);
-    let max_retries = 3;
-    let mut retry_delay = Duration::from_millis(50);
-
-    for attempt in 1..=max_retries {
-        match tokio::net::UnixStream::connect(&socket_path).await {
-            Ok(mut socket) => {
-                if let Err(e) = socket.write_all(msg.as_bytes()).await {
-                    eprintln!(
-                        "[!] IPC Write Fail (Attempt {}/{}): {}",
-                        attempt, max_retries, e
-                    );
-                } else if let Err(e) = socket.flush().await {
-                    eprintln!(
-                        "[!] IPC Flush Fail (Attempt {}/{}): {}",
-                        attempt, max_retries, e
-                    );
-                } else {
-                    let _ = socket.shutdown().await;
-                    println!(
-                        "[XDP_ACTION] IP {} sent to IPC orchestrator for XDP drop.",
-                        ip
-                    );
-                    return Ok(());
-                }
-            }
-            Err(e) => {
-                eprintln!(
-                    "[!] Cannot connect to Unix socket '{}' (Attempt {}/{}): {}",
-                    socket_path, attempt, max_retries, e
-                );
-            }
-        }
-
-        if attempt < max_retries {
-            sleep(retry_delay).await;
-            retry_delay *= 2;
-        }
-    }
-
-    let err_msg = format!(
-        "CRITICAL IPC FAILURE: Failed to deliver the block signal for IP {} after {} attempts. Is the sokol daemon running?",
-        ip, max_retries
-    );
-    eprintln!("\x1b[1;31m[CRITICAL]\x1b[0m {}", err_msg);
-
-    Err(err_msg.into())
+/// Asks the node to block `ip`, with the trap's reason recorded in its audit log. True means
+/// queued for delivery, not blocked: the node's answer is logged when it arrives.
+fn trigger_xdp_drop(ip: &str, reason: &str) -> bool {
+    submit(format!("SIGNAL:trident|{}|-|{}", ip, reason))
 }
 
 #[tokio::main]
@@ -658,6 +726,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::process::exit(1);
         }
     };
+    start_node_link(PathBuf::from(ipc_socket_path()));
     UltimateTridentOrchestrator::new(config).run().await?;
 
     Ok(())
@@ -666,6 +735,98 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A node that serves one connection per scripted reply: ACK handshake, then that reply.
+    fn scripted_node(
+        path: &std::path::Path,
+        replies: Vec<&'static str>,
+    ) -> std::thread::JoinHandle<Vec<String>> {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::os::unix::net::UnixListener::bind(path).unwrap();
+        std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            for reply in replies {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                assert_eq!(line.trim(), "ACK");
+                stream.write_all(b"OK ack\n").unwrap();
+                line.clear();
+                reader.read_line(&mut line).unwrap();
+                seen.push(line.trim().to_string());
+                stream.write_all(reply.as_bytes()).unwrap();
+            }
+            seen
+        })
+    }
+
+    /// Review 2026-10-05 F1: a written line is not a delivered one. An unknown answer keeps the
+    /// signal queued and retries it; the node's refusal is reported as a refusal.
+    #[test]
+    fn a_signal_counts_only_once_the_node_answered_it() {
+        let dir = std::env::temp_dir().join(format!("trident-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        let socket = dir.join("node.sock");
+        let node = scripted_node(
+            &socket,
+            vec!["OK something else\n", "OK refused protected\n"],
+        );
+        let (tx, rx) = std::sync::mpsc::sync_channel(4);
+        tx.send("SIGNAL:trident|203.0.113.9|-|trap port 23: probe".to_string())
+            .unwrap();
+        drop(tx);
+        let mut reports = Vec::new();
+        run_delivery(rx, delivery::Outbox::new(&socket, 4), |r| reports.push(r));
+        let line = "SIGNAL:trident|203.0.113.9|-|trap port 23: probe".to_string();
+        assert_eq!(
+            node.join().unwrap(),
+            vec![line.clone(), line.clone()],
+            "sent again after the unknown answer"
+        );
+        assert!(
+            matches!(reports.first(), Some(Report::Retrying(_))),
+            "{:?}",
+            reports
+        );
+        assert_eq!(
+            reports.last(),
+            Some(&Report::Answered(
+                line,
+                delivery::Outcome::Refused("protected".into())
+            ))
+        );
+        assert_eq!(
+            reports
+                .iter()
+                .filter(|r| matches!(r, Report::Answered(..)))
+                .count(),
+            1,
+            "nothing counted as answered before the node answered: {:?}",
+            reports
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_line_the_outbox_cannot_frame_is_reported_not_sent() {
+        let (tx, rx) = std::sync::mpsc::sync_channel(4);
+        tx.send("SIGNAL:trident|203.0.113.9|-|a\nXDP_UNLOAD".to_string())
+            .unwrap();
+        drop(tx);
+        let mut reports = Vec::new();
+        run_delivery(
+            rx,
+            delivery::Outbox::new(std::path::Path::new("/nonexistent/sokol.sock"), 4),
+            |r| reports.push(r),
+        );
+        assert!(
+            matches!(reports.as_slice(), [Report::Rejected(..)]),
+            "{:?}",
+            reports
+        );
+    }
 
     #[test]
     fn defaults_avoid_the_p2p_and_admin_ssh_ports() {

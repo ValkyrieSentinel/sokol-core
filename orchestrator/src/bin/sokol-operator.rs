@@ -159,7 +159,6 @@ async fn read_telemetry(state: &AppState, uid: u32, stream: UnixStream) {
         }
     }
 }
-const MESH_COMMANDS: [&str; 3] = ["SYNC_DAG", "RELOAD_RULES", "FLUSH_ALL_BANS"];
 
 /// Every API route needs this token, even on loopback: without it any web page the operator
 /// visits could POST to the unauthenticated endpoints (a body-less POST needs no CORS preflight).
@@ -262,11 +261,6 @@ struct BlacklistReq {
     action: String,
 }
 
-#[derive(Deserialize)]
-struct MeshCommandReq {
-    command: String,
-}
-
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
@@ -354,9 +348,6 @@ fn build_router(state: AppState) -> Router {
         .route("/api/data", get(api_get_all_data))
         .route("/api/nodes/:id/blacklist", post(api_update_blacklist))
         .route("/api/nodes/:id/flush", post(api_flush_blacklist))
-        .route("/api/nodes/:id/toggle-xdp", post(api_toggle_xdp))
-        .route("/api/nodes/:id/shield", post(api_toggle_shield))
-        .route("/api/mesh/broadcast", post(api_broadcast_command))
         .route("/metrics/stream", get(metrics_stream))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_token));
 
@@ -580,70 +571,6 @@ async fn refresh_all(state: AppState) {
     }
 }
 
-async fn api_toggle_xdp(
-    State(state): State<AppState>,
-    Path(id): Path<u32>,
-) -> Json<serde_json::Value> {
-    let Some((ctl, uid)) = route(&state, id).await else {
-        return result_json(Err(format!("unknown node {}", id)));
-    };
-    let loaded = state
-        .nodes
-        .read()
-        .await
-        .iter()
-        .any(|n| n.id == id && n.xdp_loaded);
-    let cmd = if loaded { "XDP_UNLOAD\n" } else { "XDP_LOAD\n" };
-    result_json(send_command_to_node(&ctl, Some(uid), &state.node_uids, cmd).await)
-}
-
-async fn api_toggle_shield(
-    State(state): State<AppState>,
-    Path(id): Path<u32>,
-) -> Json<serde_json::Value> {
-    let Some((ctl, uid)) = route(&state, id).await else {
-        return result_json(Err(format!("unknown node {}", id)));
-    };
-    let normal = state
-        .nodes
-        .read()
-        .await
-        .iter()
-        .any(|n| n.id == id && n.defense_mode == "NORMAL");
-    let next_mode = if normal { "MAX_SHIELD" } else { "NORMAL" };
-    result_json(
-        send_command_to_node(
-            &ctl,
-            Some(uid),
-            &state.node_uids,
-            &format!("SET_DEFENSE:{}\n", next_mode),
-        )
-        .await,
-    )
-}
-
-async fn api_broadcast_command(
-    State(state): State<AppState>,
-    Json(req): Json<MeshCommandReq>,
-) -> Json<serde_json::Value> {
-    if !MESH_COMMANDS.contains(&req.command.as_str()) {
-        return result_json(Err(format!("unknown mesh command '{}'", req.command)));
-    }
-    log::info!(
-        "[P2P MESH] Broadcasting command across active nodes: {}",
-        req.command
-    );
-    result_json(
-        send_command_to_node(
-            "/run/sokol_p2p.sock",
-            None,
-            &state.node_uids,
-            &format!("BROADCAST:{}\n", req.command),
-        )
-        .await,
-    )
-}
-
 /// Sends one command to the node's control socket (announced as CTL= in its heartbeat) and
 /// returns its reply. The node answers "OK ..." or "ERR ..."; anything else is a failure.
 /// The control socket must be served by `node_uid` (the uid the node announced itself from) or,
@@ -850,16 +777,6 @@ const HTML_DASHBOARD: &str = r###"
                     <div class="font-bold text-zinc-100">Latency: <span id="m-dblat" class="text-amber-400">0 ms</span> | Banned IPs: <span id="trap-banned" class="text-red-400">0</span></div>
                 </div>
             </div>
-            <div class="bg-zinc-900 border border-zinc-800 p-4 rounded-xl flex flex-col justify-center">
-                <div class="text-[10px] text-zinc-500 mb-1">GLOBAL MESH COMMANDS</div>
-                <div class="flex gap-2">
-                    <select id="p2p-cmd" class="bg-zinc-950 border border-zinc-700 rounded px-2 py-1 text-xs w-full">
-                        <option value="SYNC_DAG">Force DAG Sync</option>
-                        <option value="RELOAD_RULES">Reload Security Rules</option>
-                        <option value="FLUSH_ALL_BANS">Flush All Swarm Bans</option>
-                    </select>
-                    <button onclick="broadcastCommand()" class="bg-cyan-900/50 hover:bg-cyan-800 border border-cyan-700 text-cyan-300 px-3 py-1 rounded text-xs font-bold transition">SEND</button>
-                </div>
             </div>
         </div>
 
@@ -985,10 +902,6 @@ const HTML_DASHBOARD: &str = r###"
                                 <button onclick="addIp(${n.id})" class="bg-red-950 border border-red-900 hover:bg-red-900 text-red-300 px-2 rounded text-xs">Ban</button>
                             </div>
                             
-                            <div class="grid grid-cols-2 gap-1 mt-2 pt-2 border-t border-zinc-900">
-                                <button onclick="apiCall('/api/nodes/${n.id}/toggle-xdp')" class="bg-zinc-900 hover:bg-zinc-800 text-zinc-300 py-1 rounded text-xs transition">Toggle XDP</button>
-                                <button onclick="apiCall('/api/nodes/${n.id}/shield')" class="bg-amber-950/50 hover:bg-amber-900/50 text-amber-500 border border-amber-900/50 py-1 rounded text-xs transition">Shield Mode</button>
-                            </div>
                         </div>
                     `).join('');
                 }
@@ -1047,15 +960,6 @@ const HTML_DASHBOARD: &str = r###"
         async function addIp(id) {
             const input = document.getElementById(`ip-in-${id}`);
             if (input.value) { await modifyBlacklist(id, input.value, 'add'); input.value = ''; }
-        }
-
-        async function broadcastCommand() {
-            const cmd = document.getElementById('p2p-cmd').value;
-            const res = await authedFetch('/api/mesh/broadcast', {
-                method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ command: cmd })
-            });
-            report(await res.json());
-            console.log(`Command ${cmd} dispatched to P2P Daemon`);
         }
 
         fetchData(); setInterval(fetchData, 3000); initSSE();
@@ -1231,15 +1135,73 @@ mod tests {
             "state must not change on failure"
         );
 
-        let (_, _, body) = call(
-            app,
-            post_json(
-                "/api/mesh/broadcast",
-                serde_json::json!({ "command": "RELOAD_RULES\nXDP_UNLOAD" }),
-            ),
-        )
-        .await;
-        assert_eq!(body["success"], false);
+        let _ = app;
+    }
+
+    /// Review 2026-10-05 F2: the page offers only what a node carries out. Every API path the
+    /// dashboard calls is served, and the removed controls (XDP toggle, shield mode, mesh
+    /// broadcast to a socket nothing served) are gone from both the page and the router.
+    #[tokio::test]
+    async fn the_dashboard_calls_only_served_routes() {
+        let mut paths = Vec::new();
+        let mut rest = HTML_DASHBOARD;
+        while let Some(at) = rest.find("/api/") {
+            let tail = rest.get(at..).unwrap_or_default();
+            let end = tail.find(['\'', '`', '"']).unwrap_or(tail.len());
+            paths.push(
+                tail.get(..end)
+                    .unwrap_or_default()
+                    .replace("${n.id}", "7")
+                    .replace("${id}", "7"),
+            );
+            rest = tail.get(5..).unwrap_or_default();
+        }
+        assert!(paths.len() >= 4, "{:?}", paths);
+        let st = state();
+        process_trident_telemetry(&st, me(), "HEARTBEAT:ID=7|NAME=n7|EP=x|MODE=NORMAL\n").await;
+        let app = build_router(st);
+        for path in paths.iter().map(String::as_str).chain([
+            "/api/nodes/7/toggle-xdp",
+            "/api/nodes/7/shield",
+            "/api/mesh/broadcast",
+        ]) {
+            let removed = path.ends_with("toggle-xdp")
+                || path.ends_with("shield")
+                || path.ends_with("broadcast");
+            let method = if path == "/api/data" { "GET" } else { "POST" };
+            let (status, _, _) = call(
+                app.clone(),
+                Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .header(header::AUTHORIZATION, format!("Bearer {}", TOKEN))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(
+                status == StatusCode::NOT_FOUND,
+                removed,
+                "{} {} -> {}",
+                method,
+                path,
+                status
+            );
+        }
+        for gone in [
+            "toggle-xdp",
+            "/shield",
+            "/api/mesh/broadcast",
+            "FLUSH_ALL_BANS",
+            "SYNC_DAG",
+        ] {
+            assert!(
+                !HTML_DASHBOARD.contains(gone),
+                "the page still offers {}",
+                gone
+            );
+        }
     }
 
     /// A fake node that answers like the orchestrator's control socket.

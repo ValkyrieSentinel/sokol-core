@@ -1,6 +1,7 @@
 # Sokol-Core 🛡️
 
-> **Status:** Pilot / Active Testing
+> **Status:** lab-qualified, no release. Not yet measured on a target NIC in native mode and not
+> run in a field pilot ([ROADMAP](ROADMAP.md), P4).
 
 A network traffic filter running at the Linux kernel level (XDP). Built entirely in **Rust** (eBPF/XDP kernel program and user-space daemon).
 
@@ -717,5 +718,6 @@ the mesh, not line-rate packet processing on a physical NIC.
 
 # License
 
-Copyright © Sokol-Core Contributors. All rights reserved.
-Unauthorized copying, distribution, or use of this code is strictly prohibited without permission from the author.
+See [LICENSE](LICENSE): copyright © 2026 Ольга Скороход (ValkyrieSentinel), all rights reserved.
+The source is published for viewing and educational purposes; copying, modifying, compiling or
+using it needs the author's prior written permission.
