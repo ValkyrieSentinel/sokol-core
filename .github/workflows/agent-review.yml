@@ -1,0 +1,37 @@
+name: Agent review
+# SHADOW (AGENTS.md, "Agent review"). Trusted half: runs from the default branch on
+# workflow_run, so a pull request cannot change the reviewer, its prompt or these pins. Reads
+# the head as Git objects and executes nothing from it. The reviewer gets only the model
+# credential; the status token stays with scripts/agent_review.py. Not a required check: the
+# status is written with the GitHub Actions token, which a pull request's own workflow also
+# holds. Ported from s0fractal/stargate#107. Needs the repository secret CLAUDE_CODE_OAUTH_TOKEN;
+# without it every run ends in an `error` status, never a pass.
+on:
+  workflow_run:
+    workflows: [Agent review request]
+    types: [completed]
+permissions:
+  contents: read
+  statuses: write
+  pull-requests: read
+concurrency:
+  group: agent-review-${{ github.event.workflow_run.head_sha }}
+  cancel-in-progress: false
+jobs:
+  review:
+    if: github.event.workflow_run.event == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4, the default branch
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Pinned reviewer CLI
+        run: npm install --global --no-fund --no-audit @anthropic-ai/claude-code@2.1.286
+      - name: Review the head commit and publish the shadow verdict
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          REVIEW_MODEL: claude-opus-5-5
+        run: python3 -I -S scripts/agent_review.py

@@ -40,7 +40,7 @@ mod state_store;
 
 use aya::maps::{Array, LpmTrie, MapData, PerCpuArray, RingBuf};
 use aya::programs::{Xdp, XdpFlags};
-use aya::{include_bytes_aligned, Bpf, Pod};
+use aya::{Bpf, Pod};
 use clap::Parser;
 use sokol::SokolEngine;
 use std::net::IpAddr;
@@ -1051,14 +1051,19 @@ async fn main() -> Result<(), anyhow::Error> {
         .record(),
     );
 
-    #[cfg(debug_assertions)]
-    let mut bpf = Bpf::load(include_bytes_aligned!(concat!(
+    // The node embeds the compiled XDP object and cannot be built without it. Unit tests never
+    // load it, so they build without bpf-linker (`cargo test --bins`; review 2026-10-05 W4.3).
+    #[cfg(test)]
+    let mut bpf = Bpf::load(&[])?;
+
+    #[cfg(all(debug_assertions, not(test)))]
+    let mut bpf = Bpf::load(aya::include_bytes_aligned!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../target/bpfel-unknown-none/debug/ebpf-probe"
     )))?;
 
-    #[cfg(not(debug_assertions))]
-    let mut bpf = Bpf::load(include_bytes_aligned!(concat!(
+    #[cfg(all(not(debug_assertions), not(test)))]
+    let mut bpf = Bpf::load(aya::include_bytes_aligned!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../target/bpfel-unknown-none/release/ebpf-probe"
     )))?;

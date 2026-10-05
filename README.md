@@ -12,6 +12,7 @@ Design and its reasons: [ARCHITECTURE.md](ARCHITECTURE.md) (Ukrainian). Normativ
 [docs/adr/](docs/adr/README.md).
 Operating a node: [docs/RUNBOOK.md](docs/RUNBOOK.md) (install, health, incidents, keys, rollback,
 support bundle). What it is tested on: [docs/SUPPORT.md](docs/SUPPORT.md).
+Working on the code as an agent (or a new contributor): [AGENTS.md](AGENTS.md).
 
 ---
 

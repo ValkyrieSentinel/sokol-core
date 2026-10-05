@@ -138,6 +138,9 @@ jobs:
       - name: CrowdSec TTL smoke oracle regression
         run: python3 scripts/test_crowdsec_ttl.py
 
+      - name: Agent review publisher (binding, isolation, verdict contract)
+        run: python3 scripts/test_agent_review.py
+
       - name: CrowdSec stream recovery regression
         timeout-minutes: 2
         run: python3 scripts/test_crowdsec_stream.py target/release/sokol-crowdsec
