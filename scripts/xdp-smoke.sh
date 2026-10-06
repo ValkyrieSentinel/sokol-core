@@ -1255,8 +1255,7 @@ PY
     stop_orchestrator
     # Both logs closed: node 1's log checked against node 2's witnesses with the real CLI.
     check "audit witnesses: node 1's log is confirmed by node 2's witnesses" \
-        bash -c "\"$BIN\" --db-path '$WORK/events.sntl' --node-id 1 --verify-witnesses '$WORK/n2/events.log' | tee '$WORK/witness.txt' | grep -Eq '[1-9][0-9]* confirmed, 0 contradicted, 0 missing'"
-    cat "$WORK/witness.txt" | tail -1 || true
+        "$(dirname "$0")/check-witnesses.sh" "$BIN" "$WORK/events.sntl" "$WORK/n2/events.log" 1
 else
     skip wireguard "two-node WireGuard mesh checks (no wireguard support)"
 fi
