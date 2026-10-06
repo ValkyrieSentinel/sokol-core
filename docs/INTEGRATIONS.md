@@ -464,6 +464,33 @@ sokol-orchestrator --db-path /var/lib/sokol/audit.log --node-id 1 --verify-witne
 still verifies; `MISSING` means records were removed. Exit status 0/1/2 as in `--help`. This
 catches a rewrite unless every witnessing peer's log was rewritten too.
 
+**Anchor outside the mesh (opt-in, [ADR-0022](adr/0022-audit-anchor.md)).** Peers are the same
+operator's nodes. To make a rewrite visible even to someone controlling all of them, let the node
+write its durable head as a statement file and stamp it with OpenTimestamps from a separate user
+(the node itself contacts nothing; the calendars see only a SHA-256 and the stamping host's IP):
+
+```shell
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin sokol-anchor
+sudo install -d -o sokol -g sokol-anchor -m 2775 /var/lib/sokol-anchors
+sudo pip install opentimestamps-client          # provides `ots`
+sudo install -m 0755 scripts/anchor-ots.sh /usr/local/bin/sokol-anchor-ots
+sudo install -m 0644 deploy/sokol-anchor.service deploy/sokol-anchor.timer /etc/systemd/system/
+sudo systemctl enable --now sokol-anchor.timer
+# and add to SOKOL_ARGS in /etc/default/sokol:  --anchor-dir /var/lib/sokol-anchors
+```
+
+Every hour, if the log grew, the node writes `head-<node>-<records>.txt` (one line:
+`sokol-audit-head v1 node=… records=… head=…`) and records `AUDIT_ANCHOR` in its audit; the timer
+stamps new statements and upgrades pending stamps. Check later, anywhere:
+
+```shell
+sokol-orchestrator --db-path /var/lib/sokol/audit.log --node-id 1 --verify-anchors /var/lib/sokol-anchors
+ots verify /var/lib/sokol-anchors/head-1-00000000000000004031.txt.ots   # the Bitcoin attestation
+```
+
+Keep copies of the statements and `.ots` files off the node: deleting them hides nothing the audit
+does not record, but a missing proof proves nothing.
+
 Records are fsynced at most 100 ms after the last successful sync (or every 64 records), however
 steady the stream of events. One writer per log: a second process opening the same `--db-path`
 is refused (`<db-path>.lock`).

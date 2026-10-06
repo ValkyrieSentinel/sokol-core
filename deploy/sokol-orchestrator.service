@@ -44,6 +44,8 @@ RuntimeDirectory=sokol
 RuntimeDirectoryMode=0755
 
 ProtectSystem=strict
+# --anchor-dir (ADR-0022, opt-in) lives outside the state directory; ignored if absent.
+ReadWritePaths=-/var/lib/sokol-anchors
 ProtectHome=yes
 PrivateTmp=yes
 PrivateDevices=yes

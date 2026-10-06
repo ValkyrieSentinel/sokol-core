@@ -148,6 +148,7 @@ python3 scripts/test_crowdsec_ttl.py
 python3 scripts/test_witness_gate.py
 python3 scripts/test_local_ci.py
 python3 scripts/test_runbook_preflight.py
+python3 scripts/test_anchor_scripts.py
 timeout 120 python3 scripts/test_crowdsec_stream.py target/release/sokol-crowdsec
 timeout 120 python3 scripts/test_suricata_recovery.py target/release/sokol-suricata
 [ "$QUICK" = 1 ] && { step "quick run done (no smoke, demo or rehearsal)"; exit 0; }

@@ -18,6 +18,7 @@
 )]
 pub use mesh_sync::{AlertLevel, MeshCommand, MeshOrchestrator};
 mod attack_reports;
+mod audit_anchor;
 mod audit_witness;
 mod block_policy;
 mod block_table;
@@ -495,6 +496,22 @@ struct Args {
     /// Seconds between offers of this node's audit head to peers (ADR-0021; at least 1).
     #[arg(long, default_value_t = mesh_sync::AUDIT_HEAD_INTERVAL.as_secs())]
     audit_head_secs: u64,
+
+    /// Opt-in external anchor (ADR-0022): write this node's fsynced audit head as a statement
+    /// file into this directory, for a separate process to stamp with OpenTimestamps
+    /// (scripts/anchor-ots.sh). The node itself contacts nothing. Off unless given.
+    #[arg(long, value_name = "DIR")]
+    anchor_dir: Option<std::path::PathBuf>,
+
+    /// Seconds between head statements in --anchor-dir, written only when the log grew.
+    #[arg(long, default_value_t = 3600)]
+    anchor_secs: u64,
+
+    /// Check this node's audit log (--db-path) against the head statements in this directory
+    /// (ADR-0022), then exit; exit status as for --verify-witnesses. Bitcoin attestation of the
+    /// stamps themselves is checked with `ots verify`.
+    #[arg(long, value_name = "DIR")]
+    verify_anchors: Option<std::path::PathBuf>,
 
     /// Address or CIDR that must never be blocked (operator/bastion networks, mesh peers).
     /// Loopback, this node's addresses, default gateways and seed peers are always protected.
@@ -1010,6 +1027,13 @@ async fn main() -> Result<(), anyhow::Error> {
 
     if let Some(path) = &args.replay {
         std::process::exit(replay::print_report(path, env!("SOKOL_BUILD_ID")));
+    }
+    if let Some(dir) = &args.verify_anchors {
+        std::process::exit(audit_anchor::print_report(
+            std::path::Path::new(&args.db_path),
+            dir,
+            args.node_id,
+        ));
     }
     if let Some(peer_log) = &args.verify_witnesses {
         std::process::exit(audit_witness::print_report(
@@ -1902,6 +1926,13 @@ async fn main() -> Result<(), anyhow::Error> {
     let mut last_audit_head = std::time::Instant::now();
     let audit_head_every = Duration::from_secs(args.audit_head_secs.max(1));
     let mut audit_head_sent: Option<u64> = None;
+    let mut anchorer = args.anchor_dir.clone().map(|dir| {
+        audit_anchor::Anchorer::new(
+            dir,
+            args.node_id,
+            Duration::from_secs(args.anchor_secs.max(1)),
+        )
+    });
     let mut telemetry_window_start = std::time::Instant::now();
     let mut window_rx = 0u64;
     let mut window_dropped = 0u64;
@@ -2028,6 +2059,14 @@ async fn main() -> Result<(), anyhow::Error> {
                     let _ = registry_tick.broadcast(&cmd, node_id_tick, &crypto_tick).await;
                 }
 
+                // ADR-0022 (opt-in): the durable head as a statement for an external stamp.
+                // The write runs off the tick; its audit record is made here (or at shutdown).
+                if let Some(anchorer) = anchorer.as_mut() {
+                    anchorer
+                        .tick(sntl_db.durable_head(), &sntl_db, std::time::Instant::now())
+                        .await;
+                }
+
                 // ADR-0021: peers keep this node's durable audit head in their own logs, so a
                 // rewrite of this log is contradicted by records this node cannot change.
                 if last_audit_head.elapsed() >= audit_head_every {
@@ -2127,6 +2166,10 @@ async fn main() -> Result<(), anyhow::Error> {
                     snapshot.mesh_sync_requests_throttled =
                         sync_throttled.load(Ordering::Relaxed);
                     snapshot.audit_witnesses_recorded = witness_stats.recorded.load(Ordering::Relaxed);
+                    if let Some(anchorer) = anchorer.as_ref() {
+                        snapshot.audit_anchors_written = anchorer.stats.written.load(Ordering::Relaxed);
+                        snapshot.audit_anchor_failures = anchorer.stats.failed.load(Ordering::Relaxed);
+                    }
                     snapshot.audit_witnesses_refused = witness_stats.throttled.load(Ordering::Relaxed)
                         + witness_stats.malformed.load(Ordering::Relaxed);
                     snapshot.mesh_dropped_urgent = stats.dropped_urgent.load(Ordering::Relaxed);
@@ -2267,6 +2310,11 @@ async fn main() -> Result<(), anyhow::Error> {
             "[State] Shutdown without a confirmed final state write: {}",
             e
         );
+    }
+    // ADR-0022: a statement write still in flight is recorded now or not at all, never after
+    // NODE_SHUTDOWN (its worker cannot append to the audit itself).
+    if let Some(anchorer) = anchorer.as_mut() {
+        anchorer.finish(&sntl_db, Duration::from_secs(2)).await;
     }
     sntl_db.append("NODE_SHUTDOWN".to_string());
     // All audit producers have joined; the terminal record and sampled losses precede

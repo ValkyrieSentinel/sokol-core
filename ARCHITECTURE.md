@@ -690,6 +690,12 @@ sequenceDiagram
 `CONTRADICTED`. Обхід — переписати журнали й усіх свідків. Перевірка:
 `a_peers_witness_confirms_the_log_and_exposes_a_recomputed_rewrite`.
 
+**Якір поза мешем, опційно** ([ADR-0022](docs/adr/0022-audit-anchor.md)): з `--anchor-dir`
+вузол пише стійку голову як однорядкове твердження у файл (і `AUDIT_ANCHOR` в аудит), а окремий
+процес ставить на нього позначку OpenTimestamps. Після підтвердження в біткоїні переписування
+видно навіть тому, хто контролює весь меш. Вузол сам нікуди не звертається. Перевірка:
+`statements_confirm_the_log_and_expose_a_recomputed_rewrite`.
+
 ## 10. Оператор: керуючий сокет і дашборд
 
 **Керуючий сокет** (`--control-socket`, `0600` або `0660` з `--control-group`) відокремлений від
