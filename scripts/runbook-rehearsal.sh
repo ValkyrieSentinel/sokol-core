@@ -62,6 +62,20 @@ cleanup() {
 trap cleanup EXIT
 trap "exit 130" INT TERM
 
+# The rehearsal needs a fresh host. State it left on an earlier run (marked) is removed, so it
+# can be repeated on one machine (scripts/local-ci.sh); state it did not create is never touched.
+MARK=/var/lib/sokol/.runbook-rehearsal
+if [ -e /var/lib/sokol ]; then
+    if [ -e "$MARK" ]; then
+        systemctl stop sokol-orchestrator 2>/dev/null
+        rm -rf /var/lib/sokol /etc/sokol /etc/default/sokol
+        echo "removed the state of an earlier rehearsal"
+    else
+        echo "FAIL  /var/lib/sokol exists and was not made by this rehearsal: needs a fresh host"
+        exit 1
+    fi
+fi
+
 ip link add "$IF" type veth peer name "$PEER_IF"
 ip netns add "$NS"; ip link set "$PEER_IF" netns "$NS"
 ip addr add "$HOST_IP/24" dev "$IF"; ip link set "$IF" up
@@ -71,13 +85,14 @@ ip netns exec "$NS" ip link set "$PEER_IF" up
 ip netns exec "$NS" ip link set lo up
 
 step "§1 install (binaries given; building from source is not rehearsed)"
-sudo useradd --system --no-create-home --shell /usr/sbin/nologin sokol
-sudo groupadd --system sokol-ipc
-sudo groupadd --system sokol-ops
+id sokol >/dev/null 2>&1 || sudo useradd --system --no-create-home --shell /usr/sbin/nologin sokol
+getent group sokol-ipc >/dev/null || sudo groupadd --system sokol-ipc
+getent group sokol-ops >/dev/null || sudo groupadd --system sokol-ops
 sudo install -m 0755 "$A/orchestrator" /usr/local/bin/sokol-orchestrator
 sudo install -m 0755 "$A/monitor" /usr/local/bin/sokol-monitor
 sudo install -m 0644 "$REPO/deploy/sokol-orchestrator.service" /etc/systemd/system/
 sudo install -d -o sokol -g sokol -m 0700 /var/lib/sokol
+sudo touch "$MARK"
 sudo install -d -m 0755 /etc/sokol
 systemctl daemon-reload
 # §1's example with this host's interface and without a seed peer (one node).

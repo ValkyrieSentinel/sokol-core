@@ -492,6 +492,10 @@ struct Args {
     #[arg(long, value_name = "PEER_AUDIT_LOG")]
     verify_witnesses: Option<std::path::PathBuf>,
 
+    /// Seconds between offers of this node's audit head to peers (ADR-0021; at least 1).
+    #[arg(long, default_value_t = mesh_sync::AUDIT_HEAD_INTERVAL.as_secs())]
+    audit_head_secs: u64,
+
     /// Address or CIDR that must never be blocked (operator/bastion networks, mesh peers).
     /// Loopback, this node's addresses, default gateways and seed peers are always protected.
     #[arg(long, value_name = "CIDR")]
@@ -1896,6 +1900,7 @@ async fn main() -> Result<(), anyhow::Error> {
     let node_id_tick = args.node_id;
     let mut last_digest = std::time::Instant::now();
     let mut last_audit_head = std::time::Instant::now();
+    let audit_head_every = Duration::from_secs(args.audit_head_secs.max(1));
     let mut audit_head_sent: Option<u64> = None;
     let mut telemetry_window_start = std::time::Instant::now();
     let mut window_rx = 0u64;
@@ -2025,7 +2030,7 @@ async fn main() -> Result<(), anyhow::Error> {
 
                 // ADR-0021: peers keep this node's durable audit head in their own logs, so a
                 // rewrite of this log is contradicted by records this node cannot change.
-                if last_audit_head.elapsed() >= mesh_sync::AUDIT_HEAD_INTERVAL {
+                if last_audit_head.elapsed() >= audit_head_every {
                     last_audit_head = std::time::Instant::now();
                     if let Some((records, head)) = sntl_db.durable_head() {
                         if audit_head_sent != Some(records) {
