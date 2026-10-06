@@ -97,13 +97,6 @@ pub struct AuditHealth {
     durable_head: std::sync::Mutex<Option<(u64, [u8; common::audit_log::CHAIN_LEN])>>,
 }
 
-/// Head statements written for the external anchor, and writes that failed (ADR-0022).
-#[derive(Default)]
-pub struct AnchorStats {
-    written: std::sync::atomic::AtomicU64,
-    failed: std::sync::atomic::AtomicU64,
-}
-
 /// A point-in-time view of [`AuditHealth`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AuditStatus {
@@ -1933,11 +1926,13 @@ async fn main() -> Result<(), anyhow::Error> {
     let mut last_audit_head = std::time::Instant::now();
     let audit_head_every = Duration::from_secs(args.audit_head_secs.max(1));
     let mut audit_head_sent: Option<u64> = None;
-    let anchor_every = Duration::from_secs(args.anchor_secs.max(1));
-    let mut last_anchor = std::time::Instant::now();
-    let mut anchored: Option<u64> = None;
-    let anchor_busy = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let anchor_stats = Arc::new(AnchorStats::default());
+    let mut anchorer = args.anchor_dir.clone().map(|dir| {
+        audit_anchor::Anchorer::new(
+            dir,
+            args.node_id,
+            Duration::from_secs(args.anchor_secs.max(1)),
+        )
+    });
     let mut telemetry_window_start = std::time::Instant::now();
     let mut window_rx = 0u64;
     let mut window_dropped = 0u64;
@@ -2064,45 +2059,12 @@ async fn main() -> Result<(), anyhow::Error> {
                     let _ = registry_tick.broadcast(&cmd, node_id_tick, &crypto_tick).await;
                 }
 
-                // ADR-0022 (opt-in): the durable head as a statement for an external stamp. Off
-                // the tick: a slow disk must not delay expiry; at most one write in flight.
-                if let Some(dir) = args.anchor_dir.clone() {
-                    if last_anchor.elapsed() >= anchor_every
-                        && !anchor_busy.load(std::sync::atomic::Ordering::Relaxed)
-                    {
-                        last_anchor = std::time::Instant::now();
-                        if let Some((records, head)) = sntl_db.durable_head() {
-                            if anchored != Some(records) {
-                                anchored = Some(records);
-                                anchor_busy.store(true, std::sync::atomic::Ordering::Relaxed);
-                                let (db, busy, stats) =
-                                    (sntl_db.clone(), anchor_busy.clone(), anchor_stats.clone());
-                                tokio::task::spawn_blocking(move || {
-                                    use std::sync::atomic::Ordering;
-                                    match audit_anchor::write_statement(&dir, node_id_tick, records, &head) {
-                                        Ok(file) => {
-                                            stats.written.fetch_add(1, Ordering::Relaxed);
-                                            db.append(format!(
-                                                "AUDIT_ANCHOR|Records:{}|Head:{}|File:{}",
-                                                records,
-                                                p2p::to_hex(&head),
-                                                file
-                                            ));
-                                        }
-                                        Err(e) => {
-                                            stats.failed.fetch_add(1, Ordering::Relaxed);
-                                            log::error!(
-                                                "[Audit] Cannot write the head statement into {}: {}",
-                                                dir.display(),
-                                                e
-                                            );
-                                        }
-                                    }
-                                    busy.store(false, Ordering::Relaxed);
-                                });
-                            }
-                        }
-                    }
+                // ADR-0022 (opt-in): the durable head as a statement for an external stamp.
+                // The write runs off the tick; its audit record is made here (or at shutdown).
+                if let Some(anchorer) = anchorer.as_mut() {
+                    anchorer
+                        .tick(sntl_db.durable_head(), &sntl_db, std::time::Instant::now())
+                        .await;
                 }
 
                 // ADR-0021: peers keep this node's durable audit head in their own logs, so a
@@ -2204,8 +2166,10 @@ async fn main() -> Result<(), anyhow::Error> {
                     snapshot.mesh_sync_requests_throttled =
                         sync_throttled.load(Ordering::Relaxed);
                     snapshot.audit_witnesses_recorded = witness_stats.recorded.load(Ordering::Relaxed);
-                    snapshot.audit_anchors_written = anchor_stats.written.load(Ordering::Relaxed);
-                    snapshot.audit_anchor_failures = anchor_stats.failed.load(Ordering::Relaxed);
+                    if let Some(anchorer) = anchorer.as_ref() {
+                        snapshot.audit_anchors_written = anchorer.stats.written.load(Ordering::Relaxed);
+                        snapshot.audit_anchor_failures = anchorer.stats.failed.load(Ordering::Relaxed);
+                    }
                     snapshot.audit_witnesses_refused = witness_stats.throttled.load(Ordering::Relaxed)
                         + witness_stats.malformed.load(Ordering::Relaxed);
                     snapshot.mesh_dropped_urgent = stats.dropped_urgent.load(Ordering::Relaxed);
@@ -2346,6 +2310,11 @@ async fn main() -> Result<(), anyhow::Error> {
             "[State] Shutdown without a confirmed final state write: {}",
             e
         );
+    }
+    // ADR-0022: a statement write still in flight is recorded now or not at all, never after
+    // NODE_SHUTDOWN (its worker cannot append to the audit itself).
+    if let Some(anchorer) = anchorer.as_mut() {
+        anchorer.finish(&sntl_db, Duration::from_secs(2)).await;
     }
     sntl_db.append("NODE_SHUTDOWN".to_string());
     // All audit producers have joined; the terminal record and sampled losses precede

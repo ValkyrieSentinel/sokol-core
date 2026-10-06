@@ -73,6 +73,147 @@ pub fn write_statement(
     Ok(name)
 }
 
+/// How a statement is written; replaceable so tests can delay or fail it.
+pub type WriteFn =
+    dyn Fn(&Path, u64, u64, &[u8; CHAIN_LEN]) -> std::io::Result<String> + Send + Sync;
+
+/// Statements written, and writes that failed (metrics).
+#[derive(Default)]
+pub struct AnchorStats {
+    pub written: std::sync::atomic::AtomicU64,
+    pub failed: std::sync::atomic::AtomicU64,
+}
+
+type Job = (
+    u64,
+    [u8; CHAIN_LEN],
+    tokio::task::JoinHandle<std::io::Result<String>>,
+);
+
+/// The node's anchor producer (ADR-0022). The blocking write only writes the file: the audit
+/// record is made here, by the tick or by shutdown's `finish`, so it can never follow
+/// NODE_SHUTDOWN. A head counts as anchored only once its write succeeded; a failed one is
+/// tried again on the next due tick.
+pub struct Anchorer {
+    dir: PathBuf,
+    node_id: u64,
+    every: std::time::Duration,
+    last: Option<std::time::Instant>,
+    anchored: Option<u64>,
+    job: Option<Job>,
+    write: std::sync::Arc<WriteFn>,
+    pub stats: std::sync::Arc<AnchorStats>,
+}
+
+impl Anchorer {
+    pub fn new(dir: PathBuf, node_id: u64, every: std::time::Duration) -> Self {
+        Self::with_writer(dir, node_id, every, std::sync::Arc::new(write_statement))
+    }
+
+    pub fn with_writer(
+        dir: PathBuf,
+        node_id: u64,
+        every: std::time::Duration,
+        write: std::sync::Arc<WriteFn>,
+    ) -> Self {
+        Self {
+            dir,
+            node_id,
+            every,
+            last: None,
+            anchored: None,
+            job: None,
+            write,
+            stats: std::sync::Arc::default(),
+        }
+    }
+
+    fn record(
+        &mut self,
+        db: &crate::SentinelDb,
+        records: u64,
+        head: [u8; CHAIN_LEN],
+        result: Result<std::io::Result<String>, tokio::task::JoinError>,
+    ) {
+        use std::sync::atomic::Ordering;
+        match result {
+            Ok(Ok(file)) => {
+                self.anchored = Some(records);
+                self.stats.written.fetch_add(1, Ordering::Relaxed);
+                db.append(format!(
+                    "AUDIT_ANCHOR|Records:{}|Head:{}|File:{}",
+                    records,
+                    crate::p2p::to_hex(&head),
+                    file
+                ));
+            }
+            Ok(Err(e)) => {
+                self.stats.failed.fetch_add(1, Ordering::Relaxed);
+                log::error!(
+                    "[Audit] Cannot write the head statement into {}: {}; retried next time",
+                    self.dir.display(),
+                    e
+                );
+            }
+            Err(e) => {
+                self.stats.failed.fetch_add(1, Ordering::Relaxed);
+                log::error!("[Audit] Head statement writer failed: {}", e);
+            }
+        }
+    }
+
+    /// Every tick: record a finished write, then start the next one if due and the head is not
+    /// anchored yet. Never waits for the disk.
+    pub async fn tick(
+        &mut self,
+        durable: Option<(u64, [u8; CHAIN_LEN])>,
+        db: &crate::SentinelDb,
+        now: std::time::Instant,
+    ) {
+        if self
+            .job
+            .as_ref()
+            .is_some_and(|(_, _, handle)| handle.is_finished())
+        {
+            if let Some((records, head, handle)) = self.job.take() {
+                let result = handle.await;
+                self.record(db, records, head, result);
+            }
+        }
+        if self.job.is_some()
+            || self
+                .last
+                .is_some_and(|at| now.duration_since(at) < self.every)
+        {
+            return;
+        }
+        self.last = Some(now);
+        let Some((records, head)) = durable else {
+            return;
+        };
+        if self.anchored == Some(records) {
+            return;
+        }
+        let (write, dir, node) = (self.write.clone(), self.dir.clone(), self.node_id);
+        let handle = tokio::task::spawn_blocking(move || write(&dir, node, records, &head));
+        self.job = Some((records, head, handle));
+    }
+
+    /// Shutdown, before NODE_SHUTDOWN: wait up to `wait` for a write in flight and record its
+    /// outcome. A write still running then is only logged; it cannot add an audit record later.
+    pub async fn finish(&mut self, db: &crate::SentinelDb, wait: std::time::Duration) {
+        if let Some((records, head, mut handle)) = self.job.take() {
+            match tokio::time::timeout(wait, &mut handle).await {
+                Ok(result) => self.record(db, records, head, result),
+                Err(_) => log::warn!(
+                    "[Audit] Head statement for {} records still being written at shutdown;                      its file may exist without an AUDIT_ANCHOR record",
+                    records
+                ),
+            }
+        }
+    }
+}
+
 /// One statement file found for the node, with whether a stamp (`<file>.ots`) sits next to it.
 pub struct Found {
     pub file: PathBuf,
@@ -206,6 +347,96 @@ mod tests {
         }
         log.sync().unwrap();
         (log.len(), log.head())
+    }
+
+    fn audit_of(path: &str, db: &crate::SentinelDb) -> Vec<String> {
+        assert!(db.flush(std::time::Duration::from_secs(2)));
+        let mut reader = common::audit_log::AuditReader::open(Path::new(path)).unwrap();
+        let mut out = Vec::new();
+        while let Some(r) = reader.next_record().unwrap() {
+            out.push(String::from_utf8(r.payload).unwrap());
+        }
+        out
+    }
+
+    /// Review of #156 (1): a head was marked anchored before its write, so a failed write was
+    /// never retried. Here the first write fails (the directory path is a file); once that is
+    /// repaired, the next due tick writes the same head, with no new audit event in between.
+    #[tokio::test]
+    async fn a_failed_statement_write_is_retried_for_the_same_head() {
+        let d = dir("retry");
+        let audit = d.join("audit.log").to_string_lossy().into_owned();
+        let db = crate::SentinelDb::init(&audit, None).unwrap();
+        let anchors = d.join("anchors");
+        std::fs::write(&anchors, b"not a directory").unwrap();
+        let mut a = Anchorer::new(anchors.clone(), 1, std::time::Duration::from_secs(60));
+        let head = Some((3, [7; CHAIN_LEN]));
+        let t0 = std::time::Instant::now();
+        a.tick(head, &db, t0).await;
+        while a.job.as_ref().is_some_and(|j| !j.2.is_finished()) {
+            tokio::task::yield_now().await;
+        }
+        a.tick(head, &db, t0).await; // collects the failure; not due yet
+        assert_eq!(a.stats.failed.load(std::sync::atomic::Ordering::Relaxed), 1);
+        std::fs::remove_file(&anchors).unwrap();
+        a.tick(head, &db, t0 + std::time::Duration::from_secs(61))
+            .await;
+        a.finish(&db, std::time::Duration::from_secs(2)).await;
+        assert_eq!(
+            a.stats.written.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the same head was written"
+        );
+        assert!(anchors.join(file_name(1, 3)).exists());
+        assert!(audit_of(&audit, &db)
+            .iter()
+            .any(|r| r.starts_with("AUDIT_ANCHOR|Records:3|")));
+        drop(db);
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
+    /// Review of #156 (2): the blocking worker appended AUDIT_ANCHOR itself, after shutdown's
+    /// NODE_SHUTDOWN. Now `finish` waits for the write in flight and records it first; a write
+    /// that outlasts the wait records nothing at all, before or after NODE_SHUTDOWN.
+    #[tokio::test]
+    async fn a_statement_in_flight_at_shutdown_is_recorded_before_node_shutdown_or_not_at_all() {
+        for (delay_ms, wait_ms, recorded) in [(200, 2000, true), (800, 100, false)] {
+            let d = dir(&format!("shutdown-{}", recorded));
+            let audit = d.join("audit.log").to_string_lossy().into_owned();
+            let db = crate::SentinelDb::init(&audit, None).unwrap();
+            let slow: std::sync::Arc<WriteFn> =
+                std::sync::Arc::new(move |dir: &Path, n, r, h: &[u8; CHAIN_LEN]| {
+                    std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                    write_statement(dir, n, r, h)
+                });
+            let mut a = Anchorer::with_writer(
+                d.join("anchors"),
+                1,
+                std::time::Duration::from_secs(60),
+                slow,
+            );
+            a.tick(Some((5, [1; CHAIN_LEN])), &db, std::time::Instant::now())
+                .await;
+            a.finish(&db, std::time::Duration::from_millis(wait_ms))
+                .await;
+            db.append("NODE_SHUTDOWN".into());
+            std::thread::sleep(std::time::Duration::from_millis(delay_ms + 200));
+            let records = audit_of(&audit, &db);
+            assert_eq!(
+                records.last().map(String::as_str),
+                Some("NODE_SHUTDOWN"),
+                "{:?}",
+                records
+            );
+            assert_eq!(
+                records.iter().any(|r| r.starts_with("AUDIT_ANCHOR|")),
+                recorded,
+                "{:?}",
+                records
+            );
+            drop(db);
+            std::fs::remove_dir_all(d).unwrap();
+        }
     }
 
     #[test]
