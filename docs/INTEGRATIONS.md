@@ -413,6 +413,11 @@ mesh-wide broadcast (stop or start the service to change XDP).
 `trident_trap` listens on decoy ports and asks the orchestrator to block every source that
 connects, so run it on a decoy host or only on ports with no real service.
 
+Only a completed TCP handshake leads to a block (here and with `--trap-port`), so a spoofed source
+address cannot get an innocent host blocked. The XDP trap port (44333) is different: a SYN to it
+is only recorded (`KERNEL_DROP_NOTIFY|…|Reason:6`), because a single SYN's source is trivially
+forged. Do not turn those records into blocks in an external detector.
+
 - `SOKOL_TRAP_PORTS` — comma-separated ports (default `22,80,443,3306,6379,8443`; `2222`, the
   operator SSH port, is refused)
 - `SOKOL_JAIL_ADDR` — optional external interactive jail for SSH attackers; without it an

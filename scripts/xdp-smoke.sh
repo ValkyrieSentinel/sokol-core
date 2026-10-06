@@ -221,6 +221,7 @@ check "blocked IPv6 source with a truncated extension header is dropped ($MID ->
 printf 'UNBAN_IP:%s\n' "$BLOCKED_V6" | nc -U -q1 "$WORK/control.sock" >/dev/null
 
 # SYN flood on the XDP trap port: events must be rate-limited, not one per packet.
+BLOCKS_BEFORE_FLOOD=$( (grep -a -o "DYNAMIC_BLOCK_V[46]|" "$WORK/events.sntl" || true) | wc -l)
 FLOOD_START=$SECONDS
 ip netns exec "$NS" bash -c "for i in \$(seq 1 3000); do (echo > /dev/tcp/$HOST_IP/44333) 2>/dev/null; done; true"
 FLOOD_SECONDS=$((SECONDS - FLOOD_START + 1))
@@ -232,6 +233,11 @@ check "trap SYN flood: excess events are suppressed" test "$(metric sokol_xdp_ev
 # 64 events per CPU per started second of flood (+1 window for the boundary).
 check "trap SYN flood: recorded events stay within the per-CPU budget" \
     test "$TRAP_EVENTS" -le $((64 * CPUS * (FLOOD_SECONDS + 1)))
+# A single SYN's source is trivially spoofed: an XDP trap event is recorded, never a block
+# (ARCHITECTURE §4). The flooding source still reaches the node and no block was added.
+check "trap SYN flood: the source is not blocked by trap events" ping_from "$ALLOWED_IP"
+check "trap SYN flood: no block was recorded for trap events" \
+    test "$( (grep -a -o "DYNAMIC_BLOCK_V[46]|" "$WORK/events.sntl" || true) | wc -l)" -eq "$BLOCKS_BEFORE_FLOOD"
 # ABI between the XDP program and userspace (common::abi): every field of an event written by the
 # real kernel program reads back as what was sent — source, protocol, IP version and a SYN's frame
 # length (Ethernet + IPv4 + TCP with options). A shifted field reads as garbage here.
