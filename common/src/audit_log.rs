@@ -414,6 +414,19 @@ impl AuditLog {
     fn rotate(&mut self, keep: usize) -> Result<(), AuditError> {
         self.sync()?;
         let rotated = rotated_path(&self.path, self.segment_start_seq);
+        // rename(2) replaces an existing file silently. A segment of that name can only exist if
+        // an earlier rotation got past its rename and failed later; replacing it would destroy
+        // evidence. Refuse, and refuse every later write through this handle.
+        if rotated.exists() {
+            self.poisoned = true;
+            return Err(AuditError::Io(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "{} exists; not replacing an audit segment",
+                    rotated.display()
+                ),
+            )));
+        }
         std::fs::rename(&self.path, &rotated)?;
         self.file = OpenOptions::new()
             .read(true)
@@ -753,6 +766,32 @@ mod tests {
             check_witnesses(&path, &[witnessed]).unwrap(),
             vec![WitnessVerdict::Missing]
         );
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    /// A rotation never replaces an existing segment: rename(2) would, silently. The original
+    /// segment stays byte for byte, the record is refused, and the handle stays refused.
+    #[test]
+    fn rotation_refuses_to_replace_an_existing_segment() {
+        let path = temp_path("rotate-no-overwrite");
+        let rotation = Some(Rotation {
+            max_bytes: 1,
+            keep: 10,
+        });
+        let mut log = AuditLog::open_with(&path, rotation).unwrap();
+        log.append(b"first").unwrap();
+        log.sync().unwrap();
+        let taken = rotated_path(&path, 0);
+        std::fs::write(&taken, b"an earlier segment's evidence").unwrap();
+        assert!(
+            log.append(b"second").is_err(),
+            "rotation onto an existing name must fail"
+        );
+        assert_eq!(
+            std::fs::read(&taken).unwrap(),
+            b"an earlier segment's evidence"
+        );
+        assert!(matches!(log.append(b"third"), Err(AuditError::Poisoned)));
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
