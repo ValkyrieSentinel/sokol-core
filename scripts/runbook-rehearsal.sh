@@ -54,6 +54,33 @@ reachable() { ip netns exec "$NS" ping -c 1 -W 1 -I "$1" "$HOST_IP" >/dev/null 2
 wait_until() { local t=$1; shift; for _ in $(seq 1 $((t * 5))); do "$@" && return 0; sleep 0.2; done; return 1; }
 up() { systemctl is-active --quiet sokol-orchestrator && [ -n "$(value sokol_build_info)" ]; }
 
+# Ownership preflight, before any change and before the cleanup trap is armed: a refusal must
+# leave the host exactly as it was (no service stopped, no interface or namespace removed).
+# State this rehearsal left on an earlier run carries its marker and is removed, so it can be
+# repeated on one machine (scripts/local-ci.sh). REHEARSAL_ROOT only relocates these checks
+# for scripts/test_runbook_preflight.py.
+ROOT=${REHEARSAL_ROOT:-}
+STATE="$ROOT/var/lib/sokol"
+UNIT="$ROOT/etc/systemd/system/sokol-orchestrator.service"
+MARK="$STATE/.runbook-rehearsal"
+if [ -e "$MARK" ]; then
+    systemctl stop sokol-orchestrator 2>/dev/null
+    ip netns del "$NS" 2>/dev/null
+    ip link del "$IF" 2>/dev/null
+    rm -rf "$STATE" "$ROOT/etc/sokol" "$ROOT/etc/default/sokol"
+    echo "removed the state of an earlier rehearsal"
+else
+    refuse=""
+    [ -e "$STATE" ] && refuse="$STATE exists"
+    [ -z "$refuse" ] && [ -e "$UNIT" ] && refuse="$UNIT exists"
+    [ -z "$refuse" ] && ip link show "$IF" >/dev/null 2>&1 && refuse="interface $IF exists"
+    [ -z "$refuse" ] && ip netns list 2>/dev/null | grep -qw "^$NS" && refuse="network namespace $NS exists"
+    if [ -n "$refuse" ]; then
+        echo "FAIL  $refuse and was not made by this rehearsal: needs a fresh host; nothing changed"
+        exit 1
+    fi
+fi
+
 cleanup() {
     systemctl stop sokol-orchestrator 2>/dev/null
     ip netns del "$NS" 2>/dev/null
@@ -61,20 +88,6 @@ cleanup() {
 }
 trap cleanup EXIT
 trap "exit 130" INT TERM
-
-# The rehearsal needs a fresh host. State it left on an earlier run (marked) is removed, so it
-# can be repeated on one machine (scripts/local-ci.sh); state it did not create is never touched.
-MARK=/var/lib/sokol/.runbook-rehearsal
-if [ -e /var/lib/sokol ]; then
-    if [ -e "$MARK" ]; then
-        systemctl stop sokol-orchestrator 2>/dev/null
-        rm -rf /var/lib/sokol /etc/sokol /etc/default/sokol
-        echo "removed the state of an earlier rehearsal"
-    else
-        echo "FAIL  /var/lib/sokol exists and was not made by this rehearsal: needs a fresh host"
-        exit 1
-    fi
-fi
 
 ip link add "$IF" type veth peer name "$PEER_IF"
 ip netns add "$NS"; ip link set "$PEER_IF" netns "$NS"
@@ -92,7 +105,7 @@ sudo install -m 0755 "$A/orchestrator" /usr/local/bin/sokol-orchestrator
 sudo install -m 0755 "$A/monitor" /usr/local/bin/sokol-monitor
 sudo install -m 0644 "$REPO/deploy/sokol-orchestrator.service" /etc/systemd/system/
 sudo install -d -o sokol -g sokol -m 0700 /var/lib/sokol
-sudo touch "$MARK"
+sudo touch /var/lib/sokol/.runbook-rehearsal
 sudo install -d -m 0755 /etc/sokol
 systemctl daemon-reload
 # §1's example with this host's interface and without a seed peer (one node).
