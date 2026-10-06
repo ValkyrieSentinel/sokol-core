@@ -18,6 +18,7 @@
 )]
 pub use mesh_sync::{AlertLevel, MeshCommand, MeshOrchestrator};
 mod attack_reports;
+mod audit_anchor;
 mod audit_witness;
 mod block_policy;
 mod block_table;
@@ -94,6 +95,13 @@ pub struct AuditHealth {
     /// (records, chain head) as of the last successful fsync: what peers may witness
     /// (ADR-0021). A head not yet synced could still be lost to a crash.
     durable_head: std::sync::Mutex<Option<(u64, [u8; common::audit_log::CHAIN_LEN])>>,
+}
+
+/// Head statements written for the external anchor, and writes that failed (ADR-0022).
+#[derive(Default)]
+pub struct AnchorStats {
+    written: std::sync::atomic::AtomicU64,
+    failed: std::sync::atomic::AtomicU64,
 }
 
 /// A point-in-time view of [`AuditHealth`].
@@ -495,6 +503,22 @@ struct Args {
     /// Seconds between offers of this node's audit head to peers (ADR-0021; at least 1).
     #[arg(long, default_value_t = mesh_sync::AUDIT_HEAD_INTERVAL.as_secs())]
     audit_head_secs: u64,
+
+    /// Opt-in external anchor (ADR-0022): write this node's fsynced audit head as a statement
+    /// file into this directory, for a separate process to stamp with OpenTimestamps
+    /// (scripts/anchor-ots.sh). The node itself contacts nothing. Off unless given.
+    #[arg(long, value_name = "DIR")]
+    anchor_dir: Option<std::path::PathBuf>,
+
+    /// Seconds between head statements in --anchor-dir, written only when the log grew.
+    #[arg(long, default_value_t = 3600)]
+    anchor_secs: u64,
+
+    /// Check this node's audit log (--db-path) against the head statements in this directory
+    /// (ADR-0022), then exit; exit status as for --verify-witnesses. Bitcoin attestation of the
+    /// stamps themselves is checked with `ots verify`.
+    #[arg(long, value_name = "DIR")]
+    verify_anchors: Option<std::path::PathBuf>,
 
     /// Address or CIDR that must never be blocked (operator/bastion networks, mesh peers).
     /// Loopback, this node's addresses, default gateways and seed peers are always protected.
@@ -1010,6 +1034,13 @@ async fn main() -> Result<(), anyhow::Error> {
 
     if let Some(path) = &args.replay {
         std::process::exit(replay::print_report(path, env!("SOKOL_BUILD_ID")));
+    }
+    if let Some(dir) = &args.verify_anchors {
+        std::process::exit(audit_anchor::print_report(
+            std::path::Path::new(&args.db_path),
+            dir,
+            args.node_id,
+        ));
     }
     if let Some(peer_log) = &args.verify_witnesses {
         std::process::exit(audit_witness::print_report(
@@ -1902,6 +1933,11 @@ async fn main() -> Result<(), anyhow::Error> {
     let mut last_audit_head = std::time::Instant::now();
     let audit_head_every = Duration::from_secs(args.audit_head_secs.max(1));
     let mut audit_head_sent: Option<u64> = None;
+    let anchor_every = Duration::from_secs(args.anchor_secs.max(1));
+    let mut last_anchor = std::time::Instant::now();
+    let mut anchored: Option<u64> = None;
+    let anchor_busy = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let anchor_stats = Arc::new(AnchorStats::default());
     let mut telemetry_window_start = std::time::Instant::now();
     let mut window_rx = 0u64;
     let mut window_dropped = 0u64;
@@ -2028,6 +2064,47 @@ async fn main() -> Result<(), anyhow::Error> {
                     let _ = registry_tick.broadcast(&cmd, node_id_tick, &crypto_tick).await;
                 }
 
+                // ADR-0022 (opt-in): the durable head as a statement for an external stamp. Off
+                // the tick: a slow disk must not delay expiry; at most one write in flight.
+                if let Some(dir) = args.anchor_dir.clone() {
+                    if last_anchor.elapsed() >= anchor_every
+                        && !anchor_busy.load(std::sync::atomic::Ordering::Relaxed)
+                    {
+                        last_anchor = std::time::Instant::now();
+                        if let Some((records, head)) = sntl_db.durable_head() {
+                            if anchored != Some(records) {
+                                anchored = Some(records);
+                                anchor_busy.store(true, std::sync::atomic::Ordering::Relaxed);
+                                let (db, busy, stats) =
+                                    (sntl_db.clone(), anchor_busy.clone(), anchor_stats.clone());
+                                tokio::task::spawn_blocking(move || {
+                                    use std::sync::atomic::Ordering;
+                                    match audit_anchor::write_statement(&dir, node_id_tick, records, &head) {
+                                        Ok(file) => {
+                                            stats.written.fetch_add(1, Ordering::Relaxed);
+                                            db.append(format!(
+                                                "AUDIT_ANCHOR|Records:{}|Head:{}|File:{}",
+                                                records,
+                                                p2p::to_hex(&head),
+                                                file
+                                            ));
+                                        }
+                                        Err(e) => {
+                                            stats.failed.fetch_add(1, Ordering::Relaxed);
+                                            log::error!(
+                                                "[Audit] Cannot write the head statement into {}: {}",
+                                                dir.display(),
+                                                e
+                                            );
+                                        }
+                                    }
+                                    busy.store(false, Ordering::Relaxed);
+                                });
+                            }
+                        }
+                    }
+                }
+
                 // ADR-0021: peers keep this node's durable audit head in their own logs, so a
                 // rewrite of this log is contradicted by records this node cannot change.
                 if last_audit_head.elapsed() >= audit_head_every {
@@ -2127,6 +2204,8 @@ async fn main() -> Result<(), anyhow::Error> {
                     snapshot.mesh_sync_requests_throttled =
                         sync_throttled.load(Ordering::Relaxed);
                     snapshot.audit_witnesses_recorded = witness_stats.recorded.load(Ordering::Relaxed);
+                    snapshot.audit_anchors_written = anchor_stats.written.load(Ordering::Relaxed);
+                    snapshot.audit_anchor_failures = anchor_stats.failed.load(Ordering::Relaxed);
                     snapshot.audit_witnesses_refused = witness_stats.throttled.load(Ordering::Relaxed)
                         + witness_stats.malformed.load(Ordering::Relaxed);
                     snapshot.mesh_dropped_urgent = stats.dropped_urgent.load(Ordering::Relaxed);

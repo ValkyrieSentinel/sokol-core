@@ -143,6 +143,7 @@ jobs:
           python3 scripts/test_witness_gate.py
           python3 scripts/test_local_ci.py
           python3 scripts/test_runbook_preflight.py
+          python3 scripts/test_anchor_scripts.py
 
       - name: CrowdSec stream recovery regression
         timeout-minutes: 2

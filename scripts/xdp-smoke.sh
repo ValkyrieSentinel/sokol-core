@@ -1170,7 +1170,8 @@ if command -v wg >/dev/null && ip link add sokol-wgprobe type wireguard 2>/dev/n
     ip addr add "$ATTACK_SRC/24" dev "$HOST_IF"
 
     P2P_BIND=10.99.0.1:7946 start_orchestrator --node-id 1 --peers-file "$WORK/peers-n1.json" \
-        --storm-threshold 0.4 --never-block 10.99.0.2 --audit-head-secs 2
+        --storm-threshold 0.4 --never-block 10.99.0.2 --audit-head-secs 2 \
+        --anchor-dir "$WORK/anchors" --anchor-secs 1
     ip netns exec "$NS" "$BIN" --interface "$PEER_IF" --node-id 2 --block "$ATTACK_SRC" \
         --db-path "$WORK/n2/events.log" --key-file "$WORK/n2/node.key" \
         --ipc-socket "$WORK/n2/ipc.sock" --control-socket "$WORK/n2/control.sock" \
@@ -1256,6 +1257,10 @@ PY
     # Both logs closed: node 1's log checked against node 2's witnesses with the real CLI.
     check "audit witnesses: node 1's log is confirmed by node 2's witnesses" \
         "$(dirname "$0")/check-witnesses.sh" "$BIN" "$WORK/events.sntl" "$WORK/n2/events.log" 1
+    # ADR-0022: node 1 wrote its durable heads as statements for an external stamp.
+    check "audit anchor: node 1's log is confirmed by its head statements" \
+        "$(dirname "$0")/check-anchors.sh" "$BIN" "$WORK/events.sntl" "$WORK/anchors" 1
+    check "audit anchor: each statement is recorded in node 1's audit" grep -aq "AUDIT_ANCHOR|Records:" "$WORK/events.sntl"
 else
     skip wireguard "two-node WireGuard mesh checks (no wireguard support)"
 fi
