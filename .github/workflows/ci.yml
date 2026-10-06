@@ -138,10 +138,11 @@ jobs:
       - name: CrowdSec TTL smoke oracle regression
         run: python3 scripts/test_crowdsec_ttl.py
 
-      - name: Audit witness gate and local CI tool regressions
+      - name: Audit witness gate, local CI tools and rehearsal preflight regressions
         run: |
           python3 scripts/test_witness_gate.py
           python3 scripts/test_local_ci.py
+          python3 scripts/test_runbook_preflight.py
 
       - name: CrowdSec stream recovery regression
         timeout-minutes: 2
