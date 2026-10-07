@@ -1,0 +1,33 @@
+# cargo-mutants: mutants that are equivalent or cannot be observed by a unit test.
+# Every entry says why. Commands, baseline and open survivors: docs/MUTATION.md.
+exclude_re = [
+    # Disjoint bits: `|` and `^` give the same value.
+    "replace \\| with \\^ in from_hex",
+    "replace \\| with \\^ in tcp_flags::is_invalid",
+    # The reference implementation kept inside the tests, not code the node runs.
+    "in tests::Old::",
+    # The kernel map: needs a loaded XDP program; the XDP smoke covers it.
+    "KernelBlocklist",
+    # Directory fsync for durability; not observable without crash injection.
+    "in sync_dir",
+    # A clock that has not stepped: 0 and +-1 ms are indistinguishable from the real offset.
+    "replace (local_ms -> u64|wall_offset_ms -> i64) with",
+    # wall / local is 1 while the clock has not stepped, inside the tolerance of
+    # the_table_clock_starts_on_the_wall_clock; a step cannot be made in a unit test.
+    "replace - with / in wall_offset_ms",
+    # k = 1 lets the issuer's own claim reach the quorum, so `>` and `>=` agree.
+    "block_table.rs:\\d+:\\d+: replace > with >= in Quorum::applies",
+    # `tick` ends a claim at its end before `counts` reads it
+    # (an_enforced_peer_claim_ends_at_its_exact_end), so `>` and `>=` agree there.
+    "replace > with >= in BlockTable<B>::counts",
+    # Compaction threshold of strike_order: a different threshold compacts at another time
+    # with the same result. Thresholds that compact on every call time out (caught).
+    "replace (> with ==|> with >=|\\* with \\+) in BlockTable<B>::strike",
+    # Replay compares a detector's TTL and claim; a static or operator block does not change
+    # either on the current table (probed 2026-10-07).
+    "match guard t.starts_with\\(\"(STATIC_BLOCK_|OPERATOR_BAN_)\"\\) with false in replay_records",
+    # serde refuses repeated fields and a second top-level key on its own; the strict check
+    # adds nothing an accepted message could carry (p2p a_signed_payload_has_one_meaning).
+    "in check_canonical",
+    "check_canonical -> Result",
+]

@@ -454,8 +454,11 @@ mod tests {
         // Due again, but the first write is still running: no second one.
         a.tick(Some((4, [4; CHAIN_LEN])), &db, t0 + secs(61)).await;
         std::thread::sleep(std::time::Duration::from_millis(200));
-        assert_eq!(calls.load(Ordering::SeqCst), 1, "one write in flight");
+        let in_flight = calls.load(Ordering::SeqCst);
+        // Opened before asserting: a failed test must not leave a writer blocked, which the
+        // runtime would wait for at its end.
         open.store(true, Ordering::SeqCst);
+        assert_eq!(in_flight, 1, "one write in flight");
 
         settle(&a);
         a.tick(Some((4, [4; CHAIN_LEN])), &db, t0 + secs(61)).await;

@@ -69,15 +69,6 @@ impl CanonicalParser {
         }
     }
 
-    pub fn parse_ipv6_bytes(ip_str: &str) -> Result<[u8; 16], CanonicalError> {
-        use core::net::Ipv6Addr;
-
-        match ip_str.parse::<Ipv6Addr>() {
-            Ok(addr) => Ok(addr.octets()),
-            Err(_) => Err(CanonicalError::InvalidIpFormat),
-        }
-    }
-
     fn parse_and_check_keys(inner: &[u8]) -> Result<(), CanonicalError> {
         let mut keys: [Option<&[u8]>; MAX_KEYS] = [None; MAX_KEYS];
         let mut key_count = 0;

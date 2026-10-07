@@ -1013,6 +1013,23 @@ mod tests {
         std::fs::write(middle, &saved).unwrap();
         assert!(verify_chain(&path).is_ok());
 
+        // Bytes appended to a rotated segment (mutation sweep 2026-10-07: untested).
+        let (_, second) = &segs[1];
+        let mut longer = saved.clone();
+        longer.extend_from_slice(b"appended");
+        std::fs::write(second, &longer).unwrap();
+        let err = verify_chain(&path).unwrap_err();
+        assert!(err.to_string().contains("trailing bytes"), "{}", err);
+        std::fs::write(second, &saved).unwrap();
+        assert!(verify_chain(&path).is_ok());
+        // The live file may end in a record still being written: that is not tampering.
+        let mut live = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        std::io::Write::write_all(&mut live, b"SAL2 half a record").unwrap();
+        assert!(verify_chain(&path).is_ok());
+
         // Edit a byte inside a rotated segment.
         let (_, first) = &segs[0];
         let mut bytes = std::fs::read(first).unwrap();
