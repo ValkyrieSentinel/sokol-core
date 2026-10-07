@@ -14,6 +14,11 @@ use common::{
     DROP_REASON_SLOTS, EVENTS_RING_BYTES, MAX_EVENTS_PER_CPU_PER_SEC,
 };
 
+/// The license the kernel sees (GPL-2.0-or-later, `ebpf/LICENSE`); it admits GPL-only helpers.
+#[link_section = "license"]
+#[no_mangle]
+static LICENSE: [u8; 4] = *b"GPL\0";
+
 const ETH_P_IP: u16 = 0x0800;
 const ETH_P_IPV6: u16 = 0x86DD;
 const ETH_P_8021Q: u16 = 0x8100;

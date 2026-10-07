@@ -11,7 +11,9 @@ ignore = []
 
 [licenses]
 version = 2
-# Permissive licenses only: the code is proprietary, so copyleft dependencies are not allowed.
+# Permissive dependency licenses only. Sokol-Core itself is AGPL-3.0 / GPL-2.0-or-later
+# (COPYRIGHT.md), and its copyright holder may grant it under other terms as well; a
+# copyleft dependency would bind those terms, so it needs a decision first.
 allow = [
     "MIT",
     "Apache-2.0",

@@ -46,6 +46,9 @@ prefer fewer, complete pull requests over many small ones.
 
 ## Changing code
 
+- Contributions are accepted under [CLA.md](CLA.md); sign commits off (`git commit -s`).
+  `ebpf/` and `common/` are GPL-2.0-or-later, the rest AGPL-3.0-only
+  ([COPYRIGHT.md](COPYRIGHT.md)). Name third-party material and its license in the PR.
 - Outside tests nothing may panic (crate-level deny: no unwrap/expect/indexing/panic).
 - A fix starts with a test that fails **on its assertion** (not on a missing import) on the
   old code. When a test guards a boundary, check it with a mutation that restores the old
