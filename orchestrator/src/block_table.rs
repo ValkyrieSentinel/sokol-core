@@ -922,12 +922,18 @@ impl<B: Blocklist> BlockTable<B> {
         entry.1 = now_ms;
         let count = entry.0;
         self.strike_order.push_back((net, now_ms));
-        if self.strike_order.len() > 2 * MAX_STRIKES {
+        if self.strike_order_due() {
             let strikes = &self.strikes;
             self.strike_order
                 .retain(|(n, seen)| strikes.get(n).map(|&(_, last)| last) == Some(*seen));
         }
         count
+    }
+
+    /// Whether `strike_order` holds enough stale entries to compact (amortized: at most one
+    /// compaction per MAX_STRIKES strikes).
+    fn strike_order_due(&self) -> bool {
+        self.strike_order.len() > 2 * MAX_STRIKES
     }
 
     /// The earliest claim in force on `net`, as `<who>: <reason>`.
