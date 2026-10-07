@@ -828,6 +828,10 @@ check "a trap hit from a protected address is audited as refused, not enforced" 
     "grep -aq 'TRAP_HIT|Port:2324|IP:$TRAP_PROTECTED|Action:Refused' '$WORK/events.sntl' && ! grep -aq 'TRAP_HIT|Port:2324|IP:$TRAP_PROTECTED|Action:EnforcedDrop' '$WORK/events.sntl'"
 check "a trap hit from an unprotected address is audited as enforced" \
     grep -aq "TRAP_HIT|Port:2324|IP:$TRAP_OPEN|Action:EnforcedDrop" "$WORK/events.sntl"
+check "trap decisions are counted under source trap: one enforced" \
+    wait_metric 'sokol_detections_total{source="trap",result="enforced"}' 1
+check "trap decisions are counted under source trap: one refused (protected)" \
+    wait_metric 'sokol_detections_total{source="trap",result="refused"}' 1
 MONITOR_BIN="$(dirname "$BIN")/monitor"
 check "monitor --verify accepts the audit chain" audit_verdict intact "$WORK/events.sntl"
 check "audit log from the first run is re-verified on restart" \

@@ -65,6 +65,18 @@ groups:
         annotations:
           summary: "{{ $labels.instance }} {{ $labels.family }}: blocklist over 80 % of 65 536"
           runbook: "RUNBOOK §4"
+      # A detector that misfires shows as its own surge long before the map fills: over 200
+      # decisions in 5 min that also exceed ten times its pace over the hour before.
+      - alert: SokolDetectorSurge
+        expr: |
+          sum by (instance, source) (increase(sokol_detections_total{result=~"enforced|pending"}[5m])) > 200
+          and
+          sum by (instance, source) (increase(sokol_detections_total{result=~"enforced|pending"}[5m]))
+            > 10 * sum by (instance, source) (increase(sokol_detections_total{result=~"enforced|pending"}[1h] offset 5m)) / 12
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.instance }}: {{ $labels.source }} asked for {{ $value | humanize }} blocks in 5 min, over ten times its usual pace"
+          runbook: "RUNBOOK §5.1: check the detector before its blocks spread"
       - alert: SokolKernelEventsLost
         expr: increase(sokol_xdp_events_lost_total[10m]) > 0
         labels: { severity: warning }

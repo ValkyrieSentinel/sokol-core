@@ -106,3 +106,17 @@ tests:
       - eval_time: 3m
         alertname: SokolStormEngaged
         exp_alerts: [ { exp_labels: { severity: warning, job: sokol, instance: n1 }, exp_annotations: { summary: "n1: distributed storm engaged (strict parsing and fragment drops)", runbook: "ADR-0006" } } ]
+
+  # A detector surge: a quiet hour then 300 decisions a minute fires; a steady high pace and a
+  # small burst do not.
+  - interval: 1m
+    input_series:
+      - { series: 'sokol_detections_total{job="sokol",instance="n1",source="crowdsec",result="enforced"}', values: '0x65 300+300x9' }
+      - { series: 'sokol_detections_total{job="sokol",instance="n1",source="suricata",result="enforced"}', values: '0+100x75' }
+      - { series: 'sokol_detections_total{job="sokol",instance="n1",source="trap",result="enforced"}', values: '0x65 30+30x9' }
+      - { series: 'sokol_detections_total{job="sokol",instance="n1",source="crowdsec",result="duplicate"}', values: '0x65 1000+1000x9' }
+    alert_rule_test:
+      - eval_time: 70m
+        alertname: SokolDetectorSurge
+        exp_alerts: [ { exp_labels: { severity: warning, instance: n1, source: crowdsec }, exp_annotations: { summary: "n1: crowdsec asked for 1.5k blocks in 5 min, over ten times its usual pace", runbook: "RUNBOOK §5.1: check the detector before its blocks spread" } } ]
+      - { eval_time: 60m, alertname: SokolDetectorSurge, exp_alerts: [] }
