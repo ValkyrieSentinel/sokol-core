@@ -3,6 +3,7 @@ name: CI
 on:
   push:
     branches: [main]
+    tags: ['v*']
   pull_request:
 
 env:
@@ -19,17 +20,36 @@ jobs:
   # kani-verifier comes from crates.io with Cargo's checksums (--locked); `cargo kani setup`
   # then fetches the verifier bundle of that version from Kani's GitHub release, pinned by
   # version only — the one tool here without a checksum of ours.
+  # Proofs run when something they read changed (scripts/kani-scope.sh lists it: common/, the
+  # workspace manifest Kani takes its configuration from, the lock file, toolchain, this file);
+  # otherwise a pull request's job passes in seconds. main and release tags always prove. So
+  # the job can be a required check without slowing the pull requests it does not concern.
   kani:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+      - name: Scope
+        id: scope
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = pull_request ] && [ "$(scripts/kani-scope.sh "$BASE")" = skip ]; then
+            echo "prove=false" >> "$GITHUB_OUTPUT"
+            echo "nothing the proofs read changed since $BASE (scripts/kani-scope.sh): the proofs on main stand"
+          else
+            echo "prove=true" >> "$GITHUB_OUTPUT"
+          fi
       - name: Install Kani
+        if: steps.scope.outputs.prove == 'true'
         run: |
           rustup toolchain install stable --profile minimal
           cargo +stable install --locked kani-verifier --version "$KANI_VERSION"
           cargo +stable kani setup
       - name: Proofs (cargo kani -p common)
+        if: steps.scope.outputs.prove == 'true'
         run: cargo kani -p common
 
   # Both architectures run the whole suite, XDP smoke and demo included: an arm64 kernel faults
@@ -162,6 +182,7 @@ jobs:
           python3 scripts/test_local_ci.py
           python3 scripts/test_runbook_preflight.py
           python3 scripts/test_anchor_scripts.py
+          python3 scripts/test_kani_scope.py
 
       - name: CrowdSec stream recovery regression
         timeout-minutes: 2
