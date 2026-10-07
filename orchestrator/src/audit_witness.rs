@@ -60,6 +60,31 @@ pub struct Summary {
 }
 
 impl Summary {
+    /// Counts one verdict and says it the way both reports print it.
+    pub fn count(&mut self, verdict: WitnessVerdict) -> String {
+        match verdict {
+            WitnessVerdict::Confirmed => {
+                self.confirmed += 1;
+                "confirmed".to_string()
+            }
+            WitnessVerdict::Contradicted(found) => {
+                self.contradicted += 1;
+                format!(
+                    "CONTRADICTED: this log now has head {}",
+                    crate::p2p::to_hex(&found)
+                )
+            }
+            WitnessVerdict::Missing => {
+                self.missing += 1;
+                "MISSING: this log has fewer records now".to_string()
+            }
+            WitnessVerdict::Pruned => {
+                self.pruned += 1;
+                "unknown: in a pruned segment".to_string()
+            }
+        }
+    }
+
     /// 0: at least one confirmed, nothing contradicted or missing; 1: a contradiction or missing
     /// records; 2: nothing checkable.
     pub fn exit_code(&self) -> i32 {
@@ -85,27 +110,7 @@ pub fn verify(
     let mut summary = Summary::default();
     let mut lines = Vec::new();
     for ((peer_seq, records, _), verdict) in witnesses.iter().zip(verdicts) {
-        let what = match verdict {
-            WitnessVerdict::Confirmed => {
-                summary.confirmed += 1;
-                "confirmed".to_string()
-            }
-            WitnessVerdict::Contradicted(found) => {
-                summary.contradicted += 1;
-                format!(
-                    "CONTRADICTED: this log now has head {}",
-                    crate::p2p::to_hex(&found)
-                )
-            }
-            WitnessVerdict::Missing => {
-                summary.missing += 1;
-                "MISSING: this log has fewer records now".to_string()
-            }
-            WitnessVerdict::Pruned => {
-                summary.pruned += 1;
-                "unknown: in a pruned segment".to_string()
-            }
-        };
+        let what = summary.count(verdict);
         lines.push(format!(
             "peer record {}: head after {} records {}",
             peer_seq, records, what
@@ -164,6 +169,44 @@ mod tests {
         )
     }
 
+    /// Both reports count through here; every verdict lands in its own counter, and the exit
+    /// code follows (mutation sweep 2026-10-07: the pruned and missing counters were untested).
+    #[test]
+    fn each_verdict_is_counted_once_in_its_own_counter() {
+        let mut s = Summary::default();
+        assert_eq!(s.exit_code(), 2, "nothing checked");
+        s.count(WitnessVerdict::Pruned);
+        assert_eq!((s.pruned, s.exit_code()), (1, 2), "pruned proves nothing");
+        assert_eq!(s.count(WitnessVerdict::Confirmed), "confirmed");
+        assert_eq!(s.exit_code(), 0);
+        assert!(s.count(WitnessVerdict::Missing).starts_with("MISSING"));
+        assert_eq!(s.exit_code(), 1);
+        assert!(s
+            .count(WitnessVerdict::Contradicted([0xab; CHAIN_LEN]))
+            .contains(&"ab".repeat(CHAIN_LEN)));
+        assert_eq!(
+            s,
+            Summary {
+                confirmed: 1,
+                contradicted: 1,
+                missing: 1,
+                pruned: 1
+            }
+        );
+    }
+
+    #[test]
+    fn a_witness_head_of_the_wrong_length_is_not_one() {
+        let good = witness(1, (3, [0xab; CHAIN_LEN]));
+        assert_eq!(parse(&good, 1), Some((3, [0xab; CHAIN_LEN])));
+        for bad in [
+            good.replace(&"ab".repeat(CHAIN_LEN), &"ab".repeat(CHAIN_LEN - 1)),
+            good.replace(&"ab".repeat(CHAIN_LEN), &"ab".repeat(CHAIN_LEN + 1)),
+        ] {
+            assert_eq!(parse(&bad, 1), None, "{}", bad);
+        }
+    }
+
     /// ADR-0021 end to end on real logs: node 1's head kept by node 2 confirms the log as
     /// written, and exposes a rewrite that recomputed node 1's whole chain.
     #[test]
@@ -190,6 +233,7 @@ mod tests {
             "{:?}",
             lines
         );
+        assert_eq!(print_report(&own, &peer, 1), 0);
 
         let mut rewritten = decisions.clone();
         rewritten[1] = "DYNAMIC_BLOCK_V4|IP:203.0.113.200".into();
@@ -217,6 +261,9 @@ mod tests {
             2,
             "no witness for that node: nothing checked"
         );
+        // What --verify-witnesses exits with: missing records, then an unreadable own log.
+        assert_eq!(print_report(&own, &peer, 1), 1);
+        assert_eq!(print_report(&d.join("absent.log"), &peer, 1), 2);
         std::fs::remove_dir_all(d).unwrap();
     }
 }

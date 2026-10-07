@@ -2560,6 +2560,62 @@ mod tests {
         }
     }
 
+    /// ADR-0018: a node that does not share its own claims (observe mode) sends a peer nothing
+    /// for its detections; a sharing node sends the new claim. `shares_own` could return either
+    /// value unnoticed (mutation sweep 2026-10-07).
+    #[tokio::test]
+    async fn own_detections_reach_peers_only_when_the_node_shares_them() {
+        for share in [false, true] {
+            let path = temp_log(&format!("share-{}", share));
+            let db = Arc::new(SentinelDb::init(&path, None).unwrap());
+            let blocks = Arc::new(tokio::sync::Mutex::new(BlockTable::with_lists(
+                AcceptLists,
+                TtlPolicy {
+                    base: Duration::from_secs(60),
+                    max: Duration::from_secs(600),
+                },
+                1,
+            )));
+            blocks.lock().await.set_share_own(share);
+            let registry = PeerRegistry::new(TrustStore::default());
+            let (tx, mut rx) = mpsc::channel(8);
+            let link = p2p::PeerLink {
+                urgent: tx.clone(),
+                bulk: tx,
+                features: Arc::from(Vec::new()),
+            };
+            registry
+                .add_peer("127.0.0.1:1".parse().unwrap(), link, 2, 1)
+                .await;
+            let crypto = Arc::new(NodeCrypto::generate());
+            let policy = BlockPolicy::builtin();
+            let target = parse_target("198.51.100.78").unwrap();
+            enforce_block_local(
+                target,
+                "share test",
+                &blocks,
+                &db,
+                &registry,
+                1,
+                &crypto,
+                &policy,
+                Detection::default(),
+            )
+            .await;
+            assert!(
+                blocks.lock().await.is_blocked(target),
+                "enforced either way"
+            );
+            let mut sent = 0;
+            while rx.try_recv().is_ok() {
+                sent += 1;
+            }
+            assert_eq!(sent, usize::from(share), "share_own = {}", share);
+            drop(db);
+            std::fs::remove_dir_all(std::path::Path::new(&path).parent().unwrap()).unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn local_decision_is_audited_before_cancellable_mesh_publication() {
         let path = temp_log("shutdown-decision");

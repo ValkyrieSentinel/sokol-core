@@ -908,6 +908,11 @@ pub fn open(
 /// Objects must pass the strict duplicate-key check. Unit variants (Ping, Pong, Ack) serialize
 /// as a bare JSON string, which has no keys to duplicate; requiring an object here rejected
 /// every heartbeat, so idle connections were torn down by the 30 s read timeout.
+///
+/// The check reads the top level only, and a message has one key there. What keeps a signed
+/// payload to one meaning is serde: a repeated field of a message is refused, and so is a second
+/// top-level key. A repeated unknown field passes both and is ignored. Mutation sweep 2026-10-07:
+/// removing this check changes no accepted message (`a_signed_payload_has_one_meaning`).
 fn check_canonical(payload: &str) -> Result<(), common::canonical::CanonicalError> {
     let trimmed = payload.trim();
     if trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() >= 2 {
@@ -1691,11 +1696,20 @@ mod tests {
             TrustStore::load(&path).is_err(),
             "a misspelt limit must not be ignored"
         );
-        write(format!(
-            r#"[{{"node_id": 2, "public_key": "{}", "envelope": {{"min_prefix_v4": 33}}}}]"#,
-            key
-        ));
-        assert!(TrustStore::load(&path).is_err());
+        // Prefix bounds of both families, on each side (mutation sweep 2026-10-07: only v4 = 33
+        // was tested, so the v6 bound could be inverted unnoticed).
+        for (field, len, ok) in [
+            ("min_prefix_v4", 32, true),
+            ("min_prefix_v4", 33, false),
+            ("min_prefix_v6", 128, true),
+            ("min_prefix_v6", 129, false),
+        ] {
+            write(format!(
+                r#"[{{"node_id": 2, "public_key": "{}", "envelope": {{"{}": {}}}}}]"#,
+                key, field, len
+            ));
+            assert_eq!(TrustStore::load(&path).is_ok(), ok, "{} = {}", field, len);
+        }
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -2756,6 +2770,54 @@ mod tests {
             );
         }
         assert!(!accepted(&frame[..frame.len() - 1]), "truncated signature");
+    }
+
+    /// What keeps a signed payload to one meaning (see `check_canonical`): a repeated field of a
+    /// message, at any depth, and a second top-level key are refused under a valid signature; a
+    /// repeated unknown field is accepted and ignored.
+    #[test]
+    fn a_signed_payload_has_one_meaning() {
+        let peer = NodeCrypto::generate();
+        let trust = trust_with(7, &peer);
+        let signed = |payload: &str| {
+            let mut env = seal(&peer, 7, &NetworkMessage::Ping).unwrap();
+            env.payload = payload.as_bytes().to_vec();
+            env.signature = peer
+                .sign(&unsigned_bytes(
+                    env.version,
+                    env.sender_id,
+                    env.timestamp_ms,
+                    env.nonce,
+                    &env.payload,
+                ))
+                .unwrap();
+            env
+        };
+        let opened = |payload: &str| {
+            open(
+                &trust,
+                &mut ReplayGuard::default(),
+                &signed(payload),
+                now_ms(),
+            )
+        };
+        for refused in [
+            r#"{"Handshake":{"node_id":7,"node_id":8,"wire_min":2,"wire_max":2}}"#,
+            r#"{"Handshake":{"node_id":7,"wire_min":2,"wire_max":2},"Ping":null}"#,
+            r#"{"Handshake":{"node_id":7,"wire_min":2,"wire_max":2},"Handshake":{"node_id":8,"wire_min":2,"wire_max":2}}"#,
+        ] {
+            assert_eq!(
+                opened(refused).unwrap_err(),
+                EnvelopeError::MalformedPayload,
+                "{}",
+                refused
+            );
+        }
+        let ignored = r#"{"Handshake":{"node_id":7,"wire_min":2,"wire_max":2,"x":1,"x":2}}"#;
+        assert!(matches!(
+            opened(ignored),
+            Ok(NetworkMessage::Handshake { node_id: 7, .. })
+        ));
     }
 
     #[tokio::test]

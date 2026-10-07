@@ -214,6 +214,7 @@ impl Claim {
         parse_target(&self.target).filter(|net| show(net) == self.target)
     }
 
+    #[cfg(test)]
     fn live_at(&self, now_ms: u64) -> bool {
         self.expires_ms.is_none_or(|e| e > now_ms)
     }
@@ -921,12 +922,18 @@ impl<B: Blocklist> BlockTable<B> {
         entry.1 = now_ms;
         let count = entry.0;
         self.strike_order.push_back((net, now_ms));
-        if self.strike_order.len() > 2 * MAX_STRIKES {
+        if self.strike_order_due() {
             let strikes = &self.strikes;
             self.strike_order
                 .retain(|(n, seen)| strikes.get(n).map(|&(_, last)| last) == Some(*seen));
         }
         count
+    }
+
+    /// Whether `strike_order` holds enough stale entries to compact (amortized: at most one
+    /// compaction per MAX_STRIKES strikes).
+    fn strike_order_due(&self) -> bool {
+        self.strike_order.len() > 2 * MAX_STRIKES
     }
 
     /// The earliest claim in force on `net`, as `<who>: <reason>`.
@@ -2887,6 +2894,77 @@ mod tests {
             Some(Duration::from_secs(60)),
             "strikes forgotten"
         );
+        // The forgotten count restarts: the next repeat is the second strike, not the
+        // tenth (mutation sweep 2026-10-07: the reset in `strike` was untested).
+        assert_eq!(ttl(&mut t, later + S), Some(Duration::from_secs(120)));
+    }
+
+    /// The table's clock starts at the wall clock (ADR-0017): the offset is near zero until
+    /// the wall clock steps.
+    #[test]
+    fn the_table_clock_starts_on_the_wall_clock() {
+        assert!(wall_offset_ms().abs() < 1_000, "{}", wall_offset_ms());
+    }
+
+    /// A strike exactly STRIKE_MEMORY old still counts, both for the block it sets and for the
+    /// count it leaves.
+    /// A peer's block ends at its claim's end, not a millisecond later.
+    #[test]
+    fn an_enforced_peer_claim_ends_at_its_exact_end() {
+        let mut n2 = table(2, 64);
+        let claim = detect(&mut n2, "203.0.113.9", T0);
+        let end = claim.expires_ms.expect("a detector claim ends");
+        let mut n1 = table(1, 64);
+        assert_eq!(n1.adopt(claim, true, T0), Adoption::Enforced);
+        n1.tick(end - 1);
+        assert!(n1.is_blocked(ip("203.0.113.9")));
+        n1.tick(end);
+        assert!(!n1.is_blocked(ip("203.0.113.9")));
+    }
+
+    /// Compacting the strike order keeps the entries that are current, so the least recently
+    /// struck target is still the one forgotten (mutation sweep 2026-10-07: compaction that
+    /// kept the stale entries left the memory unbounded).
+    #[test]
+    fn strike_order_compaction_keeps_the_memory_bounded_and_ordered() {
+        let v4 = |i: u32| {
+            IpNet::from(std::net::IpAddr::from(std::net::Ipv4Addr::from(
+                0x0A00_0000 + i,
+            )))
+        };
+        let mut t = table(1, 64);
+        let mut now = T0;
+        for i in 0..MAX_STRIKES as u32 {
+            now += 1;
+            t.strike(v4(i), now);
+        }
+        // Repeats of the newest half push the order past 2 * MAX_STRIKES: it compacts.
+        for round in 0..3 {
+            for i in (MAX_STRIKES / 2) as u32..MAX_STRIKES as u32 {
+                now += 1;
+                assert!(t.strike(v4(i), now) >= round + 2);
+            }
+        }
+        assert!(t.strike_order.len() <= 2 * MAX_STRIKES);
+        // A new target forgets the least recently struck one: v4(0).
+        now += 1;
+        t.strike(v4(MAX_STRIKES as u32), now);
+        assert_eq!(t.strike_memory(), (MAX_STRIKES, 1));
+        assert!(!t.strikes.contains_key(&v4(0)));
+        assert!(t.strikes.contains_key(&v4(1)));
+    }
+
+    #[test]
+    fn a_strike_is_remembered_up_to_its_exact_memory() {
+        let mut t = table(1, 64);
+        let a = ip("203.0.113.2");
+        let ttl = |t: &mut BlockTable<FakeLists>, now| {
+            t.add_local(a, ClaimKind::Detector, "x", now).unwrap().ttl
+        };
+        assert_eq!(ttl(&mut t, T0), Some(Duration::from_secs(60)));
+        let edge = T0 + ms(STRIKE_MEMORY);
+        assert_eq!(ttl(&mut t, edge), Some(Duration::from_secs(120)));
+        assert_eq!(ttl(&mut t, edge), Some(Duration::from_secs(240)));
     }
 
     /// Every distinct source a detector reports gets a strike. A flood of distinct sources must
@@ -3394,6 +3472,114 @@ mod tests {
         assert!(n1.is_blocked(ip("198.51.96.0/20")));
     }
 
+    /// The envelope decides enforcement, not only the reason a claim is held: with no quorum in
+    /// the way, a peer's claim wider than its envelope blocks nothing, for IPv4 and IPv6 alike,
+    /// and a claim exactly at the envelope's prefix is enforced (mutation sweep 2026-10-07).
+    /// A peer's claim that has already ended is refused, at its exact end too; one still running
+    /// is taken (mutation sweep 2026-10-07: `claim_live` could return true unnoticed).
+    #[test]
+    fn an_ended_peer_claim_is_refused_up_to_its_exact_end() {
+        let mut n2 = table(2, 64);
+        let claim = detect(&mut n2, "203.0.113.9", T0);
+        let end = claim.expires_ms.expect("a detector claim ends");
+        let mut late = table(1, 64);
+        assert_eq!(
+            late.adopt(claim.clone(), true, end),
+            Adoption::Refused("expired")
+        );
+        assert!(!late.is_blocked(ip("203.0.113.9")));
+        let mut on_time = table(1, 64);
+        assert_eq!(on_time.adopt(claim, true, end - 1), Adoption::Enforced);
+    }
+
+    /// A full retraction memory takes no new record from a peer (a flood cannot grow it).
+    #[test]
+    fn a_full_retraction_memory_takes_no_new_peer_record() {
+        let mut t = table(1, 64);
+        fill_retraction_memory(&mut t, 0);
+        t.retract(2, &["unseen".to_string()], T0);
+        assert_eq!(t.retractions.len(), MAX_KNOWN_CLAIMS);
+        assert!(!t.retractions.contains_key("unseen"));
+    }
+
+    #[test]
+    fn a_long_reason_is_cut_on_a_character_boundary_within_the_limit() {
+        let reason = "\u{e9}".repeat(MAX_REASON_BYTES); // two bytes each
+        let cut = bounded_reason(&format!("x{}", reason));
+        assert!(cut.len() <= MAX_REASON_BYTES, "{}", cut.len());
+        assert_eq!(
+            cut.len(),
+            MAX_REASON_BYTES - 1,
+            "only the split character is dropped"
+        );
+        assert!(reason.starts_with(&cut[1..]));
+    }
+
+    #[test]
+    fn support_ends_merge_to_the_later_one_and_no_end_wins() {
+        assert_eq!(later(Some(1), Some(2)), Some(2));
+        assert_eq!(later(Some(5), Some(2)), Some(5));
+        assert_eq!(later(None, Some(2)), None);
+        assert_eq!(later(Some(2), None), None);
+    }
+
+    #[test]
+    fn the_quorum_applies_only_to_prefixes_wider_than_its_bound() {
+        for (net, applies) in [
+            ("203.0.113.0/23", true),
+            ("203.0.113.0/24", false),
+            ("2001:db8::/63", true),
+            ("2001:db8::/64", false),
+        ] {
+            assert_eq!(QUORUM2.applies(&ip(net)), applies, "{}", net);
+        }
+        assert!(!Quorum { k: 1, ..QUORUM2 }.applies(&ip("203.0.113.0/16")));
+    }
+
+    #[test]
+    fn an_out_of_envelope_claim_is_never_enforced_for_either_family() {
+        let mut n2 = table(2, 64);
+        let narrow = Envelope {
+            min_prefix_v4: 24,
+            min_prefix_v6: 64,
+            ..Envelope::unlimited(POLICY.max)
+        };
+        let mut n1 = table(1, 64);
+        n1.configure_peers(
+            Envelope::unlimited(POLICY.max),
+            [(2, narrow)].into_iter().collect(),
+            Quorum::OFF,
+            T0,
+        );
+        for (wide, edge) in [
+            ("203.0.113.0/23", "198.51.100.0/24"),
+            ("2001:db8::/63", "2001:db8:1::/64"),
+        ] {
+            let claim = detect(&mut n2, wide, T0);
+            assert_eq!(
+                n1.adopt(claim, true, T0),
+                Adoption::Held("envelope"),
+                "{}",
+                wide
+            );
+            assert!(
+                !n1.is_blocked(ip(wide)),
+                "{} is outside node 2's envelope",
+                wide
+            );
+            let claim = detect(&mut n2, edge, T0);
+            assert_eq!(n1.adopt(claim, true, T0), Adoption::Enforced, "{}", edge);
+            assert!(
+                n1.is_blocked(ip(edge)),
+                "{} is at the envelope's prefix",
+                edge
+            );
+        }
+        // This node's own claims are not bound by any peer's envelope.
+        detect(&mut n1, "192.0.2.0/23", T0);
+        assert!(n1.is_blocked(ip("192.0.2.0/23")));
+    }
+
     #[test]
     fn a_peers_envelope_bounds_what_it_can_block_here() {
         let mut n2 = table(2, 64);
@@ -3545,16 +3731,20 @@ mod tests {
     #[test]
     fn repeated_detections_of_one_target_keep_a_handful_of_claims() {
         // R26-05: the review stored 262 145 claims for one address; repeats are coalesced now.
+        // The bound is checked on every step: a table that keeps every claim fails at the
+        // ninth, instead of slowing down quadratically until the suite times out (13 mutants
+        // timed out here in the sweep of 2026-10-07).
         let mut t = table(1, 64);
         for i in 0..20_000u64 {
             t.add_local(ip("203.0.113.95"), ClaimKind::Detector, "x", T0 + i * 10)
                 .unwrap();
+            assert!(
+                t.claims.len() <= 8,
+                "{} claims for one target after {} detections",
+                t.claims.len(),
+                i + 1
+            );
         }
-        assert!(
-            t.claims.len() <= 8,
-            "{} claims for one target",
-            t.claims.len()
-        );
         assert!(t.is_blocked(ip("203.0.113.95")));
         // The claims it replaced are taken back, so peers drop them too.
         let (shared, own_retracted) = t.snapshot(T0 + 200_000 * S / 1000);

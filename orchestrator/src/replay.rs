@@ -919,6 +919,27 @@ mod tests {
         );
     }
 
+    /// A flush releases the running detector claim: a later short request is a new claim,
+    /// not one merged into the released block. Replay without the flush records would say
+    /// "58s merged" (mutation sweep 2026-10-07: both arms could be deleted unnoticed).
+    #[test]
+    fn an_operator_flush_between_decisions_is_replayed() {
+        for flush in ["OPERATOR_FLUSH", "OPERATOR_FLUSH_ALL"] {
+            let lines = vec![
+                start(60, 600),
+                decision("198.51.100.7", "60s", "new", 1_000_000, "-"),
+                format!("{}|Released:1|At:1001000", flush),
+                format!(
+                    "{}|Ttl:10",
+                    decision("198.51.100.7", "10s", "new", 1_002_000, "-")
+                ),
+            ];
+            let report = run(&lines);
+            assert_eq!(report.mismatched, vec![], "{}", flush);
+            assert_eq!(report.reproduced, 2, "{}", flush);
+        }
+    }
+
     #[test]
     fn an_operator_unban_between_decisions_is_replayed() {
         // The lift forgets the target's strikes: the next signal starts at base again.

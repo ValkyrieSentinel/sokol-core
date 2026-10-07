@@ -598,5 +598,30 @@ mod tests {
         );
         n.dispatch.local(LocalCommand::DisengageDefense).await;
         assert_eq!(*n.config.0.lock().unwrap(), Some(0));
+        // Each switch of the XDP mode is in the audit (mutation sweep 2026-10-07: untested).
+        let modes: Vec<String> = n
+            .audit()
+            .into_iter()
+            .filter(|r| r.starts_with("DEFENSE_MODE|"))
+            .collect();
+        assert_eq!(modes.len(), 2, "{:?}", modes);
+        assert!(modes[0].starts_with("DEFENSE_MODE|Strict|"));
+        assert!(modes[1].starts_with("DEFENSE_MODE|Normal|"));
+    }
+
+    #[tokio::test]
+    async fn an_observed_storm_leaves_xdp_and_the_audit_unchanged() {
+        let mut n = node("storm-observe", None);
+        n.dispatch.defense = Arc::new(Defense::new(
+            n.config.clone(),
+            0,
+            defense::StormMode::Observe,
+        ));
+        n.dispatch.local(LocalCommand::EngageDefense).await;
+        assert!(!n.audit().iter().any(|r| r.starts_with("DEFENSE_MODE|")));
+        assert_ne!(
+            *n.config.0.lock().unwrap(),
+            Some(defense::flags(0, defense::StormMode::Strict, true))
+        );
     }
 }

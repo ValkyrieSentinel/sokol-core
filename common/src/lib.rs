@@ -260,6 +260,24 @@ pub mod config_flags {
     /// Pilot phase 0: never drop. Every packet Sokol would drop is passed and counted as
     /// observed (`--enforce observe`).
     pub const OBSERVE_ONLY: u32 = 1 << 2;
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// Each flag is its own bit, so the node can set one without the others (mutation
+        /// sweep 2026-10-07: a flag could become 0 and only the XDP smoke would notice).
+        #[test]
+        fn each_flag_is_one_distinct_bit() {
+            let flags = [DROP_IPV4_FRAGMENTS, STRICT_PARSE, OBSERVE_ONLY];
+            for (i, a) in flags.iter().enumerate() {
+                assert_eq!(a.count_ones(), 1, "flag {} is one bit", i);
+                for b in &flags[i + 1..] {
+                    assert_eq!(a & b, 0);
+                }
+            }
+        }
+    }
 }
 
 pub mod tcp_flags {
