@@ -196,23 +196,7 @@ impl<R: Read + Seek> AuditReader<R> {
             offset: self.offset,
             reason,
         };
-        let (Some(magic), Some(len), Some(seq), Some(timestamp_ms)) = (
-            chunk::<4>(&header, 0),
-            chunk::<4>(&header, 4),
-            chunk::<8>(&header, 8),
-            chunk::<8>(&header, 16),
-        ) else {
-            return Err(corrupt("short record header"));
-        };
-        if magic != MAGIC {
-            return Err(corrupt("bad record magic (not a sokol audit log v2?)"));
-        }
-        let len = u32::from_le_bytes(len) as usize;
-        let seq = u64::from_le_bytes(seq);
-        let timestamp_ms = u64::from_le_bytes(timestamp_ms);
-        if len > MAX_PAYLOAD {
-            return Err(corrupt("record length exceeds maximum"));
-        }
+        let (len, seq, timestamp_ms) = parse_record_header(&header).map_err(corrupt)?;
 
         let mut body = vec![0u8; len + CHAIN_LEN];
         if !read_full(&mut self.inner, &mut body)? {
@@ -229,9 +213,12 @@ impl<R: Read + Seek> AuditReader<R> {
         if next_chain(&self.chain, &header, &body) != chain {
             return Err(corrupt("hash chain mismatch"));
         }
+        let Some((next_seq, offset)) = advance(self.next_seq, self.offset, len) else {
+            return Err(corrupt("sequence number or offset overflows"));
+        };
 
-        self.offset += (HEADER_LEN + len + CHAIN_LEN) as u64;
-        self.next_seq += 1;
+        self.offset = offset;
+        self.next_seq = next_seq;
         self.chain = chain;
         Ok(Some(Record {
             seq,
@@ -240,6 +227,39 @@ impl<R: Read + Seek> AuditReader<R> {
             chain,
         }))
     }
+}
+
+/// (payload length, seq, timestamp) of a record header, with the length within MAX_PAYLOAD
+/// (proved for every header: `proofs::a_record_header_never_admits_more_than_max_payload`).
+fn parse_record_header(header: &[u8; HEADER_LEN]) -> Result<(usize, u64, u64), &'static str> {
+    let (Some(magic), Some(len), Some(seq), Some(timestamp_ms)) = (
+        chunk::<4>(header, 0),
+        chunk::<4>(header, 4),
+        chunk::<8>(header, 8),
+        chunk::<8>(header, 16),
+    ) else {
+        return Err("short record header");
+    };
+    if magic != MAGIC {
+        return Err("bad record magic (not a sokol audit log v2?)");
+    }
+    let len =
+        usize::try_from(u32::from_le_bytes(len)).map_err(|_| "record length exceeds maximum")?;
+    if len > MAX_PAYLOAD {
+        return Err("record length exceeds maximum");
+    }
+    Ok((
+        len,
+        u64::from_le_bytes(seq),
+        u64::from_le_bytes(timestamp_ms),
+    ))
+}
+
+/// The next sequence number and byte offset after a record of `len` payload bytes, or `None`
+/// if either would overflow (a segment header can name any start sequence).
+fn advance(next_seq: u64, offset: u64, len: usize) -> Option<(u64, u64)> {
+    let size = u64::try_from(HEADER_LEN.checked_add(len)?.checked_add(CHAIN_LEN)?).ok()?;
+    Some((next_seq.checked_add(1)?, offset.checked_add(size)?))
 }
 
 /// The `N` bytes of `b` at `at`, if there are that many.
@@ -477,6 +497,12 @@ impl AuditLog {
             }
         }
         let seq = self.next_seq;
+        let Some((next_seq, size)) = advance(seq, self.size, payload.len()) else {
+            return Err(AuditError::Corrupt {
+                offset: self.size,
+                reason: "sequence number or offset overflows",
+            });
+        };
         let header = encode_header(payload.len() as u32, seq, now_ms());
         let chain = next_chain(&self.chain, &header, payload);
 
@@ -493,8 +519,8 @@ impl AuditLog {
             return Err(e.into());
         }
 
-        self.size += record.len() as u64;
-        self.next_seq += 1;
+        self.size = size;
+        self.next_seq = next_seq;
         self.chain = chain;
         self.unsynced += 1;
         Ok(seq)
@@ -689,6 +715,53 @@ pub fn check_witnesses(
         .collect())
 }
 
+/// Bounded model checking with Kani (`cargo kani -p common`, docs/VERIFICATION.md): every
+/// value of the inputs, not a sample of them.
+#[cfg(kani)]
+mod proofs {
+    use super::*;
+
+    /// Whatever the 24 bytes of a record header (a damaged or crafted file), a parsed header
+    /// admits at most MAX_PAYLOAD bytes, so the reader never allocates more than
+    /// MAX_PAYLOAD + CHAIN_LEN for a record; and it is exactly what the writer would encode.
+    #[kani::proof]
+    fn a_record_header_never_admits_more_than_max_payload() {
+        let header: [u8; HEADER_LEN] = kani::any();
+        if let Ok((len, seq, timestamp_ms)) = parse_record_header(&header) {
+            assert!(len <= MAX_PAYLOAD);
+            assert!(encode_header(len as u32, seq, timestamp_ms) == header);
+        }
+    }
+
+    /// The writer's header always parses back to what it wrote.
+    #[kani::proof]
+    fn an_encoded_header_parses_back() {
+        let len: u32 = kani::any();
+        kani::assume(len as usize <= MAX_PAYLOAD);
+        let (seq, timestamp_ms): (u64, u64) = (kani::any(), kani::any());
+        assert!(
+            parse_record_header(&encode_header(len, seq, timestamp_ms))
+                == Ok((len as usize, seq, timestamp_ms))
+        );
+    }
+
+    /// Reader and writer advance through `advance`: one more sequence number and exactly the
+    /// record's bytes, or `None` where either would wrap. Never a wrapped value.
+    #[kani::proof]
+    fn advancing_never_wraps() {
+        let (seq, offset, len): (u64, u64, usize) = (kani::any(), kani::any(), kani::any());
+        kani::assume(len <= MAX_PAYLOAD);
+        let size = (HEADER_LEN + len + CHAIN_LEN) as u64;
+        match advance(seq, offset, len) {
+            Some((next, end)) => {
+                assert!(next > seq && next - seq == 1);
+                assert!(end > offset && end - offset == size);
+            }
+            None => assert!(seq == u64::MAX || offset > u64::MAX - size),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -795,6 +868,53 @@ mod tests {
             b"an earlier segment's evidence"
         );
         assert!(matches!(log.append(b"third"), Err(AuditError::Poisoned)));
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    /// A segment header names any start sequence; one valid record at u64::MAX must not
+    /// overflow the reader's next sequence (a panic in tests and debug builds, a silent wrap to
+    /// 0 in release). The chain is unkeyed, so whoever can write the file can make the record
+    /// valid. Found while preparing the Kani proofs (2026-10-07).
+    #[test]
+    fn a_record_at_the_last_sequence_number_is_refused_not_overflowed() {
+        let prev = [7u8; CHAIN_LEN];
+        let mut bytes = segment_header(u64::MAX, &prev).to_vec();
+        let header = encode_header(0, u64::MAX, 1);
+        let chain = next_chain(&prev, &header, &[]);
+        bytes.extend_from_slice(&header);
+        bytes.extend_from_slice(&chain);
+        let outcome = std::panic::catch_unwind(|| {
+            AuditReader::new(std::io::Cursor::new(bytes)).next_record()
+        });
+        let Ok(result) = outcome else {
+            panic!("the reader panicked on a valid record at seq u64::MAX");
+        };
+        assert!(
+            matches!(result, Err(AuditError::Corrupt { .. })),
+            "{:?}",
+            result.map(|r| r.map(|r| r.seq))
+        );
+    }
+
+    /// The writer's side of the same edge: a log whose segment starts at u64::MAX takes no
+    /// record instead of overflowing its sequence.
+    #[test]
+    fn a_log_at_the_last_sequence_number_refuses_to_append() {
+        let path = temp_path("last-seq");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, segment_header(u64::MAX, &[7u8; CHAIN_LEN])).unwrap();
+        let mut log = AuditLog::open(&path).unwrap();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            log.append(b"x").map(|_| ())
+        }));
+        let Ok(result) = outcome else {
+            panic!("append panicked at seq u64::MAX");
+        };
+        assert!(
+            matches!(result, Err(AuditError::Corrupt { .. })),
+            "{:?}",
+            result
+        );
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 

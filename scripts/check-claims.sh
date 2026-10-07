@@ -39,6 +39,12 @@ for id in $(echo "$spans" | grep -oxE '[a-z][a-z0-9]*(_[a-z0-9]+){3,}' | grep -v
     git grep -h -B4 -w "fn $id" -- '*.rs' | grep -qE '#\[(tokio::)?test' \
         || bad "test $id is cited but no #[test] fn has that name"
 done
+# Kani proofs: a code span `<module>::proofs::<name>` (docs/VERIFICATION.md).
+for id in $(echo "$spans" | grep -oxE '[a-z_]+::proofs::[a-z0-9_]+' | sed 's/.*:://' | sort -u); do
+    n_tests=$((n_tests + 1))
+    git grep -h -B4 -w "fn $id" -- '*.rs' | grep -qF '#[kani::proof]' \
+        || bad "proof $id is cited but no #[kani::proof] fn has that name"
+done
 for f in $(echo "$spans" | grep -oE '(^| )--[a-z][a-z0-9-]+' | tr -d ' ' | sort -u); do
     n_flags=$((n_flags + 1))
     echo "$flags" | grep -qx -- "$f" || echo "$EXTERNAL_FLAGS" | grep -qw -- "$f" || bad "flag $f is cited but no binary declares it"

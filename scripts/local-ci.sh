@@ -6,7 +6,7 @@
 #
 #   scripts/local-ci.sh              everything CI runs, except the artifact upload
 #   scripts/local-ci.sh --quick      policy checks, build, tests, clippy, Python regressions
-#   scripts/local-ci.sh --step NAME  one step: tools, monitoring (used by test_local_ci.py)
+#   scripts/local-ci.sh --step NAME  one step: tools, monitoring (used by test_local_ci.py), kani
 #
 # Pins (versions, SHA256, the Prometheus image digest) are read from ci.yml itself, so the two
 # cannot drift: change them there, not here. Pinned tools are extracted on every run from
@@ -22,7 +22,7 @@ case "${1:-}" in
     --quick) QUICK=1 ;;
     --step) ONLY="${2:?--step needs a name}" ;;
     "") ;;
-    *) echo "usage: $0 [--quick | --step tools|monitoring]"; exit 2 ;;
+    *) echo "usage: $0 [--quick | --step tools|monitoring|kani]"; exit 2 ;;
 esac
 CI=${LOCAL_CI_YML:-.github/workflows/ci.yml}
 CACHE=${LOCAL_CI_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/sokol-local-ci}
@@ -109,10 +109,27 @@ monitoring() {
     fi
 }
 
+# CI's kani job: the bounded proofs for common (docs/VERIFICATION.md), about 10 minutes. Kani
+# installs its own verifier bundle, which has no checksum of ours (ci.yml says so), so here the
+# installed version is only compared, not verified; the run is a check, not a pinned build.
+kani() {
+    step "kani proofs (common)"
+    local want have; want="$(pin KANI_VERSION)"
+    # Read the whole version first: `grep -q` on the pipe would close it early, and the
+    # producer's SIGPIPE fails the pipeline under pipefail.
+    have="$(cargo kani --version 2>/dev/null || true)"
+    if [[ "$have" != *" $want "* ]]; then
+        echo "Kani $want is not installed: cargo +stable install --locked kani-verifier --version $want && cargo +stable kani setup"
+        exit 2
+    fi
+    cargo kani -p common
+}
+
 case "$ONLY" in
     "") ;;
     tools) tools; exit 0 ;;
     monitoring) monitoring; exit 0 ;;
+    kani) kani; exit 0 ;;
     *) echo "unknown step $ONLY"; exit 2 ;;
 esac
 

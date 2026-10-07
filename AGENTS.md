@@ -58,6 +58,8 @@ prefer fewer, complete pull requests over many small ones.
   `LocalCommand`, never mesh commands.
 - Detector and trap input reaches the node through `delivery::Outbox` in ACK mode: a line is
   delivered when the node answered it, not when it was written.
+- A parser of bytes the node does not control (in `common`) gets a Kani proof as well:
+  [docs/VERIFICATION.md](docs/VERIFICATION.md) (`scripts/local-ci.sh --step kani`).
 - A test of the security core should fail on the mutants of the code it covers;
   [docs/MUTATION.md](docs/MUTATION.md) has the commands, the baseline and the open survivors.
 - Documentation claims only what a named test, metric, flag or path shows;

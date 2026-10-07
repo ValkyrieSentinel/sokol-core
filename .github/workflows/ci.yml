@@ -12,8 +12,26 @@ env:
   GOBGP_VERSION: 4.9.0
   CARGO_DENY_VERSION: 0.20.2
   CARGO_DENY_SHA256: 9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f
+  KANI_VERSION: 0.68.0
 
 jobs:
+  # Bounded proofs for `common` (docs/VERIFICATION.md), beside the main job: about 10 minutes.
+  # kani-verifier comes from crates.io with Cargo's checksums (--locked); `cargo kani setup`
+  # then fetches the verifier bundle of that version from Kani's GitHub release, pinned by
+  # version only — the one tool here without a checksum of ours.
+  kani:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Install Kani
+        run: |
+          rustup toolchain install stable --profile minimal
+          cargo +stable install --locked kani-verifier --version "$KANI_VERSION"
+          cargo +stable kani setup
+      - name: Proofs (cargo kani -p common)
+        run: cargo kani -p common
+
   # Both architectures run the whole suite, XDP smoke and demo included: an arm64 kernel faults
   # on things x86 tolerates (a misaligned 64-bit atomic in a map value hung one, ADR-0014).
   build-test-smoke:
