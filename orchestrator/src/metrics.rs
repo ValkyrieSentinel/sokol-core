@@ -39,6 +39,8 @@ pub struct Snapshot {
     pub event_ids_evicted: u64,
     /// Detector retractions by result (ADR-0019), in `block_table::RETRACTION_RESULTS` order.
     pub detector_retractions: [u64; crate::block_table::RETRACTION_RESULTS.len()],
+    /// Block decisions by source and result, `other` last (`detections::rows`).
+    pub detections: Vec<(String, [u64; crate::detections::RESULTS.len()])>,
     pub strikes_remembered: usize,
     pub strikes_evicted: u64,
     pub claims_waiting: usize,
@@ -282,6 +284,21 @@ fn render_at(s: &Snapshot, now: Instant) -> String {
             "sokol_detector_retractions_total{{result=\"{}\"}} {}",
             label, n
         );
+    }
+    family(
+        &mut out,
+        "sokol_detections_total",
+        "counter",
+        "Block decisions by who asked (a detector's name, trap, telemetry; the first 16 names, then other) and result: enforced, pending (map full), refused (protected), duplicate (event already acted on).",
+    );
+    for (source, counts) in &s.detections {
+        for (result, n) in crate::detections::RESULTS.iter().zip(counts) {
+            let _ = writeln!(
+                out,
+                "sokol_detections_total{{source=\"{}\",result=\"{}\"}} {}",
+                source, result, n
+            );
+        }
     }
     family(
         &mut out,
@@ -773,6 +790,10 @@ mod tests {
             blocks_capacity: 65536,
             p2p_peers: 1,
             audit_queue_overflow: 0,
+            detections: vec![
+                ("suricata".into(), [4, 1, 0, 2]),
+                ("other".into(), [0, 0, 3, 0]),
+            ],
             ..Default::default()
         };
         snap.drops_by_reason[drop_reason::SLOW_PATH_LPM_HIT as usize] = 2;
@@ -796,6 +817,13 @@ mod tests {
         assert!(text.contains("sokol_claims_waiting 5\n"));
         assert!(text.contains("sokol_xdp_events_malformed_total 2\n"));
         assert!(text.contains("sokol_strikes_remembered 3\n"));
+        assert!(
+            text.contains("sokol_detections_total{source=\"suricata\",result=\"enforced\"} 4\n")
+        );
+        assert!(
+            text.contains("sokol_detections_total{source=\"suricata\",result=\"duplicate\"} 2\n")
+        );
+        assert!(text.contains("sokol_detections_total{source=\"other\",result=\"refused\"} 3\n"));
         assert!(text.contains("sokol_strikes_evicted_total 4\n"));
         assert!(text.contains("sokol_blocks_active{family=\"ipv4\"} 2\n"));
         assert!(text.contains("sokol_blocks_capacity 65536\n"));

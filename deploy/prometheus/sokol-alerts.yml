@@ -65,6 +65,35 @@ groups:
         annotations:
           summary: "{{ $labels.instance }} {{ $labels.family }}: blocklist over 80 % of 65 536"
           runbook: "RUNBOOK §4"
+      # A detector that misfires shows as its own surge long before the map fills: over 200
+      # decisions in 5 min that also exceed ten times its pace over the hour before. A source
+      # has no series until its first decision, so missing history is a policy, not a gap:
+      # - no increase over the hour before (new, or one sample only): the 200 alone decides;
+      # - a series under 5 min old already over 200 (the burst came before the first scrape,
+      #   which increase() cannot see) fires on its total. After metrics were unreachable for
+      #   over 5 min, a source above 200 in total is reported once this way.
+      - alert: SokolDetectorSurge
+        expr: |
+          (
+            sum by (instance, source) (increase(sokol_detections_total{result=~"enforced|pending"}[5m])) > 200
+            and
+            (
+              sum by (instance, source) (increase(sokol_detections_total{result=~"enforced|pending"}[5m]))
+                > 10 * sum by (instance, source) (increase(sokol_detections_total{result=~"enforced|pending"}[1h] offset 5m)) / 12
+              or
+              sum by (instance, source) (increase(sokol_detections_total{result=~"enforced|pending"}[5m]))
+                unless sum by (instance, source) (increase(sokol_detections_total{result=~"enforced|pending"}[1h] offset 5m))
+            )
+          )
+          or
+          (
+            sum by (instance, source) (sokol_detections_total{result=~"enforced|pending"}) > 200
+              unless sum by (instance, source) (sokol_detections_total{result=~"enforced|pending"} offset 5m)
+          )
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.instance }}: {{ $labels.source }} asked for {{ $value | humanize }} blocks within 5 min, over ten times its usual pace or with no history"
+          runbook: "RUNBOOK §5.1: check the detector before its blocks spread"
       - alert: SokolKernelEventsLost
         expr: increase(sokol_xdp_events_lost_total[10m]) > 0
         labels: { severity: warning }

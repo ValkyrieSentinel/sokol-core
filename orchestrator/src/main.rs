@@ -27,6 +27,7 @@ pub mod cluster_state;
 mod control;
 mod control_exec;
 mod defense;
+mod detections;
 mod flowspec;
 mod ipc;
 mod kernel_events;
@@ -844,6 +845,16 @@ enum Enforcement {
 }
 
 impl Enforcement {
+    /// Index into `detections::RESULTS`.
+    fn result_index(&self) -> usize {
+        match self {
+            Enforcement::Enforced => 0,
+            Enforcement::Pending => 1,
+            Enforcement::Refused => 2,
+            Enforcement::Duplicate => 3,
+        }
+    }
+
     /// The `Action:` a trap hit records.
     fn trap_action(self) -> &'static str {
         match self {
@@ -871,12 +882,16 @@ fn log_inbound_budget(peers: usize) {
 /// What a detector said about its decision, beyond the target (ADR-0009, ADR-0019).
 #[derive(Clone, Copy, Default)]
 struct Detection<'a> {
+    /// Who asked, for `sokol_detections_total` (a detector's name, `trap`, `telemetry`).
+    source: &'a str,
     /// (source, event id): acted on once; the source can take it back.
     event: Option<(&'a str, &'a str)>,
     /// The source's own duration (`;ttl=`).
     requested: Option<Duration>,
 }
 
+/// Decides and enforces a local block. The decision is counted under its source as soon as it
+/// is made, before any network await: a cancelled publication does not uncount it.
 #[allow(clippy::too_many_arguments)]
 async fn enforce_block_local<B: block_table::Blocklist>(
     target: IpNet,
@@ -889,7 +904,15 @@ async fn enforce_block_local<B: block_table::Blocklist>(
     policy: &BlockPolicy,
     detection: Detection<'_>,
 ) -> Enforcement {
-    let Detection { event, requested } = detection;
+    let Detection {
+        source,
+        event,
+        requested,
+    } = detection;
+    let counted = |outcome: Enforcement| {
+        detections::record(source, outcome.result_index());
+        outcome
+    };
     let ip = block_table::canonical(target);
     let shown = show(&ip);
     if let Err(why) = policy.check_net(ip) {
@@ -903,7 +926,7 @@ async fn enforce_block_local<B: block_table::Blocklist>(
             "BLOCK_REFUSED|IP:{}|Protected:{}|Reason:{}",
             shown, why, reason
         ));
-        return Enforcement::Refused;
+        return counted(Enforcement::Refused);
     }
     let now = block_table::local_ms();
     // Replay context (ADR-0016): the exact decision time and the event id go into every
@@ -936,7 +959,7 @@ async fn enforce_block_local<B: block_table::Blocklist>(
                 shown
             );
             sntl_db.append(format!("SIGNAL_DUPLICATE|IP:{}|{}", shown, context));
-            return Enforcement::Duplicate;
+            return counted(Enforcement::Duplicate);
         }
         block_table::Detected::Added(added) => added,
         block_table::Detected::Refused(why) => {
@@ -945,7 +968,7 @@ async fn enforce_block_local<B: block_table::Blocklist>(
                 "BLOCK_REFUSED|IP:{}|Why:{}|Reason:{}|{}",
                 shown, why, reason, context
             ));
-            return Enforcement::Refused;
+            return counted(Enforcement::Refused);
         }
     };
     let ttl = added.ttl;
@@ -953,7 +976,7 @@ async fn enforce_block_local<B: block_table::Blocklist>(
     // A new claim is shared either way: peers can enforce it even if this node's map is full.
     // A repeat merged into the running claim is not signed and sent again (peers have it).
     // Observe mode keeps own claims off the mesh (ADR-0018): peers in drop mode would enforce.
-    let outcome = match added.applied {
+    let outcome = counted(match added.applied {
         Ok(()) => {
             log::warn!(
                 "[Local Security] Dynamic block enforced in XDP: {} for {} | Reason: {}",
@@ -990,7 +1013,7 @@ async fn enforce_block_local<B: block_table::Blocklist>(
             ));
             Enforcement::Pending
         }
-    };
+    });
     // Mutation and audit submission share one poll. Shutdown may cancel publication or
     // the reply afterwards; a missing ACK is not evidence that the decision was refused.
     if added.new && shares_own {
@@ -1546,7 +1569,10 @@ async fn main() -> Result<(), anyhow::Error> {
                                     node_id_trap,
                                     &crypto_trap,
                                     &policy_trap.current(),
-                                    Detection::default(),
+                                    Detection {
+                                        source: detections::TRAP,
+                                        ..Detection::default()
+                                    },
                                 )
                                 .await;
                                 db_trap.append(format!(
@@ -2137,6 +2163,7 @@ async fn main() -> Result<(), anyhow::Error> {
                     (snapshot.event_ids_remembered, snapshot.event_ids_evicted) =
                         table.event_memory();
                     snapshot.detector_retractions = table.detector_retractions();
+                    snapshot.detections = detections::rows();
                     (snapshot.strikes_remembered, snapshot.strikes_evicted) =
                         table.strike_memory();
                     snapshot.claims_waiting = table.waiting_claims(block_table::local_ms());
@@ -2563,6 +2590,70 @@ mod tests {
     /// ADR-0018: a node that does not share its own claims (observe mode) sends a peer nothing
     /// for its detections; a sharing node sends the new claim. `shares_own` could return either
     /// value unnoticed (mutation sweep 2026-10-07).
+    /// Every decision is counted under its source and result (`sokol_detections_total`): a
+    /// detector that misfires shows as a surge of its own, before the map fills.
+    #[tokio::test]
+    async fn each_decision_is_counted_under_its_source() {
+        let path = temp_log("detections");
+        let db = Arc::new(SentinelDb::init(&path, None).unwrap());
+        let blocks = Arc::new(tokio::sync::Mutex::new(BlockTable::with_lists(
+            AcceptLists,
+            TtlPolicy {
+                base: Duration::from_secs(60),
+                max: Duration::from_secs(600),
+            },
+            1,
+        )));
+        let registry = PeerRegistry::new(TrustStore::default());
+        let crypto = Arc::new(NodeCrypto::generate());
+        let mut policy = BlockPolicy::builtin();
+        policy.protect("198.51.100.99/32".parse().unwrap(), "test");
+        // The counters are process-wide: a name no other test uses.
+        let source = "count-test-source";
+        let decide = |target: &'static str, event: Option<(&'static str, &'static str)>| {
+            let (blocks, db, registry, crypto, policy) = (
+                blocks.clone(),
+                db.clone(),
+                &registry,
+                crypto.clone(),
+                &policy,
+            );
+            async move {
+                enforce_block_local(
+                    parse_target(target).unwrap(),
+                    "count test",
+                    &blocks,
+                    &db,
+                    registry,
+                    1,
+                    &crypto,
+                    policy,
+                    Detection {
+                        source,
+                        event,
+                        requested: None,
+                    },
+                )
+                .await
+            }
+        };
+        decide("198.51.100.90", Some((source, "1"))).await;
+        decide("198.51.100.91", None).await;
+        decide("198.51.100.90", Some((source, "1"))).await; // the same event again
+        decide("198.51.100.99", None).await; // protected
+        let counts = detections::rows()
+            .into_iter()
+            .find(|(s, _)| s == source)
+            .map(|(_, c)| c);
+        assert_eq!(
+            counts,
+            Some([2, 0, 1, 1]),
+            "enforced, pending, refused, duplicate"
+        );
+        drop(db);
+        std::fs::remove_dir_all(std::path::Path::new(&path).parent().unwrap()).unwrap();
+    }
+
     #[tokio::test]
     async fn own_detections_reach_peers_only_when_the_node_shares_them() {
         for share in [false, true] {
@@ -2647,7 +2738,10 @@ mod tests {
                 1,
                 &crypto,
                 &policy,
-                Detection::default(),
+                Detection {
+                    source: "cancel-test-source",
+                    ..Detection::default()
+                },
             )
             .await;
         });
@@ -2668,6 +2762,14 @@ mod tests {
         );
         assert!(records[0].starts_with("DYNAMIC_BLOCK_V4|IP:198.51.100.77|"));
         producers.quiesce().await;
+        // Counted with the decision, not after the publication shutdown cancelled.
+        assert_eq!(
+            detections::rows()
+                .into_iter()
+                .find(|(s, _)| s == "cancel-test-source")
+                .map(|(_, c)| c),
+            Some([1, 0, 0, 0])
+        );
         drop(guard);
         assert!(blocks.lock().await.is_blocked(target));
         db.append("NODE_SHUTDOWN".into());

@@ -106,3 +106,33 @@ tests:
       - eval_time: 3m
         alertname: SokolStormEngaged
         exp_alerts: [ { exp_labels: { severity: warning, job: sokol, instance: n1 }, exp_annotations: { summary: "n1: distributed storm engaged (strict parsing and fragment drops)", runbook: "ADR-0006" } } ]
+
+  # A detector surge. crowdsec: a quiet hour then 300 decisions a minute; suricata: a steady
+  # high pace; trap: a small burst; duplicates do not count. The cold sources have no series at
+  # all before their first decision (as the node exports them): cold-rise grows from its first
+  # scrape, cold-jump is first scraped at 1500, cold-small stays under the threshold.
+  - interval: 1m
+    input_series:
+      - { series: 'sokol_detections_total{job="sokol",instance="n1",source="crowdsec",result="enforced"}', values: '0x65 300+300x9' }
+      - { series: 'sokol_detections_total{job="sokol",instance="n1",source="suricata",result="enforced"}', values: '0+100x75' }
+      - { series: 'sokol_detections_total{job="sokol",instance="n1",source="trap",result="enforced"}', values: '0x65 30+30x9' }
+      - { series: 'sokol_detections_total{job="sokol",instance="n1",source="crowdsec",result="duplicate"}', values: '0x65 1000+1000x9' }
+      - { series: 'sokol_detections_total{job="sokol",instance="n1",source="cold-rise",result="enforced"}', values: '_x65 300+300x9' }
+      - { series: 'sokol_detections_total{job="sokol",instance="n1",source="cold-jump",result="enforced"}', values: '_x69 1500x5' }
+      - { series: 'sokol_detections_total{job="sokol",instance="n1",source="cold-small",result="enforced"}', values: '_x65 30+30x9' }
+    alert_rule_test:
+      - eval_time: 70m
+        alertname: SokolDetectorSurge
+        exp_alerts:
+          - { exp_labels: { severity: warning, instance: n1, source: crowdsec }, exp_annotations: { summary: "n1: crowdsec asked for 1.5k blocks within 5 min, over ten times its usual pace or with no history", runbook: "RUNBOOK §5.1: check the detector before its blocks spread" } }
+          - { exp_labels: { severity: warning, instance: n1, source: cold-rise }, exp_annotations: { summary: "n1: cold-rise asked for 1.5k blocks within 5 min, over ten times its usual pace or with no history", runbook: "RUNBOOK §5.1: check the detector before its blocks spread" } }
+          - { exp_labels: { severity: warning, instance: n1, source: cold-jump }, exp_annotations: { summary: "n1: cold-jump asked for 1.5k blocks within 5 min, over ten times its usual pace or with no history", runbook: "RUNBOOK §5.1: check the detector before its blocks spread" } }
+      # At 71 min cold-rise is over 5 min old and has one sample in the hour before: only the
+      # no-history branch can report it.
+      - eval_time: 71m
+        alertname: SokolDetectorSurge
+        exp_alerts:
+          - { exp_labels: { severity: warning, instance: n1, source: crowdsec }, exp_annotations: { summary: "n1: crowdsec asked for 1.5k blocks within 5 min, over ten times its usual pace or with no history", runbook: "RUNBOOK §5.1: check the detector before its blocks spread" } }
+          - { exp_labels: { severity: warning, instance: n1, source: cold-rise }, exp_annotations: { summary: "n1: cold-rise asked for 1.5k blocks within 5 min, over ten times its usual pace or with no history", runbook: "RUNBOOK §5.1: check the detector before its blocks spread" } }
+          - { exp_labels: { severity: warning, instance: n1, source: cold-jump }, exp_annotations: { summary: "n1: cold-jump asked for 1.5k blocks within 5 min, over ten times its usual pace or with no history", runbook: "RUNBOOK §5.1: check the detector before its blocks spread" } }
+      - { eval_time: 60m, alertname: SokolDetectorSurge, exp_alerts: [] }
