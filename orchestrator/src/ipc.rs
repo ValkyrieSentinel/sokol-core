@@ -41,7 +41,10 @@ pub(crate) async fn handle_ipc_line(content: &str, c: &IpcCtx) -> String {
                         c.node_id,
                         &c.crypto,
                         &c.policy.current(),
-                        Detection::default(),
+                        Detection {
+                            source: crate::detections::TRAP,
+                            ..Detection::default()
+                        },
                     )
                     .await,
                 )
@@ -123,6 +126,7 @@ pub(crate) async fn handle_ipc_line(content: &str, c: &IpcCtx) -> String {
                             &c.crypto,
                             &c.policy.current(),
                             Detection {
+                                source: &sig.source,
                                 event,
                                 requested: verb.ttl,
                             },
