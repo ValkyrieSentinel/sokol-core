@@ -214,6 +214,37 @@ impl CanonicalParser {
     }
 }
 
+/// Bounded model checking with Kani (`cargo kani -p common`, docs/VERIFICATION.md).
+#[cfg(kani)]
+mod proofs {
+    use super::*;
+
+    /// The bytes the validator tells apart, plus one of each other kind: every structure of
+    /// object, string, escape, nesting and separator is reachable from these.
+    const ALPHABET: [u8; 10] = *b"{}[]\":,\\ a";
+
+    /// Every input of up to 8 bytes over ALPHABET (10^8 strings and all shorter ones): the
+    /// validator returns, without a panic, an overflow or a read out of bounds, and accepts
+    /// only a braced object.
+    #[kani::proof]
+    #[kani::unwind(10)]
+    fn the_strict_validator_returns_on_every_short_input() {
+        let mut bytes = [0u8; 8];
+        for b in bytes.iter_mut() {
+            let i: usize = kani::any();
+            kani::assume(i < ALPHABET.len());
+            *b = ALPHABET[i];
+        }
+        let n: usize = kani::any();
+        kani::assume(n <= bytes.len());
+        let text = core::str::from_utf8(&bytes[..n]).unwrap();
+        if CanonicalParser::validate_strict_json_object(text).is_ok() {
+            let trimmed = text.trim_ascii();
+            assert!(trimmed.starts_with('{') && trimmed.ends_with('}'));
+        }
+    }
+}
+
 #[cfg(all(test, feature = "std"))]
 mod tests {
     use super::*;
