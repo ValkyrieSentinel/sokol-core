@@ -1355,7 +1355,19 @@ mod tests {
                 damaged
             );
         }
+        // Unreadable, not only unparseable (here a directory): an error too, never a first start
+        // (review 2026-10-08: treating every read error as "no cursor" went untested).
         std::fs::remove_file(&cursor).unwrap();
+        std::fs::create_dir(&cursor).unwrap();
+        assert!(Cursor::load(&cursor).is_err());
+        let (mut f, how, flagged) = initial_follower(&eve, Some(&cursor), false);
+        assert!(flagged, "{}", how);
+        assert_eq!(
+            f.poll().unwrap().lines.len(),
+            1,
+            "an unreadable cursor rereads"
+        );
+        std::fs::remove_dir(&cursor).unwrap();
         let (mut f, _, flagged) = initial_follower(&eve, Some(&cursor), false);
         assert!(!flagged);
         assert!(

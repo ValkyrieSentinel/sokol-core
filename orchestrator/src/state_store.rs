@@ -714,6 +714,8 @@ mod tests {
         assert_eq!(read_state(&path), Ok(None), "no file: a first start");
         save_state(&path, &state(1)).unwrap();
         assert_eq!(read_state(&path), Ok(Some(state(1))));
+        // What the node calls at startup reads the same file (review 2026-10-08: untested).
+        assert_eq!(StateStore::new(path.clone()).read(), Ok(Some(state(1))));
 
         std::fs::write(&path, b"{ not json").unwrap();
         std::fs::write(path.with_extension("json.corrupt"), b"an earlier one").unwrap();
@@ -725,6 +727,11 @@ mod tests {
                     std::fs::read(&kept).unwrap(),
                     b"{ not json",
                     "the bytes are kept"
+                );
+                assert_eq!(
+                    kept,
+                    path.with_extension("json.corrupt.1"),
+                    "the next free name"
                 );
                 assert_eq!(
                     std::fs::read(path.with_extension("json.corrupt")).unwrap(),

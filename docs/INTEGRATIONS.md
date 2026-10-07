@@ -180,6 +180,16 @@ or the oldest queued alert. Metadata/open errors before scanning still return no
 The node blocks the offending address in XDP, shares the block with its mesh peers and records the
 rule in the audit log (`suricata: sid:<id> <signature>`). If the alert fired on this node's own
 outbound traffic, the remote destination is blocked instead; the never-block policy still applies.
+
+**Suricata watching other hosts** (a gateway, or a sensor on a LAN): for rules about inside hosts
+(`$HOME_NET -> $EXTERNAL_NET`, e.g. a malware beacon) the alert's source is the inside host, so
+without more information the node would block that host. Name the networks behind the node with
+`--home-net <CIDR>` (repeatable): their addresses are never blocked, and an alert whose source
+lies in one blocks its destination, as for this node's own addresses
+(`an_alert_from_a_home_network_blocks_the_remote_side`). Inside to inside, or without a
+destination, nothing is blocked. The node takes the reported source as given: a packet from
+outside that claims an inside source would name its destination as the remote party, so drop
+such packets at the border (anti-spoofing, `rp_filter`).
 The same source address is not admitted again within `--cooldown-secs` (60), and
 `--max-signals-per-sec` (50) caps policy admissions per fixed one-second window, not IPC
 retries or paced delivery. Adjacent windows can admit a burst across their boundary.

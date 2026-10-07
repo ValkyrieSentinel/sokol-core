@@ -636,6 +636,10 @@ mod tests {
         assert_eq!(duration_secs("1h"), Some(3600));
         assert_eq!(duration_secs("1m0.5s"), Some(61));
         assert_eq!(duration_secs("500ms"), Some(1));
+        // Go prints sub-millisecond units too; each rounds up to a whole second.
+        assert_eq!(duration_secs("1500000us"), Some(2));
+        assert_eq!(duration_secs("1500000µs"), Some(2));
+        assert_eq!(duration_secs("2500000000ns"), Some(3));
         assert_eq!(duration_secs("-2s"), None, "expired");
         assert_eq!(duration_secs("0s"), None);
         assert_eq!(duration_secs(""), None);

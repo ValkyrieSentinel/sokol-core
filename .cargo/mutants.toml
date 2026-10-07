@@ -24,6 +24,10 @@ exclude_re = [
     # Replay compares a detector's TTL and claim; a static or operator block does not change
     # either on the current table (probed 2026-10-07).
     "match guard t.starts_with\\(\"(STATIC_BLOCK_|OPERATOR_BAN_)\"\\) with false in replay_records",
+    # The f64 bound next to u64::MAX: no whole-second value distinguishes < from <=.
+    "replace < with <= in duration_secs$",
+    # keep_aside keeps nothing either way when the link fails for another reason.
+    "replace match guard e.kind\\(\\) == std::io::ErrorKind::AlreadyExists with true in keep_aside$",
     # serde refuses repeated fields and a second top-level key on its own; the strict check
     # adds nothing an accepted message could carry (p2p a_signed_payload_has_one_meaning).
     # Not the length bound of a bare string: a unit variant would then be refused.

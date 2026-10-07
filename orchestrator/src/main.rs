@@ -519,6 +519,13 @@ struct Args {
     #[arg(long, value_name = "CIDR")]
     never_block: Vec<String>,
 
+    /// Network behind this node (a gateway's inside, a sensor's monitored LAN). Never blocked,
+    /// and a detector's alert whose source lies in it blocks the destination instead, as for
+    /// this node's own addresses: an alert on an inside host's outbound traffic names the remote
+    /// side. Without it every reported source is taken as the remote party.
+    #[arg(long, value_name = "CIDR")]
+    home_net: Vec<String>,
+
     /// Group allowed to send commands on the control socket (mode 0660).
     /// Without it the socket is root-only (0600).
     #[arg(long)]
@@ -656,15 +663,19 @@ fn build_block_policy(args: &Args) -> anyhow::Result<BlockPolicy> {
             policy.protect_ip(addr.ip(), "mesh seed peer");
         }
     }
-    for raw in &args.never_block {
+    let cidr = |flag: &str, raw: &str| -> anyhow::Result<ipnet::IpNet> {
         let raw = raw.trim();
-        let net = match raw.parse::<ipnet::IpNet>() {
-            Ok(net) => net,
-            Err(_) => raw.parse::<IpAddr>().map(ipnet::IpNet::from).map_err(|_| {
-                anyhow::anyhow!("--never-block '{}' is not an IP address or CIDR", raw)
-            })?,
-        };
-        policy.protect(net, "operator never-block range");
+        raw.parse::<ipnet::IpNet>().or_else(|_| {
+            raw.parse::<IpAddr>()
+                .map(ipnet::IpNet::from)
+                .map_err(|_| anyhow::anyhow!("{} '{}' is not an IP address or CIDR", flag, raw))
+        })
+    };
+    for raw in &args.never_block {
+        policy.protect(cidr("--never-block", raw)?, "operator never-block range");
+    }
+    for raw in &args.home_net {
+        policy.protect(cidr("--home-net", raw)?, block_policy::HOME_NETWORK);
     }
     Ok(policy)
 }
