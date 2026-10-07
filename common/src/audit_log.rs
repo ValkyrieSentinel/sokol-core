@@ -736,7 +736,10 @@ mod tests {
             vec![WitnessVerdict::Confirmed; 3]
         );
 
-        // The second decision is erased and the whole chain recomputed.
+        // The second decision is erased and the whole chain recomputed, at least a millisecond
+        // later: records written in the same millisecond carry the same timestamp, and the
+        // unchanged first record would then keep its chain value (flaked on a fast runner).
+        std::thread::sleep(std::time::Duration::from_millis(2));
         write_log(
             &path,
             &[
