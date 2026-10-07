@@ -3394,6 +3394,114 @@ mod tests {
         assert!(n1.is_blocked(ip("198.51.96.0/20")));
     }
 
+    /// The envelope decides enforcement, not only the reason a claim is held: with no quorum in
+    /// the way, a peer's claim wider than its envelope blocks nothing, for IPv4 and IPv6 alike,
+    /// and a claim exactly at the envelope's prefix is enforced (mutation sweep 2026-10-07).
+    /// A peer's claim that has already ended is refused, at its exact end too; one still running
+    /// is taken (mutation sweep 2026-10-07: `claim_live` could return true unnoticed).
+    #[test]
+    fn an_ended_peer_claim_is_refused_up_to_its_exact_end() {
+        let mut n2 = table(2, 64);
+        let claim = detect(&mut n2, "203.0.113.9", T0);
+        let end = claim.expires_ms.expect("a detector claim ends");
+        let mut late = table(1, 64);
+        assert_eq!(
+            late.adopt(claim.clone(), true, end),
+            Adoption::Refused("expired")
+        );
+        assert!(!late.is_blocked(ip("203.0.113.9")));
+        let mut on_time = table(1, 64);
+        assert_eq!(on_time.adopt(claim, true, end - 1), Adoption::Enforced);
+    }
+
+    /// A full retraction memory takes no new record from a peer (a flood cannot grow it).
+    #[test]
+    fn a_full_retraction_memory_takes_no_new_peer_record() {
+        let mut t = table(1, 64);
+        fill_retraction_memory(&mut t, 0);
+        t.retract(2, &["unseen".to_string()], T0);
+        assert_eq!(t.retractions.len(), MAX_KNOWN_CLAIMS);
+        assert!(!t.retractions.contains_key("unseen"));
+    }
+
+    #[test]
+    fn a_long_reason_is_cut_on_a_character_boundary_within_the_limit() {
+        let reason = "\u{e9}".repeat(MAX_REASON_BYTES); // two bytes each
+        let cut = bounded_reason(&format!("x{}", reason));
+        assert!(cut.len() <= MAX_REASON_BYTES, "{}", cut.len());
+        assert_eq!(
+            cut.len(),
+            MAX_REASON_BYTES - 1,
+            "only the split character is dropped"
+        );
+        assert!(reason.starts_with(&cut[1..]));
+    }
+
+    #[test]
+    fn support_ends_merge_to_the_later_one_and_no_end_wins() {
+        assert_eq!(later(Some(1), Some(2)), Some(2));
+        assert_eq!(later(Some(5), Some(2)), Some(5));
+        assert_eq!(later(None, Some(2)), None);
+        assert_eq!(later(Some(2), None), None);
+    }
+
+    #[test]
+    fn the_quorum_applies_only_to_prefixes_wider_than_its_bound() {
+        for (net, applies) in [
+            ("203.0.113.0/23", true),
+            ("203.0.113.0/24", false),
+            ("2001:db8::/63", true),
+            ("2001:db8::/64", false),
+        ] {
+            assert_eq!(QUORUM2.applies(&ip(net)), applies, "{}", net);
+        }
+        assert!(!Quorum { k: 1, ..QUORUM2 }.applies(&ip("203.0.113.0/16")));
+    }
+
+    #[test]
+    fn an_out_of_envelope_claim_is_never_enforced_for_either_family() {
+        let mut n2 = table(2, 64);
+        let narrow = Envelope {
+            min_prefix_v4: 24,
+            min_prefix_v6: 64,
+            ..Envelope::unlimited(POLICY.max)
+        };
+        let mut n1 = table(1, 64);
+        n1.configure_peers(
+            Envelope::unlimited(POLICY.max),
+            [(2, narrow)].into_iter().collect(),
+            Quorum::OFF,
+            T0,
+        );
+        for (wide, edge) in [
+            ("203.0.113.0/23", "198.51.100.0/24"),
+            ("2001:db8::/63", "2001:db8:1::/64"),
+        ] {
+            let claim = detect(&mut n2, wide, T0);
+            assert_eq!(
+                n1.adopt(claim, true, T0),
+                Adoption::Held("envelope"),
+                "{}",
+                wide
+            );
+            assert!(
+                !n1.is_blocked(ip(wide)),
+                "{} is outside node 2's envelope",
+                wide
+            );
+            let claim = detect(&mut n2, edge, T0);
+            assert_eq!(n1.adopt(claim, true, T0), Adoption::Enforced, "{}", edge);
+            assert!(
+                n1.is_blocked(ip(edge)),
+                "{} is at the envelope's prefix",
+                edge
+            );
+        }
+        // This node's own claims are not bound by any peer's envelope.
+        detect(&mut n1, "192.0.2.0/23", T0);
+        assert!(n1.is_blocked(ip("192.0.2.0/23")));
+    }
+
     #[test]
     fn a_peers_envelope_bounds_what_it_can_block_here() {
         let mut n2 = table(2, 64);

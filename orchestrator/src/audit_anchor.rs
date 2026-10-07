@@ -268,27 +268,7 @@ pub fn verify(own_log: &Path, dir: &Path, node_id: u64) -> Result<(Summary, Vec<
     let mut summary = Summary::default();
     let mut lines = Vec::new();
     for (f, verdict) in found.iter().zip(verdicts) {
-        let what = match verdict {
-            common::audit_log::WitnessVerdict::Confirmed => {
-                summary.confirmed += 1;
-                "confirmed".to_string()
-            }
-            common::audit_log::WitnessVerdict::Contradicted(found) => {
-                summary.contradicted += 1;
-                format!(
-                    "CONTRADICTED: this log now has head {}",
-                    crate::p2p::to_hex(&found)
-                )
-            }
-            common::audit_log::WitnessVerdict::Missing => {
-                summary.missing += 1;
-                "MISSING: this log has fewer records now".to_string()
-            }
-            common::audit_log::WitnessVerdict::Pruned => {
-                summary.pruned += 1;
-                "unknown: in a pruned segment".to_string()
-            }
-        };
+        let what = summary.count(verdict);
         lines.push(format!(
             "{}: head after {} records {}{}",
             f.file.display(),
@@ -439,6 +419,69 @@ mod tests {
         }
     }
 
+    /// ADR-0022: at most one write in flight, at most one per `--anchor-secs`, and never a second
+    /// statement for an anchored head. Each clause had a surviving mutant (sweep 2026-10-07).
+    #[tokio::test]
+    async fn statements_are_paced_one_at_a_time_and_once_per_head() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let d = dir("pace");
+        let audit = d.join("audit.log").to_string_lossy().into_owned();
+        let db = crate::SentinelDb::init(&audit, None).unwrap();
+        let (open, calls) = (
+            std::sync::Arc::new(AtomicBool::new(false)),
+            std::sync::Arc::new(AtomicUsize::new(0)),
+        );
+        let (open_w, calls_w) = (open.clone(), calls.clone());
+        let gated: std::sync::Arc<WriteFn> =
+            std::sync::Arc::new(move |dir: &Path, n, r, h: &[u8; CHAIN_LEN]| {
+                calls_w.fetch_add(1, Ordering::SeqCst);
+                while !open_w.load(Ordering::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                write_statement(dir, n, r, h)
+            });
+        let every = std::time::Duration::from_secs(60);
+        let mut a = Anchorer::with_writer(d.join("anchors"), 1, every, gated);
+        let secs = std::time::Duration::from_secs;
+        let t0 = std::time::Instant::now();
+        let settle = |a: &Anchorer| {
+            while a.job.as_ref().is_some_and(|j| !j.2.is_finished()) {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        };
+
+        a.tick(Some((3, [3; CHAIN_LEN])), &db, t0).await;
+        // Due again, but the first write is still running: no second one.
+        a.tick(Some((4, [4; CHAIN_LEN])), &db, t0 + secs(61)).await;
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "one write in flight");
+        open.store(true, Ordering::SeqCst);
+
+        settle(&a);
+        a.tick(Some((4, [4; CHAIN_LEN])), &db, t0 + secs(61)).await;
+        settle(&a);
+        // 30 s after the last write: not due.
+        a.tick(Some((5, [5; CHAIN_LEN])), &db, t0 + secs(91)).await;
+        settle(&a);
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "not before --anchor-secs");
+        // Exactly --anchor-secs after the last write: due.
+        a.tick(Some((5, [5; CHAIN_LEN])), &db, t0 + secs(121)).await;
+        settle(&a);
+        assert_eq!(calls.load(Ordering::SeqCst), 3, "due at --anchor-secs");
+        // Due, but this head already has its statement.
+        a.tick(Some((5, [5; CHAIN_LEN])), &db, t0 + secs(181)).await;
+        a.tick(Some((5, [5; CHAIN_LEN])), &db, t0 + secs(241)).await;
+        settle(&a);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "an anchored head is not rewritten"
+        );
+        assert_eq!(a.stats.written.load(Ordering::SeqCst), 3);
+        drop(db);
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
     #[test]
     fn a_statement_is_one_exact_line_and_parses_back() {
         let head = [0xab; CHAIN_LEN];
@@ -456,6 +499,10 @@ mod tests {
             text.replace("v1", "v2"),
             text.replace("\n", " extra\n"),
             format!("{}{}", text, text),
+            // A short or long head is not padded or cut to fit (mutation sweep 2026-10-07).
+            text.replace(&"ab".repeat(32), &"ab".repeat(31)),
+            text.replace(&"ab".repeat(32), &"ab".repeat(33)),
+            text.replace(&"ab".repeat(32), &format!("{}zz", "ab".repeat(31))),
         ] {
             assert_eq!(parse(&bad), None, "{:?}", bad);
         }
@@ -501,6 +548,20 @@ mod tests {
             lines
         );
         assert!(!lines[0].contains("not stamped"));
+        assert_eq!(
+            lines.len(),
+            1,
+            "no malformed-file line when there is none: {:?}",
+            lines
+        );
+        assert_eq!(print_report(&own, &anchors, 1), 0);
+
+        // Records removed after the statement: MISSING, and --verify-anchors fails.
+        write_log(&own, &decisions[..2]);
+        let (summary, _) = verify(&own, &anchors, 1).unwrap();
+        assert_eq!((summary.missing, summary.exit_code()), (1, 1));
+        assert_eq!(print_report(&own, &anchors, 1), 1);
+        assert_eq!(print_report(&d.join("absent.log"), &anchors, 1), 2);
 
         let mut rewritten = decisions.clone();
         rewritten[0] = "DYNAMIC_BLOCK_V4|IP:203.0.113.1".into();
