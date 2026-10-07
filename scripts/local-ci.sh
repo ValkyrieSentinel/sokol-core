@@ -168,12 +168,12 @@ python3 scripts/test_witness_gate.py
 python3 scripts/test_local_ci.py
 python3 scripts/test_runbook_preflight.py
 python3 scripts/test_anchor_scripts.py
+python3 scripts/test_kani_scope.py
 timeout 120 python3 scripts/test_crowdsec_stream.py target/release/sokol-crowdsec
 timeout 120 python3 scripts/test_suricata_recovery.py target/release/sokol-suricata
-# CI's kani job proves when common/ or ci.yml (the Kani pin) changed against the base.
-if base=$(git merge-base HEAD origin/main 2>/dev/null) \
-        && git diff --quiet "$base" -- common/ "$CI"; then
-    step "kani: common/ and ci.yml unchanged since origin/main, proofs not rerun"
+# CI's kani job proves when something the proofs read changed (scripts/kani-scope.sh).
+if base=$(git merge-base HEAD origin/main 2>/dev/null) && [ "$(scripts/kani-scope.sh "$base")" = skip ]; then
+    step "kani: nothing the proofs read changed since origin/main, proofs not rerun"
 else
     kani
 fi
