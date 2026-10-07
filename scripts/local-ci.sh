@@ -4,8 +4,10 @@
 # Ubuntu 24.04 on x86_64 or aarch64 (a Lima VM on macOS works: AGENTS.md). Needs sudo for the
 # XDP smoke, the demo and the runbook rehearsal.
 #
-#   scripts/local-ci.sh              everything CI runs, except the artifact upload
+#   scripts/local-ci.sh              everything CI runs, except the artifact upload; the Kani
+#                                    proofs when common/ differs from origin/main, as in CI
 #   scripts/local-ci.sh --quick      policy checks, build, tests, clippy, Python regressions
+#                                    (and the Kani proofs on the same condition)
 #   scripts/local-ci.sh --step NAME  one step: tools, monitoring (used by test_local_ci.py), kani
 #
 # Pins (versions, SHA256, the Prometheus image digest) are read from ci.yml itself, so the two
@@ -168,6 +170,13 @@ python3 scripts/test_runbook_preflight.py
 python3 scripts/test_anchor_scripts.py
 timeout 120 python3 scripts/test_crowdsec_stream.py target/release/sokol-crowdsec
 timeout 120 python3 scripts/test_suricata_recovery.py target/release/sokol-suricata
+# CI's kani job proves when common/ or ci.yml (the Kani pin) changed against the base.
+if base=$(git merge-base HEAD origin/main 2>/dev/null) \
+        && git diff --quiet "$base" -- common/ "$CI"; then
+    step "kani: common/ and ci.yml unchanged since origin/main, proofs not rerun"
+else
+    kani
+fi
 [ "$QUICK" = 1 ] && { step "quick run done (no smoke, demo or rehearsal)"; exit 0; }
 
 # sudo resets PATH; keep the verified tools first for the root steps too.

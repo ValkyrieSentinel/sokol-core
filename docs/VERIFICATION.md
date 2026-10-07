@@ -45,8 +45,13 @@ cargo kani -p common --harness advancing_never_wraps
 ```
 
 About 10 minutes on 10 cores, most of it the validator proof. CI runs them in the `kani` job,
-beside the main one. A proof that runs out of memory reports `VERIFICATION:- FAILED` with "CBMC
-appears to have run out of memory": that is not a counterexample; narrow the input.
+beside the main one, when a pull request changes `common/` or `ci.yml` (which pins Kani), and
+always on `main` and on release tags (`v*`); otherwise the job passes in seconds, since nothing
+it proves has changed. `scripts/local-ci.sh` (also its quick run) applies the same rule against
+`origin/main` and fails with the install command when Kani is missing.
+
+A proof that runs out of memory reports `VERIFICATION:- FAILED` with "CBMC appears to have run
+out of memory": that is not a counterexample; narrow the input.
 
 ## Not covered
 
