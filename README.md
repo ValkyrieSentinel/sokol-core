@@ -158,6 +158,8 @@ the mesh, not line-rate packet processing on a physical NIC.
 
 # License
 
-See [LICENSE](LICENSE): copyright © 2026 Ольга Скороход (ValkyrieSentinel), all rights reserved.
-The source is published for viewing and educational purposes; copying, modifying, compiling or
-using it needs the author's prior written permission.
+Copyright © 2026 Ольга Скороход (ValkyrieSentinel) and contributors. The node is licensed
+under the [GNU AGPL-3.0](LICENSE); the XDP program (`ebpf/`) and the shared types (`common/`)
+under GPL-2.0-or-later, which the kernel requires. Other terms (e.g. for a closed product)
+are available from the copyright holder. Details: [COPYRIGHT.md](COPYRIGHT.md);
+contributions: [CLA.md](CLA.md).
