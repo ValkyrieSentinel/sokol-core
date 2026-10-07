@@ -74,6 +74,7 @@ class Steps(unittest.TestCase):
   BPF_LINKER_VERSION: v0.11.1
   GOBGP_VERSION: 4.9.0
   CARGO_DENY_VERSION: 0.20.2
+  KANI_VERSION: 0.68.0
 jobs:
   x:
     strategy:
@@ -126,6 +127,27 @@ jobs:
         ci = self.fixture(gobgp_files={'gobgpd': script('echo gobgpd verified')})
         result = self.run_step('tools', ci)
         self.assertNotEqual(result.returncode, 0, result.stdout)
+
+    def test_kani_runs_the_proofs_only_with_the_pinned_version(self):
+        ci = self.fixture()
+        # A long version text from the process itself (exec): a `grep -q` on the pipe would stop
+        # reading early, and the writer's SIGPIPE would fail the check under pipefail (the first
+        # version of this step did).
+        self.stub('cargo', f'if [ "$1 $2" = "kani --version" ]; then echo "Kani Rust Verifier '
+                           f'${{KANI_HAVE:-0.68.0}} (cargo plugin)"; exec seq 1 200000; fi; '
+                           f'echo "cargo $*" >> {self.calls}')
+        ok = self.run_step('kani', ci)
+        self.assertEqual(ok.returncode, 0, ok.stdout + ok.stderr)
+        self.assertIn('cargo kani -p common', self.calls.read_text())
+        self.calls.unlink()
+        os.environ['KANI_HAVE'] = '0.67.0'
+        try:
+            other = self.run_step('kani', ci)
+        finally:
+            del os.environ['KANI_HAVE']
+        self.assertEqual(other.returncode, 2, other.stdout)
+        self.assertIn('Kani 0.68.0 is not installed', other.stdout)
+        self.assertFalse(self.calls.exists(), 'no proof run with another version')
 
     def test_monitoring_runs_ci_pinned_promtool_and_propagates_its_failure(self):
         ci = self.fixture()
