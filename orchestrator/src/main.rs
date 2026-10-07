@@ -41,8 +41,8 @@ mod sokol;
 mod state_store;
 
 use aya::maps::{Array, LpmTrie, MapData, PerCpuArray, RingBuf};
-use aya::programs::{Xdp, XdpFlags};
-use aya::{Bpf, Pod};
+use aya::programs::Xdp;
+use aya::{Ebpf, Pod};
 use clap::Parser;
 use sokol::SokolEngine;
 use std::net::IpAddr;
@@ -635,11 +635,12 @@ enum XdpMode {
 }
 
 impl XdpMode {
-    fn flags(self) -> XdpFlags {
+    /// The attach mode (aya 0.14 `XdpMode`; the same flags as before: 0, DRV, SKB).
+    fn flags(self) -> aya::programs::XdpMode {
         match self {
-            XdpMode::Auto => XdpFlags::default(),
-            XdpMode::Native => XdpFlags::DRV_MODE,
-            XdpMode::Generic => XdpFlags::SKB_MODE,
+            XdpMode::Auto => aya::programs::XdpMode::Default,
+            XdpMode::Native => aya::programs::XdpMode::Driver,
+            XdpMode::Generic => aya::programs::XdpMode::Skb,
         }
     }
 }
@@ -1111,16 +1112,16 @@ async fn main() -> Result<(), anyhow::Error> {
     // The node embeds the compiled XDP object and cannot be built without it. Unit tests never
     // load it, so they build without bpf-linker (`cargo test --bins`; review 2026-10-05 W4.3).
     #[cfg(test)]
-    let mut bpf = Bpf::load(&[])?;
+    let mut bpf = Ebpf::load(&[])?;
 
     #[cfg(all(debug_assertions, not(test)))]
-    let mut bpf = Bpf::load(aya::include_bytes_aligned!(concat!(
+    let mut bpf = Ebpf::load(aya::include_bytes_aligned!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../target/bpfel-unknown-none/debug/ebpf-probe"
     )))?;
 
     #[cfg(all(not(debug_assertions), not(test)))]
-    let mut bpf = Bpf::load(aya::include_bytes_aligned!(concat!(
+    let mut bpf = Ebpf::load(aya::include_bytes_aligned!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../target/bpfel-unknown-none/release/ebpf-probe"
     )))?;
@@ -1216,7 +1217,8 @@ async fn main() -> Result<(), anyhow::Error> {
             .ok_or_else(|| anyhow::anyhow!("BLOCK_HITS missing"))?,
     )?;
     // N03: the per-CPU numbers multiply with this machine's CPU count.
-    let possible_cpus = aya::util::nr_cpus()?;
+    let possible_cpus =
+        aya::util::nr_cpus().map_err(|(what, e)| anyhow::anyhow!("{}: {}", what, e))?;
     let online_cpus = aya::util::online_cpus()
         .map(|c| c.len())
         .unwrap_or(possible_cpus);
@@ -1234,7 +1236,7 @@ async fn main() -> Result<(), anyhow::Error> {
         blocklist_v4_trie,
         blocklist_v6_trie,
         block_hits,
-        aya::util::nr_cpus()?,
+        aya::util::nr_cpus().map_err(|(what, e)| anyhow::anyhow!("{}: {}", what, e))?,
         ttl_policy,
         args.node_id,
     )));
