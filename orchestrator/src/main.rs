@@ -890,7 +890,8 @@ struct Detection<'a> {
     requested: Option<Duration>,
 }
 
-/// Decides and enforces a local block, and counts the decision under its source.
+/// Decides and enforces a local block. The decision is counted under its source as soon as it
+/// is made, before any network await: a cancelled publication does not uncount it.
 #[allow(clippy::too_many_arguments)]
 async fn enforce_block_local<B: block_table::Blocklist>(
     target: IpNet,
@@ -903,37 +904,15 @@ async fn enforce_block_local<B: block_table::Blocklist>(
     policy: &BlockPolicy,
     detection: Detection<'_>,
 ) -> Enforcement {
-    let outcome = decide_and_enforce(
-        target,
-        reason,
-        blocks,
-        sntl_db,
-        registry,
-        node_id,
-        node_crypto,
-        policy,
-        detection,
-    )
-    .await;
-    detections::record(detection.source, outcome.result_index());
-    outcome
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn decide_and_enforce<B: block_table::Blocklist>(
-    target: IpNet,
-    reason: &str,
-    blocks: &SharedBlockTable<B>,
-    sntl_db: &Arc<SentinelDb>,
-    registry: &PeerRegistry,
-    node_id: u64,
-    node_crypto: &Arc<NodeCrypto>,
-    policy: &BlockPolicy,
-    detection: Detection<'_>,
-) -> Enforcement {
     let Detection {
-        event, requested, ..
+        source,
+        event,
+        requested,
     } = detection;
+    let counted = |outcome: Enforcement| {
+        detections::record(source, outcome.result_index());
+        outcome
+    };
     let ip = block_table::canonical(target);
     let shown = show(&ip);
     if let Err(why) = policy.check_net(ip) {
@@ -947,7 +926,7 @@ async fn decide_and_enforce<B: block_table::Blocklist>(
             "BLOCK_REFUSED|IP:{}|Protected:{}|Reason:{}",
             shown, why, reason
         ));
-        return Enforcement::Refused;
+        return counted(Enforcement::Refused);
     }
     let now = block_table::local_ms();
     // Replay context (ADR-0016): the exact decision time and the event id go into every
@@ -980,7 +959,7 @@ async fn decide_and_enforce<B: block_table::Blocklist>(
                 shown
             );
             sntl_db.append(format!("SIGNAL_DUPLICATE|IP:{}|{}", shown, context));
-            return Enforcement::Duplicate;
+            return counted(Enforcement::Duplicate);
         }
         block_table::Detected::Added(added) => added,
         block_table::Detected::Refused(why) => {
@@ -989,7 +968,7 @@ async fn decide_and_enforce<B: block_table::Blocklist>(
                 "BLOCK_REFUSED|IP:{}|Why:{}|Reason:{}|{}",
                 shown, why, reason, context
             ));
-            return Enforcement::Refused;
+            return counted(Enforcement::Refused);
         }
     };
     let ttl = added.ttl;
@@ -997,7 +976,7 @@ async fn decide_and_enforce<B: block_table::Blocklist>(
     // A new claim is shared either way: peers can enforce it even if this node's map is full.
     // A repeat merged into the running claim is not signed and sent again (peers have it).
     // Observe mode keeps own claims off the mesh (ADR-0018): peers in drop mode would enforce.
-    let outcome = match added.applied {
+    let outcome = counted(match added.applied {
         Ok(()) => {
             log::warn!(
                 "[Local Security] Dynamic block enforced in XDP: {} for {} | Reason: {}",
@@ -1034,7 +1013,7 @@ async fn decide_and_enforce<B: block_table::Blocklist>(
             ));
             Enforcement::Pending
         }
-    };
+    });
     // Mutation and audit submission share one poll. Shutdown may cancel publication or
     // the reply afterwards; a missing ACK is not evidence that the decision was refused.
     if added.new && shares_own {
@@ -2759,7 +2738,10 @@ mod tests {
                 1,
                 &crypto,
                 &policy,
-                Detection::default(),
+                Detection {
+                    source: "cancel-test-source",
+                    ..Detection::default()
+                },
             )
             .await;
         });
@@ -2780,6 +2762,14 @@ mod tests {
         );
         assert!(records[0].starts_with("DYNAMIC_BLOCK_V4|IP:198.51.100.77|"));
         producers.quiesce().await;
+        // Counted with the decision, not after the publication shutdown cancelled.
+        assert_eq!(
+            detections::rows()
+                .into_iter()
+                .find(|(s, _)| s == "cancel-test-source")
+                .map(|(_, c)| c),
+            Some([1, 0, 0, 0])
+        );
         drop(guard);
         assert!(blocks.lock().await.is_blocked(target));
         db.append("NODE_SHUTDOWN".into());
