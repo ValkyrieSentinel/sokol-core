@@ -54,16 +54,9 @@ for a in $(grep -ohE 'ADR-0[0-9]{3}' "${DOCS[@]}" | sort -u); do
     ls docs/adr/"${a#ADR-}"-*.md >/dev/null 2>&1 || bad "$a is cited but docs/adr has no such record"
 done
 # AGENTS.md: every rule under "Changing code" names what checks it, or says only review does.
-n_rules=0
-while IFS= read -r rule; do
-    n_rules=$((n_rules + 1))
-    case "$rule" in
-        *"Checked by:"* | *"Review only"* | *"review only"*) ;;
-        *) bad "AGENTS.md rule names no check and is not marked review only: ${rule:0:70}" ;;
-    esac
-done < <(awk '/^## Changing code/ {p = 1; next} /^## / {p = 0} p' AGENTS.md \
-    | awk 'BEGIN {RS = "\n- "} NR > 1 {gsub(/\n */, " "); print}')
-[ "$n_rules" -gt 0 ] || bad "AGENTS.md has no rules under Changing code"
+while IFS= read -r line; do
+    bad "${line#FAIL }"
+done < <(scripts/check-agents-rules.sh AGENTS.md || true)
 # docs/RETIRED.md names retired paths on purpose (scripts/check-retired.sh checks it).
 # shellcheck disable=SC2016
 live_spans=$(for d in "${DOCS[@]}"; do [ "$d" = docs/RETIRED.md ] || grep -ohE '`[^`]+`' "$d"; done | tr -d '`')
