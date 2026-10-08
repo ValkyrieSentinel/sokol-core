@@ -37,7 +37,10 @@ CI's `mutants` job runs `scripts/mutants-diff.sh <base>`: cargo-mutants on the l
 request changes (`--in-diff`), in `orchestrator` (unit tests, `--bins`) and `common`. Every such
 mutant must be caught, or excluded in `.cargo/mutants.toml` with the reason it is equivalent —
 checked with its boundary value, not argued (two exclusions were wrong that way). A timeout
-counts as caught; a failing baseline fails the job. `scripts/local-ci.sh` runs the same check
+counts as caught; a failing baseline fails the job after one more run (a wall-clock test
+can fail on a loaded runner; a missed mutant is never retried). Known wall-clock test still to
+move to virtual time: `successful_no_effect_rounds_wait_despite_overdue_ticks` (a 0.5 s margin
+between a resumed round and a restarted pause). `scripts/local-ci.sh` runs the same check
 against `origin/main` (its step `mutants` runs it alone). The whole-module sweep below is still
 how the code that was there before is measured.
 

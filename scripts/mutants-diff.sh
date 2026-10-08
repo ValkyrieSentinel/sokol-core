@@ -22,6 +22,15 @@ run() {   # run <package> <extra cargo arg>...
     shift
     cargo mutants -j "$jobs" --in-diff "$out/change.diff" -p "$package" \
         --cargo-arg=--locked "$@" -o "$out/$package" || status=$?
+    # 4: the unmutated baseline failed. Wall-clock tests can fail on a loaded runner (a test
+    # failing under a mutant only counts it caught, so only the baseline needs this): one
+    # more run, then the failure stands. A missed mutant is never retried.
+    if [ "$status" = 4 ]; then
+        echo "the baseline failed; running once more"
+        status=0
+        cargo mutants -j "$jobs" --in-diff "$out/change.diff" -p "$package" \
+            --cargo-arg=--locked "$@" -o "$out/$package" || status=$?
+    fi
     # 0: all caught; 2: some missed; 3: some timed out. Anything else is not a verdict.
     case $status in
         0 | 2 | 3) ;;
