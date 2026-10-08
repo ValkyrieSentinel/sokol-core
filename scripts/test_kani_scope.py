@@ -34,6 +34,10 @@ class Scope(unittest.TestCase):
             (self.repo / name).parent.mkdir(parents=True, exist_ok=True)
             (self.repo / name).write_text(text)
         self.git('init', '-q')
+        # git commit starts `git maintenance run --auto --detach`, which can still write in
+        # the repository while the cleanup removes it (seen in CI, git 2.55).
+        self.git('config', 'maintenance.auto', 'false')
+        self.git('config', 'gc.auto', '0')
         self.git('add', '-A')
         self.git('-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', 'base')
         self.base = self.git('rev-parse', 'HEAD').strip()
