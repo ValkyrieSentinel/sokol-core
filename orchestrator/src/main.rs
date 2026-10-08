@@ -3120,16 +3120,19 @@ mod tests {
     /// nothing was fsynced until 64 records had piled up (about 2 s here).
     #[test]
     fn a_steady_stream_is_fsynced_within_the_interval() {
+        // A writer that stopped syncing would show the whole stream's age (1.8 s and more);
+        // half of it leaves room for a slow fsync on a loaded host, where a 250 ms bound
+        // failed (301 ms, CI mutants job, 2026-10-08) without anything being wrong.
         let db = SentinelDb::init(&temp_log("steady"), None).unwrap();
-        for i in 0..20 {
+        for i in 0..60 {
             db.append(format!("EVENT|{}", i));
             std::thread::sleep(Duration::from_millis(30));
         }
         let status = db.status();
         assert!(status.healthy);
         assert!(
-            status.last_sync_age_ms < 250,
-            "last fsync {} ms ago under a 30 ms event stream",
+            status.last_sync_age_ms < 900,
+            "last fsync {} ms ago under a 1.8 s stream of events every 30 ms",
             status.last_sync_age_ms
         );
         assert!(db.flush(Duration::from_secs(2)));
