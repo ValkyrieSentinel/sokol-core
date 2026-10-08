@@ -45,8 +45,9 @@ exit {status}
 ''')
         path.chmod(0o755)
 
-    def run_check(self):
-        env = dict(os.environ, PATH=str(self.stubs) + os.pathsep + os.environ['PATH'])
+    def run_check(self, **extra):
+        env = dict(os.environ, PATH=str(self.stubs) + os.pathsep + os.environ['PATH'], **extra)
+        env.pop('MUTANTS_SHARD', None) if 'MUTANTS_SHARD' not in extra else None
         return subprocess.run([str(self.repo / 'scripts' / 'mutants-diff.sh'), self.base],
                               cwd=self.repo, capture_output=True, text=True, env=env)
 
@@ -60,6 +61,18 @@ exit {status}
         self.assertIn('-p common', calls)
         diff = (self.repo / 'target' / 'mutants-diff' / 'change.diff').read_text()
         self.assertIn('+fn g() {}', diff, 'the uncommitted change is the one checked')
+
+    def test_a_shard_is_passed_to_both_packages_and_none_by_default(self):
+        self.cargo(0)
+        self.run_check()
+        self.assertNotIn('--shard', self.calls.read_text())
+        self.calls.write_text('')
+        result = self.run_check(MUTANTS_SHARD='2/4')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        calls = self.calls.read_text().splitlines()
+        self.assertEqual(len(calls), 2, calls)
+        for call in calls:
+            self.assertIn('--shard 2/4', call)
 
     def test_a_missed_mutant_fails_and_is_named(self):
         self.cargo(2, 'orchestrator/lib.rs:2:1: replace g with ()\n')

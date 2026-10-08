@@ -33,8 +33,10 @@ way to fail, so a bound is checked inside the loop that could break it
 
 ## Every pull request: the mutants of the change
 
-CI's `mutants` job runs `scripts/mutants-diff.sh <base>`: cargo-mutants on the lines the pull
-request changes (`--in-diff`), in `orchestrator` (unit tests, `--bins`) and `common`. Every such
+CI's `mutants` check runs `scripts/mutants-diff.sh <base>`: cargo-mutants on the lines the pull
+request changes (`--in-diff`), in `orchestrator` (unit tests, `--bins`) and `common`, split into
+four shards on four runners (`MUTANTS_SHARD=k/4`, cargo-mutants `--shard`); the check passes
+only if every shard does. Every such
 mutant must be caught, or excluded in `.cargo/mutants.toml` with the reason it is equivalent —
 checked with its boundary value, not argued (two exclusions were wrong that way). A timeout
 counts as caught; a failing baseline fails the job after one more run (a wall-clock test

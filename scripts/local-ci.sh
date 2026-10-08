@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# The CI job (.github/workflows/ci.yml, build-test-smoke) on this Linux host, in the same order,
+# The CI suite (.github/workflows/ci.yml: the test, smoke and demo parts that build-test-smoke
+# requires, which CI runs on three runners at once) on this Linux host, one after another,
 # with the same pinned tools and checksums, so a change can be checked before it is pushed.
 # Ubuntu 24.04 on x86_64 or aarch64 (a Lima VM on macOS works: AGENTS.md). Needs sudo for the
 # XDP smoke, the demo and the runbook rehearsal.
@@ -157,7 +158,6 @@ tools
 
 step "format"; cargo fmt --all --check; (cd ebpf && cargo fmt --check)
 step "retired surface"; scripts/check-retired.sh
-step "cited evidence"; scripts/check-claims.sh
 monitoring
 if [ "$ARCH" = x86_64 ]; then
     step "dependency policy (cargo-deny $(pin CARGO_DENY_VERSION))"
@@ -173,6 +173,10 @@ fi
 step "eBPF program"; (cd ebpf && cargo build --release --locked)
 step "workspace"; cargo build --release --locked
 step "tests"; cargo test --release --locked
+# After the tests, as in CI: a cited test must be in the compiler's own list.
+step "cited evidence"
+cargo test --release --locked --lib --bins --tests -- --list --format terse >"$CACHE/tests.txt"
+SOKOL_TEST_LIST="$CACHE/tests.txt" scripts/check-claims.sh
 step "clippy"; cargo clippy --release --locked --all-targets -- -D warnings
 step "Python regressions"
 python3 scripts/test_xdp_probe.py
@@ -186,6 +190,7 @@ python3 scripts/test_anchor_scripts.py
 python3 scripts/test_kani_scope.py
 python3 scripts/test_mutants_diff.py
 python3 scripts/test_check_agents_rules.py
+python3 scripts/test_check_claims.py
 timeout 120 python3 scripts/test_crowdsec_stream.py target/release/sokol-crowdsec
 timeout 120 python3 scripts/test_suricata_recovery.py target/release/sokol-suricata
 # CI's kani job proves when something the proofs read changed (scripts/kani-scope.sh).

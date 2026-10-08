@@ -4,6 +4,7 @@
 # the reason it is equivalent. Used by CI's mutants job and by scripts/local-ci.sh.
 #
 #   scripts/mutants-diff.sh <base commit>
+#   MUTANTS_SHARD=k/n scripts/mutants-diff.sh <base>   only shard k of n (CI runs four in parallel)
 #
 # The working tree is compared with the base (an uncommitted change counts; a new file must be
 # tracked). A timeout counts as caught: the suite did not pass. Fails on any missed mutant, and
@@ -13,6 +14,8 @@ cd "$(dirname "$0")/.."
 base=${1:?usage: mutants-diff.sh <base commit>}
 out=${MUTANTS_OUT:-target/mutants-diff}
 jobs=${MUTANTS_JOBS:-2}
+shard=()
+[ -n "${MUTANTS_SHARD:-}" ] && shard=(--shard "$MUTANTS_SHARD")
 rm -rf "$out"
 mkdir -p "$out"
 git diff "$base" -- orchestrator common >"$out/change.diff"
@@ -21,7 +24,7 @@ run() {   # run <package> <extra cargo arg>...
     local package=$1 status=0
     shift
     cargo mutants -j "$jobs" --in-diff "$out/change.diff" -p "$package" \
-        --cargo-arg=--locked "$@" -o "$out/$package" || status=$?
+        --cargo-arg=--locked ${shard[@]+"${shard[@]}"} "$@" -o "$out/$package" || status=$?
     # 4: the unmutated baseline failed. Wall-clock tests can fail on a loaded runner (a test
     # failing under a mutant only counts it caught, so only the baseline needs this): one
     # more run, then the failure stands. A missed mutant is never retried.
@@ -29,7 +32,7 @@ run() {   # run <package> <extra cargo arg>...
         echo "the baseline failed; running once more"
         status=0
         cargo mutants -j "$jobs" --in-diff "$out/change.diff" -p "$package" \
-            --cargo-arg=--locked "$@" -o "$out/$package" || status=$?
+            --cargo-arg=--locked ${shard[@]+"${shard[@]}"} "$@" -o "$out/$package" || status=$?
     fi
     # 0: all caught; 2: some missed; 3: some timed out. Anything else is not a verdict.
     case $status in
