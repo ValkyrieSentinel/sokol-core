@@ -75,6 +75,8 @@ on a rule here that does neither, and on a cited test, path or flag that does no
 - A parser of bytes the node does not control (in `common`) gets a Kani proof as well:
   [docs/VERIFICATION.md](docs/VERIFICATION.md). *Checked by:* CI's `kani` job for the proofs
   that exist; that a new parser has one is *review only*.
+- Every mutant of the lines a pull request changes is caught by a test or excluded with its
+  reason. *Checked by:* `scripts/mutants-diff.sh` (CI job `mutants`).
 - A test of the security core should fail on the mutants of the code it covers;
   [docs/MUTATION.md](docs/MUTATION.md) has the commands, the baseline and the open survivors.
   *Checked by:* the sweep in docs/MUTATION.md, run by hand; *review only* between sweeps.

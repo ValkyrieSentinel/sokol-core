@@ -31,6 +31,16 @@ A timeout counts as caught: the suite did not pass. A test that only times out i
 way to fail, so a bound is checked inside the loop that could break it
 (`repeated_detections_of_one_target_keep_a_handful_of_claims`).
 
+## Every pull request: the mutants of the change
+
+CI's `mutants` job runs `scripts/mutants-diff.sh <base>`: cargo-mutants on the lines the pull
+request changes (`--in-diff`), in `orchestrator` (unit tests, `--bins`) and `common`. Every such
+mutant must be caught, or excluded in `.cargo/mutants.toml` with the reason it is equivalent —
+checked with its boundary value, not argued (two exclusions were wrong that way). A timeout
+counts as caught; a failing baseline fails the job. `scripts/local-ci.sh` runs the same check
+against `origin/main` (its step `mutants` runs it alone). The whole-module sweep below is still
+how the code that was there before is measured.
+
 ## Baseline 2026-10-07
 
 First sweep, before the tests it led to:
