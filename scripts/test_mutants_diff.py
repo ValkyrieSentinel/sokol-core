@@ -76,6 +76,24 @@ exit {status}
         result = self.run_check()
         self.assertEqual(result.returncode, 1, result.stdout)
         self.assertIn('exited 4', result.stdout)
+        runs = [l for l in self.calls.read_text().splitlines() if '-p orchestrator' in l]
+        self.assertEqual(len(runs), 2, 'one more run, not more')
+
+    def test_a_baseline_that_passes_the_second_time_gives_its_verdict(self):
+        # The stub fails its first call (the baseline) and passes after.
+        path = self.stubs / 'cargo'
+        self.cargo(0)
+        path.write_text(path.read_text().replace(
+            'exit 0', f'n=$(grep -c . {self.calls}); [ "$n" = 1 ] && exit 4; exit 0'))
+        result = self.run_check()
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn('running once more', result.stdout)
+
+    def test_a_missed_mutant_is_not_retried(self):
+        self.cargo(2, 'orchestrator/lib.rs:2:1: replace g with ()\n')
+        self.run_check()
+        runs = [l for l in self.calls.read_text().splitlines() if '-p orchestrator' in l]
+        self.assertEqual(len(runs), 1)
 
 
 if __name__ == '__main__':
