@@ -118,7 +118,7 @@ id sokol >/dev/null && getent group sokol-ipc sokol-ops >/dev/null && pass "§1 
 
 step "§2 keys and peers"
 out=$(sudo -u sokol /usr/local/bin/sokol-orchestrator --key-file /var/lib/sokol/node.key --print-public-key 2>&1)
-if echo "$out" | grep -q '^mldsa65:'; then
+if grep -q '^mldsa65:' <<<"$out"; then
     pass "§2 --print-public-key before the first start prints the key"
 else
     deviation "§2 --print-public-key before the first start fails: $(echo "$out" | tail -1 | cut -c1-160)"
@@ -131,9 +131,9 @@ if wait_until 20 up; then pass "§3 the service starts"; else
     fail "§3 the service does not start: $(journalctl -u sokol-orchestrator -n 5 --no-pager | tail -3 | cut -c1-200)"
     exit 1
 fi
-if ! echo "$out" | grep -q '^mldsa65:'; then
+if ! grep -q '^mldsa65:' <<<"$out"; then
     out=$(sudo -u sokol /usr/local/bin/sokol-orchestrator --key-file /var/lib/sokol/node.key --print-public-key 2>&1)
-    echo "$out" | grep -q '^mldsa65:' && pass "§2 after the first start the key prints" || fail "§2 the key does not print even after the first start"
+    grep -q '^mldsa65:' <<<"$out" && pass "§2 after the first start the key prints" || fail "§2 the key does not print even after the first start"
 fi
 [ "$(stat -c %a /var/lib/sokol/node.key)" = 600 ] && pass "§2 the key file is 0600" || fail "§2 key file mode $(stat -c %a /var/lib/sokol/node.key)"
 metric sokol_build_info | grep -q "build=\"$( /usr/local/bin/sokol-orchestrator --version | sed 's/.*build \(.*\))/\1/')\"" \

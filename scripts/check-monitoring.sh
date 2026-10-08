@@ -11,10 +11,10 @@ used=$(grep -ohE 'sokol_[a-z0-9_]+' deploy/prometheus/sokol-alerts.yml deploy/gr
 fail=0
 for m in $used; do
     # A regex alternation like sokol_(a|b) is checked by its parts below.
-    echo "$exported" | grep -qx "$m" || { echo "FAIL $m is used but not exported"; fail=1; }
+    grep -qx "$m" <<<"$exported" || { echo "FAIL $m is used but not exported"; fail=1; }
 done
 for part in $(grep -ohE 'sokol_\([a-z_|]+\)' deploy/prometheus/sokol-alerts.yml deploy/grafana/sokol-dashboard.json | sed 's/sokol_(\(.*\))/\1/' | tr '|' ' '); do
-    echo "$exported" | grep -qx "sokol_$part" || { echo "FAIL sokol_$part (in a regex) is not exported"; fail=1; }
+    grep -qx "sokol_$part" <<<"$exported" || { echo "FAIL sokol_$part (in a regex) is not exported"; fail=1; }
 done
 [ $fail = 0 ] && echo "ok   $(echo "$used" | wc -l | tr -d ' ') metric names in the rules and the dashboard, all exported"
 exit $fail

@@ -6,6 +6,11 @@ on:
     tags: ['v*']
   pull_request:
 
+# A new push to a pull request cancels the run of the push before it; main and tags never cancel.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
   # Every downloaded tool is pinned by version and checksum; actions are pinned by commit.
@@ -19,11 +24,17 @@ env:
 jobs:
   # Mutants of the changed lines only (docs/MUTATION.md): each must be caught by a test or
   # excluded in .cargo/mutants.toml with its reason. Pull requests only; time grows with the
-  # change (about half a minute per mutant of the node on a 4-core runner).
-  mutants:
+  # change (about half a minute per mutant of the node on a 4-core runner), so the mutants are
+  # split into four shards on four runners (cargo-mutants --shard), each with its own baseline.
+  mutants-shard:
+    name: mutants (shard ${{ matrix.shard }}/4)
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -31,6 +42,8 @@ jobs:
       - name: Install the pinned Rust toolchain (rust-toolchain.toml)
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: mutants
       - name: Install cargo-mutants (crates.io, --locked)
         run: |
           rustup toolchain install stable --profile minimal
@@ -38,14 +51,28 @@ jobs:
       - name: Mutants of the change (scripts/mutants-diff.sh)
         env:
           BASE: ${{ github.event.pull_request.base.sha }}
+          MUTANTS_SHARD: ${{ matrix.shard }}/4
         run: scripts/mutants-diff.sh "$BASE"
       - name: Mutation results
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: mutants-diff
+          name: mutants-diff-${{ matrix.shard }}
           path: target/mutants-diff
           if-no-files-found: ignore
+
+  # The one check the shards answer to: every shard passed.
+  mutants:
+    if: always() && github.event_name == 'pull_request'
+    needs: mutants-shard
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Every shard passed
+        env:
+          RESULT: ${{ needs.mutants-shard.result }}
+        run: |
+          echo "shards: $RESULT"
+          [ "$RESULT" = success ]
 
   # Bounded proofs for `common` (docs/VERIFICATION.md), beside the main job: about 10 minutes.
   # kani-verifier comes from crates.io with Cargo's checksums (--locked); `cargo kani setup`
@@ -85,12 +112,20 @@ jobs:
 
   # Both architectures run the whole suite, XDP smoke and demo included: an arm64 kernel faults
   # on things x86 tolerates (a misaligned 64-bit atomic in a map value hung one, ADR-0014).
-  build-test-smoke:
-    name: ${{ matrix.arch == 'x86_64' && 'build-test-smoke' || 'build-test-smoke (arm64)' }}
+  # Each architecture runs it in three parts on three runners at once, each building from the
+  # same cache: `test` (policy checks, tests, clippy, script regressions, the artifact),
+  # `smoke` (the XDP smoke) and `demo` (the demo and the runbook rehearsal). One part ran after
+  # another in one job for about 12 minutes; the smoke alone is about 5. The check the ruleset
+  # requires, build-test-smoke (and its arm64 twin), is the job after them that passes only if
+  # all three parts of its architecture passed.
+  suite:
+    name: ${{ matrix.part }} (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
+        arch: [x86_64, aarch64]
+        part: [test, smoke, demo]
         include:
           - arch: x86_64
             runner: ubuntu-24.04
@@ -132,25 +167,24 @@ jobs:
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
+          shared-key: suite-${{ matrix.arch }}
+          # One part saves the cache for all three; they build the same targets.
+          save-if: ${{ matrix.part == 'test' }}
           workspaces: |
             . -> target
 
       - name: Format
-        if: matrix.policy_checks
+        if: matrix.policy_checks && matrix.part == 'test'
         run: |
           cargo fmt --all --check
           (cd ebpf && cargo fmt --check)
 
       - name: Retired surface (docs/RETIRED.md)
-        if: matrix.policy_checks
+        if: matrix.policy_checks && matrix.part == 'test'
         run: scripts/check-retired.sh
 
-      - name: Cited evidence exists (tests, metrics, flags, ADRs, paths)
-        if: matrix.policy_checks
-        run: scripts/check-claims.sh
-
       - name: Monitoring (alert rules, dashboard)
-        if: matrix.policy_checks
+        if: matrix.policy_checks && matrix.part == 'test'
         run: |
           scripts/check-monitoring.sh
           docker run --rm -v "$PWD/deploy/prometheus:/w" -w /w --entrypoint promtool \
@@ -158,7 +192,7 @@ jobs:
             test rules sokol-alerts.test.yml
 
       - name: Dependency policy (cargo-deny, deny.toml)
-        if: matrix.policy_checks
+        if: matrix.policy_checks && matrix.part == 'test'
         run: |
           curl -sSfL -o /tmp/cargo-deny.tar.gz "https://github.com/EmbarkStudios/cargo-deny/releases/download/${CARGO_DENY_VERSION}/cargo-deny-${CARGO_DENY_VERSION}-x86_64-unknown-linux-musl.tar.gz"
           echo "${CARGO_DENY_SHA256}  /tmp/cargo-deny.tar.gz" | sha256sum -c -
@@ -174,6 +208,7 @@ jobs:
         run: cargo build --release --locked
 
       - name: Test
+        if: matrix.part == 'test'
         run: |
           set -o pipefail
           cargo test --release --locked | tee /tmp/sokol-cargo-test.log
@@ -192,22 +227,34 @@ jobs:
             grep -Fq "PASS live startup intent ${family}:" /tmp/sokol-cargo-test.log
           done
 
+      - name: Cited evidence exists (tests in the compiler's list, metrics, flags, ADRs, paths)
+        if: matrix.policy_checks && matrix.part == 'test'
+        run: |
+          cargo test --release --locked --lib --bins --tests -- --list --format terse > /tmp/sokol-tests.txt
+          SOKOL_TEST_LIST=/tmp/sokol-tests.txt scripts/check-claims.sh
+
       - name: Clippy
+        if: matrix.part == 'test'
         run: cargo clippy --release --locked --all-targets -- -D warnings
 
       - name: XDP verdict probe refusal regressions
+        if: matrix.part == 'test'
         run: python3 scripts/test_xdp_probe.py
 
       - name: Audit verification smoke refusal regressions
+        if: matrix.part == 'test'
         run: python3 scripts/test_audit_smoke.py
 
       - name: FlowSpec smoke readback refusal regressions
+        if: matrix.part == 'test'
         run: python3 scripts/test_flowspec_smoke.py
 
       - name: CrowdSec TTL smoke oracle regression
+        if: matrix.part == 'test'
         run: python3 scripts/test_crowdsec_ttl.py
 
       - name: Audit witness gate, local CI tools and rehearsal preflight regressions
+        if: matrix.part == 'test'
         run: |
           python3 scripts/test_witness_gate.py
           python3 scripts/test_local_ci.py
@@ -216,16 +263,20 @@ jobs:
           python3 scripts/test_kani_scope.py
           python3 scripts/test_mutants_diff.py
           python3 scripts/test_check_agents_rules.py
+          python3 scripts/test_check_claims.py
 
       - name: CrowdSec stream recovery regression
+        if: matrix.part == 'test'
         timeout-minutes: 2
         run: python3 scripts/test_crowdsec_stream.py target/release/sokol-crowdsec
 
       - name: Suricata process recovery regression
+        if: matrix.part == 'test'
         timeout-minutes: 2
         run: python3 scripts/test_suricata_recovery.py target/release/sokol-suricata
 
-      - name: XDP smoke test (veth + netns)
+      - name: Smoke and demo packages
+        if: matrix.part != 'test'
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq netcat-openbsd wireguard-tools suricata crowdsec linux-tools-generic
@@ -239,16 +290,21 @@ jobs:
           sudo install -m 755 "$bpftool_bin" /usr/local/bin/bpftool
           sudo bpftool version
           sudo systemctl stop suricata 2>/dev/null || true
+
+      - name: XDP smoke test (veth + netns)
+        if: matrix.part == 'smoke'
+        run: |
           sudo SMOKE_REQUIRE="suricata crowdsec gobgp wireguard" scripts/xdp-smoke.sh target/release/orchestrator
 
       - name: Demo scenario (3 nodes, attacker, rogue node, Suricata)
+        if: matrix.part == 'demo'
         run: |
           sudo DEMO_AUTO=1 demo/demo.sh target/release
           # The demo leaves nothing behind (its nodes once kept running and heartbeating).
           if pgrep -af '[o]rchestrator --interface sd-'; then echo "demo left nodes running"; exit 1; fi
 
       - name: Build manifest and checksums
-        if: always()
+        if: always() && matrix.part == 'test'
         run: |
           mkdir -p dist
           for b in orchestrator sokol-operator sokol-suricata sokol-crowdsec sokol-fastnetmon-notify trident_trap; do
@@ -271,7 +327,7 @@ jobs:
           cat dist/MANIFEST.txt dist/SHA256SUMS
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        if: always()
+        if: always() && matrix.part == 'test'
         with:
           name: sokol-${{ github.sha }}-${{ matrix.arch }}
           path: dist/
@@ -280,9 +336,35 @@ jobs:
       # Last: it rebuilds the orchestrator with another build id (the "upgrade"), which replaces
       # the binary the artifacts above were made from.
       - name: Runbook rehearsal (systemd, docs/RUNBOOK.md as written)
+        if: matrix.part == 'demo'
         run: |
           mkdir -p /tmp/rh-a /tmp/rh-b
           cp target/release/orchestrator target/release/monitor /tmp/rh-a/
           SOKOL_BUILD_ID="${GITHUB_SHA::12}-upgrade" cargo build --release --locked -p orchestrator
           cp target/release/orchestrator target/release/monitor /tmp/rh-b/
           sudo scripts/runbook-rehearsal.sh /tmp/rh-a /tmp/rh-b
+
+  # The required checks: all three parts of one architecture passed. Read from this run's jobs,
+  # by name, so a failure on one architecture does not fail the other's check; exactly three
+  # parts must be found, all successful (none found is not a pass).
+  build-test-smoke:
+    name: ${{ matrix.arch == 'x86_64' && 'build-test-smoke' || 'build-test-smoke (arm64)' }}
+    if: always()
+    needs: suite
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, aarch64]
+    steps:
+      - name: Every part of ${{ matrix.arch }} passed
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs?filter=latest&per_page=100" \
+            --jq ".jobs[] | select(.name | endswith(\" ($ARCH)\")) | \"\(.name) \(.conclusion)\"" | tee parts.txt
+          [ "$(wc -l < parts.txt)" = 3 ] || { echo "expected 3 parts of $ARCH"; exit 1; }
+          ! grep -v ' success$' parts.txt

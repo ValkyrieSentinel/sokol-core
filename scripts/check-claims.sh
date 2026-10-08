@@ -3,10 +3,15 @@
 # "Перевірка", a metric in the runbook, a command-line flag, an ADR number, a file path. A test
 # renamed or removed leaves its claim standing with no evidence behind it; this makes that fail.
 # Finding nothing to check fails too: an empty scope is not a pass.
+#
+# A cited test must be in the compiler's own list of tests (`cargo test -- --list`), which
+# sees what macros generate (proptest!) and what is attached to what; a text search a few lines
+# up from `fn name` accepted a plain helper defined just after a test. CI passes the list it
+# made after the test step as SOKOL_TEST_LIST; without it the list is built here.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 DOCS=(README.md ARCHITECTURE.md ROADMAP.md AGENTS.md docs/*.md docs/adr/*.md docs/measurements/*/README.md)
-EXTERNAL_FLAGS='--locked --bin --bins --in-diff --release --quick'  # flags of other tools (cargo, scripts/local-ci.sh) the docs mention
+EXTERNAL_FLAGS='--locked --bin --bins --in-diff --shard --list --release --quick'  # flags of other tools (cargo, cargo-mutants, scripts/local-ci.sh) the docs mention
 fail=0; n_tests=0; n_metrics=0; n_flags=0; n_adrs=0; n_paths=0
 bad() { echo "FAIL $*"; fail=1; }
 # shellcheck disable=SC2207  # paths in this tree have no spaces
@@ -29,25 +34,33 @@ spans=$(grep -ohE '`[^`]+`' "${DOCS[@]}" | tr -d '`')
 for m in $(echo "$spans" | grep -oE '(^|[^/a-z0-9_])sokol_[a-z0-9_]+' | grep -oE 'sokol_[a-z0-9_]+' | sort -u); do
     n_metrics=$((n_metrics + 1))
     case "$m" in
-        *_) echo "$metrics" | grep -q "^$m" || bad "metric family $m* is cited but none is exported" ;;
-        *) echo "$metrics" | grep -qx "$m" || bad "metric $m is cited but not exported" ;;
+        *_) grep -q "^$m" <<<"$metrics" || bad "metric family $m* is cited but none is exported" ;;
+        *) grep -qx "$m" <<<"$metrics" || bad "metric $m is cited but not exported" ;;
     esac
 done
-# Tests: a whole code span that is a long snake_case name.
+# Tests: a whole code span that is a long snake_case name, found in the compiler's list.
+if [ -n "${SOKOL_TEST_LIST:-}" ]; then
+    test_list=$(cat "$SOKOL_TEST_LIST")
+else
+    test_list=$(cargo test --release --locked --lib --bins --tests -- --list --format terse)
+fi
+tests=$(echo "$test_list" | sed -n 's/: test$//p' | sed 's/.*:://' | sort -u)
+[ -n "$tests" ] || bad "the test list names no test: nothing to check the cited tests against"
 for id in $(echo "$spans" | grep -oxE '[a-z][a-z0-9]*(_[a-z0-9]+){3,}' | grep -v '^sokol_' | sort -u); do
     n_tests=$((n_tests + 1))
-    git grep -h -B4 -w "fn $id" -- '*.rs' | grep -qE '#\[(tokio::)?test' \
-        || bad "test $id is cited but no #[test] fn has that name"
+    grep -qx -- "$id" <<<"$tests" || bad "test $id is cited but no test has that name"
 done
-# Kani proofs: a code span `<module>::proofs::<name>` (docs/VERIFICATION.md).
+# Kani proofs: a code span `<module>::proofs::<name>` (docs/VERIFICATION.md), a function with
+# #[kani::proof] attached (Kani's own harnesses are not in the test list).
+# shellcheck disable=SC2046  # paths in this tree have no spaces
+proofs=$(python3 scripts/attached-fns.py '#[kani::proof]' $(git ls-files 'common/src/*.rs' 'orchestrator/src/*.rs') | sort -u)
 for id in $(echo "$spans" | grep -oxE '[a-z_]+::proofs::[a-z0-9_]+' | sed 's/.*:://' | sort -u); do
     n_tests=$((n_tests + 1))
-    git grep -h -B4 -w "fn $id" -- '*.rs' | grep -qF '#[kani::proof]' \
-        || bad "proof $id is cited but no #[kani::proof] fn has that name"
+    grep -qx -- "$id" <<<"$proofs" || bad "proof $id is cited but no #[kani::proof] fn has that name"
 done
 for f in $(echo "$spans" | grep -oE '(^| )--[a-z][a-z0-9-]+' | tr -d ' ' | sort -u); do
     n_flags=$((n_flags + 1))
-    echo "$flags" | grep -qx -- "$f" || echo "$EXTERNAL_FLAGS" | grep -qw -- "$f" || bad "flag $f is cited but no binary declares it"
+    grep -qx -- "$f" <<<"$flags" || grep -qw -- "$f" <<<"$EXTERNAL_FLAGS" || bad "flag $f is cited but no binary declares it"
 done
 for a in $(grep -ohE 'ADR-0[0-9]{3}' "${DOCS[@]}" | sort -u); do
     n_adrs=$((n_adrs + 1))

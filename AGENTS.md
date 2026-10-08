@@ -81,8 +81,8 @@ on a rule here that does neither, and on a cited test, path or flag that does no
   [docs/MUTATION.md](docs/MUTATION.md) has the commands, the baseline and the open survivors.
   *Checked by:* the sweep in docs/MUTATION.md, run by hand; *review only* between sweeps.
 - Documentation claims only what a named test, metric, flag or path shows. *Checked by:*
-  `scripts/check-claims.sh`, which checks that what is cited exists, not that it proves the
-  claim.
+  `scripts/check-claims.sh`, which checks that what is cited exists (a test in the compiler's
+  own list of tests, a proof with `#[kani::proof]` attached), not that it proves the claim.
 - A retired subject stays retired. *Checked by:* `scripts/check-retired.sh` (see
   [Removing things](#removing-things)).
 
