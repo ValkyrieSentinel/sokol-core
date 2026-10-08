@@ -14,8 +14,39 @@ env:
   CARGO_DENY_VERSION: 0.20.2
   CARGO_DENY_SHA256: 9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f
   KANI_VERSION: 0.68.0
+  CARGO_MUTANTS_VERSION: 27.1.0
 
 jobs:
+  # Mutants of the changed lines only (docs/MUTATION.md): each must be caught by a test or
+  # excluded in .cargo/mutants.toml with its reason. Pull requests only; time grows with the
+  # change (about half a minute per mutant of the node on a 4-core runner).
+  mutants:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+      - name: Install the pinned Rust toolchain (rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Install cargo-mutants (crates.io, --locked)
+        run: |
+          rustup toolchain install stable --profile minimal
+          cargo +stable install --locked cargo-mutants --version "$CARGO_MUTANTS_VERSION"
+      - name: Mutants of the change (scripts/mutants-diff.sh)
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: scripts/mutants-diff.sh "$BASE"
+      - name: Mutation results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: mutants-diff
+          path: target/mutants-diff
+          if-no-files-found: ignore
+
   # Bounded proofs for `common` (docs/VERIFICATION.md), beside the main job: about 10 minutes.
   # kani-verifier comes from crates.io with Cargo's checksums (--locked); `cargo kani setup`
   # then fetches the verifier bundle of that version from Kani's GitHub release, pinned by
@@ -183,6 +214,7 @@ jobs:
           python3 scripts/test_runbook_preflight.py
           python3 scripts/test_anchor_scripts.py
           python3 scripts/test_kani_scope.py
+          python3 scripts/test_mutants_diff.py
 
       - name: CrowdSec stream recovery regression
         timeout-minutes: 2
