@@ -46,24 +46,43 @@ prefer fewer, complete pull requests over many small ones.
 
 ## Changing code
 
-- Contributions are accepted under [CLA.md](CLA.md); sign commits off (`git commit -s`).
+Each rule names what checks it, or says that only review does. `scripts/check-claims.sh` fails
+on a rule here that does neither, and on a cited test, path or flag that does not exist.
+
+- Contributions are accepted under [CLA.md](CLA.md): opening a pull request is the agreement.
   `ebpf/` and `common/` are GPL-2.0-or-later, the rest AGPL-3.0-only
   ([COPYRIGHT.md](COPYRIGHT.md)). Name third-party material and its license in the PR.
-- Outside tests nothing may panic (crate-level deny: no unwrap/expect/indexing/panic).
+  *Review only.*
+- Outside tests nothing may panic: no unwrap/expect/indexing/panic.
+  *Checked by:* the crate-level clippy `deny` in `orchestrator/src/main.rs` and
+  `common/src/lib.rs`, in CI's clippy step.
 - A fix starts with a test that fails **on its assertion** (not on a missing import) on the
   old code. When a test guards a boundary, check it with a mutation that restores the old
-  behaviour and say so in the pull request.
+  behaviour and say so in the pull request. *Checked by:* the mutation check of the changed
+  lines, `scripts/mutants-diff.sh` (CI job `mutants`, [docs/MUTATION.md](docs/MUTATION.md));
+  the red-first order is *review only*.
 - Keep every collection bounded by a named constant; say what happens at the bound.
-- A peer speaks only for itself (`p2p.rs` sender binding). This node's own decisions are
-  `LocalCommand`, never mesh commands.
+  *Review only.*
+- A peer speaks only for itself (`p2p.rs` sender binding). *Checked by:*
+  `a_peer_cannot_send_claims_in_another_nodes_name`,
+  `a_snapshot_with_claims_of_other_nodes_is_refused`. This node's own decisions are
+  `LocalCommand`, never mesh commands. *Checked by:* the type: `LocalCommand` has no
+  `Serialize`, so it cannot be put on the wire.
 - Detector and trap input reaches the node through `delivery::Outbox` in ACK mode: a line is
-  delivered when the node answered it, not when it was written.
+  delivered when the node answered it, not when it was written. *Checked by:*
+  `unknown_reply_keeps_the_obligation_and_a_later_ack_retires_it` and the Stargate shadow
+  contract (`.github/workflows/stargate-shadow.yml`).
 - A parser of bytes the node does not control (in `common`) gets a Kani proof as well:
-  [docs/VERIFICATION.md](docs/VERIFICATION.md) (`scripts/local-ci.sh --step kani`).
+  [docs/VERIFICATION.md](docs/VERIFICATION.md). *Checked by:* CI's `kani` job for the proofs
+  that exist; that a new parser has one is *review only*.
 - A test of the security core should fail on the mutants of the code it covers;
   [docs/MUTATION.md](docs/MUTATION.md) has the commands, the baseline and the open survivors.
-- Documentation claims only what a named test, metric, flag or path shows;
-  `scripts/check-claims.sh` checks that what is cited exists, not that it proves the claim.
+  *Checked by:* the sweep in docs/MUTATION.md, run by hand; *review only* between sweeps.
+- Documentation claims only what a named test, metric, flag or path shows. *Checked by:*
+  `scripts/check-claims.sh`, which checks that what is cited exists, not that it proves the
+  claim.
+- A retired subject stays retired. *Checked by:* `scripts/check-retired.sh` (see
+  [Removing things](#removing-things)).
 
 ## Review
 

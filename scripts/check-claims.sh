@@ -5,8 +5,8 @@
 # Finding nothing to check fails too: an empty scope is not a pass.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-DOCS=(README.md ARCHITECTURE.md ROADMAP.md docs/*.md docs/adr/*.md docs/measurements/*/README.md)
-EXTERNAL_FLAGS='--locked --bin'  # flags of other tools (cargo) the docs mention
+DOCS=(README.md ARCHITECTURE.md ROADMAP.md AGENTS.md docs/*.md docs/adr/*.md docs/measurements/*/README.md)
+EXTERNAL_FLAGS='--locked --bin --release --quick'  # flags of other tools (cargo, scripts/local-ci.sh) the docs mention
 fail=0; n_tests=0; n_metrics=0; n_flags=0; n_adrs=0; n_paths=0
 bad() { echo "FAIL $*"; fail=1; }
 # shellcheck disable=SC2207  # paths in this tree have no spaces
@@ -53,6 +53,17 @@ for a in $(grep -ohE 'ADR-0[0-9]{3}' "${DOCS[@]}" | sort -u); do
     n_adrs=$((n_adrs + 1))
     ls docs/adr/"${a#ADR-}"-*.md >/dev/null 2>&1 || bad "$a is cited but docs/adr has no such record"
 done
+# AGENTS.md: every rule under "Changing code" names what checks it, or says only review does.
+n_rules=0
+while IFS= read -r rule; do
+    n_rules=$((n_rules + 1))
+    case "$rule" in
+        *"Checked by:"* | *"Review only"* | *"review only"*) ;;
+        *) bad "AGENTS.md rule names no check and is not marked review only: ${rule:0:70}" ;;
+    esac
+done < <(awk '/^## Changing code/ {p = 1; next} /^## / {p = 0} p' AGENTS.md \
+    | awk 'BEGIN {RS = "\n- "} NR > 1 {gsub(/\n */, " "); print}')
+[ "$n_rules" -gt 0 ] || bad "AGENTS.md has no rules under Changing code"
 # docs/RETIRED.md names retired paths on purpose (scripts/check-retired.sh checks it).
 # shellcheck disable=SC2016
 live_spans=$(for d in "${DOCS[@]}"; do [ "$d" = docs/RETIRED.md ] || grep -ohE '`[^`]+`' "$d"; done | tr -d '`')
