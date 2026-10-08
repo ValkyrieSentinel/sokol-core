@@ -54,9 +54,16 @@ for a in $(grep -ohE 'ADR-0[0-9]{3}' "${DOCS[@]}" | sort -u); do
     ls docs/adr/"${a#ADR-}"-*.md >/dev/null 2>&1 || bad "$a is cited but docs/adr has no such record"
 done
 # AGENTS.md: every rule under "Changing code" names what checks it, or says only review does.
-while IFS= read -r line; do
-    bad "${line#FAIL }"
-done < <(scripts/check-agents-rules.sh AGENTS.md || true)
+# The checker's exit status decides, not only its lines: a checker that cannot run (a lost
+# executable bit, a broken interpreter) fails this check too (review of #168).
+rules_status=0
+rules_out=$("${AGENTS_RULES_CHECK:-scripts/check-agents-rules.sh}" AGENTS.md 2>&1) || rules_status=$?
+if [ "$rules_status" != 0 ]; then
+    [ -n "$rules_out" ] || bad "the AGENTS.md rule check exited $rules_status without output"
+    while IFS= read -r line; do
+        [ -n "$line" ] && bad "${line#FAIL }"
+    done <<<"$rules_out"
+fi
 # docs/RETIRED.md names retired paths on purpose (scripts/check-retired.sh checks it).
 # shellcheck disable=SC2016
 live_spans=$(for d in "${DOCS[@]}"; do [ "$d" = docs/RETIRED.md ] || grep -ohE '`[^`]+`' "$d"; done | tr -d '`')

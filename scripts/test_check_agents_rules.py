@@ -5,6 +5,7 @@ passed on that rule's "Checked by:".
 
     python3 scripts/test_check_agents_rules.py
 """
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -60,6 +61,43 @@ class Rules(unittest.TestCase):
         self.assertEqual(self.check(real).returncode, 0)
         broken = real.replace('\n## Review\n', '* Bound every review queue.\n\n## Review\n', 1)
         self.assertEqual(self.check(broken).returncode, 1)
+
+
+
+class ThroughCheckClaims(unittest.TestCase):
+    """check-claims.sh honours the rule checker's exit status, not only its lines (review of
+    #168: a checker that could not run left the whole check green)."""
+
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.dir)
+
+    def run_with(self, body):
+        stub = self.dir / 'rules-check'
+        stub.write_text('#!/bin/sh\n' + body + '\n')
+        stub.chmod(0o755)
+        env = dict(os.environ, AGENTS_RULES_CHECK=str(stub))
+        return subprocess.run([str(HERE / 'check-claims.sh')], capture_output=True, text=True,
+                              env=env, cwd=HERE.parent)
+
+    def test_a_checker_that_fails_without_output_fails_the_check(self):
+        result = self.run_with('exit 126')
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn('exited 126 without output', result.stdout)
+
+    def test_a_checker_that_cannot_run_fails_the_check(self):
+        stub = self.dir / 'not-executable'
+        stub.write_text('#!/bin/sh\nexit 0\n')  # no executable bit: Permission denied
+        env = dict(os.environ, AGENTS_RULES_CHECK=str(stub))
+        result = subprocess.run([str(HERE / 'check-claims.sh')], capture_output=True, text=True,
+                                env=env, cwd=HERE.parent)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+
+    def test_its_findings_are_reported_and_a_passing_checker_passes(self):
+        failing = self.run_with('echo "FAIL AGENTS.md rule names no check: x"; exit 1')
+        self.assertNotEqual(failing.returncode, 0)
+        self.assertIn('rule names no check: x', failing.stdout)
+        self.assertEqual(self.run_with('exit 0').returncode, 0)
 
 
 if __name__ == '__main__':
