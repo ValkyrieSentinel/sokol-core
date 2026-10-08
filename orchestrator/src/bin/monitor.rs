@@ -378,7 +378,8 @@ fn flush_releases(all: bool, cause: &str) -> bool {
 }
 
 /// A new decision on a target this soon after the operator lifted it is a relapse: the human
-/// and the detector disagree.
+/// and the detector disagree. Only this node's own decisions count: a peer's MESH_BLOCK record
+/// does not name its issuer, so it cannot be matched to the `peer <id>` row.
 const RELAPSE_MS: u64 = 10 * 60 * 1000;
 
 /// What a source's blocks became (ROADMAP: regret, measured, not optimized). Regret is a lower
@@ -402,7 +403,8 @@ struct Regret {
     flushed: u64,
     /// Released because its target became protected.
     protected: u64,
-    /// Taken back by its source (a retraction; with CrowdSec also a timed decision's expiry).
+    /// Taken back by its source: a detector's retraction (with CrowdSec also a timed
+    /// decision's expiry) or a peer's (MESH_UNBLOCK).
     retracted: u64,
     expired: u64,
     /// Ended otherwise (quorum, envelope, protected set, a newer decision, a restart).
@@ -440,6 +442,11 @@ fn regret<'a>(records: impl Iterator<Item = (u64, &'a str)>) -> Vec<(String, Reg
                 ended.insert(ip, (Ended::OperatorLift, at));
             }
             ("DETECTOR_RETRACT", Some(ip)) if record_field(text, "Result") == Some("lifted") => {
+                ended.insert(ip, (Ended::SourceRetraction, at));
+            }
+            // A peer took back its claims on the target (review of #170: ignored before, so a
+            // later unrelated flush took the credit).
+            ("MESH_UNBLOCK", Some(ip)) => {
                 ended.insert(ip, (Ended::SourceRetraction, at));
             }
             (t, Some(ip)) if t.starts_with("BLOCK_EXPIRED_") => {
@@ -936,6 +943,65 @@ mod tests {
         // A path that does not exist: an error too, not an empty report.
         assert!(chain_records(dir.join("absent.log").to_str().unwrap()).is_err());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Every record that names a block's end takes precedence over a flush in between: the
+    /// end, the flush of another target, then the outcome (outcomes wait for the next tick).
+    #[test]
+    fn a_named_end_is_never_taken_for_a_flush_in_between() {
+        let ends = [
+            (
+                "OPERATOR_UNBAN_V4|IP:198.51.100.2|Claims:1|At:9000",
+                "ids",
+                "lifted",
+            ),
+            (
+                "DETECTOR_RETRACT|IP:198.51.100.2|Result:lifted|Claims:1|At:9000|Event:ids/1",
+                "ids",
+                "retracted",
+            ),
+            (
+                "MESH_UNBLOCK|IP:198.51.100.2|Issuer:2",
+                "peer 2",
+                "retracted",
+            ),
+            ("BLOCK_EXPIRED_V4|IP:198.51.100.2", "ids", "expired"),
+            (
+                "BLOCK_RELEASED_PROTECTED|IP:198.51.100.2",
+                "ids",
+                "protected",
+            ),
+        ];
+        for (end, source, column) in ends {
+            let cause = if source == "peer 2" {
+                "peer 2: ids: scan"
+            } else {
+                "detector: ids: scan"
+            };
+            let records = [
+                (9 * S, end.to_string()),
+                (10 * S, "OPERATOR_FLUSH|Released:1|At:10000".to_string()),
+                (11 * S, outcome("198.51.100.2", "0", 9, cause)),
+                (
+                    11 * S,
+                    outcome("198.51.100.1", "0", 10, "detector: other-ids: scan"),
+                ),
+            ];
+            let rows = regret(records.iter().map(|(at, t)| (*at, t.as_str())));
+            let r = row(&rows, source);
+            let counted = match column {
+                "lifted" => r.lifted_early + r.lifted_late,
+                "retracted" => r.retracted,
+                "expired" => r.expired,
+                _ => r.protected,
+            };
+            assert_eq!((r.flushed, counted), (0, 1), "{}", end);
+            assert_eq!(
+                row(&rows, "other-ids").flushed,
+                1,
+                "the flushed target still is"
+            );
+        }
     }
 
     /// A flush names no targets: an outcome is the flush's only within FLUSH_WINDOW_MS, with
