@@ -5,10 +5,12 @@
 # XDP smoke, the demo and the runbook rehearsal.
 #
 #   scripts/local-ci.sh              everything CI runs, except the artifact upload; the Kani
-#                                    proofs when common/ differs from origin/main, as in CI
+#                                    proofs when common/ differs from origin/main, as in CI,
+#                                    and the mutants of the change (needs cargo-mutants)
 #   scripts/local-ci.sh --quick      policy checks, build, tests, clippy, Python regressions
 #                                    (and the Kani proofs on the same condition)
-#   scripts/local-ci.sh --step NAME  one step: tools, monitoring (used by test_local_ci.py), kani
+#   scripts/local-ci.sh --step NAME  one step: tools, monitoring (used by test_local_ci.py), kani,
+#                                    mutants (the change against origin/main)
 #
 # Pins (versions, SHA256, the Prometheus image digest) are read from ci.yml itself, so the two
 # cannot drift: change them there, not here. Pinned tools are extracted on every run from
@@ -24,7 +26,7 @@ case "${1:-}" in
     --quick) QUICK=1 ;;
     --step) ONLY="${2:?--step needs a name}" ;;
     "") ;;
-    *) echo "usage: $0 [--quick | --step tools|monitoring|kani]"; exit 2 ;;
+    *) echo "usage: $0 [--quick | --step tools|monitoring|kani|mutants]"; exit 2 ;;
 esac
 CI=${LOCAL_CI_YML:-.github/workflows/ci.yml}
 CACHE=${LOCAL_CI_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/sokol-local-ci}
@@ -127,11 +129,24 @@ kani() {
     cargo kani -p common
 }
 
+# CI's mutants job: the mutants of this change against origin/main (docs/MUTATION.md).
+mutants() {
+    step "mutants of the change (against origin/main)"
+    command -v cargo-mutants >/dev/null || {
+        echo "cargo-mutants is not installed: cargo +stable install --locked cargo-mutants --version $(pin CARGO_MUTANTS_VERSION)"
+        exit 2
+    }
+    local base
+    base=$(git merge-base HEAD origin/main) || { echo "no origin/main to compare with"; exit 2; }
+    MUTANTS_JOBS=${MUTANTS_JOBS:-4} scripts/mutants-diff.sh "$base"
+}
+
 case "$ONLY" in
     "") ;;
     tools) tools; exit 0 ;;
     monitoring) monitoring; exit 0 ;;
     kani) kani; exit 0 ;;
+    mutants) mutants; exit 0 ;;
     *) echo "unknown step $ONLY"; exit 2 ;;
 esac
 
@@ -169,6 +184,7 @@ python3 scripts/test_local_ci.py
 python3 scripts/test_runbook_preflight.py
 python3 scripts/test_anchor_scripts.py
 python3 scripts/test_kani_scope.py
+python3 scripts/test_mutants_diff.py
 timeout 120 python3 scripts/test_crowdsec_stream.py target/release/sokol-crowdsec
 timeout 120 python3 scripts/test_suricata_recovery.py target/release/sokol-suricata
 # CI's kani job proves when something the proofs read changed (scripts/kani-scope.sh).
@@ -182,6 +198,7 @@ fi
 # sudo resets PATH; keep the verified tools first for the root steps too.
 as_root() { sudo env "PATH=$PATH" "SOKOL_GOBGP_TEST_BIN=$SOKOL_GOBGP_TEST_BIN" "$@"; }
 
+mutants
 step "XDP smoke (veth + netns)"
 sudo apt-get install -y -qq netcat-openbsd wireguard-tools suricata crowdsec linux-tools-generic >/dev/null
 shopt -s nullglob
