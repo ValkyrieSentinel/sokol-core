@@ -363,6 +363,18 @@ enum Ended {
     Expired,
     OperatorLift,
     SourceRetraction,
+    /// Released because its target became protected (BLOCK_RELEASED_PROTECTED).
+    Protected,
+}
+
+/// A flush names no targets. An outcome is taken for a flush's only when it follows it within
+/// this window and no record names another end; anything later is `other`, not a guess.
+const FLUSH_WINDOW_MS: u64 = 3000;
+
+/// Whether a flush releases blocks of this cause: OPERATOR_FLUSH only detector claims (local,
+/// trap, telemetry, peers), OPERATOR_FLUSH_ALL also the operator's; never static ones.
+fn flush_releases(all: bool, cause: &str) -> bool {
+    !cause.starts_with("static") && (all || !cause.starts_with("operator"))
 }
 
 /// A new decision on a target this soon after the operator lifted it is a relapse: the human
@@ -385,8 +397,11 @@ struct Regret {
     lifted_late: u64,
     /// A new decision of the same source on the same target within RELAPSE_MS of a lift.
     relapses: u64,
-    /// Ended by an operator flush (all dynamic blocks at once): incident response.
+    /// Ended within FLUSH_WINDOW_MS after an operator flush that releases blocks of its kind,
+    /// with no other end recorded: incident response.
     flushed: u64,
+    /// Released because its target became protected.
+    protected: u64,
     /// Taken back by its source (a retraction; with CrowdSec also a timed decision's expiry).
     retracted: u64,
     expired: u64,
@@ -401,7 +416,8 @@ fn regret<'a>(records: impl Iterator<Item = (u64, &'a str)>) -> Vec<(String, Reg
     let mut decided: HashMap<String, (Option<u64>, String)> = HashMap::new();
     let mut ended: HashMap<String, (Ended, u64)> = HashMap::new();
     let mut lifted: HashMap<String, (u64, String)> = HashMap::new();
-    let mut flushed_at: Option<u64> = None;
+    // The last flush: when, and whether it was FLUSH_ALL.
+    let mut flushed_at: Option<(u64, bool)> = None;
     for (at, text) in records {
         let ip = record_field(text, "IP").map(str::to_string);
         let tag = text.split('|').next().unwrap_or("");
@@ -429,10 +445,13 @@ fn regret<'a>(records: impl Iterator<Item = (u64, &'a str)>) -> Vec<(String, Reg
             (t, Some(ip)) if t.starts_with("BLOCK_EXPIRED_") => {
                 ended.insert(ip, (Ended::Expired, at));
             }
-            ("OPERATOR_FLUSH" | "OPERATOR_FLUSH_ALL", _)
+            ("BLOCK_RELEASED_PROTECTED", Some(ip)) => {
+                ended.insert(ip, (Ended::Protected, at));
+            }
+            (t @ ("OPERATOR_FLUSH" | "OPERATOR_FLUSH_ALL"), _)
                 if record_field(text, "Released").is_some_and(|n| n != "0") =>
             {
-                flushed_at = Some(at);
+                flushed_at = Some((at, t == "OPERATOR_FLUSH_ALL"));
             }
             ("BLOCK_OUTCOME", Some(ip)) => {
                 let Some((dropped, seconds, cause)) = parse_outcome(text) else {
@@ -459,7 +478,15 @@ fn regret<'a>(records: impl Iterator<Item = (u64, &'a str)>) -> Vec<(String, Reg
                     }
                     Some((Ended::SourceRetraction, _)) => s.retracted += 1,
                     Some((Ended::Expired, _)) => s.expired += 1,
-                    None if flushed_at.is_some_and(|f| f >= since) => s.flushed += 1,
+                    Some((Ended::Protected, _)) => s.protected += 1,
+                    None if flushed_at.is_some_and(|(f, all)| {
+                        f >= since
+                            && at.saturating_sub(f) <= FLUSH_WINDOW_MS
+                            && flush_releases(all, &cause)
+                    }) =>
+                    {
+                        s.flushed += 1
+                    }
                     None => s.other += 1,
                 }
             }
@@ -471,34 +498,48 @@ fn regret<'a>(records: impl Iterator<Item = (u64, &'a str)>) -> Vec<(String, Reg
     out
 }
 
-/// Every record of the retained audit chain, oldest first, with its timestamp.
-fn chain_records(path: &str) -> Vec<(u64, String)> {
+/// Every record of the retained audit chain, oldest first, with its timestamp. The whole chain
+/// is verified first, as for `--replay`: a missing file, a broken chain or a record that does
+/// not read is an error naming the file, never a shorter report. A final record still being
+/// written ends the reading, as it ends every reader of a live log.
+fn chain_records(path: &str) -> Result<Vec<(u64, String)>, String> {
+    verify_chain(Path::new(path)).map_err(|e| e.to_string())?;
     let mut files: Vec<std::path::PathBuf> = rotated_segments(Path::new(path))
-        .map(|segs| segs.into_iter().map(|(_, p)| p).collect())
-        .unwrap_or_default();
+        .map_err(|e| format!("{}: {}", path, e))?
+        .into_iter()
+        .map(|(_, p)| p)
+        .collect();
     files.push(Path::new(path).to_path_buf());
     let mut records = Vec::new();
     for file in &files {
-        let Ok(mut reader) = AuditReader::open(file) else {
-            continue;
-        };
-        while let Ok(Some(r)) = reader.next_record() {
+        let mut reader =
+            AuditReader::open(file).map_err(|e| format!("{}: {}", file.display(), e))?;
+        while let Some(r) = reader
+            .next_record()
+            .map_err(|e| format!("{}: {}", file.display(), e))?
+        {
             records.push((
                 r.timestamp_ms,
                 String::from_utf8_lossy(&r.payload).into_owned(),
             ));
         }
     }
-    records
+    Ok(records)
 }
 
 /// `monitor --regret [path]`: by source, what its blocks became; corrections by the operator
 /// and blocks that did nothing, beside the packets they dropped. Measured, not a verdict.
 fn regret_report(path: &str) -> ! {
-    let records = chain_records(path);
+    let records = match chain_records(path) {
+        Ok(records) => records,
+        Err(why) => {
+            eprintln!("no regret report: {}", why);
+            std::process::exit(1);
+        }
+    };
     let rows = regret(records.iter().map(|(at, t)| (*at, t.as_str())));
     println!(
-        "{:>7} {:>7} {:>11} {:>8} {:>7} {:>8} {:>8} {:>9} {:>8} {:>6}  source",
+        "{:>7} {:>7} {:>11} {:>8} {:>7} {:>8} {:>8} {:>9} {:>8} {:>9} {:>6}  source",
         "blocks",
         "idle %",
         "packets",
@@ -508,11 +549,12 @@ fn regret_report(path: &str) -> ! {
         "flushed",
         "retracted",
         "expired",
+        "protected",
         "other"
     );
     for (source, r) in rows {
         println!(
-            "{:>7} {:>6.0}% {:>11} {:>8} {:>7} {:>8} {:>8} {:>9} {:>8} {:>6}  {}",
+            "{:>7} {:>6.0}% {:>11} {:>8} {:>7} {:>8} {:>8} {:>9} {:>8} {:>9} {:>6}  {}",
             r.blocks,
             100.0 * r.idle as f64 / r.blocks.max(1) as f64,
             r.packets,
@@ -522,6 +564,7 @@ fn regret_report(path: &str) -> ! {
             r.flushed,
             r.retracted,
             r.expired,
+            r.protected,
             r.other,
             source
         );
@@ -867,7 +910,7 @@ mod tests {
         log.append(b"first").unwrap();
         log.append(b"second").unwrap();
         log.sync().unwrap();
-        let records = chain_records(path.to_str().unwrap());
+        let records = chain_records(path.to_str().unwrap()).unwrap();
         assert_eq!(
             records.iter().map(|(_, t)| t.as_str()).collect::<Vec<_>>(),
             vec!["first", "second"]
@@ -876,7 +919,69 @@ mod tests {
             records.iter().all(|(at, _)| *at > 0),
             "records carry their time"
         );
+        // A final record still being written is not an error: the prefix is read.
+        let mut bytes = std::fs::read(&path).unwrap();
+        let whole = bytes.clone();
+        bytes.extend_from_slice(b"SAL2 half");
+        std::fs::write(&path, &bytes).unwrap();
+        assert_eq!(chain_records(path.to_str().unwrap()).unwrap().len(), 2);
+        // A changed byte in the second record, after a valid first one: an error, not a
+        // shorter report (review of #170).
+        let mut broken = whole.clone();
+        let second_payload = 24 + 5 + 32 + 24;
+        broken[second_payload] ^= 1;
+        std::fs::write(&path, &broken).unwrap();
+        let err = chain_records(path.to_str().unwrap()).unwrap_err();
+        assert!(err.contains("audit.log"), "{}", err);
+        // A path that does not exist: an error too, not an empty report.
+        assert!(chain_records(dir.join("absent.log").to_str().unwrap()).is_err());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A flush names no targets: an outcome is the flush's only within FLUSH_WINDOW_MS, with
+    /// no other end recorded, and only for blocks of the kinds that flush releases. The
+    /// review's case: an operator block released by the protected set after an unrelated
+    /// flush is `protected`, not `flushed`.
+    #[test]
+    fn a_flush_is_counted_only_for_what_it_can_have_released() {
+        let records: Vec<(u64, String)> = vec![
+            (10 * S, "OPERATOR_FLUSH|Released:1|At:10000".into()),
+            (11 * S, outcome("198.51.100.1", "0", 11, "detector: ids: a")),
+            (12 * S, outcome("198.51.100.2", "0", 12, "operator: ban")),
+            (20 * S, outcome("198.51.100.3", "0", 20, "detector: ids: c")),
+            (100 * S, "BLOCK_RELEASED_PROTECTED|IP:198.51.100.4".into()),
+            (101 * S, outcome("198.51.100.4", "0", 100, "operator: ban")),
+            (200 * S, "OPERATOR_FLUSH_ALL|Released:2|At:200000".into()),
+            (201 * S, outcome("198.51.100.5", "0", 10, "operator: ban")),
+            (201 * S, outcome("198.51.100.6", "0", 10, "static: --block")),
+        ];
+        let rows = regret(records.iter().map(|(at, t)| (*at, t.as_str())));
+        let ids = row(&rows, "ids");
+        assert_eq!(
+            (ids.flushed, ids.other),
+            (1, 1),
+            "in the window, then after it"
+        );
+        let operator = row(&rows, "operator");
+        assert_eq!(
+            (operator.flushed, operator.protected, operator.other),
+            (1, 1, 1),
+            "FLUSH keeps operator blocks, FLUSH_ALL does not"
+        );
+        assert_eq!(
+            row(&rows, "static").other,
+            1,
+            "no flush releases a static block"
+        );
+        // Each flush on its own: FLUSH keeps operator blocks, FLUSH_ALL releases them.
+        for (flush, flushed) in [("OPERATOR_FLUSH", 0), ("OPERATOR_FLUSH_ALL", 1)] {
+            let alone = [
+                (10 * S, format!("{flush}|Released:1|At:10000")),
+                (11 * S, outcome("198.51.100.7", "0", 11, "operator: ban")),
+            ];
+            let rows = regret(alone.iter().map(|(at, t)| (*at, t.as_str())));
+            assert_eq!(row(&rows, "operator").flushed, flushed, "{}", flush);
+        }
     }
 
     #[test]
