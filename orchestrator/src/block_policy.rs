@@ -7,6 +7,10 @@ use ipnet::IpNet;
 /// Reason given for this host's own interface addresses.
 pub const LOCAL_ADDRESS: &str = "address of this node";
 
+/// Reason given for an address in an operator's `--home-net`: a network behind this node. Like
+/// this node's own addresses it is never blocked, and an alert from it names the remote side.
+pub const HOME_NETWORK: &str = "home network (--home-net)";
+
 /// Reason given for a WireGuard peer's outer (endpoint) address: XDP sees the tunnel's UDP
 /// packets from it, so blocking it would cut the peer, and the mesh running over the tunnel, off.
 pub const WIREGUARD_ENDPOINT: &str = "WireGuard peer endpoint";

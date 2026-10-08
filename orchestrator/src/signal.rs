@@ -5,9 +5,10 @@
 //! ```
 //!
 //! The adapter reports both endpoints of the offending packet; the node decides which one is
-//! the remote party. Normally that is the source. When the source is this node itself (the
-//! alert fired on our own outbound traffic, e.g. a beacon to a malicious host), the destination
-//! is blocked instead. Every other protection of the block policy still applies.
+//! the remote party. Normally that is the source. When the source is this node itself, or lies
+//! in a network behind it named with `--home-net` (the alert fired on outbound traffic, e.g. a
+//! beacon to a malicious host), the destination is blocked instead. Every other protection of
+//! the block policy still applies.
 //!
 //! An adapter that can name the event it reports sends `SIGNAL#<event id>:...` instead. The id
 //! (1-64 of `A-Z a-z 0-9 . _ -`) is unique per source; the node acts on a (source, id) once
@@ -26,7 +27,7 @@ use std::net::IpAddr;
 
 use ipnet::IpNet;
 
-use crate::block_policy::{BlockPolicy, LOCAL_ADDRESS};
+use crate::block_policy::{BlockPolicy, HOME_NETWORK, LOCAL_ADDRESS};
 use crate::block_table::{host, parse_target};
 
 #[derive(Debug, PartialEq, Eq)]
@@ -178,10 +179,12 @@ pub fn target(signal: &Signal, policy: &BlockPolicy) -> Result<IpNet, String> {
     }
     match policy.check(signal.src.addr()) {
         Ok(()) => Ok(signal.src),
-        Err(LOCAL_ADDRESS) => {
+        // The alert fired on traffic from this side (this node, or a network behind it given
+        // with --home-net): the remote party is the destination.
+        Err(why @ (LOCAL_ADDRESS | HOME_NETWORK)) => {
             let dst = signal
                 .dst
-                .ok_or("source is this node and no destination was given")?;
+                .ok_or_else(|| format!("source is {} and no destination was given", why))?;
             policy
                 .check(dst.addr())
                 .map(|()| dst)
@@ -287,6 +290,22 @@ mod tests {
         );
     }
 
+    /// Source names keep `-` and `_` (an adapter named `my-ids_2`), for signals and retractions.
+    #[test]
+    fn source_names_may_carry_hyphens_and_underscores() {
+        assert_eq!(
+            parse("my-ids_2|203.0.113.5|-|x").unwrap().source,
+            "my-ids_2"
+        );
+        assert_eq!(
+            parse_retract("RETRACT#1:my-ids_2|203.0.113.9")
+                .unwrap()
+                .unwrap()
+                .source,
+            "my-ids_2"
+        );
+    }
+
     #[test]
     fn rejects_malformed_signals() {
         for bad in [
@@ -312,6 +331,31 @@ mod tests {
         // Alert on our own outbound traffic: the remote is the destination.
         let outbound = parse("suricata|10.0.0.1|198.51.100.9|beacon").unwrap();
         assert_eq!(target(&outbound, &p), Ok(ip("198.51.100.9")));
+    }
+
+    /// A sensor or gateway sees hosts behind it: with --home-net, an alert on an inside host's
+    /// outbound traffic blocks the remote side, and never the inside host. Without it the inside
+    /// host itself would be blocked (the source is taken as the remote party).
+    #[test]
+    fn an_alert_from_a_home_network_blocks_the_remote_side() {
+        let mut p = policy();
+        let beacon = parse("suricata|192.168.10.5|198.51.100.9|ET MALWARE beacon").unwrap();
+        assert_eq!(target(&beacon, &p), Ok(ip("192.168.10.5")), "no --home-net");
+        p.protect("192.168.10.0/24".parse().unwrap(), HOME_NETWORK);
+        assert_eq!(target(&beacon, &p), Ok(ip("198.51.100.9")));
+        // Inbound from outside is unchanged.
+        let inbound = parse("suricata|203.0.113.5|192.168.10.5|probe").unwrap();
+        assert_eq!(target(&inbound, &p), Ok(ip("203.0.113.5")));
+        // Inside to inside, or no destination: nothing to block, the inside host is protected.
+        let lateral = parse("suricata|192.168.10.5|192.168.10.6|smb").unwrap();
+        assert!(target(&lateral, &p).unwrap_err().contains("home network"));
+        let no_dst = parse("suricata|192.168.10.5|-|x").unwrap();
+        assert!(target(&no_dst, &p).unwrap_err().contains("no destination"));
+        // Towards the node's own protected addresses: refused, not flipped further.
+        let to_gateway = parse("suricata|192.168.10.5|10.0.0.254|x").unwrap();
+        assert!(target(&to_gateway, &p)
+            .unwrap_err()
+            .contains("default gateway"));
     }
 
     #[test]
