@@ -843,6 +843,10 @@ check "trap decisions are counted under source trap: one refused (protected)" \
     wait_metric 'sokol_detections_total{source="trap",result="refused"}' 1
 MONITOR_BIN="$(dirname "$BIN")/monitor"
 check "monitor --verify accepts the audit chain" audit_verdict intact "$WORK/events.sntl"
+# Regret by source (ROADMAP: measured, not optimized): the smoke's own
+# signal was lifted by the operator early in its block, so its row counts one correction.
+check "monitor --regret counts the operator's early lift of the smoke source's block" bash -c \
+    "'$MONITOR_BIN' --regret '$WORK/events.sntl' | awk '\$NF == \"smoke\" && \$4 >= 1 { found = 1 } END { exit !found }'"
 check "audit log from the first run is re-verified on restart" \
     grep -qE "Audit log .* opened: [1-9][0-9]* records verified" "$LOG"
 check "strict mode: unfragmented traffic from $ALLOWED_IP passes" ping_from "$ALLOWED_IP"
