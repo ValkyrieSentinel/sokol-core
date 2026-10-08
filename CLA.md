@@ -26,6 +26,3 @@ documentation, tests or other material):
 
 Material copied from another repository you own (for example under the MIT license) remains
 yours there; this agreement covers the copy contributed here.
-
-Commits carry a `Signed-off-by:` line (`git commit -s`), which states that you agree to this
-file for that commit.

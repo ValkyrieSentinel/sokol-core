@@ -215,6 +215,7 @@ jobs:
           python3 scripts/test_anchor_scripts.py
           python3 scripts/test_kani_scope.py
           python3 scripts/test_mutants_diff.py
+          python3 scripts/test_check_agents_rules.py
 
       - name: CrowdSec stream recovery regression
         timeout-minutes: 2
