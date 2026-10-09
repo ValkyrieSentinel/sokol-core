@@ -304,7 +304,10 @@ impl<B: Blocklist + Send + 'static, M: ConfigMap + 'static> MeshDispatch<B, M> {
                         self.node_id,
                         &self.crypto,
                         &self.policy.current(),
-                        Detection::default(),
+                        Detection {
+                            source: crate::detections::TELEMETRY,
+                            ..Detection::default()
+                        },
                     )
                     .await;
                 }

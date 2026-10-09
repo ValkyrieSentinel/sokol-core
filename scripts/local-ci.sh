@@ -1,12 +1,17 @@
 #!/usr/bin/env bash
-# The CI job (.github/workflows/ci.yml, build-test-smoke) on this Linux host, in the same order,
+# The CI suite (.github/workflows/ci.yml: the test, smoke and demo parts that build-test-smoke
+# requires, which CI runs on three runners at once) on this Linux host, one after another,
 # with the same pinned tools and checksums, so a change can be checked before it is pushed.
 # Ubuntu 24.04 on x86_64 or aarch64 (a Lima VM on macOS works: AGENTS.md). Needs sudo for the
 # XDP smoke, the demo and the runbook rehearsal.
 #
-#   scripts/local-ci.sh              everything CI runs, except the artifact upload
+#   scripts/local-ci.sh              everything CI runs, except the artifact upload; the Kani
+#                                    proofs when common/ differs from origin/main, as in CI,
+#                                    and the mutants of the change (needs cargo-mutants)
 #   scripts/local-ci.sh --quick      policy checks, build, tests, clippy, Python regressions
-#   scripts/local-ci.sh --step NAME  one step: tools, monitoring (used by test_local_ci.py)
+#                                    (and the Kani proofs on the same condition)
+#   scripts/local-ci.sh --step NAME  one step: tools, monitoring (used by test_local_ci.py), kani,
+#                                    mutants (the change against origin/main)
 #
 # Pins (versions, SHA256, the Prometheus image digest) are read from ci.yml itself, so the two
 # cannot drift: change them there, not here. Pinned tools are extracted on every run from
@@ -22,7 +27,7 @@ case "${1:-}" in
     --quick) QUICK=1 ;;
     --step) ONLY="${2:?--step needs a name}" ;;
     "") ;;
-    *) echo "usage: $0 [--quick | --step tools|monitoring]"; exit 2 ;;
+    *) echo "usage: $0 [--quick | --step tools|monitoring|kani|mutants]"; exit 2 ;;
 esac
 CI=${LOCAL_CI_YML:-.github/workflows/ci.yml}
 CACHE=${LOCAL_CI_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/sokol-local-ci}
@@ -109,10 +114,40 @@ monitoring() {
     fi
 }
 
+# CI's kani job: the bounded proofs for common (docs/VERIFICATION.md), about 10 minutes. Kani
+# installs its own verifier bundle, which has no checksum of ours (ci.yml says so), so here the
+# installed version is only compared, not verified; the run is a check, not a pinned build.
+kani() {
+    step "kani proofs (common)"
+    local want have; want="$(pin KANI_VERSION)"
+    # Read the whole version first: `grep -q` on the pipe would close it early, and the
+    # producer's SIGPIPE fails the pipeline under pipefail.
+    have="$(cargo kani --version 2>/dev/null || true)"
+    if [[ "$have" != *" $want "* ]]; then
+        echo "Kani $want is not installed: cargo +stable install --locked kani-verifier --version $want && cargo +stable kani setup"
+        exit 2
+    fi
+    cargo kani -p common
+}
+
+# CI's mutants job: the mutants of this change against origin/main (docs/MUTATION.md).
+mutants() {
+    step "mutants of the change (against origin/main)"
+    command -v cargo-mutants >/dev/null || {
+        echo "cargo-mutants is not installed: cargo +stable install --locked cargo-mutants --version $(pin CARGO_MUTANTS_VERSION)"
+        exit 2
+    }
+    local base
+    base=$(git merge-base HEAD origin/main) || { echo "no origin/main to compare with"; exit 2; }
+    MUTANTS_JOBS=${MUTANTS_JOBS:-4} scripts/mutants-diff.sh "$base"
+}
+
 case "$ONLY" in
     "") ;;
     tools) tools; exit 0 ;;
     monitoring) monitoring; exit 0 ;;
+    kani) kani; exit 0 ;;
+    mutants) mutants; exit 0 ;;
     *) echo "unknown step $ONLY"; exit 2 ;;
 esac
 
@@ -123,7 +158,6 @@ tools
 
 step "format"; cargo fmt --all --check; (cd ebpf && cargo fmt --check)
 step "retired surface"; scripts/check-retired.sh
-step "cited evidence"; scripts/check-claims.sh
 monitoring
 if [ "$ARCH" = x86_64 ]; then
     step "dependency policy (cargo-deny $(pin CARGO_DENY_VERSION))"
@@ -139,6 +173,10 @@ fi
 step "eBPF program"; (cd ebpf && cargo build --release --locked)
 step "workspace"; cargo build --release --locked
 step "tests"; cargo test --release --locked
+# After the tests, as in CI: a cited test must be in the compiler's own list.
+step "cited evidence"
+cargo test --release --locked --lib --bins --tests -- --list --format terse >"$CACHE/tests.txt"
+SOKOL_TEST_LIST="$CACHE/tests.txt" scripts/check-claims.sh
 step "clippy"; cargo clippy --release --locked --all-targets -- -D warnings
 step "Python regressions"
 python3 scripts/test_xdp_probe.py
@@ -149,13 +187,24 @@ python3 scripts/test_witness_gate.py
 python3 scripts/test_local_ci.py
 python3 scripts/test_runbook_preflight.py
 python3 scripts/test_anchor_scripts.py
+python3 scripts/test_kani_scope.py
+python3 scripts/test_mutants_diff.py
+python3 scripts/test_check_agents_rules.py
+python3 scripts/test_check_claims.py
 timeout 120 python3 scripts/test_crowdsec_stream.py target/release/sokol-crowdsec
 timeout 120 python3 scripts/test_suricata_recovery.py target/release/sokol-suricata
+# CI's kani job proves when something the proofs read changed (scripts/kani-scope.sh).
+if base=$(git merge-base HEAD origin/main 2>/dev/null) && [ "$(scripts/kani-scope.sh "$base")" = skip ]; then
+    step "kani: nothing the proofs read changed since origin/main, proofs not rerun"
+else
+    kani
+fi
 [ "$QUICK" = 1 ] && { step "quick run done (no smoke, demo or rehearsal)"; exit 0; }
 
 # sudo resets PATH; keep the verified tools first for the root steps too.
 as_root() { sudo env "PATH=$PATH" "SOKOL_GOBGP_TEST_BIN=$SOKOL_GOBGP_TEST_BIN" "$@"; }
 
+mutants
 step "XDP smoke (veth + netns)"
 sudo apt-get install -y -qq netcat-openbsd wireguard-tools suricata crowdsec linux-tools-generic >/dev/null
 shopt -s nullglob

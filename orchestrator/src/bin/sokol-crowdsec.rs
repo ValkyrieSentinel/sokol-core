@@ -636,6 +636,13 @@ mod tests {
         assert_eq!(duration_secs("1h"), Some(3600));
         assert_eq!(duration_secs("1m0.5s"), Some(61));
         assert_eq!(duration_secs("500ms"), Some(1));
+        // Go prints sub-millisecond units too; each rounds up to a whole second.
+        assert_eq!(duration_secs("1500000us"), Some(2));
+        assert_eq!(duration_secs("1500000µs"), Some(2));
+        assert_eq!(duration_secs("2500000000ns"), Some(3));
+        // u64::MAX as f64 rounds up to 2^64: exactly that many seconds is out of range, not
+        // u64::MAX (review of #166: a `<=` there was taken for equivalent).
+        assert_eq!(duration_secs("18446744073709551616s"), None);
         assert_eq!(duration_secs("-2s"), None, "expired");
         assert_eq!(duration_secs("0s"), None);
         assert_eq!(duration_secs(""), None);

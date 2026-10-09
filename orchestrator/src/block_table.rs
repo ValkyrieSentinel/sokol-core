@@ -4852,4 +4852,173 @@ mod tests {
             }
         }
     }
+
+    /// Mesh convergence as a fixed point of repair. Whatever happened before (detections and
+    /// retractions on any node; claims and retraction lists sent, then arriving later, in any
+    /// order, repeated or never; time passing past expiry), one exchange between every pair of nodes
+    /// leaves every node's view of every issuer equal to that issuer's own, the same addresses
+    /// blocked on every node, and a second exchange changes nothing.
+    mod mesh {
+        use super::*;
+        use proptest::prelude::*;
+
+        const TARGETS: &[&str] = &[
+            "203.0.113.1",
+            "203.0.113.2",
+            "203.0.113.0/24",
+            "2001:db8::1",
+        ];
+
+        #[derive(Clone, Debug)]
+        enum Op {
+            Signal {
+                node: usize,
+                t: usize,
+                event: u8,
+            },
+            Retract {
+                node: usize,
+                t: usize,
+                event: u8,
+            },
+            /// One of `from`'s claims, or its retraction list, goes on the wire.
+            Send {
+                from: usize,
+                k: usize,
+                retractions: bool,
+            },
+            /// A message on the wire arrives at `to`; it stays on the wire (it may arrive again).
+            Arrive {
+                to: usize,
+                m: usize,
+            },
+            Tick {
+                secs: u64,
+            },
+        }
+
+        #[derive(Clone, Debug)]
+        enum Msg {
+            Claim(usize, Claim),
+            Retractions(usize, u64, Vec<ClaimId>),
+        }
+
+        /// Dense on purpose: few targets and event ids, so signals, sends, arrivals and
+        /// retractions meet on the same claims within 1024 cases.
+        fn op() -> impl Strategy<Value = Op> {
+            prop_oneof![
+                3 => (0..3usize, 0..TARGETS.len(), 0..2u8)
+                    .prop_map(|(node, t, event)| Op::Signal { node, t, event }),
+                2 => (0..3usize, 0..TARGETS.len(), 0..2u8)
+                    .prop_map(|(node, t, event)| Op::Retract { node, t, event }),
+                3 => (0..3usize, 0..4usize, any::<bool>())
+                    .prop_map(|(from, k, retractions)| Op::Send { from, k, retractions }),
+                4 => (0..3usize, 0..16usize).prop_map(|(to, m)| Op::Arrive { to, m }),
+                1 => (0..120u64).prop_map(|secs| Op::Tick { secs }),
+            ]
+        }
+
+        fn pair(
+            nodes: &mut [BlockTable<FakeLists>],
+            i: usize,
+            j: usize,
+        ) -> (&mut BlockTable<FakeLists>, &mut BlockTable<FakeLists>) {
+            let (low, high) = nodes.split_at_mut(j);
+            (&mut low[i], &mut high[0])
+        }
+
+        fn repair(nodes: &mut [BlockTable<FakeLists>], now: u64) {
+            for (i, j) in [(0, 1), (0, 2), (1, 2)] {
+                let (a, b) = pair(nodes, i, j);
+                exchange(a, b, now);
+            }
+        }
+
+        fn view(nodes: &[BlockTable<FakeLists>], now: u64) -> Vec<(Vec<String>, Vec<bool>)> {
+            nodes
+                .iter()
+                .map(|n| {
+                    let digests = nodes.iter().map(|i| n.digest_of(i.node_id, now)).collect();
+                    let blocked = TARGETS.iter().map(|t| n.is_blocked(ip(t))).collect();
+                    (digests, blocked)
+                })
+                .collect()
+        }
+
+        fn run(ops: Vec<Op>) -> Result<(), TestCaseError> {
+            let mut nodes = vec![table(1, 64), table(2, 64), table(3, 64)];
+            let mut wire: Vec<Msg> = Vec::new();
+            let mut now = T0;
+            for op in ops {
+                match op {
+                    Op::Signal { node, t, event } => {
+                        let id = event.to_string();
+                        let _ = signal(&mut nodes[node], "ids", &id, TARGETS[t], now, None);
+                    }
+                    Op::Retract { node, t, event } => {
+                        let id = event.to_string();
+                        let _ = nodes[node].retract_detection("ids", &id, ip(TARGETS[t]), now);
+                    }
+                    Op::Send {
+                        from,
+                        k,
+                        retractions,
+                    } => {
+                        let (claims, ids) = nodes[from].snapshot(now);
+                        if retractions {
+                            wire.push(Msg::Retractions(from, nodes[from].node_id, ids));
+                        } else if let Some(claim) = claims.get(k).cloned() {
+                            wire.push(Msg::Claim(from, claim));
+                        }
+                    }
+                    Op::Arrive { to, m } if !wire.is_empty() => {
+                        match wire[m % wire.len()].clone() {
+                            Msg::Claim(from, claim) if from != to => {
+                                let _ = nodes[to].adopt(claim, true, now);
+                            }
+                            Msg::Retractions(from, issuer, ids) if from != to => {
+                                nodes[to].retract(issuer, &ids, now);
+                            }
+                            _ => {}
+                        }
+                    }
+                    Op::Arrive { .. } => {}
+                    Op::Tick { secs } => {
+                        now += secs * S;
+                        for n in nodes.iter_mut() {
+                            n.tick(now);
+                        }
+                    }
+                }
+            }
+            repair(&mut nodes, now);
+            prop_assert!(
+                converged(&[&nodes[0], &nodes[1], &nodes[2]], now),
+                "a view differs from its issuer after one repair"
+            );
+            let first = view(&nodes, now);
+            for other in &first[1..] {
+                prop_assert_eq!(
+                    &other.1,
+                    &first[0].1,
+                    "the same addresses are blocked everywhere"
+                );
+            }
+            repair(&mut nodes, now);
+            prop_assert_eq!(view(&nodes, now), first, "a second repair changes nothing");
+            Ok(())
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig {
+                cases: std::env::var("SOKOL_FUZZ_CASES").ok().and_then(|v| v.parse().ok()).unwrap_or(1024),
+                max_shrink_iters: 4096,
+                ..ProptestConfig::default()
+            })]
+            #[test]
+            fn one_repair_is_a_fixed_point_of_any_delivery_history(ops in prop::collection::vec(op(), 1..40)) {
+                run(ops)?;
+            }
+        }
+    }
 }

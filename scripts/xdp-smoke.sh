@@ -817,7 +817,9 @@ check "a stopped node leaves no XDP program on the interface (traffic passes unf
 TRAP_PROTECTED=10.231.0.8; TRAP_OPEN=10.231.0.10
 ip netns exec "$NS" ip addr add "$TRAP_PROTECTED/24" dev "$PEER_IF"
 ip netns exec "$NS" ip addr add "$TRAP_OPEN/24" dev "$PEER_IF"
-start_orchestrator --drop-ipv4-fragments --trap-port 2324 --never-block "$TRAP_PROTECTED"
+HOME_NET=10.250.0.0/24
+start_orchestrator --drop-ipv4-fragments --trap-port 2324 --never-block "$TRAP_PROTECTED" \
+    --home-net "$HOME_NET"
 check "orchestrator restarts on the same interface" orchestrator_up
 # The built-in decoy trap audits what actually happened to its block, not a fixed EnforcedDrop.
 for src in "$TRAP_PROTECTED" "$TRAP_OPEN"; do
@@ -828,8 +830,23 @@ check "a trap hit from a protected address is audited as refused, not enforced" 
     "grep -aq 'TRAP_HIT|Port:2324|IP:$TRAP_PROTECTED|Action:Refused' '$WORK/events.sntl' && ! grep -aq 'TRAP_HIT|Port:2324|IP:$TRAP_PROTECTED|Action:EnforcedDrop' '$WORK/events.sntl'"
 check "a trap hit from an unprotected address is audited as enforced" \
     grep -aq "TRAP_HIT|Port:2324|IP:$TRAP_OPEN|Action:EnforcedDrop" "$WORK/events.sntl"
+# --home-net: an alert on an inside host's outbound traffic blocks the remote side, never the host.
+ipc_ack "SIGNAL:smoke|10.250.0.5|198.51.100.88|beacon" "SIGNAL:smoke|10.250.0.5|10.250.0.6|lateral" \
+    >"$WORK/home-net.txt"
+check "--home-net: an inside source's alert is applied to its remote destination" bash -c \
+    "sed -n 2p '$WORK/home-net.txt' | grep -q '^OK applied' && grep -q 'Dynamic block enforced in XDP: 198.51.100.88' '$LOG'"
+check "--home-net: the inside host is never blocked, inside to inside nothing is" bash -c \
+    "! grep -q 'Dynamic block enforced in XDP: 10.250.0.' '$LOG' && sed -n 3p '$WORK/home-net.txt' | grep -q '^OK refused'"
+check "trap decisions are counted under source trap: one enforced" \
+    wait_metric 'sokol_detections_total{source="trap",result="enforced"}' 1
+check "trap decisions are counted under source trap: one refused (protected)" \
+    wait_metric 'sokol_detections_total{source="trap",result="refused"}' 1
 MONITOR_BIN="$(dirname "$BIN")/monitor"
 check "monitor --verify accepts the audit chain" audit_verdict intact "$WORK/events.sntl"
+# Regret by source (ROADMAP: measured, not optimized): the smoke's own
+# signal was lifted by the operator early in its block, so its row counts one correction.
+check "monitor --regret counts the operator's early lift of the smoke source's block" bash -c \
+    "'$MONITOR_BIN' --regret '$WORK/events.sntl' | awk '\$NF == \"smoke\" && \$4 >= 1 { found = 1 } END { exit !found }'"
 check "audit log from the first run is re-verified on restart" \
     grep -qE "Audit log .* opened: [1-9][0-9]* records verified" "$LOG"
 check "strict mode: unfragmented traffic from $ALLOWED_IP passes" ping_from "$ALLOWED_IP"
