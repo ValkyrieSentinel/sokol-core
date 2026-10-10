@@ -16,6 +16,7 @@ the owner has accepted yet. Removing or changing what is pinned is refused.
 import ast
 import hashlib
 import json
+from itertools import islice
 import pathlib
 import re
 import subprocess
@@ -41,12 +42,94 @@ def git_files(pattern: str) -> list[pathlib.Path]:
     return [ROOT / p for p in out.stdout.split()]
 
 
+MAX_CONTRACTS = 256
+MAX_CONTRACT_BYTES = 2_097_152
+CONTRACT_ID = re.compile(r'[A-Z][A-Z0-9]*-[A-Z0-9-]+')
+GENERATED_MARKER = re.compile(
+    r'^<!-- Generated ([A-Z][A-Z0-9]*-[A-Z0-9-]+) from docs/contracts/\1\.shadow\.json; '
+    r'edit the contract, then regenerate\. -->$', re.M)
+
+
+def contract_marker(rid: str) -> str:
+    if not isinstance(rid, str) or not CONTRACT_ID.fullmatch(rid):
+        raise ValueError('Invalid contract ID')
+    return f'<!-- Generated {rid} from docs/contracts/{rid}.shadow.json; edit the contract, then regenerate. -->'
+
+
+def contract_row(contract: dict) -> str:
+    """Public legacy table projection; the signed statement hash format stays unchanged."""
+    rid = contract['id']
+    contract_marker(rid)
+    if contract['profile'] != 'sokol.contract-shadow.v1':
+        raise ValueError('Unsupported contract profile')
+    for field in ('statement', 'evidence_text'):
+        if not isinstance(contract[field], str) or any(c in contract[field] for c in '\n\r|'):
+            raise ValueError('Invalid contract table cell')
+    return '| ' + rid + ' | ' + contract['statement'] + ' | ' + contract['evidence_text'] + ' |'
+
+
+def project_invariants(text: str, contract: dict) -> str:
+    """Render one contract into its marked slot; other rows keep their current owners."""
+    rid = contract['id']
+    marker = contract_marker(rid)
+    lines = text.splitlines(keepends=True)
+    indices = [i for i, line in enumerate(lines) if line.startswith('| ' + rid + ' |')]
+    if len(indices) != 1 or text.count(marker) != 1:
+        raise ValueError('Missing or ambiguous generated ' + rid + ' slot')
+    index = indices[0]
+    if index + 1 >= len(lines) or lines[index + 1].rstrip('\r\n') != marker:
+        raise ValueError('Generated marker must follow ' + rid)
+    lines[index] = contract_row(contract) + '\n'
+    return ''.join(lines)
+
+
+def generated_invariants(text: str, root: pathlib.Path) -> str:
+    """Validate all source-backed slots using bounded local contract data only."""
+    marker_ids = [m.group(1) for m in GENERATED_MARKER.finditer(text)]
+    if len(marker_ids) != text.count('<!-- Generated ') or len(set(marker_ids)) != len(marker_ids):
+        raise ValueError('Malformed or duplicate generated contract marker')
+    directory = root / 'docs/contracts'
+    if directory.is_symlink():
+        raise ValueError('Symlink contract directory refused')
+    sources = list(islice(directory.glob('*.shadow.json'), MAX_CONTRACTS + 1))
+    if len(sources) > MAX_CONTRACTS:
+        raise ValueError('Too many contracts')
+    sources.sort()
+    source_ids = set()
+    for path in sources:
+        if path.is_symlink():
+            raise ValueError('Symlink contract source refused')
+        with path.open('rb') as stream:
+            data = stream.read(MAX_CONTRACT_BYTES + 1)
+        if len(data) > MAX_CONTRACT_BYTES:
+            raise ValueError('Contract exceeds bound')
+        contract = json.loads(data)
+        rid = contract['id']
+        contract_marker(rid)
+        if path.name != rid + '.shadow.json':
+            raise ValueError('Contract filename differs from ID')
+        names = sorted({w for w in re.findall(r'`([^`]+)`', contract['evidence_text'])
+                        if RUST_TEST.fullmatch(w) or PY_TEST.fullmatch(w)})
+        if not names or names != contract['witnesses']:
+            raise ValueError('Contract witness list differs from its evidence text')
+        projected = project_invariants(text, contract)
+        if projected != text:
+            raise ValueError('Generated ' + rid + ' is stale; regenerate from its contract')
+        source_ids.add(rid)
+    if source_ids != set(marker_ids):
+        raise ValueError('Generated markers and contract sources differ')
+    return text
+
+
 def rows() -> dict:
     found = {}
-    for line in INVARIANTS.read_text().splitlines():
+    text = generated_invariants(INVARIANTS.read_text(), ROOT)
+    for line in text.splitlines():
         m = ROW.match(line)
         if not m:
             continue
+        if m.group(1) in found:
+            raise ValueError('Duplicate invariant row: ' + m.group(1))
         cells = [c.strip() for c in line.strip().strip("|").split("|")]
         spans = re.findall(r"`([^`]+)`", cells[-1])
         found[m.group(1)] = {
@@ -116,22 +199,31 @@ def squeeze(code: str) -> str:
     return re.sub(r" (?=\W)|(?<=\W) ", "", code)
 
 
-def rust_bodies(names: set[str]) -> dict[str, list[str]]:
+def rust_witness_hashes(source: str, relative_path: str, names: set[str]) -> dict[str, list[str]]:
+    """Public byte-to-pin API: same normalizer as the gate, no file reads or subprocesses."""
     bodies: dict[str, list[str]] = {}
+    src = strip_rust(source)
+    masked = rust_mask(src)
+    for m in re.finditer(r"\bfn ([a-z][a-z0-9_]*)\s*[(<]", masked):
+        if m.group(1) not in names:
+            continue
+        start = masked.find("{", m.end())
+        depth, j = 0, start
+        for j in range(start, len(src)):
+            depth += {"{": 1, "}": -1}.get(masked[j], 0)
+            if depth == 0:
+                break
+        rel = relative_path
+        bodies.setdefault(m.group(1), []).append(f"{rel}:{sha(rust_layout(src[m.start():j + 1]))}")
+    return bodies
+
+
+def rust_bodies(names: set[str]) -> dict[str, list[str]]:
+    bodies = {}
     for path in git_files("*.rs"):
-        src = strip_rust(path.read_text())
-        masked = rust_mask(src)
-        for m in re.finditer(r"\bfn ([a-z][a-z0-9_]*)\s*[(<]", masked):
-            if m.group(1) not in names:
-                continue
-            start = masked.find("{", m.end())
-            depth, j = 0, start
-            for j in range(start, len(src)):
-                depth += {"{": 1, "}": -1}.get(masked[j], 0)
-                if depth == 0:
-                    break
-            rel = path.relative_to(ROOT).as_posix()
-            bodies.setdefault(m.group(1), []).append(f"{rel}:{sha(rust_layout(src[m.start():j + 1]))}")
+        found = rust_witness_hashes(path.read_text(), path.relative_to(ROOT).as_posix(), names)
+        for name, hashes in found.items():
+            bodies.setdefault(name, []).extend(hashes)
     return bodies
 
 
@@ -212,12 +304,17 @@ def current() -> dict:
     return {"rows": table, "witnesses": {w: sorted(bodies.get(w, [])) for w in sorted(cited)}}
 
 
-def verify(signers: pathlib.Path) -> bool:
-    if not (MANIFEST.exists() and SIGNATURE.exists() and signers.exists()):
+def verify_manifest(manifest: pathlib.Path, signature: pathlib.Path, signers: pathlib.Path) -> bool:
+    """Verify owner against the supplied trust file; callers choose its trusted provenance."""
+    if not (manifest.exists() and signature.exists() and signers.exists()):
         return False
     r = subprocess.run(["ssh-keygen", "-Y", "verify", "-f", str(signers), "-I", "owner", "-n", NAMESPACE,
-                        "-s", str(SIGNATURE)], input=MANIFEST.read_bytes(), capture_output=True)
+                        "-s", str(signature)], input=manifest.read_bytes(), capture_output=True, timeout=10)
     return r.returncode == 0
+
+
+def verify(signers: pathlib.Path) -> bool:
+    return verify_manifest(MANIFEST, SIGNATURE, signers)
 
 
 def check(signers: pathlib.Path) -> int:
