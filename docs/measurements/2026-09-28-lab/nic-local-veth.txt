@@ -1,0 +1,6 @@
+# bench/nic.sh local, native XDP on veth, lab VM (aarch64, 10 vCPU, kernel 6.8), build n70 (#70 head). Method dry run: the generator shares the CPUs.
+# XDP program successfully locked and attached to interface: nicd0 (mode: Native) | host=aarch64 cpus=10 kernel=6.8.0-142-generic step=5s
+target_pps     sent_pps  dropped_pps   drop_% softirq_%    busy_% ping_loss    p50_ms    p99_ms
+idle                  0            0        -       0.0       0.4       0%     0.057     0.141
+100000           100000       100000   100.00       0.1       7.6       0%     0.005     0.073
+max             4524289      4524289   100.00       4.0       9.0       0%     0.014     0.047

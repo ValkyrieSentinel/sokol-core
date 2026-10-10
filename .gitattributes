@@ -1,0 +1,3 @@
+monitor linguist-detectable=false
+sntl.db linguist-detectable=false
+sokol_audit.sntl linguist-detectable=false

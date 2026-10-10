@@ -1,0 +1,5 @@
+# nodes=10 netem='delay 20ms 10ms loss 5%' host=aarch64 cpus=10 kernel=6.8.0-142-generic
+# full mesh after 4s: 10/10 nodes see 9 peers
+per node (issue on node 1 -> recorded on node k): n=180 min=11 median=26 p95=154 max=472 (ms)
+until the last node has it:                       n=20 min=28 median=67 p95=339 max=472 (ms)
+missing deliveries: 0 of 180

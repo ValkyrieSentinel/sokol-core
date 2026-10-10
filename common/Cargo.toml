@@ -1,0 +1,20 @@
+[package]
+name = "common"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0-or-later"
+publish = false
+
+[dependencies]
+blake3 = { version = "1.5", optional = true }
+
+[features]
+default = ["std"]
+std = ["dep:blake3"]
+
+# Kani proofs (`cargo kani -p common`) live under cfg(kani); see docs/VERIFICATION.md.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
+
+[dev-dependencies]
+proptest = { version = "1", default-features = false, features = ["std"] }

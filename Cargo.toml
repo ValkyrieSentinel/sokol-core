@@ -1,0 +1,19 @@
+[workspace]
+resolver = "2"
+members = [
+    "orchestrator",
+    "common",
+]
+exclude = [
+    "ebpf",
+]
+
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+opt-level = 2
+debug = false
+strip = "debuginfo"
+panic = "abort"

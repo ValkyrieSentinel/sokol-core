@@ -1,0 +1,28 @@
+# Build artifacts & targets
+target/
+**/target/
+**/zig-out/
+**/.zig-cache/
+zig-out/
+.zig-cache/
+
+# Libraries & binaries
+*.a
+*.o
+*.so
+*.dll
+
+# Databases & local audit files
+*.db
+sntl.db
+sokol_audit.sntl
+monitor
+
+# Backups & editor temp files
+*.bak
+*~
+.DS_Store
+
+# Nested targets and static libs
+**/target/
+**/*.a

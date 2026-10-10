@@ -1,0 +1,39 @@
+# cargo-deny: dependency policy checked in CI (`cargo deny check`).
+[graph]
+all-features = true
+
+[advisories]
+# RustSec: known vulnerabilities fail; unmaintained crates are reported for our direct deps.
+version = 2
+yanked = "deny"
+unmaintained = "workspace"
+ignore = []
+
+[licenses]
+version = 2
+# Permissive dependency licenses only. Sokol-Core itself is AGPL-3.0 / GPL-2.0-or-later
+# (COPYRIGHT.md), and its copyright holder may grant it under other terms as well; a
+# copyleft dependency would bind those terms, so it needs a decision first.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "Zlib",
+    "Unicode-3.0",
+    "CC0-1.0",
+]
+confidence-threshold = 0.9
+# Our own crates are not published and carry no license field.
+private = { ignore = true }
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

@@ -1,0 +1,854 @@
+// Release builds abort on panic (panic = "abort"), so a panic reachable from input (a peer's
+// frame, an IPC line, a trap connection, a file) stops the node. Outside tests, code must not
+// be able to panic: no unwrap/expect, no unchecked indexing or slicing, no panic!-family macros.
+// A provably safe exception is allowed locally, with its reason.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::string_slice,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented
+    )
+)]
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError};
+use std::sync::{Arc, OnceLock};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
+use tokio::time::{sleep, timeout, Duration};
+
+#[path = "../delivery.rs"]
+mod delivery;
+
+fn ipc_socket_path() -> String {
+    std::env::var("SOKOL_IPC_SOCKET").unwrap_or_else(|_| "/run/sokol.sock".to_string())
+}
+
+/// Lines waiting for the delivery thread, and signals the node has not answered yet.
+const SUBMIT_QUEUE: usize = 1024;
+const OUTBOX_CAP: usize = 1024;
+
+/// The trap's only path to the node. Connection handlers hand lines to one thread that owns
+/// the IPC outbox (`delivery.rs`, ACK mode, as the Suricata and CrowdSec adapters use): a line
+/// counts as delivered only when the node answered it, and a refusal or error is reported as
+/// such. Writing to the socket is not delivery (review 2026-10-05 F1).
+struct NodeLink {
+    tx: SyncSender<String>,
+    /// Lines refused because the hand-off queue was full: lost before the outbox saw them.
+    overflow: AtomicU64,
+}
+
+static NODE: OnceLock<NodeLink> = OnceLock::new();
+
+/// What happened to a line, as the delivery thread learned it.
+#[derive(Debug, PartialEq, Eq)]
+enum Report {
+    /// The node answered; the line left the outbox.
+    Answered(String, delivery::Outcome),
+    /// The outbox would not take the line (framing or size); it was never sent.
+    Rejected(String, String),
+    /// Delivery failed for now; the line stays queued and is retried with backoff.
+    Retrying(String),
+    /// The outbox was full and dropped its oldest line(s); `lost` is the running total.
+    Lost(u64),
+}
+
+/// Queues `line` for the node; false if it was lost before reaching the outbox.
+fn submit(line: String) -> bool {
+    let Some(node) = NODE.get() else {
+        eprintln!("[!] node link not started; dropped: {}", line);
+        return false;
+    };
+    match node.tx.try_send(line) {
+        Ok(()) => true,
+        Err(TrySendError::Full(line)) | Err(TrySendError::Disconnected(line)) => {
+            let n = node.overflow.fetch_add(1, Ordering::Relaxed) + 1;
+            eprintln!(
+                "[!] node hand-off queue full ({} lost so far); dropped: {}",
+                n, line
+            );
+            false
+        }
+    }
+}
+
+/// Owns the outbox until every sender is gone and nothing is pending.
+fn run_delivery(
+    rx: Receiver<String>,
+    mut outbox: delivery::Outbox,
+    mut report: impl FnMut(Report),
+) {
+    let mut lost_seen = 0;
+    loop {
+        let first = if outbox.pending() == 0 {
+            match rx.recv() {
+                Ok(line) => Some(line),
+                Err(_) => return,
+            }
+        } else {
+            match rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(line) => Some(line),
+                Err(RecvTimeoutError::Timeout) => None,
+                Err(RecvTimeoutError::Disconnected) => None,
+            }
+        };
+        for line in first.into_iter().chain(rx.try_iter()) {
+            if let Err(e) = outbox.push(&line) {
+                report(Report::Rejected(line, e.to_string()));
+            }
+        }
+        if outbox.lost > lost_seen {
+            lost_seen = outbox.lost;
+            report(Report::Lost(lost_seen));
+        }
+        while outbox.pending() > 0 {
+            let (done, err) = outbox.flush(16);
+            let answered = !done.is_empty();
+            for (line, outcome) in done {
+                report(Report::Answered(line, outcome));
+            }
+            if let Some(e) = err {
+                report(Report::Retrying(e));
+                break;
+            }
+            if !answered {
+                break; // backoff: wait for new lines or the retry time
+            }
+        }
+    }
+}
+
+fn log_report(r: Report) {
+    match r {
+        Report::Answered(line, delivery::Outcome::Refused(why)) => {
+            eprintln!("[!] node refused {}: {}", line, why)
+        }
+        Report::Answered(line, delivery::Outcome::Rejected(why)) => {
+            eprintln!("[!] node rejected {}: {}", line, why)
+        }
+        Report::Answered(line, outcome) => {
+            println!("[XDP_ACTION] node answered {} ({:?})", line, outcome)
+        }
+        Report::Rejected(line, why) => eprintln!("[!] not sent (invalid line: {}): {}", why, line),
+        Report::Retrying(e) => eprintln!("[!] node unreachable, retrying: {}", e),
+        Report::Lost(n) => eprintln!("[!] outbox full: {} oldest lines dropped so far", n),
+    }
+}
+
+/// Starts the delivery thread for `socket`; later calls keep the first link.
+fn start_node_link(socket: PathBuf) {
+    let (tx, rx) = std::sync::mpsc::sync_channel(SUBMIT_QUEUE);
+    if NODE
+        .set(NodeLink {
+            tx,
+            overflow: AtomicU64::new(0),
+        })
+        .is_ok()
+    {
+        let outbox = delivery::Outbox::new(&socket, OUTBOX_CAP);
+        std::thread::spawn(move || run_delivery(rx, outbox, log_report));
+    }
+}
+
+/// Ports that decoy services listen on. 8080 is left out: local services such as the CrowdSec
+/// Local API use it, and a trap there would ban their clients.
+const DEFAULT_TRAP_PORTS: [u16; 6] = [22, 80, 443, 3306, 6379, 8443];
+// The XDP program always passes this port as the operator's real SSH (common::ADMIN_SSH_PORT).
+use common::ADMIN_SSH_PORT;
+const MAX_CONCURRENT_CONNECTIONS: usize = 256;
+
+pub struct TrapConfig {
+    pub ports: Vec<u16>,
+    /// External interactive jail to proxy SSH attackers to. None = embedded mock jail.
+    pub jail_addr: Option<SocketAddr>,
+}
+
+impl TrapConfig {
+    /// SOKOL_TRAP_PORTS="22,80,3306" and SOKOL_JAIL_ADDR="127.0.0.1:2022".
+    pub fn from_env() -> Result<Self, String> {
+        Self::parse(
+            std::env::var("SOKOL_TRAP_PORTS").ok().as_deref(),
+            std::env::var("SOKOL_JAIL_ADDR").ok().as_deref(),
+        )
+    }
+
+    fn parse(ports: Option<&str>, jail: Option<&str>) -> Result<Self, String> {
+        let ports = match ports {
+            None => DEFAULT_TRAP_PORTS.to_vec(),
+            Some(list) => list
+                .split(',')
+                .map(|p| {
+                    p.trim()
+                        .parse::<u16>()
+                        .map_err(|_| format!("invalid trap port '{}'", p.trim()))
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        };
+        if ports.contains(&ADMIN_SSH_PORT) {
+            return Err(format!(
+                "port {} is the operator SSH port and cannot be a trap",
+                ADMIN_SSH_PORT
+            ));
+        }
+        let jail_addr = match jail {
+            None | Some("") => None,
+            Some(raw) => {
+                let addr: SocketAddr = raw
+                    .parse()
+                    .map_err(|_| format!("invalid SOKOL_JAIL_ADDR '{}'", raw))?;
+                // Proxying into the real sshd would hand attackers a login prompt that
+                // appears to come from localhost.
+                if addr.port() == ADMIN_SSH_PORT {
+                    return Err(format!(
+                        "SOKOL_JAIL_ADDR must not point at the operator SSH port {}",
+                        ADMIN_SSH_PORT
+                    ));
+                }
+                Some(addr)
+            }
+        };
+        Ok(Self { ports, jail_addr })
+    }
+}
+
+pub struct UltimateTridentOrchestrator {
+    config: Arc<TrapConfig>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum TridentTier {
+    Tier1BotTarpit,
+    Tier1_5SlowDrip,
+    Tier2PayloadCapture,
+    Tier3InteractiveJail,
+}
+
+impl TridentTier {
+    /// Plain description used as the block reason in the node's audit log.
+    pub fn describe(self) -> &'static str {
+        match self {
+            TridentTier::Tier1BotTarpit => "scanner held in an HTTP tarpit",
+            TridentTier::Tier1_5SlowDrip => "binary flood held with a slow drip",
+            TridentTier::Tier2PayloadCapture => "shellcode-like payload captured",
+            TridentTier::Tier3InteractiveJail => "SSH session held in the decoy",
+        }
+    }
+}
+
+pub struct ConnectionFingerprint {
+    pub ip: String,
+    pub port: u16,
+    pub payload_len: usize,
+    pub entropy: f64,
+    pub non_printable_ratio: f64,
+    pub fingerprint_hash: u64,
+    pub snippet: String,
+}
+
+impl ConnectionFingerprint {
+    pub fn empty(ip: &str, port: u16) -> Self {
+        Self {
+            ip: ip.to_string(),
+            port,
+            payload_len: 0,
+            entropy: 0.0,
+            non_printable_ratio: 0.0,
+            fingerprint_hash: 0,
+            snippet: String::new(),
+        }
+    }
+}
+
+impl UltimateTridentOrchestrator {
+    pub fn new(config: TrapConfig) -> Self {
+        Self {
+            config: Arc::new(config),
+        }
+    }
+
+    pub async fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
+        println!("[*] Sokol-Core Trident Node initializing (Single-Writer via Unix Socket)...");
+        match self.config.jail_addr {
+            Some(addr) => println!("[*] Tier-3 attackers are proxied to external jail {}", addr),
+            None => println!("[*] Tier-3 attackers are handled by the embedded mock jail"),
+        }
+
+        let mut handles = vec![];
+        let permits = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
+
+        for &port in &self.config.ports {
+            let config = self.config.clone();
+            let permits = permits.clone();
+            let addr = format!("0.0.0.0:{}", port);
+
+            let handle = tokio::spawn(async move {
+                let listener = match TcpListener::bind(&addr).await {
+                    Ok(l) => {
+                        println!("[*] Sokol-Core Trident Node armed on port {}", port);
+                        l
+                    }
+                    Err(e) => {
+                        eprintln!("[!] Failed to bind port {}: {}", port, e);
+                        return;
+                    }
+                };
+
+                while let Ok((stream, peer_addr)) = listener.accept().await {
+                    // Over the limit the connection is simply closed: the trap must not let a
+                    // flood exhaust this host's memory or file descriptors.
+                    let Ok(permit) = permits.clone().try_acquire_owned() else {
+                        drop(stream);
+                        continue;
+                    };
+                    let ip = peer_addr.ip().to_canonical().to_string();
+                    let config = config.clone();
+
+                    tokio::spawn(async move {
+                        let _ = handle_trident_connection(stream, ip, port, &config).await;
+                        drop(permit);
+                    });
+                }
+            });
+
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            let _ = handle.await;
+        }
+
+        Ok(())
+    }
+}
+
+async fn handle_trident_connection(
+    mut stream: TcpStream,
+    ip: String,
+    port: u16,
+    config: &TrapConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut buf = vec![0u8; 2048];
+
+    let read_result = timeout(Duration::from_secs(5), stream.read(&mut buf)).await;
+
+    let n = match read_result {
+        Ok(Ok(n)) if n > 0 => n,
+        _ => {
+            let reason = format!("trap port {}: connected without sending data", port);
+            let _ = trigger_xdp_drop(&ip, &reason);
+            let _ = stream.shutdown().await;
+            return Ok(());
+        }
+    };
+
+    let payload = buf.get(..n).unwrap_or_default();
+    let fingerprint = analyze_and_fingerprint(&ip, port, payload);
+    let tier = classify_traffic_tier(payload, &fingerprint);
+
+    let unique_log_record = format!(
+        "TRIDENT_HIT|TIER={:?}|IP={}|PORT={}|LEN={}|ENTROPY={:.2}|NON_PRINT={:.2}|HASH={:016X}|SNIPPET={}",
+        tier,
+        fingerprint.ip,
+        fingerprint.port,
+        fingerprint.payload_len,
+        fingerprint.entropy,
+        fingerprint.non_printable_ratio,
+        fingerprint.fingerprint_hash,
+        fingerprint.snippet
+    );
+
+    let _ = send_log_to_orchestrator(&unique_log_record);
+
+    match tier {
+        TridentTier::Tier1BotTarpit => {
+            println!(
+                "[TIER-1] Bot/Scanner detected from IP: {} on port {} | Hash: {:016X}",
+                ip, port, fingerprint.fingerprint_hash
+            );
+            run_tier1_bot_tarpit(stream).await?;
+        }
+        TridentTier::Tier1_5SlowDrip => {
+            println!(
+                "[TIER-1.5 SLOW DRIP] Binary flood from IP: {} on port {} | holding the connection with a slow drip",
+                ip, port
+            );
+            run_slow_drip_tarpit(stream, fingerprint.fingerprint_hash).await?;
+        }
+        TridentTier::Tier2PayloadCapture => {
+            println!(
+                "[TIER-2 CAPTURE] Shellcode-like payload from IP: {} on port {} | capturing it for analysis",
+                ip, port
+            );
+            run_tier2_payload_capture(stream, payload, &ip).await?;
+        }
+        TridentTier::Tier3InteractiveJail => {
+            println!(
+                "[TIER-3 JAIL] SSH interaction detected from IP: {} on port {}! Engaging bait and proxying to Jail...",
+                ip, port
+            );
+            run_tier3_interactive_jail(stream, payload, &ip, config.jail_addr).await?;
+        }
+    }
+
+    let reason = format!("trap port {}: {}", port, tier.describe());
+    let _ = trigger_xdp_drop(&ip, &reason);
+
+    Ok(())
+}
+
+fn classify_traffic_tier(payload: &[u8], fp: &ConnectionFingerprint) -> TridentTier {
+    if payload.is_empty() {
+        return TridentTier::Tier1BotTarpit;
+    }
+
+    if payload.starts_with(b"SSH-2.0-") || fp.port == 22 {
+        return TridentTier::Tier3InteractiveJail;
+    }
+
+    let has_shellcode_patterns = payload
+        .windows(4)
+        .any(|w| w == b"\x90\x90\x90\x90" || w == b"\x31\xc0\x50\x68" || w == b"\xeb\xfe\x90\x90");
+
+    if has_shellcode_patterns || (fp.non_printable_ratio > 0.6 && payload.len() > 128) {
+        return TridentTier::Tier2PayloadCapture;
+    }
+
+    if fp.non_printable_ratio > 0.4 && payload.len() > 16 {
+        return TridentTier::Tier1_5SlowDrip;
+    }
+
+    TridentTier::Tier1BotTarpit
+}
+
+fn analyze_and_fingerprint(ip: &str, port: u16, payload: &[u8]) -> ConnectionFingerprint {
+    if payload.is_empty() {
+        return ConnectionFingerprint::empty(ip, port);
+    }
+
+    let payload_len = payload.len();
+
+    let non_printable = payload
+        .iter()
+        .filter(|&&b| !b.is_ascii_graphic() && !b.is_ascii_whitespace())
+        .count();
+
+    let non_printable_ratio = non_printable as f64 / payload_len as f64;
+    let entropy = calculate_shannon_entropy(payload);
+
+    let mut hasher = DefaultHasher::new();
+    payload.hash(&mut hasher);
+    ip.hash(&mut hasher);
+    let fingerprint_hash = hasher.finish();
+
+    let snippet = String::from_utf8_lossy(payload.get(..payload_len.min(32)).unwrap_or_default())
+        .chars()
+        .filter(|c| c.is_ascii_graphic() || *c == ' ')
+        .collect::<String>();
+
+    ConnectionFingerprint {
+        ip: ip.to_string(),
+        port,
+        payload_len,
+        entropy,
+        non_printable_ratio,
+        fingerprint_hash,
+        snippet,
+    }
+}
+
+fn calculate_shannon_entropy(data: &[u8]) -> f64 {
+    if data.is_empty() {
+        return 0.0;
+    }
+    let mut counts = [0u64; 256];
+    for &b in data {
+        if let Some(c) = counts.get_mut(usize::from(b)) {
+            *c += 1;
+        }
+    }
+    let len = data.len() as f64;
+    let mut entropy = 0.0;
+    for &count in &counts {
+        if count > 0 {
+            let p = (count as f64) / len;
+            entropy -= p * p.log2();
+        }
+    }
+    entropy
+}
+
+async fn run_tier1_bot_tarpit(mut stream: TcpStream) -> Result<(), Box<dyn std::error::Error>> {
+    let _ = stream
+        .write_all(
+            b"HTTP/1.1 200 OK\r\n\
+        Server: nginx/1.18.0\r\n\
+        Content-Type: text/html\r\n\
+        Transfer-Encoding: chunked\r\n\r\n",
+        )
+        .await;
+
+    for i in 0..120 {
+        let chunk_data = format!(
+            "<div>Diagnostic block ID: {} - Synchronizing state...</div>\n",
+            i
+        );
+        let chunk = format!("{:X}\r\n{}\r\n", chunk_data.len(), chunk_data);
+        if stream.write_all(chunk.as_bytes()).await.is_err() {
+            break;
+        }
+        let _ = stream.flush().await;
+        sleep(Duration::from_millis(150)).await;
+    }
+    let _ = stream.write_all(b"0\r\n\r\n").await;
+    let _ = stream.shutdown().await;
+    Ok(())
+}
+
+/// Binary floods get a slow drip of noise: the connection is held for up to 30 s at 32 bytes
+/// per second. Answering with a burst (formerly 1 MiB per connection) spent this host's own
+/// uplink on the attacker.
+async fn run_slow_drip_tarpit(
+    mut stream: TcpStream,
+    seed_hash: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut seed: u64 = seed_hash ^ 0xDEADBEEFCAFEBABE;
+    let mut chunk = [0u8; 16];
+
+    for _ in 0..60 {
+        for byte in chunk.iter_mut() {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            *byte = (seed & 0xFF) as u8;
+        }
+        if stream.write_all(&chunk).await.is_err() {
+            break;
+        }
+        let _ = stream.flush().await;
+        sleep(Duration::from_millis(500)).await;
+    }
+
+    let _ = stream.shutdown().await;
+    Ok(())
+}
+
+/// Keeps reading what the sender uploads (up to 2 MiB) so the payload can be analysed later.
+async fn run_tier2_payload_capture(
+    mut stream: TcpStream,
+    initial_payload: &[u8],
+    ip: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut captured = initial_payload.to_vec();
+    let mut buf = vec![0u8; 4096];
+
+    loop {
+        let read_res = timeout(Duration::from_secs(8), stream.read(&mut buf)).await;
+
+        match read_res {
+            Ok(Ok(0)) | Err(_) => break,
+            Ok(Ok(n)) => {
+                captured.extend_from_slice(buf.get(..n).unwrap_or_default());
+
+                let chunk_log = format!("CAPTURE_CHUNK|IP={}|BYTES={}", ip, n);
+                let _ = send_log_to_orchestrator(&chunk_log);
+
+                if captured.len() > 2 * 1024 * 1024 {
+                    break;
+                }
+            }
+            Ok(Err(_)) => break,
+        }
+    }
+
+    println!(
+        "[TIER-2 CAPTURE] Captured {} bytes from {}.",
+        captured.len(),
+        ip
+    );
+
+    let _ = stream
+        .write_all(b"\x7fELF\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00")
+        .await;
+    let _ = stream.flush().await;
+
+    let _ = stream.shutdown().await;
+    Ok(())
+}
+
+async fn run_tier3_interactive_jail(
+    mut attacker_stream: TcpStream,
+    initial_payload: &[u8],
+    ip: &str,
+    jail_addr: Option<SocketAddr>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let jail = match jail_addr {
+        Some(addr) => TcpStream::connect(addr).await.ok(),
+        None => None,
+    };
+
+    match jail {
+        Some(mut jail_stream) => {
+            let juicy_bait_banner = b"SSH-2.0-OpenSSH_7.4p1 Debian-10+deb9u7\r\n";
+            if attacker_stream.write_all(juicy_bait_banner).await.is_ok() {
+                let _ = attacker_stream.flush().await;
+
+                if !initial_payload.is_empty() {
+                    let _ = jail_stream.write_all(initial_payload).await;
+                }
+
+                if let Ok((from_attacker, from_jail)) =
+                    tokio::io::copy_bidirectional(&mut attacker_stream, &mut jail_stream).await
+                {
+                    println!(
+                        "[TIER-3 JAIL] Session ended for {}. Attacker sent {} bytes, Jail replied with {} bytes.",
+                        ip, from_attacker, from_jail
+                    );
+                    let session_log = format!(
+                        "JAIL_SESSION_END|IP={}|IN={}|OUT={}",
+                        ip, from_attacker, from_jail
+                    );
+                    let _ = send_log_to_orchestrator(&session_log);
+                }
+            }
+        }
+        None => {
+            let _ = run_embedded_mock_jail(&mut attacker_stream, initial_payload, ip).await;
+        }
+    };
+
+    let _ = attacker_stream.shutdown().await;
+    Ok(())
+}
+
+async fn run_embedded_mock_jail(
+    stream: &mut TcpStream,
+    initial_payload: &[u8],
+    ip: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    println!(
+        "[TIER-3 EMBEDDED TRAP] External jail offline. Engaging internal Async Mock Jail for IP: {}",
+        ip
+    );
+
+    if stream
+        .write_all(b"SSH-2.0-OpenSSH_8.2p1 Ubuntu-4ubuntu0.5\r\n")
+        .await
+        .is_err()
+    {
+        return Ok(());
+    }
+    let _ = stream.flush().await;
+
+    let mut buf = vec![0u8; 1024];
+    let mut captured_data = initial_payload.to_vec();
+
+    loop {
+        let read_res = timeout(Duration::from_secs(8), stream.read(&mut buf)).await;
+        match read_res {
+            Ok(Ok(0)) | Err(_) => break,
+            Ok(Ok(n)) => {
+                captured_data.extend_from_slice(buf.get(..n).unwrap_or_default());
+
+                let snippet = String::from_utf8_lossy(buf.get(..n.min(32)).unwrap_or_default())
+                    .chars()
+                    .filter(|c| c.is_ascii_graphic() || *c == ' ')
+                    .collect::<String>();
+
+                let chunk_log = format!(
+                    "EMBEDDED_JAIL_INPUT|IP={}|BYTES={}|SNIPPET={}",
+                    ip, n, snippet
+                );
+                let _ = send_log_to_orchestrator(&chunk_log);
+
+                if stream
+                    .write_all(b"Permission denied (publickey,password).\r\nlogin: ")
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                let _ = stream.flush().await;
+
+                if captured_data.len() > 1024 * 1024 {
+                    break;
+                }
+            }
+            Ok(Err(_)) => break,
+        }
+    }
+
+    let final_log = format!(
+        "EMBEDDED_TRAP_FINALISED|IP={}|TOTAL_CAPTURED={}",
+        ip,
+        captured_data.len()
+    );
+    let _ = send_log_to_orchestrator(&final_log);
+    println!(
+        "[TIER-3 EMBEDDED TRAP] Recorded {} bytes of interactive input from {}.",
+        captured_data.len(),
+        ip
+    );
+
+    Ok(())
+}
+
+/// Records a trap observation in the node's audit log (`DB_LOG:`), acknowledged like a signal.
+fn send_log_to_orchestrator(log_msg: &str) -> bool {
+    submit(format!("DB_LOG:{}", log_msg))
+}
+
+/// Asks the node to block `ip`, with the trap's reason recorded in its audit log. True means
+/// queued for delivery, not blocked: the node's answer is logged when it arrives.
+fn trigger_xdp_drop(ip: &str, reason: &str) -> bool {
+    submit(format!("SIGNAL:trident|{}|-|{}", ip, reason))
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    println!("======================================================");
+    println!("        SOKOL-CORE: MULTI-PORT DECOY TRAP (trident)    ");
+    println!("======================================================");
+
+    let config = match TrapConfig::from_env() {
+        Ok(config) => config,
+        Err(e) => {
+            eprintln!("[!] {}", e);
+            std::process::exit(1);
+        }
+    };
+    start_node_link(PathBuf::from(ipc_socket_path()));
+    UltimateTridentOrchestrator::new(config).run().await?;
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A node that serves one connection per scripted reply: ACK handshake, then that reply.
+    fn scripted_node(
+        path: &std::path::Path,
+        replies: Vec<&'static str>,
+    ) -> std::thread::JoinHandle<Vec<String>> {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::os::unix::net::UnixListener::bind(path).unwrap();
+        std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            for reply in replies {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                assert_eq!(line.trim(), "ACK");
+                stream.write_all(b"OK ack\n").unwrap();
+                line.clear();
+                reader.read_line(&mut line).unwrap();
+                seen.push(line.trim().to_string());
+                stream.write_all(reply.as_bytes()).unwrap();
+            }
+            seen
+        })
+    }
+
+    /// Review 2026-10-05 F1: a written line is not a delivered one. An unknown answer keeps the
+    /// signal queued and retries it; the node's refusal is reported as a refusal.
+    #[test]
+    fn a_signal_counts_only_once_the_node_answered_it() {
+        let dir = std::env::temp_dir().join(format!("trident-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        let socket = dir.join("node.sock");
+        let node = scripted_node(
+            &socket,
+            vec!["OK something else\n", "OK refused protected\n"],
+        );
+        let (tx, rx) = std::sync::mpsc::sync_channel(4);
+        tx.send("SIGNAL:trident|203.0.113.9|-|trap port 23: probe".to_string())
+            .unwrap();
+        drop(tx);
+        let mut reports = Vec::new();
+        run_delivery(rx, delivery::Outbox::new(&socket, 4), |r| reports.push(r));
+        let line = "SIGNAL:trident|203.0.113.9|-|trap port 23: probe".to_string();
+        assert_eq!(
+            node.join().unwrap(),
+            vec![line.clone(), line.clone()],
+            "sent again after the unknown answer"
+        );
+        assert!(
+            matches!(reports.first(), Some(Report::Retrying(_))),
+            "{:?}",
+            reports
+        );
+        assert_eq!(
+            reports.last(),
+            Some(&Report::Answered(
+                line,
+                delivery::Outcome::Refused("protected".into())
+            ))
+        );
+        assert_eq!(
+            reports
+                .iter()
+                .filter(|r| matches!(r, Report::Answered(..)))
+                .count(),
+            1,
+            "nothing counted as answered before the node answered: {:?}",
+            reports
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_line_the_outbox_cannot_frame_is_reported_not_sent() {
+        let (tx, rx) = std::sync::mpsc::sync_channel(4);
+        tx.send("SIGNAL:trident|203.0.113.9|-|a\nXDP_UNLOAD".to_string())
+            .unwrap();
+        drop(tx);
+        let mut reports = Vec::new();
+        run_delivery(
+            rx,
+            delivery::Outbox::new(std::path::Path::new("/nonexistent/sokol.sock"), 4),
+            |r| reports.push(r),
+        );
+        assert!(
+            matches!(reports.as_slice(), [Report::Rejected(..)]),
+            "{:?}",
+            reports
+        );
+    }
+
+    #[test]
+    fn defaults_avoid_the_p2p_and_admin_ssh_ports() {
+        let config = TrapConfig::parse(None, None).unwrap();
+        assert!(
+            !config.ports.contains(&8080),
+            "8080 is left to local services such as the CrowdSec Local API"
+        );
+        assert!(!config.ports.contains(&ADMIN_SSH_PORT));
+        assert!(
+            config.jail_addr.is_none(),
+            "no external jail unless configured"
+        );
+    }
+
+    #[test]
+    fn admin_ssh_port_can_be_neither_trap_nor_jail() {
+        assert!(TrapConfig::parse(Some("22,2222"), None).is_err());
+        assert!(TrapConfig::parse(None, Some("127.0.0.1:2222")).is_err());
+        let config = TrapConfig::parse(Some("23, 3389"), Some("127.0.0.1:2022")).unwrap();
+        assert_eq!(config.ports, vec![23, 3389]);
+        assert_eq!(config.jail_addr, Some("127.0.0.1:2022".parse().unwrap()));
+        assert!(TrapConfig::parse(Some("22,http"), None).is_err());
+    }
+}

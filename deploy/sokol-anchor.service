@@ -1,0 +1,18 @@
+# Stamps Sokol audit head statements with OpenTimestamps (ADR-0022, opt-in). Runs as its own
+# user with network access; the node unit is unchanged and contacts nothing. Setup:
+# docs/INTEGRATIONS.md, "Audit log".
+[Unit]
+Description=Sokol-Core audit head stamps (OpenTimestamps)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=sokol-anchor
+Group=sokol-anchor
+ExecStart=/usr/local/bin/sokol-anchor-ots /var/lib/sokol-anchors
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/sokol-anchors
+ProtectHome=read-only
+PrivateTmp=yes

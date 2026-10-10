@@ -1,0 +1,16 @@
+# nodes=20 netem='none' host=aarch64 cpus=10 kernel=6.8.0-142-generic
+# full mesh after 3s: 20/20 nodes see 19 peers
+# soak 60 min, TTL 300 s
+# t=600 s: node 16 restarted
+# t=900 s: node 11 cut off for 30 s
+# t=1201 s: node 20 restarted
+# t=1800 s: node 8 restarted
+# t=1800 s: node 10 cut off for 30 s
+# t=2400 s: node 11 restarted
+# t=2700 s: node 5 cut off for 30 s
+# t=3000 s: node 12 restarted
+# load done: 15665 events, 5 restarts, 3 cuts; settling 90 s
+PASS all 20 nodes agree on the active blocks (812 )
+PASS every audit chain verifies; no node panicked
+RSS growth after the first 5 min: min 6.3%, max 17.8% (per node)
+samples: /tmp/soak-long/soak.csv

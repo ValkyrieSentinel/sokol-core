@@ -1,0 +1,25 @@
+[package]
+name = "ebpf"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0-or-later"
+publish = false
+
+[[bin]]
+name = "ebpf-probe"
+path = "src/main.rs"
+test = false
+
+[dependencies]
+aya-ebpf = "0.2.1"
+common = { path = "../common", default-features = false }
+
+# Target and build-std live in .cargo/config.toml (cargo ignores them here).
+
+[profile.dev]
+opt-level = 3
+panic = "abort"
+
+[profile.release]
+opt-level = 3
+panic = "abort"

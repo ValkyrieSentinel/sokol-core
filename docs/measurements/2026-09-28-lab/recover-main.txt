@@ -1,0 +1,9 @@
+# nodes=10 netem='none' host=aarch64 cpus=10 kernel=6.8.0-142-generic
+# full mesh after 3s: 10/10 nodes see 9 peers
+# recover: 30000 signals at node 1, its link held to 8mbit
+# flood done in 11 s; node 1 dropped 263729 urgent broadcasts; control answered 21 times, max 15 ms
+PASS L1 control socket answered within 1000 ms during the flood (max 15 ms)
+PASS L3 all 10 nodes hold node 1's blocks (16384, envelope 16384) 62 s after the flood
+PASS L2 no maintenance tick over 500 ms
+PASS L4 no node has blocks waiting for the kernel map
+PASS L5 no node exited
