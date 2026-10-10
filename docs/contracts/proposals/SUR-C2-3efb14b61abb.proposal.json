@@ -1,0 +1,14 @@
+{
+  "after": null,
+  "base_contract_sha256": "16f815968c5f2dec55d14712eab6eec74e0431ccf095381a9c67e15a3b551eda",
+  "because": "Counterexample (hunt 2026-10-10): a cursor file named *.tmp was its own temporary file (with_extension), truncated in place before the new bytes were synced; a write failure left neither the old nor the new cursor. Fix: the temporary file is the cursor's name plus .tmp.",
+  "evidence_text": "`a_damaged_cursor_rereads_the_log_instead_of_skipping_it` (empty, truncated and non-JSON cursors; mutation \"damaged = missing\" fails it), `a_cursor_is_replaced_not_rewritten_in_place_whatever_its_name`",
+  "id": "SUR-C2",
+  "profile": "sokol.contract-proposal.v1",
+  "statement": "The saved cursor is replaced durably (temporary file synced, renamed, directory synced). A cursor file that exists but cannot be read or parsed starts reading the current file from its start, never its end; a missing cursor follows `--from-start`. Re-read alerts are bounded by the forwarding age and deduplicated by event id at the node.",
+  "status": "UNSIGNED_INTENT",
+  "witnesses": [
+    "a_cursor_is_replaced_not_rewritten_in_place_whatever_its_name",
+    "a_damaged_cursor_rereads_the_log_instead_of_skipping_it"
+  ]
+}

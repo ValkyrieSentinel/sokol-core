@@ -114,7 +114,36 @@ impl Conn {
         Ok(conn)
     }
 
+    /// A line is an answer to a request only if the node sent it after the request was written.
+    /// Bytes already waiting (buffered here or readable on the socket) were sent before: a surplus
+    /// or unsolicited line that would otherwise settle the next signal (IPC-A1). The connection is
+    /// then unusable and the caller drops it, keeping the signal queued.
+    fn quiet_before_request(&mut self) -> io::Result<()> {
+        let unsolicited = || {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "node sent bytes before the request",
+            )
+        };
+        if !self.reader.buffer().is_empty() {
+            return Err(unsolicited());
+        }
+        self.stream.set_nonblocking(true)?;
+        let probe = self.reader.fill_buf().map(|bytes| bytes.len());
+        self.stream.set_nonblocking(false)?;
+        match probe {
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(()),
+            Err(error) => Err(error),
+            Ok(0) => Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "node closed the connection",
+            )),
+            Ok(_) => Err(unsolicited()),
+        }
+    }
+
     fn exchange(&mut self, line: &str) -> io::Result<String> {
+        self.quiet_before_request()?;
         self.stream
             .write_all(format!("{}\n", line.trim_end()).as_bytes())?;
         self.stream.flush()?;
@@ -1176,5 +1205,65 @@ mod tests {
             .queue
             .iter()
             .all(|line| line.len() + 1 == MAX_SIGNAL_BYTES));
+    }
+
+    /// A node answering one request with two recognized lines: the second stays buffered and
+    /// must not settle the next signal, whose own answer is unknown (IPC-A1).
+    #[test]
+    fn a_surplus_answer_does_not_settle_the_next_signal() {
+        let path = temp_socket("surplus-answer");
+        let listener = UnixListener::bind(&path).unwrap();
+        let node = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let answers: [&[u8]; 3] = [b"OK ack\n", b"OK applied\nOK applied\n", b"OK unknown\n"];
+            for answer in answers {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                    return;
+                }
+                let _ = stream.write_all(answer);
+            }
+        });
+        let mut out = Outbox::new(&path, 4);
+        out.push("SIGNAL#1:test|203.0.113.1|-|x").unwrap();
+        out.push("SIGNAL#2:test|203.0.113.2|-|x").unwrap();
+        let (done, _) = out.flush(2);
+        let lines: Vec<&str> = done.iter().map(|(line, _)| line.as_str()).collect();
+        assert_eq!(lines, ["SIGNAL#1:test|203.0.113.1|-|x"]);
+        assert_eq!(
+            out.pending(),
+            1,
+            "#2 had no answer of its own and must stay queued"
+        );
+        drop(out);
+        node.join().unwrap();
+    }
+
+    /// A recognized line that arrives before the signal is written (here appended to the ACK
+    /// answer) is not its answer: a node that then stays silent leaves the signal queued.
+    #[test]
+    fn a_line_sent_before_the_request_does_not_retire_it() {
+        let path = temp_socket("before-request");
+        let listener = UnixListener::bind(&path).unwrap();
+        let node = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            stream.write_all(b"OK ack\nOK applied\n").unwrap();
+            line.clear();
+            let _ = reader.read_line(&mut line);
+        });
+        let mut out = Outbox::new(&path, 4);
+        out.push("SIGNAL#1:test|203.0.113.1|-|x").unwrap();
+        let (done, _) = out.flush(1);
+        assert!(
+            done.is_empty(),
+            "a line sent before the request retired it: {done:?}"
+        );
+        assert_eq!(out.pending(), 1);
+        drop(out);
+        node.join().unwrap();
     }
 }

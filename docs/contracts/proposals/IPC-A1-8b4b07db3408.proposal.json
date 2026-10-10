@@ -1,0 +1,16 @@
+{
+  "after": null,
+  "base_contract_sha256": "c08e1aa5a80ad5073af30994b1bfbc7e79b5f98d4090d3f890d87d31a42480d1",
+  "because": "Counterexample (hunt 2026-10-10): a recognized line already buffered before a signal was written was taken as its answer. A node answering one request with two lines settled the next signal, whose own answer was unknown, as Applied; a line appended to the ACK answer retired a signal the node never answered. Fix: Conn::exchange refuses bytes that arrived before the request and drops the connection, keeping the signal queued.",
+  "evidence_text": "`unknown_reply_keeps_the_obligation_and_a_later_ack_retires_it`, `an_unterminated_ack_does_not_retire_the_signal`, overflow test above, `a_line_sent_before_the_request_does_not_retire_it`, `a_surplus_answer_does_not_settle_the_next_signal`",
+  "id": "IPC-A1",
+  "profile": "sokol.contract-proposal.v1",
+  "statement": "Transport failure, unknown reply or missing terminating LF retains an unexpired obligation. A complete recognized final reply removes it; bounded overflow and an opt-in forwarding deadline are explicit, separately counted local loss paths. ACK outcome is node acceptance/refusal, not proof of durable storage or completed kernel enforcement.",
+  "status": "UNSIGNED_INTENT",
+  "witnesses": [
+    "a_line_sent_before_the_request_does_not_retire_it",
+    "a_surplus_answer_does_not_settle_the_next_signal",
+    "an_unterminated_ack_does_not_retire_the_signal",
+    "unknown_reply_keeps_the_obligation_and_a_later_ack_retires_it"
+  ]
+}
