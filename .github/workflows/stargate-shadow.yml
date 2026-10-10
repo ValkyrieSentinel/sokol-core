@@ -42,8 +42,10 @@ jobs:
         run: python .stargate-checker/integration/sokol_intents.py --sokol-root "$GITHUB_WORKSPACE"
       - name: Exact source for the frozen experiments
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        # This repository starts from one commit with no earlier history; the exact frozen
+        # commit lives in the bridge fork, which keeps the full upstream history.
         with:
-          repository: ${{ github.repository }}
+          repository: s0fractal/sokol-core-upstream
           ref: 5ffaf0854158f4674a470378279a4dd4d237f9fb
           path: .stargate-frozen-sokol
           persist-credentials: false

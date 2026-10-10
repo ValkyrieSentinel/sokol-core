@@ -227,6 +227,23 @@ jobs:
             grep -Fq "PASS live startup intent ${family}:" /tmp/sokol-cargo-test.log
           done
 
+      - name: Pinned witnesses unchanged without the owner's signature (ADR-0023)
+        if: matrix.policy_checks && matrix.part == 'test'
+        # The checker and the signers come from the base branch: a pull request that weakened
+        # a witness could otherwise also weaken the check or add its own key. Until the base
+        # has them (the pull request that introduces this check), the tree's own are used.
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          cp scripts/witness-pin.py /tmp/witness-pin-tree.py
+          cp .github/witness-signers /tmp/witness-signers
+          if git cat-file -e "$BASE:scripts/witness-pin.py" 2>/dev/null; then
+            git show "$BASE:scripts/witness-pin.py" > scripts/witness-pin.py
+            git show "$BASE:.github/witness-signers" > /tmp/witness-signers
+          fi
+          python3 scripts/witness-pin.py check --signers /tmp/witness-signers
+          cp /tmp/witness-pin-tree.py scripts/witness-pin.py
+
       - name: Cited evidence exists (tests in the compiler's list, metrics, flags, ADRs, paths)
         if: matrix.policy_checks && matrix.part == 'test'
         run: |
@@ -264,6 +281,8 @@ jobs:
           python3 scripts/test_mutants_diff.py
           python3 scripts/test_check_agents_rules.py
           python3 scripts/test_check_claims.py
+          python3 scripts/test_witness_pin.py
+          python3 scripts/test_outbox_task.py
 
       - name: CrowdSec stream recovery regression
         if: matrix.part == 'test'
