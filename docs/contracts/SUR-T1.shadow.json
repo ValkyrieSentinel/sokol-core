@@ -1,0 +1,12 @@
+{
+  "annotations": {
+    "status": "UNSIGNED_EXPLANATORY_DRAFT"
+  },
+  "evidence_text": "`forwarding_budget_ages_exactly_and_future_timestamps_cannot_enlarge_it`",
+  "id": "SUR-T1",
+  "profile": "sokol.contract-shadow.v1",
+  "statement": "A parsed timestamp consumes the configured age budget. Future timestamps grant at most that budget from observation. Integer conversion and local-clock addition are checked; stale/unrepresentable timestamps do not enqueue. Missing/invalid timestamps retain the untimed policy.",
+  "witnesses": [
+    "forwarding_budget_ages_exactly_and_future_timestamps_cannot_enlarge_it"
+  ]
+}

@@ -1,0 +1,13 @@
+{
+  "annotations": {
+    "status": "UNSIGNED_EXPLANATORY_DRAFT"
+  },
+  "evidence_text": "`explicit_audit_gaps_fence_dependent_decisions`, `a_gap_alone_prevents_a_successful_cli_result` (real chained files)",
+  "id": "REPLAY-R5",
+  "profile": "sokol.contract-shadow.v1",
+  "statement": "Explicit loss markers fence dependent replay until a usable start. Any marker prevents CLI 0, including a tail/pre-context gap; known mismatches retain 1.",
+  "witnesses": [
+    "a_gap_alone_prevents_a_successful_cli_result",
+    "explicit_audit_gaps_fence_dependent_decisions"
+  ]
+}

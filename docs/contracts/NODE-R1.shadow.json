@@ -1,0 +1,15 @@
+{
+  "annotations": {
+    "status": "UNSIGNED_EXPLANATORY_DRAFT"
+  },
+  "evidence_text": "`a_capacity_refusal_preserves_retraction_intent_for_retry`, `a_shortening_capacity_refusal_keeps_both_event_supports`, `retraction_admission_reserves_every_needed_record`, `a_full_retractor_set_preserves_support_until_its_owner_fits`",
+  "id": "NODE-R1",
+  "profile": "sokol.contract-shadow.v1",
+  "statement": "When an identified event requires lifting/shortening own detector claims, capacity is checked for every missing retraction record, owner entry and replacement claim before support removal or replay-marker insertion. Capacity refusal preserves claims, support and event memory; after capacity is freed the same explicit request remains eligible.",
+  "witnesses": [
+    "a_capacity_refusal_preserves_retraction_intent_for_retry",
+    "a_full_retractor_set_preserves_support_until_its_owner_fits",
+    "a_shortening_capacity_refusal_keeps_both_event_supports",
+    "retraction_admission_reserves_every_needed_record"
+  ]
+}

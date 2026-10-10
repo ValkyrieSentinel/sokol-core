@@ -1,0 +1,14 @@
+{
+  "annotations": {
+    "status": "UNSIGNED_EXPLANATORY_DRAFT"
+  },
+  "evidence_text": "`every_gate_refusal_has_one_counted_policy_reason`, `gate_refusal_counters_saturate_independently`; per-step accounting over 10,000 attempts in `gate_generated_history_preserves_cooldown_and_bounded_unique_memory`",
+  "id": "SUR-G4",
+  "profile": "sokol.contract-shadow.v1",
+  "statement": "Every `Gate::admit` attempt either admits or routes exactly one refusal reason to its saturating counter: cooldown first, then rate, then capacity. Admission increments no refusal counter; refusing creates no new cooldown or rate slot. Before any category saturates, attempted count equals admissions plus the three refusal counts.",
+  "witnesses": [
+    "every_gate_refusal_has_one_counted_policy_reason",
+    "gate_generated_history_preserves_cooldown_and_bounded_unique_memory",
+    "gate_refusal_counters_saturate_independently"
+  ]
+}

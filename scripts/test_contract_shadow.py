@@ -22,6 +22,9 @@ class ContractShadow(unittest.TestCase):
             path = self.root / name
             path.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(ROOT / name, path)
+        # Every row is generated (ADR-0024), so the gate needs every contract, not only IPC-A1's.
+        for source in (ROOT / 'docs/contracts').glob('*.shadow.json'):
+            shutil.copyfile(source, self.root / 'docs/contracts' / source.name)
 
     def tearDown(self):
         self.temp.cleanup()
@@ -104,12 +107,14 @@ class ContractShadow(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'stale'):
             gate.rows()
 
-    def test_removed_marker_cannot_detach_source_from_gate(self):
+    def test_removed_declaration_cannot_detach_sources_from_gate(self):
         path = self.root / 'docs/INVARIANTS.md'
         text = path.read_text()
-        path.write_text('\n'.join(x for x in text.splitlines() if not x.startswith('<!-- Generated IPC-A1')))
+        path.write_text('\n'.join(x for x in text.splitlines() if not x.startswith('<!-- Every invariant row')))
         with self.assertRaisesRegex(ValueError, 'generated IPC-A1 slot'):
             tool.project(self.root)
+        with self.assertRaisesRegex(ValueError, 'generated [A-Z0-9-]+ slot'):
+            self.gate().rows()
 
     def gate(self):
         spec = importlib.util.spec_from_file_location('generic_gate', self.root / 'scripts/witness-pin.py')
@@ -125,7 +130,7 @@ class ContractShadow(unittest.TestCase):
             contract = {**base, 'id': rid, 'statement': 'A second independent contract.'}
             source = self.root / ('docs/contracts/' + rid + '.shadow.json')
             source.write_text(json.dumps(contract))
-            path.write_text(path.read_text() + '\n' + gate.contract_row(contract) + '\n' + gate.contract_marker(rid) + '\n')
+            path.write_text(path.read_text() + '\n' + gate.contract_row(contract) + '\n')
         rows = gate.rows()
         self.assertIn('DEMO-A2', rows)
         self.assertIn('QUEUE-B7', rows)
@@ -137,16 +142,16 @@ class ContractShadow(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'filename differs'):
             self.gate().rows()
 
-    def test_missing_source_keeps_marker_unresolved(self):
+    def test_missing_source_leaves_its_row_unbacked(self):
         (self.root / tool.SOURCE).unlink()
-        with self.assertRaisesRegex(ValueError, 'markers and contract sources differ'):
+        with self.assertRaisesRegex(ValueError, 'IPC-A1 has no contract source'):
             self.gate().rows()
 
     def test_duplicate_row_cannot_override_a_generated_row(self):
         path = self.root / 'docs/INVARIANTS.md'
         row = next(x for x in path.read_text().splitlines() if x.startswith('| IPC-A1 |'))
         path.write_text(path.read_text() + row + '\n')
-        with self.assertRaisesRegex(ValueError, 'ambiguous generated'):
+        with self.assertRaisesRegex(ValueError, 'needs exactly one row'):
             self.gate().rows()
 
     def test_symlink_input_is_refused(self):

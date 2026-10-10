@@ -1,0 +1,13 @@
+{
+  "annotations": {
+    "status": "UNSIGNED_EXPLANATORY_DRAFT"
+  },
+  "evidence_text": "`a_read_error_preserves_completed_alerts_and_unfinished_bytes`, `read_errors_before_a_complete_line_preserve_the_cursor_and_retry_bytes` (fault injected through the actual buffered scanner).",
+  "id": "SUR-R1",
+  "profile": "sokol.contract-shadow.v1",
+  "statement": "Complete records read before a later I/O error are returned alongside the error; unfinished bytes and their starting position survive for retry. Byte/line quotas still apply.",
+  "witnesses": [
+    "a_read_error_preserves_completed_alerts_and_unfinished_bytes",
+    "read_errors_before_a_complete_line_preserve_the_cursor_and_retry_bytes"
+  ]
+}

@@ -1,0 +1,13 @@
+{
+  "annotations": {
+    "status": "UNSIGNED_EXPLANATORY_DRAFT"
+  },
+  "evidence_text": "`a_retraction_capacity_refusal_is_not_an_ipc_success`, `a_retraction_capacity_refusal_is_a_final_refusal_not_a_recorded_effect`",
+  "id": "NODE-R3",
+  "profile": "sokol.contract-shadow.v1",
+  "statement": "Capacity refusal is reported as `refused` in audit/metrics and `OK refused retraction state capacity` over IPC. The outbox classifies it as a final refusal, not a recorded lift or transport retry.",
+  "witnesses": [
+    "a_retraction_capacity_refusal_is_a_final_refusal_not_a_recorded_effect",
+    "a_retraction_capacity_refusal_is_not_an_ipc_success"
+  ]
+}

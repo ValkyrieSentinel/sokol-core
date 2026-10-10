@@ -50,7 +50,16 @@ def project(root, signers=None):
     checker = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(checker)
     generated_row = checker.contract_row(contract)
-    document = checker.project_invariants(inputs['docs/INVARIANTS.md'].decode(), contract)
+    document = inputs['docs/INVARIANTS.md'].decode()
+    if checker.DECLARATION in document:
+        lines = document.splitlines(keepends=True)
+        slots = [i for i, line in enumerate(lines) if line.startswith('| IPC-A1 |')]
+        if len(slots) != 1:
+            raise ValueError('Missing or ambiguous generated IPC-A1 row')
+        lines[slots[0]] = generated_row + '\n'
+        document = ''.join(lines)
+    else:
+        document = checker.project_invariants(document, contract)
     pin = json.loads(inputs['docs/witness-manifest.json'])
     trust = Path(signers).resolve() if signers else root / '.github/witness-signers'
     trust_bytes = read(trust.parent, trust.name)
