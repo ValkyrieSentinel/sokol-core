@@ -1,0 +1,15 @@
+{
+  "after": null,
+  "base_contract_sha256": "7dd3dfcdc754e50f9a6cf2e0d9d010945108a5968ad7678bb734c4c6f87fe35a",
+  "because": "Counterexample (hunt 2026-10-10): a head witnessed for 0 records of a log whose start is pruned was reported confirmed although nothing retained was compared. Fix: it is Pruned (unknown).",
+  "evidence_text": "`a_witnessed_head_exposes_a_recomputed_rewrite_that_the_chain_alone_accepts`, `a_peers_witness_confirms_the_log_and_exposes_a_recomputed_rewrite` (mutation \"compare without the head\" fails both), `a_head_for_zero_records_of_a_pruned_log_is_not_confirmed`",
+  "id": "AUDIT-W1",
+  "profile": "sokol.contract-proposal.v1",
+  "statement": "A head witnessed for \"after N records\" is compared with this log's record N-1 after both chains verify. A different chain value is a contradiction even when the rewritten chain verifies on its own; fewer records than witnessed is missing; a pruned record is unknown, never confirmed.",
+  "status": "UNSIGNED_INTENT",
+  "witnesses": [
+    "a_head_for_zero_records_of_a_pruned_log_is_not_confirmed",
+    "a_peers_witness_confirms_the_log_and_exposes_a_recomputed_rewrite",
+    "a_witnessed_head_exposes_a_recomputed_rewrite_that_the_chain_alone_accepts"
+  ]
+}

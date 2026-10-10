@@ -150,6 +150,16 @@ class ContractTool(unittest.TestCase):
         self.assertEqual(c['witnesses'], ['a_late_ack_retires_the_obligation', 'an_unknown_reply_keeps_the_obligation'])
         self.assertFalse(list((self.dir / 'docs/contracts/proposals').glob('*.proposal.json')))
 
+    def test_an_added_witness_keeps_the_existing_evidence_prose(self):
+        c = self.read_contract('T-2')
+        c['evidence_text'] = '`an_unknown_reply_keeps_the_obligation`, overflow test above.'
+        self.write_contract(c)
+        name = self.tool('propose', 'T-2', '--witness', 'an_unknown_reply_keeps_the_obligation',
+                         '--witness', 'a_late_ack_retires_the_obligation', '--because', 'x').stdout.strip()
+        proposal = json.loads((self.dir / name).read_text())
+        self.assertEqual(proposal['evidence_text'], '`an_unknown_reply_keeps_the_obligation`, overflow test '
+                         'above, `a_late_ack_retires_the_obligation`')
+
     def test_a_rewritten_decision_history_is_refused(self):
         name = self.tool('propose', 'T-1', '--statement', 'Stronger.', '--because', 'real reason').stdout.strip()
         self.assertEqual(self.tool('accept', name, '--key', self.key).returncode, 0)
