@@ -1,12 +1,18 @@
 {
-  "after": "NODE-R4",
-  "base_contract_sha256": null,
-  "because": "Counterexample (hunt round 3, 2026-10-10): signal, the target becomes a host address (claim suspended, ADR-0012), RETRACT answered 'OK nothing held' and broadcast nothing; when the address left the host the block came back on a reason the detector took back, and peers kept enforcing it.",
+  "annotations": {
+    "status": "UNSIGNED_EXPLANATORY_DRAFT"
+  },
+  "decisions": [
+    {
+      "because": "Counterexample (hunt round 3, 2026-10-10): signal, the target becomes a host address (claim suspended, ADR-0012), RETRACT answered 'OK nothing held' and broadcast nothing; when the address left the host the block came back on a reason the detector took back, and peers kept enforcing it.",
+      "previous_statement_sha256": null,
+      "proposal_sha256": "f87d9d9850436d9f96e0e884fc9ca779403f11a665272ce356cc9d9ded30a975"
+    }
+  ],
   "evidence_text": "`a_block_shortened_while_protected_stays_suspended_until_the_target_is_allowed`, `a_retraction_while_the_target_is_protected_takes_its_claim_back_mesh_wide`",
   "id": "NODE-R5",
-  "profile": "sokol.contract-proposal.v1",
+  "profile": "sokol.contract-shadow.v1",
   "statement": "A retraction that removes an event's support retracts, mesh-wide, every own detector claim on the target that no remaining support holds, also one the protected set suspends now; such a claim does not come back when the target leaves the host.",
-  "status": "UNSIGNED_INTENT",
   "witnesses": [
     "a_block_shortened_while_protected_stays_suspended_until_the_target_is_allowed",
     "a_retraction_while_the_target_is_protected_takes_its_claim_back_mesh_wide"

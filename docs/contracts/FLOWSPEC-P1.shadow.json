@@ -1,0 +1,20 @@
+{
+  "annotations": {
+    "status": "UNSIGNED_EXPLANATORY_DRAFT"
+  },
+  "decisions": [
+    {
+      "because": "Counterexample (hunt round 3, 2026-10-10): a gobgp -j reply naming one destination twice (a foreign local path, then []) parsed as a healthy empty RIB, and the round wrote over the foreign path (FLOWSPEC-R3, R4).",
+      "previous_statement_sha256": null,
+      "proposal_sha256": "36556063468e36855f618fab05e1432480ba9241ae46e7f9cd5d5d70b423165f"
+    }
+  ],
+  "evidence_text": "`a_repeated_key_inside_a_path_is_rejected_and_authorizes_no_withdrawal`, `a_repeated_rib_key_cannot_hide_a_foreign_path_from_the_round`",
+  "id": "FLOWSPEC-P1",
+  "profile": "sokol.contract-shadow.v1",
+  "statement": "A RIB read that repeats an object key at any level is unusable: it classifies no path and authorizes no write.",
+  "witnesses": [
+    "a_repeated_key_inside_a_path_is_rejected_and_authorizes_no_withdrawal",
+    "a_repeated_rib_key_cannot_hide_a_foreign_path_from_the_round"
+  ]
+}

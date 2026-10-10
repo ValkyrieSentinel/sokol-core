@@ -1,0 +1,20 @@
+{
+  "annotations": {
+    "status": "UNSIGNED_EXPLANATORY_DRAFT"
+  },
+  "decisions": [
+    {
+      "because": "Counterexample (hunt round 3, 2026-10-10): a 1500-byte line was run as two commands with two replies, against control.rs 'one command per line, one reply line each'.",
+      "previous_statement_sha256": null,
+      "proposal_sha256": "39dafcbcf0866aabc870c8330b9b6bd36425c27d08791f24612712992f943c3a"
+    }
+  ],
+  "evidence_text": "`an_overlong_line_gets_one_error_and_runs_no_command`, `normal_lines_still_run_one_command_each`",
+  "id": "CONTROL-L1",
+  "profile": "sokol.contract-shadow.v1",
+  "statement": "The control socket runs one command per line: a line that reaches the 1024-byte limit without a newline gets one error, runs no command and closes the connection.",
+  "witnesses": [
+    "an_overlong_line_gets_one_error_and_runs_no_command",
+    "normal_lines_still_run_one_command_each"
+  ]
+}
