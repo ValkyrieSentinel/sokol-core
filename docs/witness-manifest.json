@@ -18,8 +18,8 @@
   "NODE-R1": "4618ac4d2bb0c89369d0a8b83d84cb96e1b22f630db08c56320e0b25022bcb15",
   "NODE-R2": "3ebe18170f979f75008aa350f225e2afbb617ed4960d90b6568053bd7bc9bd71",
   "NODE-R3": "745bb8369c5b678cc8cfd1e12a53cf61b32c027792f0d9f66b915eb0913f646a",
-  "NODE-R4": "0cb87a3cc46b51aa6e3fbcbcb9ea3c9a02c0b0e631484b69b5f52c158a737ac8",
-  "NODE-R5": "f82ae945fff5ef7fb82f236c238e9acbf34d72a713eeb1d568398bb239f67834",
+  "NODE-R4": "8cf92b49ba813fd0f9065d7877260af8b9767edd0eb63b977928799166b467e5",
+  "NODE-R5": "9b6a8bf99e620cb06f68e6c4121c881c37d676d5be4cfa18c49626b6a389451d",
   "REPLAY-R1": "02e461a6ac12481a554c9af346378ed023100fce66f6a26224c20d8d84c68d4e",
   "REPLAY-R2": "6234809388ac9d18ef96ea855bfc54ac8fecf0527d28da8587977e2faaab0352",
   "REPLAY-R3": "3c228c7d000e878bc3643046f6b789ca25d8dd840e9dc43d1b9fe1c302986018",
@@ -185,6 +185,7 @@
   "NODE-R4": {
    "statement": "850d42cca881271d5e80b567297dcd8ee46b507d94d997ed23d16ca822da4658",
    "witnesses": [
+    "a_remaining_reason_with_the_same_end_keeps_the_block_unchanged",
     "a_shortened_block_stays_blocked_until_the_remaining_reason_ends"
    ]
   },
@@ -192,6 +193,7 @@
    "statement": "8a972cd7c4d184bb521badb547482ca4b6226ad4a9d27d2f3345ca516fbd9307",
    "witnesses": [
     "a_block_shortened_while_protected_stays_suspended_until_the_target_is_allowed",
+    "a_retraction_at_the_claims_exact_end_finds_nothing_standing",
     "a_retraction_while_the_target_is_protected_takes_its_claim_back_mesh_wide"
    ]
   },
@@ -426,6 +428,9 @@
   "a_real_source_ttl_survives_reason_decoys": [
    "orchestrator/src/replay.rs:978d1605b4b93ade5db25305d610d3a5416ac0512d8f3e4602d00e558b6320f4"
   ],
+  "a_remaining_reason_with_the_same_end_keeps_the_block_unchanged": [
+   "orchestrator/src/block_table.rs:d2cbb141deffafcd392606132acd5de97e643dc9011cc28243c32d36e33f821a"
+  ],
   "a_repeated_key_inside_a_path_is_rejected_and_authorizes_no_withdrawal": [
    "orchestrator/src/flowspec.rs:b0fe568fd1cde0292ea2450d1c2e49fd4cf5b5282c5d8a19b7c58af1140e72cc"
   ],
@@ -437,6 +442,9 @@
   ],
   "a_retraction_answers_lifted_only_when_nothing_else_blocks_the_target": [
    "orchestrator/src/ipc.rs:be79fed2c10d060d653847b9f36ff657287dab5131ae7ff9d3bf8d09607c063f"
+  ],
+  "a_retraction_at_the_claims_exact_end_finds_nothing_standing": [
+   "orchestrator/src/block_table.rs:8e18dce33c717a93b9785ec273ddd85bdf7267025459a9de8bf4ddf37dd9889d"
   ],
   "a_retraction_capacity_refusal_is_a_final_refusal_not_a_recorded_effect": [
    "orchestrator/src/delivery.rs:2dfa88fe20c73afa55f1ad93b0a9f26a17056d2ab0aed2ce1e16e02e0f015bc6"
