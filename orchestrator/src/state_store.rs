@@ -313,7 +313,7 @@ fn writer_loop(path: &Path, rx: &mpsc::Receiver<()>, shared: &Shared, write: &Wr
 pub fn save_state(path: &Path, state: &Persisted) -> std::io::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
-    let tmp = path.with_extension("tmp");
+    let tmp = state_tmp(path);
     let mut f = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
@@ -330,16 +330,31 @@ pub fn save_state(path: &Path, state: &Persisted) -> std::io::Result<()> {
     Ok(())
 }
 
+/// The temporary file a state is written through: the state file's own name plus `.tmp`, as
+/// `sokol-suricata` does for its cursor. `with_extension("tmp")` would be the state file itself
+/// for `--state-file sokol.tmp`, and the save would truncate it in place instead of replacing it
+/// atomically (ADR-0004).
+fn state_tmp(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(".tmp");
+    PathBuf::from(name)
+}
+
 /// `Ok(None)`: no state file (a first start).
 pub fn read_state(path: &Path) -> Result<Option<Persisted>, Restore> {
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => {
+            // An unreadable regular file (EACCES, EIO) is not a first start either, and the next
+            // save would rename over it: keep it aside like an unparseable one. The hard link
+            // needs no read permission. A directory or another non-regular path has no bytes
+            // to keep.
+            let regular = std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_file());
             return Err(Restore::Failed {
                 why: format!("cannot read {}: {}", path.display(), e),
-                kept: None,
-            })
+                kept: if regular { keep_aside(path) } else { None },
+            });
         }
     };
     // The layout is checked first, so a file of another schema is named as such, not as corrupt.
@@ -748,6 +763,56 @@ mod tests {
             matches!(read_state(&dir), Err(Restore::Failed { kept: None, .. })),
             "an unreadable path is a failure, not a first start"
         );
+    }
+
+    #[test]
+    fn an_unreadable_state_file_is_kept_aside_and_survives_the_next_save() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = temp("unreadable");
+        save_state(&path, &state(1)).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        assert!(
+            std::fs::read(&path).is_err(),
+            "the witness needs a non-root user: mode 000 must make the file unreadable"
+        );
+        let kept = match read_state(&path) {
+            Err(Restore::Failed { kept, .. }) => kept,
+            other => panic!("expected a failed restore, got {:?}", other),
+        };
+        assert_eq!(
+            kept,
+            Some(path.with_extension("json.corrupt")),
+            "an unreadable file is kept aside under the first free name"
+        );
+        save_state(&path, &state(2)).unwrap();
+        let kept = path.with_extension("json.corrupt");
+        std::fs::set_permissions(&kept, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            std::fs::read(&kept).unwrap(),
+            original,
+            "the kept bytes survive the next save"
+        );
+        assert_eq!(read_state(&path), Ok(Some(state(2))));
+    }
+
+    #[test]
+    fn a_save_replaces_the_state_file_atomically_whatever_its_name() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = temp("atomic");
+        for name in ["state.json", "sokol.tmp"] {
+            let path = dir.with_file_name(name);
+            save_state(&path, &state(1)).unwrap();
+            let before = std::fs::metadata(&path).unwrap().ino();
+            save_state(&path, &state(2)).unwrap();
+            assert_ne!(
+                std::fs::metadata(&path).unwrap().ino(),
+                before,
+                "{}: a save renames a new file over the state, not rewrites it in place",
+                name
+            );
+            assert_eq!(read_state(&path), Ok(Some(state(2))), "{}", name);
+        }
     }
 
     #[test]

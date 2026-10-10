@@ -321,6 +321,9 @@ impl Quorum {
 /// Known claims (and retraction records) beyond this are refused (a flooding peer cannot exhaust memory).
 pub const MAX_KNOWN_CLAIMS: usize = 4 * common::BLOCKLIST_CAPACITY as usize;
 
+/// Why a new claim is refused at MAX_KNOWN_CLAIMS; the IPC answer names it (`ipc::enforcement_reply`).
+pub const TOO_MANY_CLAIMS: &str = "too many known claims";
+
 struct Held {
     claim: Claim,
     net: IpNet,
@@ -420,6 +423,15 @@ impl Default for Persisted {
             support: Vec::new(),
         }
     }
+}
+
+/// What a restore left out to keep each table within its runtime bound.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Dropped {
+    claims: usize,
+    retractions: usize,
+    events: usize,
+    support: usize,
 }
 
 /// Durable part of the table (ADR-4): this node's own decisions and lifts.
@@ -1123,7 +1135,8 @@ impl<B: Blocklist> BlockTable<B> {
     }
 
     /// A detector takes back one of its events (ADR-0019). The event stops holding the block;
-    /// this node's own detector claims on `net` are retracted mesh-wide only when no other
+    /// this node's own detector claims on `net` (also those the protected set suspends here,
+    /// ADR-0012) are retracted mesh-wide only when no other
     /// reason (another event, of any source, or one without an id) still holds it, and are
     /// replaced by a shorter claim when the remaining reasons end earlier. A retraction that
     /// arrives before its signal is remembered, so the signal adds nothing.
@@ -1164,8 +1177,11 @@ impl<B: Blocklist> BlockTable<B> {
             .support
             .get(&net)
             .is_some_and(|list| list.iter().any(|s| s.event == Some(key)));
+        // Every own detector claim that still stands, also one the protected set suspends now
+        // (ADR-0012): it would come back when the target leaves the host, and peers that
+        // adopted it enforce it meanwhile, so the retraction must reach it too.
         let own = if supported {
-            self.own_effective(net, ClaimKind::Detector, now_ms)
+            self.own_standing(net, now_ms)
         } else {
             Vec::new()
         };
@@ -1222,14 +1238,20 @@ impl<B: Blocklist> BlockTable<B> {
             // The rest holds at least as long as the running block: nothing changes.
             Some(None) => return DetectorRetraction::StillHeld,
             Some(Some(end)) if longest.is_none_or(|l| end < l) => {
-                let reason = own
+                let (reason, allowed) = own
                     .iter()
                     .filter_map(|(id, _)| self.claims.get(id))
                     .max_by_key(|h| h.end_local.unwrap_or(u64::MAX))
-                    .map(|h| h.claim.reason.clone())
+                    .map(|h| (h.claim.reason.clone(), h.allowed))
                     .unwrap_or_default();
                 // Issued before the old claims go, so the target is never unblocked between.
-                Some(self.issue_own(net, ClaimKind::Detector, &reason, now_ms, Some(end)))
+                let claim = self.issue_own(net, ClaimKind::Detector, &reason, now_ms, Some(end));
+                // The never-block verdict is the target's, not the claim's: a shorter claim on a
+                // target the protected set suspends stays suspended until `recheck` says otherwise.
+                if let Some(h) = self.claims.get_mut(&claim.id()) {
+                    h.allowed = allowed;
+                }
+                Some(claim)
             }
             Some(Some(_)) => return DetectorRetraction::StillHeld,
         };
@@ -1295,6 +1317,26 @@ impl<B: Blocklist> BlockTable<B> {
                 (h.claim.issuer == self.node_id
                     && h.claim.kind == kind
                     && self.effective(id, h, now_ms))
+                .then(|| (id.clone(), h.end_local))
+            })
+            .collect()
+    }
+
+    /// This node's own detector claims on `net` that still stand (not retracted, not past their
+    /// local end), whether or not the never-block policy suspends them now. Unlike
+    /// [`Self::own_effective`] this includes a claim that is not enforced here only because its
+    /// target is protected: it is still in force on peers and returns here when `recheck` allows.
+    fn own_standing(&self, net: IpNet, now_ms: u64) -> Vec<(ClaimId, Option<u64>)> {
+        self.by_target
+            .get(&net)
+            .into_iter()
+            .flatten()
+            .filter_map(|id| {
+                let h = self.claims.get(id)?;
+                (h.claim.issuer == self.node_id
+                    && h.claim.kind == ClaimKind::Detector
+                    && h.until_ms.is_none_or(|u| u > now_ms)
+                    && !self.retracted(id, h))
                 .then(|| (id.clone(), h.end_local))
             })
             .collect()
@@ -1366,7 +1408,7 @@ impl<B: Blocklist> BlockTable<B> {
             }
         }
         if self.claims.len() >= MAX_KNOWN_CLAIMS {
-            return Err("too many known claims");
+            return Err(TOO_MANY_CLAIMS);
         }
         if strike_due {
             self.strike(net, now_ms);
@@ -1424,7 +1466,7 @@ impl<B: Blocklist> BlockTable<B> {
             return Adoption::Refused("expired");
         }
         if self.claims.len() >= MAX_KNOWN_CLAIMS {
-            return Adoption::Refused("too many known claims");
+            return Adoption::Refused(TOO_MANY_CLAIMS);
         }
         let envelope = *self.envelope(claim.issuer);
         let cap = now_ms.saturating_add(ms(self.policy.max.min(envelope.max_ttl)));
@@ -1840,6 +1882,14 @@ impl<B: Blocklist> BlockTable<B> {
         self.applied.contains(&canonical(net))
     }
 
+    /// Whether `net` is still blocked on this node, applied or meant to be: a kernel entry is
+    /// in place (a failed delete leaves one), or an effective claim wants one (a failed write
+    /// leaves none yet). Only when neither holds may an answer say the block is gone.
+    pub fn still_blocks(&self, net: IpNet, now_ms: u64) -> bool {
+        let net = canonical(net);
+        self.applied.contains(&net) || self.wanted(&net, now_ms)
+    }
+
     /// What this node sends a peer (R26-01): only its own live detector claims and its own
     /// retractions. A node speaks only for itself; other nodes' claims come from those nodes, so
     /// a relay cannot introduce claims (or quorum votes) in another node's name.
@@ -2006,6 +2056,12 @@ impl<B: Blocklist> BlockTable<B> {
             .collect();
         events.sort_by_key(|(_, seen)| *seen);
         let skip = events.len().saturating_sub(MAX_EVENTS);
+        // The runtime bound holds from the first moment: the oldest are dropped, as
+        // `record_event` would have done.
+        let mut dropped = Dropped {
+            events: skip,
+            ..Dropped::default()
+        };
         for (key, seen) in events.into_iter().skip(skip) {
             self.events.insert(key, seen);
             self.event_order.push_back((key, seen));
@@ -2025,7 +2081,15 @@ impl<B: Blocklist> BlockTable<B> {
                 };
                 let until = until.map(|u| self.to_local(u));
                 if until.is_none_or(|u| u > now_ms) {
-                    self.note_support(canonical(net), event, until);
+                    let net = canonical(net);
+                    // `note_support` refuses a new target past MAX_SUPPORT_TARGETS; counted here
+                    // so the loss is visible. Such a block holds, but cannot be retracted.
+                    if !self.support.contains_key(&net) && self.support.len() >= MAX_SUPPORT_TARGETS
+                    {
+                        dropped.support += 1;
+                        continue;
+                    }
+                    self.note_support(net, event, until);
                 }
             }
         }
@@ -2035,16 +2099,29 @@ impl<B: Blocklist> BlockTable<B> {
                 self.lease_ends.insert(id, (end, expires));
             }
         }
+        // Retraction records share MAX_KNOWN_CLAIMS as at runtime (`retract`, `adopt`). Operator
+        // lifts come first: they are local only, no peer can resend them. A record that merges
+        // into one already restored takes no new room.
         for (id, forget_ms) in state.operator_lifts {
+            if !self.retractions.contains_key(&id) && self.retractions_full() {
+                dropped.retractions += 1;
+                continue;
+            }
             let forget_ms = forget_ms.map(|f| self.to_local(f));
             let r = self.retractions.entry(id).or_default();
             r.operator = true;
             r.forget_ms = forget_ms;
         }
         for (id, forget_ms) in state.retracted {
+            if !self.retractions.contains_key(&id) && self.retractions_full() {
+                dropped.retractions += 1;
+                continue;
+            }
             let forget_ms = forget_ms.map(|f| self.to_local(f));
             let r = self.retractions.entry(id).or_default();
-            r.by_nodes.push(self.node_id);
+            if !r.by_nodes.contains(&self.node_id) {
+                r.by_nodes.push(self.node_id);
+            }
             r.forget_ms = forget_ms;
         }
         let (mut restored, mut refused) = (0, 0);
@@ -2059,6 +2136,12 @@ impl<B: Blocklist> BlockTable<B> {
                 || !self.claim_live(&claim, now_ms)
             {
                 refused += 1;
+                continue;
+            }
+            // MAX_KNOWN_CLAIMS bounds the claims as at runtime (`add_claim` refuses past it).
+            if !self.claims.contains_key(&claim.id()) && self.claims.len() >= MAX_KNOWN_CLAIMS {
+                refused += 1;
+                dropped.claims += 1;
                 continue;
             }
             let ok = allowed(net);
@@ -2081,6 +2164,16 @@ impl<B: Blocklist> BlockTable<B> {
                 },
             );
             nets.push(net);
+        }
+        if dropped != Dropped::default() {
+            log::warn!(
+                "[State] Restore past the runtime bounds: dropped {} claims (counted as refused), \
+                 {} retraction records, {} events, {} support targets",
+                dropped.claims,
+                dropped.retractions,
+                dropped.events,
+                dropped.support
+            );
         }
         self.settle(nets, now_ms);
         (restored, refused)
@@ -2582,6 +2675,70 @@ mod tests {
             t.retract_detection("crowdsec", "17", ip("203.0.113.9"), T0 + 2 * S),
             DetectorRetraction::Duplicate
         );
+    }
+
+    #[test]
+    fn a_retraction_while_the_target_is_protected_takes_its_claim_back_mesh_wide() {
+        // K1: the claim is suspended, not gone, while the address is the host's (ADR-0012). A
+        // retraction then must still reach it, or the block returns when the address leaves
+        // the host, and peers that adopted the claim keep it for the rest of its TTL.
+        let target = ip("203.0.113.9");
+        let mut t = table(1, 64);
+        let claim = signal(&mut t, "crowdsec", "17", "203.0.113.9", T0, Some(600))
+            .unwrap()
+            .claim;
+        t.recheck(|net| net != target, T0 + S);
+        assert!(!t.is_blocked(target), "suspended while protected");
+        let out = t.retract_detection("crowdsec", "17", target, T0 + 2 * S);
+        let DetectorRetraction::Lifted {
+            retracted,
+            reissued: None,
+            ..
+        } = &out
+        else {
+            panic!("expected the claim taken back, got {:?}", out);
+        };
+        assert_eq!(retracted, &vec![claim.id()]);
+        assert!(
+            t.retractions
+                .get(&claim.id())
+                .is_some_and(|r| r.by_nodes.contains(&1)),
+            "in this node's own retractions, which go to its peers"
+        );
+        assert!(!t.still_blocks(target, T0 + 2 * S));
+        t.recheck(|_| true, T0 + 3 * S);
+        assert!(
+            !t.is_blocked(target),
+            "a reason the detector took back does not return with the address"
+        );
+    }
+
+    #[test]
+    fn a_block_shortened_while_protected_stays_suspended_until_the_target_is_allowed() {
+        // The shorter claim inherits the target's never-block verdict: issuing it must not
+        // enforce a block on an address the host holds now.
+        let target = ip("203.0.113.9");
+        let mut t = table(1, 64);
+        signal(&mut t, "crowdsec", "17", "203.0.113.9", T0, Some(600)).unwrap();
+        signal(&mut t, "suricata", "5", "203.0.113.9", T0 + S, None).unwrap();
+        t.recheck(|net| net != target, T0 + 2 * S);
+        let out = t.retract_detection("crowdsec", "17", target, T0 + 3 * S);
+        assert!(
+            matches!(
+                out,
+                DetectorRetraction::Lifted {
+                    reissued: Some(_),
+                    ..
+                }
+            ),
+            "{:?}",
+            out
+        );
+        assert!(!t.is_blocked(target), "still protected");
+        t.recheck(|_| true, T0 + 4 * S);
+        assert!(t.is_blocked(target), "Suricata's reason holds once allowed");
+        t.tick(T0 + S + 61 * S);
+        assert!(!t.is_blocked(target), "and ends with it");
     }
 
     #[test]
@@ -3387,6 +3544,64 @@ mod tests {
         assert_eq!(lifted_nets.len(), 2);
         assert_eq!(lifted.retracted, vec![mine.id()]);
         assert!(n1.is_blocked(ip("203.0.113.42")), "operator bans stay");
+    }
+
+    #[test]
+    fn a_restore_keeps_every_bounded_table_within_its_runtime_bound() {
+        // F3: a state file is bytes on disk, not a promise of the runtime bounds; a restore
+        // past them must not hold more than the running table ever could.
+        let mut t = table(1, 64);
+        let wall = t.to_wall(T0);
+        let state = Persisted {
+            operator_lifts: vec![("lifted-by-operator".to_string(), None)],
+            retracted: (0..=MAX_KNOWN_CLAIMS)
+                .map(|i| (format!("retracted-{i}"), Some(wall + 600 * S)))
+                .collect(),
+            claims: (0..=MAX_KNOWN_CLAIMS as u64)
+                .map(|i| Claim {
+                    issuer: 1,
+                    kind: ClaimKind::Detector,
+                    target: "203.0.113.9".to_string(),
+                    issued_ms: wall - i,
+                    expires_ms: None,
+                    reason: "test".to_string(),
+                })
+                .collect(),
+            events: (0..=MAX_EVENTS as u128)
+                .map(|i| (crate::p2p::to_hex(&i.to_be_bytes()), wall))
+                .collect(),
+            support: (0..=MAX_SUPPORT_TARGETS as u32)
+                .map(|i| {
+                    let net = host(IpAddr::from(std::net::Ipv4Addr::from(0x0a00_0000 + i)));
+                    (show(&net), vec![(None, None)])
+                })
+                .collect(),
+            ..Persisted::default()
+        };
+        let (restored, refused) = t.restore(state, |_| true, T0);
+        assert!(
+            t.retractions.len() <= MAX_KNOWN_CLAIMS,
+            "{} retraction records",
+            t.retractions.len()
+        );
+        assert!(
+            t.retractions
+                .get("lifted-by-operator")
+                .is_some_and(|r| r.operator),
+            "operator lifts are kept first: no peer can resend them"
+        );
+        assert!(
+            t.claims.len() <= MAX_KNOWN_CLAIMS,
+            "{} claims",
+            t.claims.len()
+        );
+        assert_eq!(
+            (restored, refused),
+            (MAX_KNOWN_CLAIMS, 1),
+            "the cut is counted"
+        );
+        assert!(t.events.len() <= MAX_EVENTS, "{} events", t.events.len());
+        assert!(t.support.len() <= MAX_SUPPORT_TARGETS);
     }
 
     #[test]
