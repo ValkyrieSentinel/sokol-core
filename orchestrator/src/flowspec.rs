@@ -150,6 +150,24 @@ fn family(net: &IpNet) -> &'static str {
     }
 }
 
+/// The private ASN of the default ownership community (ADR-0008: `64512:<node-id>`).
+pub const DEFAULT_COMMUNITY_ASN: u16 = 64512;
+
+/// This node's default ownership community, `64512:<node-id>`. A node id that does not
+/// fit the 16-bit value is refused rather than truncated: truncation gives nodes 1 and
+/// 65537 one community, and each would withdraw the other's rules on a shared gobgpd.
+pub fn default_community(node_id: u64) -> Result<(u16, u16), String> {
+    u16::try_from(node_id)
+        .map(|value| (DEFAULT_COMMUNITY_ASN, value))
+        .map_err(|_| {
+            format!(
+                "node id {} does not fit the 16-bit value of the default Flowspec community \
+                 {}:<node-id>; give this node its own --flowspec-community",
+                node_id, DEFAULT_COMMUNITY_ASN
+            )
+        })
+}
+
 impl GobgpCli {
     fn community_str(&self) -> String {
         format!("{}:{}", self.community.0, self.community.1)
@@ -219,12 +237,83 @@ impl GobgpCli {
     }
 }
 
+/// A JSON document in which no object, at any depth, repeats a key. Deserializing
+/// into it only checks; the value is read again into a `serde_json::Map`, which
+/// would otherwise keep the last of two equal keys and drop the first unseen.
+/// Keys are compared after unescaping, as the map would compare them. The key set
+/// of one object is no larger than the map built from the same bytes, and depth
+/// stays under serde_json's recursion limit, so the check adds no new bound.
+struct UniqueKeys;
+
+impl<'de> serde::Deserialize<'de> for UniqueKeys {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(UniqueKeysVisitor)
+    }
+}
+
+struct UniqueKeysVisitor;
+
+impl<'de> serde::de::Visitor<'de> for UniqueKeysVisitor {
+    type Value = UniqueKeys;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("JSON without repeated object keys")
+    }
+
+    fn visit_bool<E>(self, _: bool) -> Result<UniqueKeys, E> {
+        Ok(UniqueKeys)
+    }
+
+    fn visit_i64<E>(self, _: i64) -> Result<UniqueKeys, E> {
+        Ok(UniqueKeys)
+    }
+
+    fn visit_u64<E>(self, _: u64) -> Result<UniqueKeys, E> {
+        Ok(UniqueKeys)
+    }
+
+    fn visit_f64<E>(self, _: f64) -> Result<UniqueKeys, E> {
+        Ok(UniqueKeys)
+    }
+
+    fn visit_str<E>(self, _: &str) -> Result<UniqueKeys, E> {
+        Ok(UniqueKeys)
+    }
+
+    fn visit_unit<E>(self) -> Result<UniqueKeys, E> {
+        Ok(UniqueKeys)
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<UniqueKeys, A::Error> {
+        while seq.next_element::<UniqueKeys>()?.is_some() {}
+        Ok(UniqueKeys)
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<UniqueKeys, A::Error> {
+        let mut seen = HashSet::new();
+        while let Some(key) = map.next_key::<String>()? {
+            if seen.contains(&key) {
+                return Err(serde::de::Error::custom(format!(
+                    "repeated object key {:?}",
+                    key
+                )));
+            }
+            seen.insert(key);
+            map.next_value::<UniqueKeys>()?;
+        }
+        Ok(UniqueKeys)
+    }
+}
+
 /// Parse the pinned GoBGP JSON. A managed path is local, ID zero, tagged and
 /// matches one full source prefix (IPv6 offset zero). Other local paths sharing
 /// that exact NLRI are collisions; learned peer paths are not local CLI targets.
 pub fn parse_rib(json: &[u8], community: u32) -> Result<Rib, String> {
     // Only an actual JSON object can establish absence. Do not normalize missing
     // stdout/null or silently skip unclassifiable entries into a healthy empty RIB.
+    // serde_json keeps only the last value of a repeated key, silently, so a
+    // repeated key could replace a foreign path with an empty list (FLOWSPEC-R3/R4).
+    serde_json::from_slice::<UniqueKeys>(json).map_err(|e| format!("unreadable RIB: {}", e))?;
     let rib: serde_json::Map<String, serde_json::Value> =
         serde_json::from_slice(json).map_err(|e| format!("unreadable RIB: {}", e))?;
     let mut own = Rib::default();
@@ -814,6 +903,19 @@ mod tests {
             "prefixes are announced as prefixes"
         );
         assert_eq!(c.community_value(), 4259912202);
+    }
+
+    #[test]
+    fn the_default_community_is_64512_and_the_node_id_and_is_refused_above_16_bits() {
+        assert_eq!(default_community(1), Ok((64512, 1)));
+        assert_eq!(default_community(65535), Ok((64512, 65535)));
+        for wide in [65536, 65537, u64::MAX] {
+            assert!(
+                default_community(wide).is_err(),
+                "node {wide} got a truncated community: {:?}",
+                default_community(wide)
+            );
+        }
     }
 
     /// Captured from gobgpd 4.9.0: one local rule with our community, one local rule without
@@ -4809,6 +4911,53 @@ exec "$real" "$@"
             );
             assert!(text.contains(&format!("sokol_flowspec_round_converged {expected}\n")));
         }
+    }
+
+    #[tokio::test]
+    async fn a_repeated_rib_key_cannot_hide_a_foreign_path_from_the_round() {
+        // A foreign local discard path for the target NLRI, followed by the same key
+        // with no paths: a last-value-wins reader sees a healthy empty RIB.
+        let foreign = RIB.replace("4259912202", "4259915535");
+        let foreign: serde_json::Value = serde_json::from_str(&foreign).unwrap();
+        let path = foreign["[source: 198.51.100.7/32]"].to_string();
+        let raw =
+            format!("{{\"[source: 198.51.100.7/32]\":{path},\"[source: 198.51.100.7/32]\":[]}}");
+        assert!(
+            parse_rib(raw.as_bytes(), 4259912202).is_err(),
+            "a repeated key parsed as a usable RIB"
+        );
+        let fixture = RoundFixture::new(&raw, RIB, false);
+        let db = fixture.db();
+        assert!(
+            round(&fixture.cli, &ips(&["198.51.100.7"]), &db)
+                .await
+                .is_err(),
+            "a repeated key hid the foreign path"
+        );
+        assert!(
+            !fixture.dir.join("applied").exists(),
+            "the round wrote over a foreign local path"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_repeated_key_inside_a_path_is_rejected_and_authorizes_no_withdrawal() {
+        // LocalID 7 is not a CLI path; a trailing LocalID 0 would make it look owned.
+        let raw = RIB.replacen("\"LocalID\":0}", "\"LocalID\":7,\"LocalID\":0}", 1);
+        assert!(
+            parse_rib(raw.as_bytes(), 4259912202).is_err(),
+            "a repeated LocalID parsed as a usable path"
+        );
+        let fixture = RoundFixture::new(&raw, "{}", false);
+        let db = fixture.db();
+        assert!(
+            round(&fixture.cli, &HashSet::new(), &db).await.is_err(),
+            "a repeated LocalID was classified"
+        );
+        assert!(
+            !fixture.dir.join("applied").exists(),
+            "a repeated LocalID authorized withdrawal"
+        );
     }
 
     #[tokio::test]
