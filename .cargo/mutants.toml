@@ -11,6 +11,13 @@ exclude_re = [
     # The monitor's process entry: the XDP smoke runs `monitor --regret` on its audit log.
     "bin/monitor.rs:\\d+:\\d+: replace main -> io::Result<\\(\\)> with Ok\\(\\(\\)\\)$",
     "bin/monitor.rs:\\d+:\\d+: delete match arm Some\\(\"--regret\"\\) in main$",
+    # The IPC handlers lock a SharedBlockTable over the kernel map (KernelBlocklist), so no unit
+    # test can call them; the XDP smoke checks their replies exactly (event ids: OK ack, applied,
+    # duplicate; a retraction: OK lifted, then duplicate). Their reply logic is unit-tested in
+    # enforcement_reply and retraction_reply.
+    "ipc.rs:\\d+:\\d+: replace (handle_ipc_line|retract_detection) -> String with (String::new\\(\\)|\"xyzzy\".into\\(\\))$",
+    # The orchestrator's process entry: the XDP smoke starts and drives it end to end.
+    "orchestrator/src/main.rs:\\d+:\\d+: replace main -> Result<\\(\\), anyhow::Error> with Ok\\(\\(\\)\\)$",
     # Directory fsync for durability; not observable without crash injection.
     "in sync_dir",
     # An offset while the clock has not stepped: 0 and +-1 ms are indistinguishable from it.
