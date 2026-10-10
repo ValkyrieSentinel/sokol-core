@@ -691,6 +691,38 @@ impl<B: Blocklist> BlockTable<B> {
         quorum: Quorum,
         now_ms: u64,
     ) -> bool {
+        self.configure_peer_state(default, per_peer, quorum, None, now_ms)
+    }
+
+    /// Installs trust and envelopes together. A revoked issuer's old envelope is retained only
+    /// for its held records: an implicit fallback to a smaller default must not block revocation.
+    /// Its claims stop counting immediately, and their lease/retraction memory is preserved.
+    pub fn configure_trusted_peers(
+        &mut self,
+        default: Envelope,
+        per_peer: HashMap<u64, Envelope>,
+        quorum: Quorum,
+        pinned: HashSet<u64>,
+        now_ms: u64,
+    ) -> bool {
+        self.configure_peer_state(default, per_peer, quorum, Some(pinned), now_ms)
+    }
+
+    fn configure_peer_state(
+        &mut self,
+        default: Envelope,
+        mut per_peer: HashMap<u64, Envelope>,
+        quorum: Quorum,
+        pinned: Option<HashSet<u64>>,
+        now_ms: u64,
+    ) -> bool {
+        if let Some(trusted) = &pinned {
+            for issuer in self.known_by_issuer.keys() {
+                if *issuer != self.node_id && !trusted.contains(issuer) {
+                    per_peer.insert(*issuer, *self.envelope(*issuer));
+                }
+            }
+        }
         if self.known_by_issuer.iter().any(|(issuer, known)| {
             *issuer != self.node_id && *known > per_peer.get(issuer).unwrap_or(&default).max_known
         }) {
@@ -699,6 +731,9 @@ impl<B: Blocklist> BlockTable<B> {
         self.default_envelope = default;
         self.envelopes = per_peer;
         self.quorum = quorum;
+        if let Some(pinned) = pinned {
+            self.pinned = Some(pinned);
+        }
         let nets: Vec<IpNet> = self.by_target.keys().copied().collect();
         self.settle(nets, now_ms);
         true

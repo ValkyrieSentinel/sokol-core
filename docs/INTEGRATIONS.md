@@ -376,7 +376,9 @@ claim keeps its own expiry but is enforced here for at most `--block-ttl-max`.
   "min_prefix_v4": 32, "min_prefix_v6": 128}` (unknown fields are refused; `RELOAD_PEERS` applies
   changes). A reload that lowers `max_known` below a peer's already held count returns `ERR`
   and keeps the previous envelopes and trust store; it does not evict claims or reset their
-  leases. Retry once the held count fits. Held claims are audited as `MESH_BLOCK_HELD` with the reason, and are still shared,
+  leases. Retry once the held count fits. Revocation still applies immediately: a removed
+  peer's old envelope stays only with its remembered records, which no longer count toward enforcement.
+  Held claims are audited as `MESH_BLOCK_HELD` with the reason, and are still shared,
   so the mesh state converges whatever each node enforces.
 - Every 15 s each node sends a digest of its own claims; a peer whose view of them differs asks
   for them (SyncRequest), so a node that missed messages (a partition, a full send queue)

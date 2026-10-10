@@ -162,17 +162,16 @@ pub(crate) async fn execute_control<B: block_table::Blocklist>(
                     let legacy = trust.legacy_peers().to_vec();
                     {
                         let mut table = ctx.blocks.lock().await;
-                        if !table.configure_peers(
+                        if !table.configure_trusted_peers(
                             ctx.peer_limits.default,
                             per_peer,
                             ctx.peer_limits.quorum,
+                            trust.node_ids(),
                             block_table::local_ms(),
                         ) {
                             return "ERR known-claims share below currently held claims; previous trust store kept"
                                 .to_string();
                         }
-                        // A revoked node's claims stop counting here at once.
-                        table.set_pinned(trust.node_ids(), block_table::local_ms());
                     }
                     let pinned = ctx.registry.reload(trust);
                     log_inbound_budget(pinned);
@@ -264,7 +263,10 @@ mod tests {
         let ctx = ControlCtx {
             state: Arc::new(StateStore::new(dir.join("state.json"))),
             peer_limits: PeerLimits {
-                default: Envelope::unlimited(ttl.max),
+                default: Envelope {
+                    max_known: 1,
+                    ..Envelope::unlimited(ttl.max)
+                },
                 quorum: Quorum::OFF,
             },
             blocks,
@@ -296,6 +298,21 @@ mod tests {
         assert!(
             !ctx.registry.trusts(3),
             "valid reload did not apply new trust"
+        );
+        // Revoking an over-default peer must not be refused as an implicit quota reduction.
+        std::fs::write(&file, serde_json::to_vec(&vec![peer(3, 1)]).unwrap()).unwrap();
+        assert_eq!(
+            execute_control(control::ControlCommand::ReloadPeers, &ctx).await,
+            "OK 1 pinned peers",
+            "known claims must not prevent revocation"
+        );
+        assert!(!ctx.registry.trusts(2));
+        assert!(
+            !ctx.blocks
+                .lock()
+                .await
+                .is_blocked("203.0.113.10/32".parse().unwrap()),
+            "revoked peer still enforces its held claim"
         );
         drop(ctx);
         std::fs::remove_dir_all(dir).unwrap();
