@@ -434,6 +434,22 @@ struct Dropped {
     support: usize,
 }
 
+impl Dropped {
+    /// One warning line when a restore left anything out; the counts stay in the table.
+    fn log(&self) {
+        if *self != Dropped::default() {
+            log::warn!(
+                "[State] Restore past the runtime bounds: dropped {} claims (counted as refused), \
+                 {} retraction records, {} events, {} support targets",
+                self.claims,
+                self.retractions,
+                self.events,
+                self.support
+            );
+        }
+    }
+}
+
 /// Durable part of the table (ADR-4): this node's own decisions and lifts.
 #[derive(Serialize, Deserialize, Debug, PartialEq)]
 pub struct Persisted {
@@ -500,6 +516,9 @@ pub struct BlockTable<B = KernelBlocklist> {
     support: HashMap<IpNet, Vec<Support>>,
     retraction_counts: [u64; RETRACTION_RESULTS.len()],
     dirty: bool,
+    /// What the last restore left out to stay within the runtime bounds (logged, and kept so a
+    /// test can check the count rather than the log).
+    restore_dropped: Dropped,
     default_envelope: Envelope,
     envelopes: HashMap<u64, Envelope>,
     quorum: Quorum,
@@ -578,6 +597,7 @@ impl<B: Blocklist> BlockTable<B> {
             support: HashMap::new(),
             retraction_counts: [0; RETRACTION_RESULTS.len()],
             dirty: false,
+            restore_dropped: Dropped::default(),
             default_envelope: Envelope::unlimited(policy.max),
             envelopes: HashMap::new(),
             quorum: Quorum::OFF,
@@ -2165,16 +2185,8 @@ impl<B: Blocklist> BlockTable<B> {
             );
             nets.push(net);
         }
-        if dropped != Dropped::default() {
-            log::warn!(
-                "[State] Restore past the runtime bounds: dropped {} claims (counted as refused), \
-                 {} retraction records, {} events, {} support targets",
-                dropped.claims,
-                dropped.retractions,
-                dropped.events,
-                dropped.support
-            );
-        }
+        dropped.log();
+        self.restore_dropped = dropped;
         self.settle(nets, now_ms);
         (restored, refused)
     }
@@ -3602,6 +3614,96 @@ mod tests {
         );
         assert!(t.events.len() <= MAX_EVENTS, "{} events", t.events.len());
         assert!(t.support.len() <= MAX_SUPPORT_TARGETS);
+        assert_eq!(
+            t.restore_dropped,
+            Dropped {
+                claims: 1,
+                retractions: 2,
+                events: 1,
+                support: 1,
+            },
+            "each cut is counted once, exactly"
+        );
+    }
+
+    /// At a full table a record or reason for something already restored merges and takes no
+    /// new room; a support reason ending exactly now is over (STATE-P2 boundaries).
+    #[test]
+    fn a_full_restore_merges_into_what_it_holds_and_drops_only_new_entries() {
+        let mut t = table(1, 64);
+        let wall = t.to_wall(T0);
+        let ids = |p: &'static str| (0..MAX_KNOWN_CLAIMS).map(move |i| format!("{p}-{i}"));
+        let target = |i: u32| {
+            show(&host(IpAddr::from(std::net::Ipv4Addr::from(
+                0x0a00_0000 + i,
+            ))))
+        };
+        let state = Persisted {
+            operator_lifts: ids("lift")
+                .chain(["lift-0".to_string()])
+                .map(|id| (id, None))
+                .collect(),
+            retracted: vec![("lift-1".to_string(), None)],
+            support: (0..MAX_SUPPORT_TARGETS as u32)
+                .map(|i| (target(i), vec![(None, None)]))
+                .chain([
+                    (
+                        target(0),
+                        vec![(Some(crate::p2p::to_hex(&[7u8; 16])), None)],
+                    ),
+                    (target(9_999_999), vec![(None, Some(wall))]),
+                ])
+                .collect(),
+            ..Persisted::default()
+        };
+        t.restore(state, |_| true, T0);
+        assert_eq!(t.retractions.len(), MAX_KNOWN_CLAIMS);
+        assert!(t
+            .retractions
+            .get("lift-1")
+            .is_some_and(|r| r.operator && r.by_nodes.contains(&1)));
+        assert_eq!(t.support.len(), MAX_SUPPORT_TARGETS);
+        let first = canonical(parse_target(&target(0)).unwrap());
+        assert_eq!(
+            t.support.get(&first).map(Vec::len),
+            Some(2),
+            "a reason for a held target merges"
+        );
+        assert_eq!(
+            t.restore_dropped,
+            Dropped::default(),
+            "nothing new was refused"
+        );
+    }
+
+    /// Operator lifts past the bound are counted like any other retraction record (STATE-P2).
+    #[test]
+    fn operator_lifts_past_the_bound_are_counted() {
+        let mut t = table(1, 64);
+        let state = Persisted {
+            operator_lifts: (0..=MAX_KNOWN_CLAIMS)
+                .map(|i| (format!("lift-{i}"), None))
+                .collect(),
+            ..Persisted::default()
+        };
+        t.restore(state, |_| true, T0);
+        assert_eq!(t.retractions.len(), MAX_KNOWN_CLAIMS);
+        assert_eq!(t.restore_dropped.retractions, 1);
+    }
+
+    /// A block meant but not written (no room in the kernel map) still blocks for the answer;
+    /// so does an entry left in the map with no claim wanting it (IPC-R1).
+    #[test]
+    fn a_wanted_block_not_yet_written_still_blocks() {
+        let mut t = table(1, 1);
+        t.add_local(ip("203.0.113.1"), ClaimKind::Operator, "a", T0)
+            .unwrap();
+        let _ = t.add_local(ip("203.0.113.2"), ClaimKind::Operator, "b", T0);
+        assert!(
+            !t.is_blocked(ip("203.0.113.2")),
+            "precondition: the map is full"
+        );
+        assert!(t.still_blocks(ip("203.0.113.2"), T0));
     }
 
     #[test]
