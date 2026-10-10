@@ -1,0 +1,13 @@
+{
+  "annotations": {
+    "status": "UNSIGNED_EXPLANATORY_DRAFT"
+  },
+  "evidence_text": "`invalid_input_cannot_evict_a_queued_signal`, `a_full_queue_drops_the_oldest_and_counts_it`; actual process restart/ACK cases below exercise cursor alignment.",
+  "id": "SUR-Q1",
+  "profile": "sokol.contract-shadow.v1",
+  "statement": "At checkpoint time, queued positions correspond to the remaining FIFO outbox entries. Only successful push adds a position; overflow removes the oldest pair; forwarding expiry drops its request/deadline pair; after flush the loop trims positions to remaining pending length. Outbox request/deadline entries are likewise paired.",
+  "witnesses": [
+    "a_full_queue_drops_the_oldest_and_counts_it",
+    "invalid_input_cannot_evict_a_queued_signal"
+  ]
+}

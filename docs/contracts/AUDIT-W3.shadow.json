@@ -1,0 +1,13 @@
+{
+  "annotations": {
+    "status": "UNSIGNED_EXPLANATORY_DRAFT"
+  },
+  "evidence_text": "`feature_commands_reach_only_peers_that_announced_the_feature`, `a_handshake_without_features_still_parses` (mutation \"send to all\" fails the first).",
+  "id": "AUDIT-W3",
+  "profile": "sokol.contract-shadow.v1",
+  "statement": "`AuditHead` goes only to peers whose handshake announced `audit-head`; a handshake without `features` parses (older nodes). Other commands go to every peer as before.",
+  "witnesses": [
+    "a_handshake_without_features_still_parses",
+    "feature_commands_reach_only_peers_that_announced_the_feature"
+  ]
+}

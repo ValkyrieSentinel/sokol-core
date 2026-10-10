@@ -1,0 +1,15 @@
+{
+  "annotations": {
+    "status": "UNSIGNED_EXPLANATORY_DRAFT"
+  },
+  "evidence_text": "`a_flush_records_real_queue_overflow_without_a_following_record`, `idle_sync_records_real_queue_overflow_without_a_following_record`, `disconnected_final_sync_records_real_queue_overflow`, `a_failed_loss_notice_retains_its_count_until_recovery` (actual Full channels, writer loop and unavailable-path recovery)",
+  "id": "AUDIT-R2",
+  "profile": "sokol.contract-shadow.v1",
+  "statement": "Queue loss is emitted before following data and every sync path: explicit Flush, idle timeout, disconnected final sync. A failed notice retains its sampled count; that record cannot bypass the notice. Cross-producer drop publication and send are not atomic.",
+  "witnesses": [
+    "a_failed_loss_notice_retains_its_count_until_recovery",
+    "a_flush_records_real_queue_overflow_without_a_following_record",
+    "disconnected_final_sync_records_real_queue_overflow",
+    "idle_sync_records_real_queue_overflow_without_a_following_record"
+  ]
+}

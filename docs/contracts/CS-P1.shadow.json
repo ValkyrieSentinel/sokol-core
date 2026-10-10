@@ -1,0 +1,14 @@
+{
+  "annotations": {
+    "status": "UNSIGNED_EXPLANATORY_DRAFT"
+  },
+  "evidence_text": "`cli_rejects_zero_ipc_pacing_before_startup`, `cli_pacing_accepts_positive_u32_bounds_and_zero_poll_interval`; actual process `StreamTests.test_zero_pacing_fails_before_lapi_or_ipc_requests`",
+  "id": "CS-P1",
+  "profile": "sokol.contract-shadow.v1",
+  "statement": "The parsed command pacing rate is a `NonZeroU32`. Zero is rejected by `Args::parse` before outbox construction, LAPI polling or IPC; a zero rate cannot silently become one command per second. Default 200 and positive `u32` bounds remain valid, and zero poll interval remains a separate valid policy.",
+  "witnesses": [
+    "StreamTests.test_zero_pacing_fails_before_lapi_or_ipc_requests",
+    "cli_pacing_accepts_positive_u32_bounds_and_zero_poll_interval",
+    "cli_rejects_zero_ipc_pacing_before_startup"
+  ]
+}

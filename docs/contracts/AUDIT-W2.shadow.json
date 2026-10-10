@@ -1,0 +1,12 @@
+{
+  "annotations": {
+    "status": "UNSIGNED_EXPLANATORY_DRAFT"
+  },
+  "evidence_text": "`a_peers_audit_head_is_witnessed_once_per_interval` (mutation \"no interval\" fails it).",
+  "id": "AUDIT-W2",
+  "profile": "sokol.contract-shadow.v1",
+  "statement": "Only a fsynced head is offered. A peer adds at most one witness record per WITNESS_MIN_INTERVAL to this log, and a head that is not 64 lowercase hex is not recorded; both refusals are counted.",
+  "witnesses": [
+    "a_peers_audit_head_is_witnessed_once_per_interval"
+  ]
+}

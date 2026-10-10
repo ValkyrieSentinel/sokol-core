@@ -1,0 +1,15 @@
+{
+  "annotations": {
+    "status": "UNSIGNED_EXPLANATORY_DRAFT"
+  },
+  "evidence_text": "`quiesce_joins_a_stalled_producer_before_final_state_and_audit`, `child_handlers_are_joined_with_their_listener`, `a_closed_owner_refuses_late_child_registration`, `producer_quiescence_keeps_shutdown_record_last`; active/idle socket XDP shutdown smoke",
+  "id": "SHUTDOWN-S1",
+  "profile": "sokol.contract-shadow.v1",
+  "statement": "Once quiescence returns, registered listeners and accepted IPC/control children have been dropped; they cannot mutate the final table snapshot or submit records after the terminal audit submission. Child registration is closed before cancellation, including concurrent registration.",
+  "witnesses": [
+    "a_closed_owner_refuses_late_child_registration",
+    "child_handlers_are_joined_with_their_listener",
+    "producer_quiescence_keeps_shutdown_record_last",
+    "quiesce_joins_a_stalled_producer_before_final_state_and_audit"
+  ]
+}

@@ -1,0 +1,15 @@
+{
+  "annotations": {
+    "status": "UNSIGNED_EXPLANATORY_DRAFT"
+  },
+  "evidence_text": "`reason_fields_cannot_hide_a_wrong_detector_ttl`, `a_real_source_ttl_survives_reason_decoys`, `free_text_reason_is_not_a_field_namespace`, `generated_reasons_preserve_fields_and_bytes`, chained-file CLI cases",
+  "id": "REPLAY-R3",
+  "profile": "sokol.contract-shadow.v1",
+  "statement": "In current detector writer layouts, `Reason` is opaque data: it cannot override leading `IP`/`TTL`/`Why`/`Protected` or appended `Claim`/`At`/`Event`/`Ttl`. The complete reason bytes are retained.",
+  "witnesses": [
+    "a_real_source_ttl_survives_reason_decoys",
+    "free_text_reason_is_not_a_field_namespace",
+    "generated_reasons_preserve_fields_and_bytes",
+    "reason_fields_cannot_hide_a_wrong_detector_ttl"
+  ]
+}

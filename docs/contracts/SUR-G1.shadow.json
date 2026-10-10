@@ -1,0 +1,13 @@
+{
+  "annotations": {
+    "status": "UNSIGNED_EXPLANATORY_DRAFT"
+  },
+  "evidence_text": "`gate_cooldown_memory_has_a_hard_bound_without_eviction`, `gate_generated_history_preserves_cooldown_and_bounded_unique_memory`",
+  "id": "SUR-G1",
+  "profile": "sokol.contract-shadow.v1",
+  "statement": "Cooldown membership and expiry FIFO describe the same distinct addresses; each has at most `COOLDOWN_CAP` = 100,000 entries. Start empty; remove the expired prefix from both; refuse at capacity before inserting into both. Never evict an unexpired address to admit another.",
+  "witnesses": [
+    "gate_cooldown_memory_has_a_hard_bound_without_eviction",
+    "gate_generated_history_preserves_cooldown_and_bounded_unique_memory"
+  ]
+}
