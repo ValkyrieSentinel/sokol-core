@@ -1661,17 +1661,24 @@ async fn main() -> Result<(), anyhow::Error> {
                 let mut line = String::new();
                 let mut budget = p2p::Bucket::new(CONTROL_LINES_PER_SEC, CONTROL_LINE_BURST);
                 loop {
-                    line.clear();
-                    let mut limited = (&mut reader).take(control::MAX_LINE);
-                    match tokio::time::timeout(CONTROL_IDLE, limited.read_line(&mut line)).await {
-                        Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
-                        Ok(Ok(_)) => {}
-                    }
+                    let next =
+                        tokio::time::timeout(CONTROL_IDLE, control::next(&mut reader, &mut line));
+                    let parsed = match next.await {
+                        Ok(control::Next::Line(parsed)) => parsed,
+                        Ok(control::Next::Refuse(e)) => {
+                            log::warn!("[Control] {}", e);
+                            let _ = write_half
+                                .write_all(format!("ERR {}\n", e).as_bytes())
+                                .await;
+                            break;
+                        }
+                        Ok(control::Next::Close) | Err(_) => break,
+                    };
                     let wait = budget.take(1.0, std::time::Instant::now());
                     if !wait.is_zero() {
                         tokio::time::sleep(wait).await;
                     }
-                    let reply = match control::parse(&line) {
+                    let reply = match parsed {
                         Ok(cmd) => {
                             use control::ControlCommand as C;
                             let mutating = matches!(
@@ -1999,7 +2006,9 @@ async fn main() -> Result<(), anyhow::Error> {
                         )
                     })?
                 }
-                None => (64512, (args.node_id & 0xFFFF) as u16),
+                None => {
+                    flowspec::default_community(args.node_id).map_err(|e| anyhow::anyhow!(e))?
+                }
             };
             let cli = flowspec::GobgpCli {
                 bin,

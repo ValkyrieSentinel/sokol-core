@@ -1397,7 +1397,7 @@ mod tests {
         };
         at.save(&cursor).unwrap();
         assert_eq!(Cursor::load(&cursor), Ok(Some(at)));
-        assert!(!cursor.with_extension("tmp").exists());
+        assert!(!cursor_tmp(&cursor).exists());
         std::fs::remove_dir_all(dir).unwrap();
     }
 
