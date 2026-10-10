@@ -681,19 +681,27 @@ impl<B: Blocklist> BlockTable<B> {
 
     /// Sets what peers may impose (ADR-7): `default` for every peer, `per_peer` overrides, and
     /// the quorum for wide prefixes. Applies to enforcement from now on; slot counts and local
-    /// ends of claims already adopted are kept.
+    /// ends of claims already adopted are kept. Returns false without changing anything if a
+    /// new known-claims share is below what a peer already holds: a reload cannot silently
+    /// violate the share or discard claims and their remembered leases.
     pub fn configure_peers(
         &mut self,
         default: Envelope,
         per_peer: HashMap<u64, Envelope>,
         quorum: Quorum,
         now_ms: u64,
-    ) {
+    ) -> bool {
+        if self.known_by_issuer.iter().any(|(issuer, known)| {
+            *issuer != self.node_id && *known > per_peer.get(issuer).unwrap_or(&default).max_known
+        }) {
+            return false;
+        }
         self.default_envelope = default;
         self.envelopes = per_peer;
         self.quorum = quorum;
         let nets: Vec<IpNet> = self.by_target.keys().copied().collect();
         self.settle(nets, now_ms);
+        true
     }
 
     fn envelope(&self, issuer: u64) -> &Envelope {
@@ -4549,6 +4557,77 @@ mod tests {
         assert!(n1
             .add_local(ip("198.51.100.8"), ClaimKind::Detector, "own", later)
             .is_ok());
+    }
+
+    #[test]
+    fn a_reload_below_held_known_claims_keeps_the_previous_envelopes() {
+        let mut t = table(1, 64);
+        for i in 0..3 {
+            assert!(!matches!(
+                t.adopt(
+                    peer_claim(2, &format!("203.0.113.{}", 10 + i), T0),
+                    true,
+                    T0
+                ),
+                Adoption::Refused(_)
+            ));
+        }
+        let before = t.envelope(2).max_known;
+        let one = Envelope {
+            max_known: 1,
+            ..Envelope::unlimited(POLICY.max)
+        };
+        assert!(
+            !t.configure_peers(one, HashMap::new(), Quorum::OFF, T0 + S),
+            "reload accepted a share below its three held claims"
+        );
+        assert_eq!(t.envelope(2).max_known, before);
+        assert_eq!(t.known_of(2), 3);
+        assert!(t.is_blocked(ip("203.0.113.10")), "no claim is discarded");
+        // The same check applies to an explicit per-peer override, not just the default.
+        assert!(!t.configure_peers(
+            Envelope::unlimited(POLICY.max),
+            HashMap::from([(2, one)]),
+            Quorum::OFF,
+            T0 + S
+        ));
+        assert_eq!(t.envelope(2).max_known, before);
+    }
+
+    #[test]
+    fn a_reload_at_the_held_known_claims_bound_applies_and_ignores_own_claims() {
+        let mut t = table(1, 64);
+        for i in 0..3 {
+            detect(&mut t, &format!("198.51.100.{}", 10 + i), T0);
+        }
+        assert!(!matches!(
+            t.adopt(peer_claim(2, "203.0.113.10", T0), true, T0),
+            Adoption::Refused(_)
+        ));
+        let one = Envelope {
+            max_known: 1,
+            ..Envelope::unlimited(POLICY.max)
+        };
+        assert!(t.configure_peers(one, HashMap::new(), Quorum::OFF, T0 + S));
+        assert_eq!(t.envelope(2).max_known, 1);
+        assert_eq!(t.known_of(1), 3, "own reserve is not a peer share");
+        assert_eq!(
+            t.adopt(peer_claim(2, "203.0.113.11", T0), true, T0 + S),
+            Adoption::Refused(PEER_SHARE_FULL)
+        );
+        assert!(!matches!(
+            t.adopt(peer_claim(3, "203.0.113.12", T0), true, T0 + S),
+            Adoption::Refused(_)
+        ));
+        let zero = Envelope {
+            max_known: 0,
+            ..one
+        };
+        assert!(t.configure_peers(one, HashMap::from([(4, zero)]), Quorum::OFF, T0 + S));
+        assert_eq!(
+            t.adopt(peer_claim(4, "203.0.113.13", T0), true, T0 + S),
+            Adoption::Refused(PEER_SHARE_FULL)
+        );
     }
 
     /// A peer at its known-claims share is refused with its own reason, and the refused claim
