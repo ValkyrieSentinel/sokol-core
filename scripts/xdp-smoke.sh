@@ -398,6 +398,13 @@ check "an event id is acted on once, a resend is a duplicate" \
     test "$(sed -n 1,3p "$WORK/event-ids.txt" | tr '\n' ,)" = "OK ack,OK applied,OK duplicate,"
 check "the same id from another source is another event" test "$(sed -n 4p "$WORK/event-ids.txt")" = "OK applied"
 check "a malformed event id is an error" grep -q "^ERR invalid event id 'bad id'" "$WORK/event-ids.txt"
+# The retraction handler's reply, exactly (IPC-R1): nothing else holds this target, so the
+# detector's event lifts it; a second retraction of the same event is a duplicate.
+RT_IP=198.51.100.78
+ipc_ack "SIGNAL#smoke-r1:smoke|$RT_IP|-|to be retracted" "RETRACT#smoke-r1:smoke|$RT_IP" \
+    "RETRACT#smoke-r1:smoke|$RT_IP" >"$WORK/retract-replies.txt"
+check "a retraction is answered lifted when nothing else holds the target, then duplicate" \
+    test "$(tr '\n' , <"$WORK/retract-replies.txt")" = "OK ack,OK applied,OK lifted,OK duplicate,"
 check "the resend added no claim" test "$(grep -c "Dynamic block enforced in XDP: $EV_IP" "$LOG")" = 2
 printf 'UNBAN_IP:%s\n' "$EV_IP" | nc -U -q1 "$WORK/control.sock" >/dev/null
 
