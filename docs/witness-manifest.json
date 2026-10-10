@@ -14,6 +14,7 @@
   "IPC-A1": "6a0096b5b18b5190ee613bc7e2e3e94604665f205385b18ae074bb0b9138aafa",
   "IPC-R1": "07a01de5339ebf18834a4c377965c9b4ea9763835cabed6e46f7db5f1a39f2f1",
   "IPC-T1": "088af71858cc841192a1cac08dd3a0cfe6f6fcded7772bf9ba5fbd3a13122cc3",
+  "MESH-K1": "8975b1afa6741440e11aec783271a54234761b0977bceddc275c7896e1dd81f9",
   "NODE-D1": "0765e06474e6a67f70ffa2f6ca4e0c78da7f252909be75c56a3a5c7b8740efd3",
   "NODE-R1": "4618ac4d2bb0c89369d0a8b83d84cb96e1b22f630db08c56320e0b25022bcb15",
   "NODE-R2": "3ebe18170f979f75008aa350f225e2afbb617ed4960d90b6568053bd7bc9bd71",
@@ -148,6 +149,14 @@
     "invalid_freshness_input_does_not_evict_or_create_a_deadline",
     "lost_ack_then_freshness_expiry_does_not_resend_or_undo_the_signal",
     "lost_answer_keeps_expiry_and_later_retry_sends_its_retraction"
+   ]
+  },
+  "MESH-K1": {
+   "statement": "e092a7415d3bf45595fda0e186330327776810be438fbee72fea914e7ee1d8e9",
+   "witnesses": [
+    "a_one_slot_peer_cannot_deny_this_nodes_own_detections_by_volume",
+    "a_peer_beyond_its_known_claims_share_is_refused_alone",
+    "peers_together_leave_the_room_kept_for_this_nodes_own_decisions"
    ]
   },
   "NODE-D1": {
@@ -405,8 +414,14 @@
   "a_non_canonical_statement_file_fails_the_check": [
    "orchestrator/src/audit_anchor.rs:0ca8fde409b31f9014a6f568436fb66daa4d08892859baf1deb322990ed972d8"
   ],
+  "a_one_slot_peer_cannot_deny_this_nodes_own_detections_by_volume": [
+   "orchestrator/src/block_table.rs:fa4959307bd1fcfe0e7af8c6a5d4d75e3d70a9af837c1f59e75842f4c2cb31ed"
+  ],
   "a_partially_reproduced_audit_is_not_a_successful_cli_result": [
    "orchestrator/src/replay.rs:43f88ca49b4e414a74aafb77d397e7f5df0b297ff43e58778240e4482feb0293"
+  ],
+  "a_peer_beyond_its_known_claims_share_is_refused_alone": [
+   "orchestrator/src/block_table.rs:1f5e371c2dc361bbe7ef8d682ba6c58377ed12451ca7e7d5cb123ad67716e64f"
   ],
   "a_peers_audit_head_is_witnessed_once_per_interval": [
    "orchestrator/src/mesh_dispatch.rs:07715d75cbe271d25f56fa81a48021df6e80ad9cf85aca77c9315dfa880cd5ff"
@@ -590,6 +605,9 @@
   ],
   "oversized_audit_records_are_counted_and_marked_before_following_data_or_flush": [
    "orchestrator/src/main.rs:5f8238ea09e54d0084116377203678b159470a25e2ce754f919cac38e557fd60"
+  ],
+  "peers_together_leave_the_room_kept_for_this_nodes_own_decisions": [
+   "orchestrator/src/block_table.rs:6c5485ea850b7de205b17b32cc1a9abe1163b63932e2a4c5bbf20cbd38453fa6"
   ],
   "producer_quiescence_keeps_shutdown_record_last": [
    "orchestrator/src/main.rs:6fc7156a6e4465af5181e53d689d5036d1253615f41d16a3ba355db21ed55fb0"
