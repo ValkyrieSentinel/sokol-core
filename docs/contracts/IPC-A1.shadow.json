@@ -1,0 +1,29 @@
+{
+  "profile": "sokol.contract-shadow.v1",
+  "id": "IPC-A1",
+  "statement": "Transport failure, unknown reply or missing terminating LF retains an unexpired obligation. A complete recognized final reply removes it; bounded overflow and an opt-in forwarding deadline are explicit, separately counted local loss paths. ACK outcome is node acceptance/refusal, not proof of durable storage or completed kernel enforcement.",
+  "evidence_text": "`unknown_reply_keeps_the_obligation_and_a_later_ack_retires_it`, `an_unterminated_ack_does_not_retire_the_signal`, overflow test above.",  
+  "witnesses": [
+    "an_unterminated_ack_does_not_retire_the_signal",
+    "unknown_reply_keeps_the_obligation_and_a_later_ack_retires_it"
+  ],
+  "annotations": {
+    "status": "UNSIGNED_EXPLANATORY_DRAFT",
+    "question": "Коли адаптер може прибрати повідомлення з черги?",
+    "answer": "Повна розпізнана кінцева відповідь вузла завершує зобов’язання. Невідома чи незавершена відповідь залишає непрострочене повідомлення в черзі. Переповнення та ввімкнений дедлайн можуть прибрати його як окремо обліковану локальну втрату; запис у сокет сам по собі не є підтвердженням.",
+    "scope": "ACK-mode delivery::Outbox; unexpired queued obligations; adapter-to-node acknowledgement.",
+    "owner_path": "orchestrator/src/delivery.rs",
+    "policy_reference": "docs/adr/0023-owner-pinned-witnesses.md",
+    "non_claims": [
+      "ACK does not prove durable storage or completed kernel enforcement.",
+      "No exactly-once delivery, durable outbox or eventual progress guarantee.",
+      "Witness helpers and runtime implementation are not pinned by witness-body hashes."
+    ],
+    "coverage_gap": "The legacy evidence text says overflow test above; IPC-A1 pins only the two named ACK witnesses. Overflow/deadline coverage requires separately inspecting SUR-Q1 and IPC-T1.",
+    "agent_objective": "Reproduce a counterexample without weakening the preserved statement or witnesses.",
+    "stop_conditions": [
+      "Changing the pinned statement or witnesses requires owner re-pin.",
+      "New delivery guarantees require a separate accepted decision."
+    ]
+  }
+}
