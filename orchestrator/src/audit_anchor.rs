@@ -658,17 +658,26 @@ mod tests {
     }
 
     /// A file named for 99 records that states 3, or for another node than it states, is not
-    /// a statement file (AUDIT-A1).
+    /// a statement file: it is counted malformed next to a valid statement that is confirmed,
+    /// so the check fails because of it (AUDIT-A1).
     #[test]
     fn a_statement_file_named_for_another_statement_fails_the_check() {
         let (d, own, anchors, n, h) = three_records("misnamed");
-        std::fs::write(anchors.join(file_name(1, 99)), statement(1, n, &h)).unwrap();
-        let (summary, lines) = verify(&own, &anchors, 1).unwrap();
-        assert_ne!(summary.exit_code(), 0, "{summary:?} {lines:?}");
-        std::fs::remove_file(anchors.join(file_name(1, 99))).unwrap();
-        std::fs::write(anchors.join(file_name(1, n)), statement(9, n, &h)).unwrap();
-        let (summary, lines) = verify(&own, &anchors, 1).unwrap();
+        std::fs::write(anchors.join(file_name(1, n)), statement(1, n, &h)).unwrap();
+        for (name, text) in [
+            (file_name(1, 99), statement(1, n, &h)),
+            (file_name(1, 2), statement(9, 2, &h)),
+        ] {
+            std::fs::write(anchors.join(&name), text).unwrap();
+            let (summary, lines) = verify(&own, &anchors, 1).unwrap();
+            std::fs::remove_file(anchors.join(&name)).unwrap();
+            assert_eq!(summary.confirmed, 1, "{name}: {summary:?} {lines:?}");
+            assert_eq!(
+                summary.contradicted, 1,
+                "{name} is not counted malformed: {summary:?}"
+            );
+            assert_ne!(summary.exit_code(), 0, "{name}: {summary:?} {lines:?}");
+        }
         std::fs::remove_dir_all(d).unwrap();
-        assert_ne!(summary.exit_code(), 0, "{summary:?} {lines:?}");
     }
 }
