@@ -139,7 +139,14 @@ fn decide(line: &str, filter: &Filter) -> Option<Alert> {
     if severity > filter.max_severity || filter.ignore_sid.contains(&sid) {
         return None;
     }
-    let src: IpAddr = event.get("src_ip")?.as_str()?.parse().ok()?;
+    // `::ffff:a.b.c.d` is the host `a.b.c.d`, as the node reads it: one host, one cooldown
+    // (SUR-G2).
+    let src: IpAddr = event
+        .get("src_ip")?
+        .as_str()?
+        .parse::<IpAddr>()
+        .ok()?
+        .to_canonical();
     let dst = event
         .get("dest_ip")
         .and_then(|v| v.as_str())
@@ -2056,5 +2063,35 @@ mod tests {
             );
         }
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// One host written as IPv4 and as IPv4-mapped IPv6 shares one cooldown: the node reads
+    /// `::ffff:a.b.c.d` as `a.b.c.d` (SUR-G2).
+    #[test]
+    fn a_mapped_and_a_plain_address_of_one_host_share_a_cooldown() {
+        let filter = Filter {
+            max_severity: 3,
+            ignore_sid: Vec::new(),
+        };
+        let line = |src: &str| {
+            format!(
+                r#"{{"event_type":"alert","src_ip":"{}","alert":{{"severity":1,"signature_id":7,"signature":"x"}}}}"#,
+                src
+            )
+        };
+        let plain = decide(&line("203.0.113.5"), &filter).unwrap();
+        let mapped = decide(&line("::ffff:203.0.113.5"), &filter).unwrap();
+        let t = Instant::now();
+        let mut gate = Gate::new(Duration::from_secs(60), 100);
+        let admitted: Vec<_> = [&plain, &mapped]
+            .into_iter()
+            .filter(|alert| gate.admit(alert.src, t))
+            .map(|alert| alert.signal_line())
+            .collect();
+        assert_eq!(
+            admitted.len(),
+            1,
+            "one host admitted twice within its cooldown: {admitted:?}"
+        );
     }
 }

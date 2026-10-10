@@ -10,10 +10,11 @@
   "CS-P2": "5dd517e4115b6735f6e7477f4118095dccc8075d384adeb95b2bbf1a0069b031",
   "IPC-A1": "6a0096b5b18b5190ee613bc7e2e3e94604665f205385b18ae074bb0b9138aafa",
   "IPC-T1": "088af71858cc841192a1cac08dd3a0cfe6f6fcded7772bf9ba5fbd3a13122cc3",
-  "NODE-D1": "e89eebfd4b5e4283a70f2af56f3f7c13219cde80d09b667d5215987eb6d332b5",
+  "NODE-D1": "0765e06474e6a67f70ffa2f6ca4e0c78da7f252909be75c56a3a5c7b8740efd3",
   "NODE-R1": "4618ac4d2bb0c89369d0a8b83d84cb96e1b22f630db08c56320e0b25022bcb15",
   "NODE-R2": "3ebe18170f979f75008aa350f225e2afbb617ed4960d90b6568053bd7bc9bd71",
   "NODE-R3": "745bb8369c5b678cc8cfd1e12a53cf61b32c027792f0d9f66b915eb0913f646a",
+  "NODE-R4": "0cb87a3cc46b51aa6e3fbcbcb9ea3c9a02c0b0e631484b69b5f52c158a737ac8",
   "REPLAY-R1": "02e461a6ac12481a554c9af346378ed023100fce66f6a26224c20d8d84c68d4e",
   "REPLAY-R2": "6234809388ac9d18ef96ea855bfc54ac8fecf0527d28da8587977e2faaab0352",
   "REPLAY-R3": "3c228c7d000e878bc3643046f6b789ca25d8dd840e9dc43d1b9fe1c302986018",
@@ -25,7 +26,7 @@
   "SUR-C2": "7fcaf10dafce330390b4f11b6d613a8f16500cbe135bdd57382e877471c642d0",
   "SUR-D1": "0df7ecc50aad9a0ce7a4b75881a5dab0870bb4bd5947cd5ab0a7078e65554bd8",
   "SUR-G1": "812cf4e7d434265b5a94250aaef909f4f5cc814308f1bcaddd4fbd806bacabcf",
-  "SUR-G2": "5edcb19a8a40752f7b4cdd3d67fcf3f6857fa9d0985f3304934ebf42258e7b25",
+  "SUR-G2": "5bd8f38332a5ec711d597ba90f8da237b412e2da740b63e57fca993414958dad",
   "SUR-G3": "a01235bfbae6b72e5866e26bb56b0223e280d7c0ab1ffca04bec1c29f58d066e",
   "SUR-G4": "d43b633e2108b1dff3332736d2d3e5182af91bf6f624c57c183a910eba660fb1",
   "SUR-Q1": "2bc447f61d219b83a7199f3a67cf4e87c4dd0c290714f971d7a4e4e60176a62b",
@@ -118,7 +119,9 @@
   "NODE-D1": {
    "statement": "7a65cae6a697519d005fe57189f0611ec6cf3659269209fafd3e7dcf2d9c2f07",
    "witnesses": [
-    "a_detection_refused_at_capacity_leaves_no_event_and_no_strike"
+    "a_detection_after_a_same_instant_retraction_is_enforced",
+    "a_detection_refused_at_capacity_leaves_no_event_and_no_strike",
+    "a_permanent_redetection_after_a_same_instant_retraction_is_enforced"
    ]
   },
   "NODE-R1": {
@@ -143,6 +146,12 @@
    "witnesses": [
     "a_retraction_capacity_refusal_is_a_final_refusal_not_a_recorded_effect",
     "a_retraction_capacity_refusal_is_not_an_ipc_success"
+   ]
+  },
+  "NODE-R4": {
+   "statement": "850d42cca881271d5e80b567297dcd8ee46b507d94d997ed23d16ca822da4658",
+   "witnesses": [
+    "a_shortened_block_stays_blocked_until_the_remaining_reason_ends"
    ]
   },
   "REPLAY-R1": {
@@ -230,6 +239,7 @@
   "SUR-G2": {
    "statement": "1b6e73b23807ddd0c0dc52ddf837e0ccdae5cb806382dd4eaff97b0224446e18",
    "witnesses": [
+    "a_mapped_and_a_plain_address_of_one_host_share_a_cooldown",
     "gate_capacity_refusal_keeps_live_cooldowns_and_releases_only_expired_slots",
     "gate_rate_refusal_does_not_start_cooldown_and_zero_policies_are_defined"
    ]
@@ -299,6 +309,9 @@
   "a_damaged_cursor_rereads_the_log_instead_of_skipping_it": [
    "orchestrator/src/bin/sokol-suricata.rs:e4bb88597143a6fbec20e29bcf0cb558143cb96c1edcc174e9dfda12f878e7f4"
   ],
+  "a_detection_after_a_same_instant_retraction_is_enforced": [
+   "orchestrator/src/block_table.rs:568663d0e5acbf56de779805a11d939d0ca87c7c651cbe90adff2b06798700c6"
+  ],
   "a_detection_refused_at_capacity_leaves_no_event_and_no_strike": [
    "orchestrator/src/block_table.rs:d8898bdce5f3c4c004eb7eaeb0dd89c417eacd36e304fd160f038df88b35ecd6"
   ],
@@ -326,6 +339,9 @@
   "a_line_sent_before_the_request_does_not_retire_it": [
    "orchestrator/src/delivery.rs:3f476f8638b77d4c2ea93c1097033d7db48bec0ef154ee5716c9b42ac3f7dd7f"
   ],
+  "a_mapped_and_a_plain_address_of_one_host_share_a_cooldown": [
+   "orchestrator/src/bin/sokol-suricata.rs:b6d357cd10615d362959494d4a1b36dee1c1013145b2c66b7a6fa93790881cc4"
+  ],
   "a_non_canonical_statement_file_fails_the_check": [
    "orchestrator/src/audit_anchor.rs:0ca8fde409b31f9014a6f568436fb66daa4d08892859baf1deb322990ed972d8"
   ],
@@ -337,6 +353,9 @@
   ],
   "a_peers_witness_confirms_the_log_and_exposes_a_recomputed_rewrite": [
    "orchestrator/src/audit_witness.rs:be38ba3c3a78c5957cf3ac657e65e8fac0a3cb4935d0f6575d68f9e14f97b8c3"
+  ],
+  "a_permanent_redetection_after_a_same_instant_retraction_is_enforced": [
+   "orchestrator/src/block_table.rs:302c11a745b3ad9b15aa072ae75aae3a0f83f760c233c1d3750e69baeff305c6"
   ],
   "a_plain_lift_needs_no_free_claim_slot": [
    "orchestrator/src/block_table.rs:8f417c1cac64251147e86d7b6f02e05bd49e6d37fe791e84bee4824a9afe47ba"
@@ -352,6 +371,9 @@
   ],
   "a_retraction_capacity_refusal_is_not_an_ipc_success": [
    "orchestrator/src/main.rs:b6d2c70928903768f294f61324d5c58c47bb63e8157015ca12e690e581e03adc"
+  ],
+  "a_shortened_block_stays_blocked_until_the_remaining_reason_ends": [
+   "orchestrator/src/block_table.rs:38f60345f3871a3a22b0c71a0f94d30795b0451c828d17d8a66812077395c6d6"
   ],
   "a_shortening_capacity_refusal_keeps_both_event_supports": [
    "orchestrator/src/block_table.rs:5c95f1954bd8cf22b4d899bde6a76e0cf89974b83ac51666c71fed8629307a31"
