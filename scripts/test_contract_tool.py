@@ -1,0 +1,195 @@
+"""scripts/contract.py and the gate's generated mode: a row changes only through its contract.
+
+Each case builds a small repository whose two invariant rows are generated from contracts and
+pinned by an owner key, then changes something and runs the gate with the owner's signers.
+
+    python3 scripts/test_contract_tool.py
+"""
+import json
+from pathlib import Path
+import shutil
+import subprocess
+import tempfile
+import unittest
+
+HERE = Path(__file__).resolve().parent
+DECLARATION = ('<!-- Every invariant row is generated from docs/contracts/<ID>.shadow.json; '
+               'change a contract with scripts/contract.py, never this table by hand. -->')
+
+RUST = '''\
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn a_refusal_creates_no_cooldown() {
+        assert_eq!(gate(), 0);
+    }
+
+    #[test]
+    fn an_unknown_reply_keeps_the_obligation() {
+        assert!(kept());
+    }
+
+    #[test]
+    fn a_late_ack_retires_the_obligation() {
+        assert!(retired());
+    }
+}
+'''
+
+
+def contract(rid, statement, witnesses):
+    return {'profile': 'sokol.contract-shadow.v1', 'id': rid, 'statement': statement,
+            'evidence_text': ', '.join(f'`{w}`' for w in witnesses), 'witnesses': witnesses,
+            'annotations': {'status': 'UNSIGNED_EXPLANATORY_DRAFT', 'answer': 'draft'}}
+
+
+def run(cwd, *cmd):
+    return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=60)
+
+
+class ContractTool(unittest.TestCase):
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp())
+        for sub in ('scripts', 'docs/contracts', '.github', 'src'):
+            (self.dir / sub).mkdir(parents=True)
+        for name in ('witness-pin.py', 'contract.py'):
+            shutil.copy(HERE / name, self.dir / 'scripts' / name)
+        (self.dir / 'src/gate.rs').write_text(RUST)
+        self.contracts = {
+            'T-1': contract('T-1', 'A refusal creates no cooldown.', ['a_refusal_creates_no_cooldown']),
+            'T-2': contract('T-2', 'An unknown reply keeps the obligation.', ['an_unknown_reply_keeps_the_obligation']),
+        }
+        for rid, c in self.contracts.items():
+            self.write_contract(c)
+        (self.dir / 'docs/INVARIANTS.md').write_text(
+            DECLARATION + '\n\n| ID | Invariant | Evidence |\n|---|---|---|\n'
+            '| T-1 | x | `a_refusal_creates_no_cooldown` |\n'
+            '| T-2 | x | `an_unknown_reply_keeps_the_obligation` |\n')
+        self.key = str(self.dir.parent / f'{self.dir.name}-owner')
+        subprocess.run(['ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-f', self.key], check=True)
+        self.signers = self.dir.parent / f'{self.dir.name}-signers'
+        self.signers.write_text(f'owner namespaces="sokol-witness" {Path(self.key + ".pub").read_text()}')
+        shutil.copy(self.signers, self.dir / '.github/witness-signers')
+        run(self.dir, 'git', 'init', '-q')
+        run(self.dir, 'git', 'add', '-A')
+        self.assertEqual(self.tool('regenerate').returncode, 0)
+        self.assertEqual(run(self.dir, 'python3', 'scripts/witness-pin.py', 'sign', '--key', self.key).returncode, 0)
+
+    def tearDown(self):
+        shutil.rmtree(self.dir, ignore_errors=True)
+        for p in self.dir.parent.glob(f'{self.dir.name}-*'):
+            p.unlink()
+
+    def write_contract(self, c):
+        (self.dir / f"docs/contracts/{c['id']}.shadow.json").write_text(json.dumps(c, indent=2) + '\n')
+
+    def read_contract(self, rid):
+        return json.loads((self.dir / f'docs/contracts/{rid}.shadow.json').read_text())
+
+    def tool(self, *args):
+        return run(self.dir, 'python3', 'scripts/contract.py', *args)
+
+    def check(self):
+        return run(self.dir, 'python3', 'scripts/witness-pin.py', 'check', '--signers', str(self.signers))
+
+    def assert_refused(self, needle):
+        r = self.check()
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn(needle, r.stdout + r.stderr)
+
+    def invariants(self):
+        return (self.dir / 'docs/INVARIANTS.md').read_text()
+
+    def test_a_generated_and_pinned_tree_passes(self):
+        r = self.check()
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertIn('| T-1 | A refusal creates no cooldown. |', self.invariants())
+
+    def test_a_hand_edited_row_is_refused_and_regenerate_restores_it(self):
+        p = self.dir / 'docs/INVARIANTS.md'
+        p.write_text(p.read_text().replace('creates no cooldown.', 'usually creates no cooldown.'))
+        self.assert_refused('T-1 is stale')
+        self.assertEqual(self.tool('regenerate').returncode, 0)
+        self.assertEqual(self.check().returncode, 0)
+
+    def test_a_row_without_a_contract_is_refused(self):
+        p = self.dir / 'docs/INVARIANTS.md'
+        p.write_text(p.read_text() + '| T-3 | Hand written. | `a_refusal_creates_no_cooldown` |\n')
+        self.assert_refused('T-3 has no contract source')
+
+    def test_a_per_row_marker_cannot_be_mixed_with_the_declaration(self):
+        p = self.dir / 'docs/INVARIANTS.md'
+        p.write_text(p.read_text() + '<!-- Generated T-2 from docs/contracts/T-2.shadow.json; '
+                     'edit the contract, then regenerate. -->\n')
+        self.assert_refused('one declaration and no per-row markers')
+
+    def test_an_open_proposal_changes_nothing_and_is_noted(self):
+        r = self.tool('propose', 'T-1', '--statement', 'A refusal never creates a cooldown.',
+                      '--because', 'reworded after review')
+        self.assertEqual(r.returncode, 0, r.stdout)
+        r = self.check()
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertIn('open proposal T-1-', r.stdout)
+        self.assertIn('| T-1 | A refusal creates no cooldown. |', self.invariants())
+
+    def test_acceptance_without_the_owner_signature_is_refused(self):
+        name = self.tool('propose', 'T-1', '--statement', 'Weaker.', '--because', 'pressure').stdout.strip()
+        self.assertEqual(self.tool('accept', name).returncode, 0)
+        self.assertIn('| T-1 | Weaker. |', self.invariants())
+        self.assert_refused('T-1: invariant statement changed')
+
+    def test_the_owner_accepts_and_the_history_records_why(self):
+        name = self.tool('propose', 'T-2', '--witness', 'an_unknown_reply_keeps_the_obligation',
+                         '--witness', 'a_late_ack_retires_the_obligation',
+                         '--because', 'counterexample: a late ACK was never retired').stdout.strip()
+        r = self.tool('accept', name, '--key', self.key)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(self.check().returncode, 0)
+        c = self.read_contract('T-2')
+        self.assertEqual(c['decisions'][-1]['because'], 'counterexample: a late ACK was never retired')
+        self.assertEqual(c['witnesses'], ['a_late_ack_retires_the_obligation', 'an_unknown_reply_keeps_the_obligation'])
+        self.assertFalse(list((self.dir / 'docs/contracts/proposals').glob('*.proposal.json')))
+
+    def test_a_rewritten_decision_history_is_refused(self):
+        name = self.tool('propose', 'T-1', '--statement', 'Stronger.', '--because', 'real reason').stdout.strip()
+        self.assertEqual(self.tool('accept', name, '--key', self.key).returncode, 0)
+        c = self.read_contract('T-1')
+        c['decisions'][-1]['because'] = 'a nicer story'
+        self.write_contract(c)
+        self.assert_refused('T-1: contract statement, witnesses or decision history changed')
+
+    def test_an_unsigned_explanation_may_change(self):
+        c = self.read_contract('T-1')
+        c['annotations']['answer'] = 'a better draft'
+        self.write_contract(c)
+        self.assertEqual(self.check().returncode, 0)
+
+    def test_a_stale_proposal_is_refused(self):
+        first = self.tool('propose', 'T-1', '--statement', 'First.', '--because', 'one').stdout.strip()
+        second = self.tool('propose', 'T-1', '--statement', 'Second.', '--because', 'two').stdout.strip()
+        self.assertEqual(self.tool('accept', second, '--key', self.key).returncode, 0)
+        r = self.tool('accept', first)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn('stale proposal', r.stdout)
+
+    def test_a_proposal_needs_existing_witnesses_and_a_reason(self):
+        r = self.tool('propose', 'T-1', '--witness', 'a_witness_that_does_not_exist', '--because', 'x')
+        self.assertEqual(r.returncode, 1)
+        self.assertIn('witnesses must be existing tests', r.stdout)
+        r = self.tool('propose', 'T-1', '--statement', 'S.', '--because', '  ')
+        self.assertEqual(r.returncode, 1)
+
+    def test_a_new_invariant_is_placed_after_an_existing_row(self):
+        name = self.tool('propose', 'T-9', '--statement', 'A late ACK retires the obligation.',
+                         '--witness', 'a_late_ack_retires_the_obligation', '--after', 'T-1',
+                         '--because', 'new boundary').stdout.strip()
+        self.assertEqual(self.tool('accept', name).returncode, 0)
+        lines = self.invariants().splitlines()
+        self.assertTrue(lines[lines.index(next(x for x in lines if x.startswith('| T-1 |'))) + 1].startswith('| T-9 |'))
+        r = self.check()
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertIn('T-9: contract is not pinned yet', r.stdout)
+
+
+if __name__ == '__main__':
+    unittest.main()
