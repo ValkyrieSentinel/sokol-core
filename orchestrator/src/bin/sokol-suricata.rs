@@ -394,7 +394,7 @@ impl Cursor {
     /// cursor or the new one, never an empty file.
     fn save(&self, path: &Path) -> io::Result<()> {
         use std::io::Write;
-        let tmp = path.with_extension("tmp");
+        let tmp = cursor_tmp(path);
         let mut file = File::create(&tmp)?;
         file.write_all(&serde_json::to_vec(self).map_err(io::Error::other)?)?;
         file.sync_all()?;
@@ -404,6 +404,15 @@ impl Cursor {
         }
         Ok(())
     }
+}
+
+/// The temporary file a cursor is written through: the cursor's own name plus `.tmp`. Replacing
+/// the extension instead made a cursor named `*.tmp` its own temporary file (truncated before
+/// the new bytes were synced) and let two cursors differing only by extension share one (SUR-C2).
+fn cursor_tmp(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(".tmp");
+    PathBuf::from(name)
 }
 
 /// Where reading starts: the saved cursor; without one, the end (or the start with
@@ -2010,5 +2019,42 @@ mod tests {
             Some(1_790_250_503_712),
             "2026-09-24T11:48:23.712804Z"
         );
+    }
+
+    /// A cursor is replaced by renaming a synced temporary file onto it, never rewritten in
+    /// place, also when its own name ends in `.tmp`: in place, a crash between truncation and
+    /// sync left neither the old cursor nor the new one (SUR-C2).
+    #[test]
+    fn a_cursor_is_replaced_not_rewritten_in_place_whatever_its_name() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = std::env::temp_dir().join(format!("sokol-cursor-replace-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in ["eve-cursor.json", "eve-cursor.tmp"] {
+            let path = dir.join(name);
+            Cursor {
+                inode: 7,
+                position: 1,
+            }
+            .save(&path)
+            .unwrap();
+            let before = std::fs::metadata(&path).unwrap().ino();
+            Cursor {
+                inode: 7,
+                position: 2,
+            }
+            .save(&path)
+            .unwrap();
+            let after = std::fs::metadata(&path).unwrap().ino();
+            assert_ne!(before, after, "{name}: the cursor was rewritten in place");
+            assert_eq!(
+                Cursor::load(&path),
+                Ok(Some(Cursor {
+                    inode: 7,
+                    position: 2
+                }))
+            );
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
