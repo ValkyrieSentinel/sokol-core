@@ -125,6 +125,12 @@ class WitnessPin(unittest.TestCase):
         self.edit("scripts/test_recovery.py", 'cursor("a b")', 'cursor("a  b")')
         self.assert_refused("witness RecoveryTests.test_recovery_keeps_the_cursor changed")
 
+    def test_python_fstring_whitespace_is_not_formatting(self):
+        self.edit("scripts/test_recovery.py", "self.assertEqual(cursor(), 7)", 'self.assertEqual(cursor(f"a {7} b"), 7)')
+        self.assertEqual(self.pin(self.key).returncode, 0)
+        self.edit("scripts/test_recovery.py", 'f"a {7} b"', 'f"a  {7} b"')
+        self.assert_refused("witness RecoveryTests.test_recovery_keeps_the_cursor changed")
+
     def test_literal_braces_cannot_hide_following_assertions(self):
         self.edit("src/gate.rs", 'let url = "http://x";', 'let url = "}";')
         self.assertEqual(self.pin(self.key).returncode, 0)
