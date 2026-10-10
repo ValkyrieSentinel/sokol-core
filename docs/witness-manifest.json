@@ -237,220 +237,220 @@
  },
  "witnesses": {
   "RecoveryTests.test_cooldown_diagnostics_aggregate_across_batches_without_losing_counts": [
-   "scripts/test_suricata_recovery.py:40904b7b29fd47b4b129f021c2b950c9ef3c78453ed0f596532fe9add317f561"
+   "scripts/test_suricata_recovery.py:9901e28f9d7fa253f827045c1b71b164453154cd1aac8290db91c038b4c3a777"
   ],
   "RecoveryTests.test_invalid_forwarding_age_leaves_cursor_and_ipc_untouched": [
-   "scripts/test_suricata_recovery.py:4142266bf5a2841867b8934fd9e192a68a427a347f0e637d1cf6ec190267d661"
+   "scripts/test_suricata_recovery.py:782b9d2ef47448c4a191d462bfa94d2ca92ea12f3e3e67f13a68f2911beb4df5"
   ],
   "StreamTests.test_zero_pacing_fails_before_lapi_or_ipc_requests": [
-   "scripts/test_crowdsec_stream.py:311741ce9c6569f803cfbf7e1ecefc5127cc9528888b05fd7f3123c365dabac1"
+   "scripts/test_crowdsec_stream.py:7a9cc86a61a984b692c1294648017ff8b4d1ae018742129ce070592944dfe8ce"
   ],
   "a_capacity_refusal_preserves_retraction_intent_for_retry": [
-   "orchestrator/src/block_table.rs:86ca0f32a99eaa503405937b2b1376e8bd7dbad90c85ea51c119bb3e8a551c22"
+   "orchestrator/src/block_table.rs:2783bd17daf809d881602646b152468d3a7d2022aece47146aacb83ddbf376be"
   ],
   "a_closed_owner_refuses_late_child_registration": [
-   "orchestrator/src/shutdown.rs:21ede4a8f8112876dfa362328107d6f8bf77f728af6dc9d27709d4f17f554fa5"
+   "orchestrator/src/shutdown.rs:42cd58f69062cfec51699e7f019e70a92cf3a2be1bd5f850188dc132c11238d8"
   ],
   "a_damaged_cursor_rereads_the_log_instead_of_skipping_it": [
-   "orchestrator/src/bin/sokol-suricata.rs:22090a708fce1db528e20a0708eebd2ba2a9fb3caf3332b204ec6d5c3a5fd2fc"
+   "orchestrator/src/bin/sokol-suricata.rs:e4bb88597143a6fbec20e29bcf0cb558143cb96c1edcc174e9dfda12f878e7f4"
   ],
   "a_detection_refused_at_capacity_leaves_no_event_and_no_strike": [
-   "orchestrator/src/block_table.rs:29cf0b03c390076931af6cf963553650696c0f95813be9ae8767d39feb4cf036"
+   "orchestrator/src/block_table.rs:d8898bdce5f3c4c004eb7eaeb0dd89c417eacd36e304fd160f038df88b35ecd6"
   ],
   "a_failed_loss_notice_retains_its_count_until_recovery": [
-   "orchestrator/src/main.rs:39e4ded0435e50a60f7766ff0a98afde65576c27b6edd819e8247cbe30b51d65"
+   "orchestrator/src/main.rs:e9c701e40b514fee6dbf20fce74d11cc56e5c1f2f6ddac4c20ea760dd1fbc6af"
   ],
   "a_flush_records_real_queue_overflow_without_a_following_record": [
-   "orchestrator/src/main.rs:3fdb2379ca4a30be2b65e71d9c6770fe559175a11331a5b371d5a1f5c5ff6445"
+   "orchestrator/src/main.rs:647c2d250aa2f6a1f356dc0f5e9a89798908d7985293a090cccfc7a2040e5385"
   ],
   "a_full_queue_drops_the_oldest_and_counts_it": [
-   "orchestrator/src/delivery.rs:5846cee95fddc276037dc4bfdd2727f48a3436da8ebc5f5bb58ca0c8d582f37b"
+   "orchestrator/src/delivery.rs:6c8570fd6e91b549a46de442429084c682d4e14b19eac9ea6d28634454c07603"
   ],
   "a_full_retractor_set_preserves_support_until_its_owner_fits": [
-   "orchestrator/src/block_table.rs:8c69d2ddb0f27ab9af48f386b7ae368e4f12cb9cb014fd32088f07856c4cf53a"
+   "orchestrator/src/block_table.rs:4552e701b668889edf07982775e2c51ec36ae473643a6a616d85efb5bf74081b"
   ],
   "a_gap_alone_prevents_a_successful_cli_result": [
-   "orchestrator/src/replay.rs:c9ab0c51075336a0483c0c595c184657416bac4d40dd95185ed2bf66ee31f6fc"
+   "orchestrator/src/replay.rs:49aff98c34d04b836fe4c4dfdf6ddb7c6f3d54fae7c5979b28c6bf5470a4ebfc"
   ],
   "a_handshake_without_features_still_parses": [
-   "orchestrator/src/p2p.rs:2fa817e24d97fa7224148601a5f160fc59aafd18d71f662ea61bb322d145f16b"
+   "orchestrator/src/p2p.rs:4e29aebd1be0f034e734c63ea7e7b03a6a5468c9a010e0d5d2c024009deb8bb4"
   ],
   "a_partially_reproduced_audit_is_not_a_successful_cli_result": [
-   "orchestrator/src/replay.rs:52ee3599c839016fce11a8084454cb0a722bd736ad047e39a632f62ba2d13022"
+   "orchestrator/src/replay.rs:43f88ca49b4e414a74aafb77d397e7f5df0b297ff43e58778240e4482feb0293"
   ],
   "a_peers_audit_head_is_witnessed_once_per_interval": [
-   "orchestrator/src/mesh_dispatch.rs:0ccb2b26fbd15bd8c6b8e757db5b2e86fbd11b5d2a90260c0f0c92d9b99177a9"
+   "orchestrator/src/mesh_dispatch.rs:07715d75cbe271d25f56fa81a48021df6e80ad9cf85aca77c9315dfa880cd5ff"
   ],
   "a_peers_witness_confirms_the_log_and_exposes_a_recomputed_rewrite": [
-   "orchestrator/src/audit_witness.rs:ad4e3f005dbbb43d1171d2ce61ef9b440b369144de9f9622125c35adf33261ff"
+   "orchestrator/src/audit_witness.rs:be38ba3c3a78c5957cf3ac657e65e8fac0a3cb4935d0f6575d68f9e14f97b8c3"
   ],
   "a_plain_lift_needs_no_free_claim_slot": [
-   "orchestrator/src/block_table.rs:97973f591400c7486e7ae76acda7829043abe4b23e6d89f54846b4e50f0c0cc1"
+   "orchestrator/src/block_table.rs:8f417c1cac64251147e86d7b6f02e05bd49e6d37fe791e84bee4824a9afe47ba"
   ],
   "a_read_error_preserves_completed_alerts_and_unfinished_bytes": [
-   "orchestrator/src/bin/sokol-suricata.rs:72ed8637b83a1642f2ebd6e40afff012af8af015c52af0040dfa5985e7d96ef7"
+   "orchestrator/src/bin/sokol-suricata.rs:deb55b2ab1cb5388cfe54270f47113f69be14751901e2478dac9226f69a94bfd"
   ],
   "a_real_source_ttl_survives_reason_decoys": [
-   "orchestrator/src/replay.rs:9ea0103c716029de19445e89292072bcd0bc91063ee52a8bc2709830b3c1d603"
+   "orchestrator/src/replay.rs:978d1605b4b93ade5db25305d610d3a5416ac0512d8f3e4602d00e558b6320f4"
   ],
   "a_retraction_capacity_refusal_is_a_final_refusal_not_a_recorded_effect": [
-   "orchestrator/src/delivery.rs:a219d2bd7158b2ed8ce4bd9a4d2bf5aab6115b0e66d0c2bc51c6f53569f618c6"
+   "orchestrator/src/delivery.rs:2dfa88fe20c73afa55f1ad93b0a9f26a17056d2ab0aed2ce1e16e02e0f015bc6"
   ],
   "a_retraction_capacity_refusal_is_not_an_ipc_success": [
-   "orchestrator/src/main.rs:ebf00e1a7286633b70641037f3287c270d0c62b32e79ff9d8344afd7cb9337c6"
+   "orchestrator/src/main.rs:b6d2c70928903768f294f61324d5c58c47bb63e8157015ca12e690e581e03adc"
   ],
   "a_shortening_capacity_refusal_keeps_both_event_supports": [
-   "orchestrator/src/block_table.rs:277b8c7d398d7562e0a9dad4d2d2bc6851aee304bdd64e4ac204f0b1850e1a8c"
+   "orchestrator/src/block_table.rs:5c95f1954bd8cf22b4d899bde6a76e0cf89974b83ac51666c71fed8629307a31"
   ],
   "a_statement_is_one_exact_line_and_parses_back": [
-   "orchestrator/src/audit_anchor.rs:d806636c3a333b00559df05063dc45046301f10b86ae217efa79483f52685a0a"
+   "orchestrator/src/audit_anchor.rs:c5bf55d30ef440b9b156359c89fb509be4dd74cec6b8d177a07cd59226c5ebe6"
   ],
   "a_statement_is_written_once_and_never_rewritten": [
-   "orchestrator/src/audit_anchor.rs:9955fad7fbe4604daefe9e536a088b92f083885fc473919b17211ddd24944cb3"
+   "orchestrator/src/audit_anchor.rs:1bc1e4a25b7b85d45fbef81aec1821e457bb3bf2fca2d73d4d5c912672a9b61e"
   ],
   "a_timed_out_cleanup_worker_is_cancelled_and_joined": [
-   "orchestrator/src/shutdown.rs:c3928b7f68dc11a0c94113bbec3b36cc1eb528d07bfd7e962920e183bd72245f"
+   "orchestrator/src/shutdown.rs:54dff102e072c1246b298f0887514622ed3d7fa8c1f0fb6e8ee1bc70aff8d633"
   ],
   "a_witnessed_head_exposes_a_recomputed_rewrite_that_the_chain_alone_accepts": [
-   "common/src/audit_log.rs:8fbec130c5f8165b7078594513f8b736291a344a20d0879d8cf6e6ec8ba4bef8"
+   "common/src/audit_log.rs:a49cfa0139529780e7d604e6651fabcc2a170b66102e5228463e19f2603b2d7f"
   ],
   "a_wrong_retraction_outcome_remains_a_mismatch": [
-   "orchestrator/src/replay.rs:3580d59efc661bec57a0c706fd491c5710149460c532a54b0462ea5083e02c2d"
+   "orchestrator/src/replay.rs:8739442458927b8860e5da12b3f3249e3a49d714a79eab7dd2bae2981a70a4fb"
   ],
   "an_event_still_held_needs_no_new_retraction_storage": [
-   "orchestrator/src/block_table.rs:a7f828fdcade972da8a35f3ce0a861e69f0eab9e2e127daf6c840375a9809fce"
+   "orchestrator/src/block_table.rs:3a8245282ee23211dba2ba18b4d10ac5e18f759feaab1ba4c14a2f1f6b2b5ef2"
   ],
   "an_existing_record_can_accept_its_owner_at_the_global_capacity": [
-   "orchestrator/src/block_table.rs:16e8d7e8e60a5d648534c72a29d1039d25098e0d890c79f0dbf93e213ec20f3e"
+   "orchestrator/src/block_table.rs:7493c55f460f87805f5b261cfceb5450fe5d20bc098dea0764823df4b802aff5"
   ],
   "an_unterminated_ack_does_not_retire_the_signal": [
-   "orchestrator/src/delivery.rs:a31c261f3633cb55f723e7148f72862700f6a2b329935f1f38ab9fb1b49fba63"
+   "orchestrator/src/delivery.rs:5db75f685bfb2d9940c94edcea25efcadb7e2a61269418d7ce31eb4d948d14ed"
   ],
   "an_unverified_capacity_refusal_fences_dependent_replay_until_a_fresh_start": [
-   "orchestrator/src/replay.rs:d1dff6f5f7eba4b07927bdc7bd05b394f2964af2cc5441f74dcb16194c0c62e5"
+   "orchestrator/src/replay.rs:1ee635f3c72d0c00ea20f7e358527fcbc7201cc1bba4f670fd281760c8c67547"
   ],
   "child_handlers_are_joined_with_their_listener": [
-   "orchestrator/src/shutdown.rs:e81b6df0b14bc49337ab74ef0be0f1dec0ba09123f91cf3b1503a251a39d9075"
+   "orchestrator/src/shutdown.rs:ba6d284a7b53a98cfde10939e255aeaee185c8fec949d666fdf17cdae1717293"
   ],
   "cli_forwarding_age_accepts_zero_and_normal_intervals_but_rejects_bad_numbers": [
-   "orchestrator/src/bin/sokol-suricata.rs:d0bbcd7ab287d61f46acb48378e21423651108ec82890685b8098b48971774b5"
+   "orchestrator/src/bin/sokol-suricata.rs:2c4f0a47349f0263507fc05a4bed4bb1297750291b912b1d6c89c927e671fa19"
   ],
   "cli_pacing_accepts_positive_u32_bounds_and_zero_poll_interval": [
-   "orchestrator/src/bin/sokol-crowdsec.rs:a5943452585e34a62deb970754749849d62c924b79c276ac7debe01447535e51"
+   "orchestrator/src/bin/sokol-crowdsec.rs:82bf3bc2d2253ac8c70a0b5c3a11b54bc1af706b37a3b5aed270df68c2e3dfb9"
   ],
   "cli_rejects_unrepresentable_forwarding_age_before_startup": [
-   "orchestrator/src/bin/sokol-suricata.rs:108567468f833361e0033dd3123a052d7edbd5e14145a2a251d7df84c4651955"
+   "orchestrator/src/bin/sokol-suricata.rs:f33e2e8e271e03c2c37e2d09ecb6d129b62a2d5c048152c7e887893be6f7a96a"
   ],
   "cli_rejects_zero_ipc_pacing_before_startup": [
-   "orchestrator/src/bin/sokol-crowdsec.rs:76cb848579315396232e6b786d7014336cbb3ffe4d8be7c8ea0e63ef43e86632"
+   "orchestrator/src/bin/sokol-crowdsec.rs:3b0c4dc584caf1a7fc99c228969399f3ce80ee1bb14181ea00898bae831dc3ac"
   ],
   "client_logs_cannot_supply_replay_authority": [
-   "orchestrator/src/main.rs:3ed89ba5dc38f6510588a2e5f2737539498856e30d27eeb2b648e85fbb00d44e"
+   "orchestrator/src/main.rs:d7f9fb6fdf61fdd2e10ce75f6570ad35d0ad219edfcff3cfd74ca0131fd4999c"
   ],
   "detected_truncation_fences_offsets_from_previous_contents": [
-   "orchestrator/src/bin/sokol-suricata.rs:16048976020919fb0a546611ed96f3410fab2a74b2d95acce3ef75cbcce18643"
+   "orchestrator/src/bin/sokol-suricata.rs:74dfe334f5b4061db70e4a5b0b5408f69443d96e805df0e114635777dddc2998"
   ],
   "disconnected_final_sync_records_real_queue_overflow": [
-   "orchestrator/src/main.rs:a1edc657bc032a988df062925315b3a5ac6f10d06c17084f00059037e32f4d49"
+   "orchestrator/src/main.rs:bb44d5f4384b276f3760ce7c34328d3f49148a4d888562896b7f04f17665486a"
   ],
   "every_gate_refusal_has_one_counted_policy_reason": [
-   "orchestrator/src/bin/sokol-suricata.rs:c0a5120b40bb3423c9f792e98ab5b3aea61faf57a89e798a4cf8b7d15d7aef64"
+   "orchestrator/src/bin/sokol-suricata.rs:b2f9553541a54678a16193b45687ccf4d1d55433c38918ccf5bde92d59f35db9"
   ],
   "explicit_audit_gaps_fence_dependent_decisions": [
-   "orchestrator/src/replay.rs:7e5fa72b2d5d4848d2827b95a8c3813785af75deb3d3e22d8c5afcc72e51f078"
+   "orchestrator/src/replay.rs:db89e772a9f5bb7ee0fd64c87a2494e529dcd7208f6c57b7dd26772b12ec5ddf"
   ],
   "failed_install_does_not_erase_the_selected_resume_anchor": [
-   "orchestrator/src/bin/sokol-suricata.rs:861540e862cf1027d5c0f0b5bacf37bd69772901ea468e70ea6e88afd71cac3d"
+   "orchestrator/src/bin/sokol-suricata.rs:f07ad9e1515bb91c7c7c632f47980fdad51a0c76e0a99cb50b00a48a6626a765"
   ],
   "feature_commands_reach_only_peers_that_announced_the_feature": [
-   "orchestrator/src/p2p.rs:a220ad9adfab06f57a86ae7bb792fdfdc8b4de09b1f2f38a818eab8d4899906c"
+   "orchestrator/src/p2p.rs:dc39fe5ca27e4e865bb5b7cb836b6111a3651f3a2df42c8c09c2a421654d997b"
   ],
   "forwarding_budget_ages_exactly_and_future_timestamps_cannot_enlarge_it": [
-   "orchestrator/src/bin/sokol-suricata.rs:f4d571ffe68af1c00faff0b6a9b989e1da43bea1c04318980ab2f1e0d5e9b7c2"
+   "orchestrator/src/bin/sokol-suricata.rs:c42d227a868671c9cd34fe83d6ece8982fd4163a63b6b4480d2c27fe7ed1b07a"
   ],
   "forwarding_expiry_is_counted_loss_not_an_ack_and_spends_flush_budget": [
-   "orchestrator/src/delivery.rs:ce588a33282968d54ca25a8d34d96a8ad49b6dc6a20b5f404563d0e99d36d12c"
+   "orchestrator/src/delivery.rs:192ed909a39a213c69474c84277eacb0c3cfd379f2e81a59f5e4f471be453066"
   ],
   "free_text_reason_is_not_a_field_namespace": [
-   "orchestrator/src/replay.rs:30feec3a144df18bd091f1136fcff5b79995b2e8d84c0a1cc3f36e366d971eb2"
+   "orchestrator/src/replay.rs:451470a3cb953b554b1a0174098b8f7082002d808c33714ef6f96f1ae7b4fe23"
   ],
   "gate_capacity_refusal_keeps_live_cooldowns_and_releases_only_expired_slots": [
-   "orchestrator/src/bin/sokol-suricata.rs:3f3105b2ca8bc1d40ab438d8b9dd55f328316018831bccbaaf1504bacd787529"
+   "orchestrator/src/bin/sokol-suricata.rs:61b8d6d0e24b7418fb43f510925d89becc54f79b35d9f4108d9b05440e476e52"
   ],
   "gate_cooldown_memory_has_a_hard_bound_without_eviction": [
-   "orchestrator/src/bin/sokol-suricata.rs:e5b6b6e05d1d383f7bd3e3b325a3d51322d26054f08b0da541a5164761c583d6"
+   "orchestrator/src/bin/sokol-suricata.rs:df19e5816f6640f78736100c0692ec2608d49fce3800ccfd25bfdd383afc01e2"
   ],
   "gate_generated_history_preserves_cooldown_and_bounded_unique_memory": [
-   "orchestrator/src/bin/sokol-suricata.rs:4a46c04b83cb54b86fb156daec9c966066131f77b688f0811cc3e95f8ccb4c38"
+   "orchestrator/src/bin/sokol-suricata.rs:1491d3a1b8fd41aa0cbd683d1ee72b2e1333a9169ea51f644ba05de03963f889"
   ],
   "gate_rate_refusal_does_not_start_cooldown_and_zero_policies_are_defined": [
-   "orchestrator/src/bin/sokol-suricata.rs:f4e931023077cd266d290155d881c181c198f81461c8729e30a08862bb70e7f8"
+   "orchestrator/src/bin/sokol-suricata.rs:d01586e866ecbd11d60afec2c12b5268db5b412b3a43598e842ae7ac63860f45"
   ],
   "gate_refusal_counters_saturate_independently": [
-   "orchestrator/src/bin/sokol-suricata.rs:6661b57441a89d040a59d70976511231f68cc84377ad2c4215b77f22ed31eb96"
+   "orchestrator/src/bin/sokol-suricata.rs:29eac53d178477f760a057c5f172b917db71065190881b78cf1016995aacc455"
   ],
   "generated_reasons_preserve_fields_and_bytes": [
-   "orchestrator/src/replay.rs:477ac87c010bd56282ad545a7b301c708a0ce1b656bc7194a0d066f7c6550c5e"
+   "orchestrator/src/replay.rs:e9c9fd8f0d7c1445611bd4a681497ee4c3243476163f6bba1216d24a4b6371a3"
   ],
   "idle_sync_records_real_queue_overflow_without_a_following_record": [
-   "orchestrator/src/main.rs:e13e0eca0ab5fb1a0a3aff5d6a8762cc6e6d77f5d3511de2618c7f44cab60760"
+   "orchestrator/src/main.rs:1a1101b2e62b9ab31fa5d9579d1cb9cb1cf14ddc1b65894a29f35d9238c90d09"
   ],
   "invalid_freshness_input_does_not_evict_or_create_a_deadline": [
-   "orchestrator/src/delivery.rs:feaf68a274e04ba03c5d17dd87f324f1c651d04d3c9277f9ab6a0675d81c6506"
+   "orchestrator/src/delivery.rs:0ec831c4a6db41be9882f9ad1086b92f9a81bd3577d58c49ca0208645f7f7181"
   ],
   "invalid_input_cannot_evict_a_queued_signal": [
-   "orchestrator/src/delivery.rs:24ed4135525d24bca58c6b42393f7bc26381dce658829701b4ff86405cd06632"
+   "orchestrator/src/delivery.rs:1669cf734d4862fea149cdc4b7092b35c9e32b00603b944334e9e94c46e92211"
   ],
   "ipc_pacing_interval_does_not_round_below_the_configured_budget": [
-   "orchestrator/src/bin/sokol-crowdsec.rs:97f74b5d213dd9a4f18f6503f54a18a828e5f7608cc8ef57b17b593d6026fbf5"
+   "orchestrator/src/bin/sokol-crowdsec.rs:6936af2a57a884eedf8e538ffaffe5c266156bd03fab7afbe17884642a8d2ecd"
   ],
   "ipc_pacing_intervals_are_positive_minimal_integer_budgets": [
-   "orchestrator/src/bin/sokol-crowdsec.rs:25116b528a4febab82644f095425f1c5127e1ff0eb8e634114fc6ace495164a3"
+   "orchestrator/src/bin/sokol-crowdsec.rs:61e565050b8aedb2117e8cffa944ac5790a08da2fe12898eb2c0d4de3c686720"
   ],
   "local_decision_is_audited_before_cancellable_mesh_publication": [
-   "orchestrator/src/main.rs:1abeef835ec2ab0c2f6e691caa2d6c8ad0fd434c56982f973390395d847c4d8d"
+   "orchestrator/src/main.rs:60f15be671476e5113c9e4a5e8a37fa351650216add7874bdacdc029415f0126"
   ],
   "lost_ack_then_freshness_expiry_does_not_resend_or_undo_the_signal": [
-   "orchestrator/src/delivery.rs:96b998032bc6cef2c048d952ec12243dead5685669ac91653f0af9063147cdd3"
+   "orchestrator/src/delivery.rs:7dee60f94be1202803274bb5e2417cae646818c6b1d4314e1a66b6c087d7d315"
   ],
   "lost_answer_keeps_expiry_and_later_retry_sends_its_retraction": [
-   "orchestrator/src/delivery.rs:cd15bbaf81ad04dbb63347a603024b02725a70ec7f123a0df1f31951115117ed"
+   "orchestrator/src/delivery.rs:0a5d4949613481d8183ef76d002b8e2b57001accfa5390eb73566e4d86a98848"
   ],
   "oversized_audit_records_are_counted_and_marked_before_following_data_or_flush": [
-   "orchestrator/src/main.rs:392002935eda7f12742b9473428bcde452f47a51af471d3c40e2c15273400284"
+   "orchestrator/src/main.rs:5f8238ea09e54d0084116377203678b159470a25e2ce754f919cac38e557fd60"
   ],
   "producer_quiescence_keeps_shutdown_record_last": [
-   "orchestrator/src/main.rs:1be2627d5ea4b8a1da744f7b1c66c8d2b6e2d438354af6b51fdb4983c5040e55"
+   "orchestrator/src/main.rs:6fc7156a6e4465af5181e53d689d5036d1253615f41d16a3ba355db21ed55fb0"
   ],
   "quiesce_joins_a_stalled_producer_before_final_state_and_audit": [
-   "orchestrator/src/shutdown.rs:ec647578134419e45316768f5e34360ba53b6539f468aa6b62c953fd4283a841"
+   "orchestrator/src/shutdown.rs:c5d5258ceb4390cd90b4bb30ce8bde09b7ced08a1c5800524a08c3ddb4dd7e36"
   ],
   "rate_only_diagnostics_wait_for_the_shared_interval_and_preserve_pending_counts": [
-   "orchestrator/src/bin/sokol-suricata.rs:564e576ab29eac630d4244757d383a6aec54fe1244de24eb505144011efc678f"
+   "orchestrator/src/bin/sokol-suricata.rs:07b06520e8d3af4e47f7936482270e7b88b51bec59e3a7885bd1508285149684"
   ],
   "read_errors_before_a_complete_line_preserve_the_cursor_and_retry_bytes": [
-   "orchestrator/src/bin/sokol-suricata.rs:189a8129c38edcf325ebb807d6be3851414f7f22f368f5435e7c5300c2aa634c"
+   "orchestrator/src/bin/sokol-suricata.rs:144933f74fa38cd61667020340623acab6514f5389d37ebd5bec7d3088c4fe03"
   ],
   "reason_fields_cannot_hide_a_wrong_detector_ttl": [
-   "orchestrator/src/replay.rs:9d6c004386e98067fa0ead77fdf58b8d0d498b2717b4771bfb877444fe1a2556"
+   "orchestrator/src/replay.rs:57f268576ad5be1fbf0b9e5d94598a0232c4169eed75f33f8f67e0a62204f4bc"
   ],
   "refusal_diagnostics_do_not_wrap_or_reemit_saturated_totals": [
-   "orchestrator/src/bin/sokol-suricata.rs:6bef58d8a5b09f61fd7a46e4eb4f9430e9299aea4a56312f8a9ec61490a71ed4"
+   "orchestrator/src/bin/sokol-suricata.rs:4c7ff0a7f7e5becd7a73f3b5ed19f3124325b7fbd35daa2ee921648aa6f635e6"
   ],
   "refusal_diagnostics_preserve_counts_and_space_emissions_across_batches": [
-   "orchestrator/src/bin/sokol-suricata.rs:4da5803db6d37715c3ad92c40e10e546b082d7fd9c567c683f79a090002a831f"
+   "orchestrator/src/bin/sokol-suricata.rs:230567c360e68f740ac458347f6991ec08215c1430eacfbb53ba1e4282587010"
   ],
   "resume_retains_its_anchor_while_the_source_is_missing": [
-   "orchestrator/src/bin/sokol-suricata.rs:2da7f38db2270035177c98a2d10d7af7c4dab71518175f376d53381bbdff42f7"
+   "orchestrator/src/bin/sokol-suricata.rs:d61ca20adab36212c565f1881670dff1788e793e5510f06ddd269dae3f0070d7"
   ],
   "retraction_admission_reserves_every_needed_record": [
-   "orchestrator/src/block_table.rs:d1982f6679315f6d4646d5fdbf773f095d4a0d1e65696226b36273ff01b0534f"
+   "orchestrator/src/block_table.rs:4c02a188abd2794498f179c5003caf1ff72f43017cd2a838c40a28b242b9bdc9"
   ],
   "statements_confirm_the_log_and_expose_a_recomputed_rewrite": [
-   "orchestrator/src/audit_anchor.rs:96893802ec7f8be5823dce40aa1fd872218310f2dd8995a82e4b092e74914d0b"
+   "orchestrator/src/audit_anchor.rs:e0ddaf11cdfacddd7d3a3a8130597982ec297d9d6b8c100e85fd2ba5170ac4d6"
   ],
   "unknown_reply_keeps_the_obligation_and_a_later_ack_retires_it": [
-   "orchestrator/src/delivery.rs:7d30e406e2680d3ea536ce5c19c0e79656b0ec2a3281bf125cc61a5c43caed01"
+   "orchestrator/src/delivery.rs:08eaebdf5f929438bef556b1076aa80740818212bc39bde3b0b011d68598d7d9"
   ]
  }
 }
