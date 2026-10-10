@@ -1,0 +1,15 @@
+{
+  "annotations": {
+    "status": "UNSIGNED_EXPLANATORY_DRAFT"
+  },
+  "evidence_text": "`forwarding_expiry_is_counted_loss_not_an_ack_and_spends_flush_budget`, `invalid_freshness_input_does_not_evict_or_create_a_deadline`, `lost_ack_then_freshness_expiry_does_not_resend_or_undo_the_signal`, `lost_answer_keeps_expiry_and_later_retry_sends_its_retraction`",
+  "id": "IPC-T1",
+  "profile": "sokol.contract-shadow.v1",
+  "statement": "An opt-in forwarding deadline is checked before connection/backoff work and after handshake, immediately before preparing a send/retry. Expired FIFO entries are removed in pairs and increment `expired`, never a node-answer result. Each removal spends flush work budget. Source TTL entries still render retractions and require ACK; expired entries behind an unexpired FIFO head wait until they reach the front.",
+  "witnesses": [
+    "forwarding_expiry_is_counted_loss_not_an_ack_and_spends_flush_budget",
+    "invalid_freshness_input_does_not_evict_or_create_a_deadline",
+    "lost_ack_then_freshness_expiry_does_not_resend_or_undo_the_signal",
+    "lost_answer_keeps_expiry_and_later_retry_sends_its_retraction"
+  ]
+}

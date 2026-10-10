@@ -1,0 +1,12 @@
+{
+  "annotations": {
+    "status": "UNSIGNED_EXPLANATORY_DRAFT"
+  },
+  "evidence_text": "`a_detection_refused_at_capacity_leaves_no_event_and_no_strike` (mutations \"remember the event first\" and \"count the strike first\" each fail it).",
+  "id": "NODE-D1",
+  "profile": "sokol.contract-shadow.v1",
+  "statement": "A detection checks its event id, adds or merges the claim, then records the event, under one table lock. A resend of an event acted on within EVENT_MEMORY is a duplicate. A refused detection (here: the known-claims cap) records no event and counts no strike: a resend after capacity frees is decided afresh, and the next block of that target gets the TTL of its first strike.",
+  "witnesses": [
+    "a_detection_refused_at_capacity_leaves_no_event_and_no_strike"
+  ]
+}

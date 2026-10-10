@@ -1,0 +1,12 @@
+{
+  "annotations": {
+    "status": "UNSIGNED_EXPLANATORY_DRAFT"
+  },
+  "evidence_text": "`client_logs_cannot_supply_replay_authority` (real writer/reader/CLI), XDP smoke client ACK/dump/fresh-replay checks",
+  "id": "REPLAY-R4",
+  "profile": "sokol.contract-shadow.v1",
+  "statement": "Signal-socket `DB_LOG` text has a fixed `CLIENT_LOG` outer tag and cannot supply node lifecycle/decision/loss records.",
+  "witnesses": [
+    "client_logs_cannot_supply_replay_authority"
+  ]
+}

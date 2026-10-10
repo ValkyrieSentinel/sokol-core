@@ -1,0 +1,13 @@
+{
+  "annotations": {
+    "status": "UNSIGNED_EXPLANATORY_DRAFT"
+  },
+  "evidence_text": "`an_unverified_capacity_refusal_fences_dependent_replay_until_a_fresh_start`, `a_wrong_retraction_outcome_remains_a_mismatch`",
+  "id": "REPLAY-R1",
+  "profile": "sokol.contract-shadow.v1",
+  "statement": "A recorded retraction capacity refusal that the fresh replay cannot reproduce is unverified. Its speculative table is discarded; dependent decisions are insufficient until a new usable start record. It is neither a verified refusal nor a cascade of mismatches.",
+  "witnesses": [
+    "a_wrong_retraction_outcome_remains_a_mismatch",
+    "an_unverified_capacity_refusal_fences_dependent_replay_until_a_fresh_start"
+  ]
+}

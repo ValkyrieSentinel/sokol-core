@@ -1,0 +1,14 @@
+{
+  "annotations": {
+    "status": "UNSIGNED_EXPLANATORY_DRAFT"
+  },
+  "evidence_text": "`cli_rejects_unrepresentable_forwarding_age_before_startup`, `cli_forwarding_age_accepts_zero_and_normal_intervals_but_rejects_bad_numbers`; actual process `RecoveryTests.test_invalid_forwarding_age_leaves_cursor_and_ipc_untouched`",
+  "id": "SUR-T2",
+  "profile": "sokol.contract-shadow.v1",
+  "statement": "CLI parsing rejects an age interval that cannot be added to the startup local `Instant`, before source/cursor/IPC operations. Zero and normal intervals remain valid configuration; each later per-alert addition is independently checked. This does not promise representability forever for values close to the clock limit.",
+  "witnesses": [
+    "RecoveryTests.test_invalid_forwarding_age_leaves_cursor_and_ipc_untouched",
+    "cli_forwarding_age_accepts_zero_and_normal_intervals_but_rejects_bad_numbers",
+    "cli_rejects_unrepresentable_forwarding_age_before_startup"
+  ]
+}

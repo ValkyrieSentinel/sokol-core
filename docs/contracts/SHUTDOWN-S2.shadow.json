@@ -1,0 +1,13 @@
+{
+  "annotations": {
+    "status": "UNSIGNED_EXPLANATORY_DRAFT"
+  },
+  "evidence_text": "`a_timed_out_cleanup_worker_is_cancelled_and_joined`, `local_decision_is_audited_before_cancellable_mesh_publication` (actual registry lock held); XDP final-state/audit checks",
+  "id": "SHUTDOWN-S2",
+  "profile": "sokol.contract-shadow.v1",
+  "statement": "A cleanup-worker timeout cancels and joins the task instead of detaching it. Table mutation and its decision audit submission precede cancellable network awaits.",
+  "witnesses": [
+    "a_timed_out_cleanup_worker_is_cancelled_and_joined",
+    "local_decision_is_audited_before_cancellable_mesh_publication"
+  ]
+}

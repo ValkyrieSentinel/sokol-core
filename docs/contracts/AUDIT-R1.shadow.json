@@ -1,0 +1,12 @@
+{
+  "annotations": {
+    "status": "UNSIGNED_EXPLANATORY_DRAFT"
+  },
+  "evidence_text": "`oversized_audit_records_are_counted_and_marked_before_following_data_or_flush` (real asynchronous writer, chained file, metrics and CLI)",
+  "id": "AUDIT-R1",
+  "profile": "sokol.contract-shadow.v1",
+  "statement": "Oversized records are known losses, not successful appends. Before following data or sync, `AUDIT_LOST` accounts for them even on a still-writable log.",
+  "witnesses": [
+    "oversized_audit_records_are_counted_and_marked_before_following_data_or_flush"
+  ]
+}
