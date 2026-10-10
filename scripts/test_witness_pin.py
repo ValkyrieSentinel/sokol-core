@@ -115,6 +115,12 @@ class WitnessPin(unittest.TestCase):
         self.edit("scripts/test_recovery.py", "self.assertEqual(cursor(), 7)", "cursor()")
         self.assert_refused("witness RecoveryTests.test_recovery_keeps_the_cursor changed")
 
+    def test_python_comments_and_indentation_do_not_count(self):
+        self.edit("scripts/test_recovery.py", "        self.assertEqual(cursor(), 7)",
+                  "        # The cursor survives a restart.\n        self.assertEqual(cursor(), 7)  # seven")
+        r = self.check()
+        self.assertEqual(r.returncode, 0, r.stdout)
+
     def test_a_dropped_witness_is_refused(self):
         self.edit("docs/INVARIANTS.md", "`a_refusal_creates_no_cooldown`", "code review")
         self.assert_refused("T-1: witness a_refusal_creates_no_cooldown was dropped")
