@@ -169,12 +169,38 @@ def py_layout(code: str) -> str:
     import io
     import textwrap
     import tokenize
+    code = textwrap.dedent(code)
+    lines = code.splitlines(keepends=True)
+    offsets = [0]
+    for line in lines:
+        offsets.append(offsets[-1] + len(line))
+    source_tokens = iter(tokenize.generate_tokens(io.StringIO(code).readline))
+    # The owner pins already use Python 3.9 token IDs. Python 3.13 moved OP
+    # and splits f-strings into several tokens: keep the same source identity.
+    canonical = {"NAME": 1, "NUMBER": 2, "STRING": 3, "NEWLINE": 4,
+                 "INDENT": 5, "DEDENT": 6, "OP": 54, "ERRORTOKEN": 60}
     tokens = []
-    for token in tokenize.generate_tokens(io.StringIO(textwrap.dedent(code)).readline):
+    for token in source_tokens:
+        kind = tokenize.tok_name[token.type]
         if token.type in (tokenize.COMMENT, tokenize.NL, tokenize.ENDMARKER):
             continue
+        if kind == "FSTRING_START":
+            start = offsets[token.start[0] - 1] + token.start[1]
+            depth = 1
+            for part in source_tokens:
+                part_kind = tokenize.tok_name[part.type]
+                depth += int(part_kind == "FSTRING_START") - int(part_kind == "FSTRING_END")
+                if depth == 0:
+                    end = offsets[part.end[0] - 1] + part.end[1]
+                    tokens.append((3, code[start:end]))
+                    break
+            else:
+                raise ValueError("Unterminated f-string")
+            continue
+        if kind not in canonical:
+            raise ValueError("Unsupported Python token: " + kind)
         value = "" if token.type in (tokenize.INDENT, tokenize.DEDENT, tokenize.NEWLINE) else token.string
-        tokens.append((token.type, value))
+        tokens.append((canonical[kind], value))
     return json.dumps(tokens, ensure_ascii=True, separators=(",", ":"))
 
 
