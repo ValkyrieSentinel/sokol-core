@@ -7,13 +7,20 @@
       "because": "Counterexample (hunt round 3, 2026-10-10): a state file with MAX_KNOWN_CLAIMS + 1 retraction records restored all of them, past the bound the runtime enforces (block_table MAX_KNOWN_CLAIMS doc).",
       "previous_statement_sha256": null,
       "proposal_sha256": "b99d970b08dbea9880e66b6bb706cedb71df6d451d6d50b642ac049165245e5f"
+    },
+    {
+      "because": "Mutation check (CI, PR #7): the drop counts and the merge-at-full and exact-end boundaries of restore were unwitnessed (12 surviving mutants). They are now observable and pinned.",
+      "previous_statement_sha256": "9ee9047a6b6418819c3278d759fbec00be55e725792305faf8e5085b2edea53f",
+      "proposal_sha256": "1e86dde65411091afb6e2cc95631f46245c85aff9ca429d16162d14d19028cd5"
     }
   ],
-  "evidence_text": "`a_restore_keeps_every_bounded_table_within_its_runtime_bound`",
+  "evidence_text": "`a_restore_keeps_every_bounded_table_within_its_runtime_bound`, `a_full_restore_merges_into_what_it_holds_and_drops_only_new_entries`, `operator_lifts_past_the_bound_are_counted`",
   "id": "STATE-P2",
   "profile": "sokol.contract-shadow.v1",
   "statement": "After a restore every bounded table holds no more than its runtime bound (claims and retraction records MAX_KNOWN_CLAIMS, events MAX_EVENTS, support targets MAX_SUPPORT_TARGETS), whatever the file holds; operator lifts are kept first and what is dropped is counted.",
   "witnesses": [
-    "a_restore_keeps_every_bounded_table_within_its_runtime_bound"
+    "a_full_restore_merges_into_what_it_holds_and_drops_only_new_entries",
+    "a_restore_keeps_every_bounded_table_within_its_runtime_bound",
+    "operator_lifts_past_the_bound_are_counted"
   ]
 }

@@ -7,14 +7,20 @@
       "because": "Counterexample (hunt round 3, 2026-10-10): with an operator ban on the target, RETRACT answered 'OK lifted' (INTEGRATIONS.md: nothing else held the block) while it stayed blocked; 'too many known claims' was answered 'OK refused protected'.",
       "previous_statement_sha256": null,
       "proposal_sha256": "653ac6964a449005da49d05fd0cd0eeec4b6820027047b487c51a18f6e908eba"
+    },
+    {
+      "because": "Mutation check (CI, PR #7): still_blocks could use && instead of || and no witness failed; a wanted block the kernel map could not take must still count as blocking for the reply.",
+      "previous_statement_sha256": "7d16704800297f6e2d79383db3843e71721b3826d19fc4449b63acac5d6013e0",
+      "proposal_sha256": "e0a63554d0be1c8c82818a9e15df39eadfac8b78ded1fcadd6ef6551c0b3fc2d"
     }
   ],
-  "evidence_text": "`a_capacity_refusal_is_not_reported_as_a_protected_target`, `a_retraction_answers_lifted_only_when_nothing_else_blocks_the_target`",
+  "evidence_text": "`a_capacity_refusal_is_not_reported_as_a_protected_target`, `a_retraction_answers_lifted_only_when_nothing_else_blocks_the_target`, `a_wanted_block_not_yet_written_still_blocks`",
   "id": "IPC-R1",
   "profile": "sokol.contract-shadow.v1",
   "statement": "A detector retraction is answered OK lifted only when nothing blocks the target on this node any more; a block still held by an operator, static or peer claim is answered as still held. A capacity refusal of a signal is answered as a capacity refusal, never as a protected target.",
   "witnesses": [
     "a_capacity_refusal_is_not_reported_as_a_protected_target",
-    "a_retraction_answers_lifted_only_when_nothing_else_blocks_the_target"
+    "a_retraction_answers_lifted_only_when_nothing_else_blocks_the_target",
+    "a_wanted_block_not_yet_written_still_blocks"
   ]
 }

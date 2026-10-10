@@ -12,7 +12,7 @@
   "FLOWSPEC-P1": "23412916e4d4b48929c79ebd1541c49345a29b49377f67aff8ef23ac673153ce",
   "FLOWSPEC-P2": "092a77fd366261837398647687cf247ee43845d3f66f263be8bbd108625df225",
   "IPC-A1": "6a0096b5b18b5190ee613bc7e2e3e94604665f205385b18ae074bb0b9138aafa",
-  "IPC-R1": "07a01de5339ebf18834a4c377965c9b4ea9763835cabed6e46f7db5f1a39f2f1",
+  "IPC-R1": "b9989e447aaf0ac528045bb46ae30f905b77868400866b3732711082527f9986",
   "IPC-T1": "088af71858cc841192a1cac08dd3a0cfe6f6fcded7772bf9ba5fbd3a13122cc3",
   "NODE-D1": "0765e06474e6a67f70ffa2f6ca4e0c78da7f252909be75c56a3a5c7b8740efd3",
   "NODE-R1": "4618ac4d2bb0c89369d0a8b83d84cb96e1b22f630db08c56320e0b25022bcb15",
@@ -28,7 +28,7 @@
   "SHUTDOWN-S1": "20f05174abd36f01bf7b650b1dc2d099bc9c482d2bccbd9b549db27d750e5cff",
   "SHUTDOWN-S2": "4b603c1a2c197fc71e551940b80a2df275920b45405489d7e899fbeb4e1a7046",
   "STATE-P1": "c77333a2be0f751dac1ec9ce6663e325d36efa51c8dc917ebe9cb81bd5af5561",
-  "STATE-P2": "4dfdd09dea5f78e8ee945a364d114902261ee0daf145fd80388d53172da98d13",
+  "STATE-P2": "93fa21f3199e8249b2367c1c03cfe7dc9fb86f4ac18bc32812cfb588c4a4bc52",
   "SUR-C1": "71649ca5848e6bfeec0e1cb516058d937298924631f88b0141127498686b614a",
   "SUR-C2": "7fcaf10dafce330390b4f11b6d613a8f16500cbe135bdd57382e877471c642d0",
   "SUR-D1": "0df7ecc50aad9a0ce7a4b75881a5dab0870bb4bd5947cd5ab0a7078e65554bd8",
@@ -138,7 +138,8 @@
    "statement": "7d16704800297f6e2d79383db3843e71721b3826d19fc4449b63acac5d6013e0",
    "witnesses": [
     "a_capacity_refusal_is_not_reported_as_a_protected_target",
-    "a_retraction_answers_lifted_only_when_nothing_else_blocks_the_target"
+    "a_retraction_answers_lifted_only_when_nothing_else_blocks_the_target",
+    "a_wanted_block_not_yet_written_still_blocks"
    ]
   },
   "IPC-T1": {
@@ -258,7 +259,9 @@
   "STATE-P2": {
    "statement": "9ee9047a6b6418819c3278d759fbec00be55e725792305faf8e5085b2edea53f",
    "witnesses": [
-    "a_restore_keeps_every_bounded_table_within_its_runtime_bound"
+    "a_full_restore_merges_into_what_it_holds_and_drops_only_new_entries",
+    "a_restore_keeps_every_bounded_table_within_its_runtime_bound",
+    "operator_lifts_past_the_bound_are_counted"
    ]
   },
   "SUR-C1": {
@@ -386,6 +389,9 @@
   "a_full_queue_drops_the_oldest_and_counts_it": [
    "orchestrator/src/delivery.rs:6c8570fd6e91b549a46de442429084c682d4e14b19eac9ea6d28634454c07603"
   ],
+  "a_full_restore_merges_into_what_it_holds_and_drops_only_new_entries": [
+   "orchestrator/src/block_table.rs:d7011e8954e01ea208a232665e48014b768297456c0fb30d6f48647c5273a787"
+  ],
   "a_full_retractor_set_preserves_support_until_its_owner_fits": [
    "orchestrator/src/block_table.rs:4552e701b668889edf07982775e2c51ec36ae473643a6a616d85efb5bf74081b"
   ],
@@ -438,7 +444,7 @@
    "orchestrator/src/flowspec.rs:b5d3cf31d040245ff461508926800bb080b355aa46e2537287fb2a10c3c41646"
   ],
   "a_restore_keeps_every_bounded_table_within_its_runtime_bound": [
-   "orchestrator/src/block_table.rs:254aae5e9fc823beda57b87a5ac82376ceed4bc047de250a70cf66d0a946d8b1"
+   "orchestrator/src/block_table.rs:775d036b2124ba22dc5febc7900ea5df4a9d687eb5cf521f9a618f2bdfe54c8d"
   ],
   "a_retraction_answers_lifted_only_when_nothing_else_blocks_the_target": [
    "orchestrator/src/ipc.rs:be79fed2c10d060d653847b9f36ff657287dab5131ae7ff9d3bf8d09607c063f"
@@ -478,6 +484,9 @@
   ],
   "a_timed_out_cleanup_worker_is_cancelled_and_joined": [
    "orchestrator/src/shutdown.rs:54dff102e072c1246b298f0887514622ed3d7fa8c1f0fb6e8ee1bc70aff8d633"
+  ],
+  "a_wanted_block_not_yet_written_still_blocks": [
+   "orchestrator/src/block_table.rs:b6a306ae70461b5aaad79f7450c6935bf1fb9030dd553f4b9767e214265b0025"
   ],
   "a_witnessed_head_exposes_a_recomputed_rewrite_that_the_chain_alone_accepts": [
    "common/src/audit_log.rs:a49cfa0139529780e7d604e6651fabcc2a170b66102e5228463e19f2603b2d7f"
@@ -595,6 +604,9 @@
   ],
   "only_the_canonical_line_is_a_statement": [
    "orchestrator/src/audit_anchor.rs:4666938b8edb555bc0d8a6a16cb83be5d765366264298881a0a3621c68aa70bc"
+  ],
+  "operator_lifts_past_the_bound_are_counted": [
+   "orchestrator/src/block_table.rs:8655b9032d02c23bc26a9fc6c8a0afb9610d8ddafa1a70967902946f534af01a"
   ],
   "oversized_audit_records_are_counted_and_marked_before_following_data_or_flush": [
    "orchestrator/src/main.rs:5f8238ea09e54d0084116377203678b159470a25e2ce754f919cac38e557fd60"
