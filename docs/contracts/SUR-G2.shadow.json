@@ -2,11 +2,19 @@
   "annotations": {
     "status": "UNSIGNED_EXPLANATORY_DRAFT"
   },
-  "evidence_text": "`gate_capacity_refusal_keeps_live_cooldowns_and_releases_only_expired_slots`, `gate_rate_refusal_does_not_start_cooldown_and_zero_policies_are_defined`, generated history above",
+  "decisions": [
+    {
+      "because": "Counterexample (hunt round 2, 2026-10-10): 203.0.113.5 and ::ffff:203.0.113.5 were two keys of the cooldown set, so one host was admitted twice at one Instant under a 60 s cooldown, while the node reads both as one host. Fix: the source address is canonical from parsing on.",
+      "previous_statement_sha256": "1b6e73b23807ddd0c0dc52ddf837e0ccdae5cb806382dd4eaff97b0224446e18",
+      "proposal_sha256": "451fa79ee8e3b4ffaf16c839a4105a1915f0e37340ae050dbc7903173381f2d6"
+    }
+  ],
+  "evidence_text": "`gate_capacity_refusal_keeps_live_cooldowns_and_releases_only_expired_slots`, `gate_rate_refusal_does_not_start_cooldown_and_zero_policies_are_defined`, generated history above, `a_mapped_and_a_plain_address_of_one_host_share_a_cooldown`",
   "id": "SUR-G2",
   "profile": "sokol.contract-shadow.v1",
   "statement": "Successful admissions of one source IP are separated by at least cooldown. A capacity or rate refusal creates neither a new cooldown nor an admitted-rate slot. Only successful admission inserts an expiry tuple and increments the quota.",
   "witnesses": [
+    "a_mapped_and_a_plain_address_of_one_host_share_a_cooldown",
     "gate_capacity_refusal_keeps_live_cooldowns_and_releases_only_expired_slots",
     "gate_rate_refusal_does_not_start_cooldown_and_zero_policies_are_defined"
   ]
