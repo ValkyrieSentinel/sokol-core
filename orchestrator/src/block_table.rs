@@ -4451,6 +4451,46 @@ mod tests {
         ));
     }
 
+    /// A peer's share frees exactly as its claims go: one expired claim of two makes room for
+    /// one more, not for two (ADR-0025).
+    #[test]
+    fn a_peers_share_frees_exactly_as_its_claims_end() {
+        let two = Envelope {
+            max_known: 2,
+            ..Envelope::unlimited(POLICY.max)
+        };
+        let mut t = limited(1, Envelope::unlimited(POLICY.max), &[(2, two)]);
+        let ending = |target: &str, secs: u64| Claim {
+            expires_ms: Some(T0 + secs * S),
+            ..peer_claim(2, target, T0)
+        };
+        assert!(!matches!(
+            t.adopt(ending("203.0.113.30", 60), true, T0),
+            Adoption::Refused(_)
+        ));
+        assert!(!matches!(
+            t.adopt(ending("203.0.113.31", 600), true, T0),
+            Adoption::Refused(_)
+        ));
+        let later = T0 + 61 * S;
+        t.tick(later);
+        assert_eq!(
+            t.known_of(2),
+            1,
+            "the ended claim still counts against the share"
+        );
+        assert!(!matches!(
+            t.adopt(ending("203.0.113.32", 600), true, later),
+            Adoption::Refused(_)
+        ));
+        assert_eq!(t.known_of(2), 2);
+        assert_eq!(
+            t.adopt(ending("203.0.113.33", 600), true, later),
+            Adoption::Refused(PEER_SHARE_FULL),
+            "the share freed more room than the claims that ended"
+        );
+    }
+
     /// Peers with no share limit together stop at the room kept for this node's own decisions:
     /// the table is never so full of peer claims that an own detection is refused (ADR-0025).
     #[test]
