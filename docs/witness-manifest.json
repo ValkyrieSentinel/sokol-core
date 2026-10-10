@@ -237,13 +237,13 @@
  },
  "witnesses": {
   "RecoveryTests.test_cooldown_diagnostics_aggregate_across_batches_without_losing_counts": [
-   "scripts/test_suricata_recovery.py:508e4695f3c3c7c68e42d2a0bc58682a1b81b5411544edbda8fcf43620248e51"
+   "scripts/test_suricata_recovery.py:40904b7b29fd47b4b129f021c2b950c9ef3c78453ed0f596532fe9add317f561"
   ],
   "RecoveryTests.test_invalid_forwarding_age_leaves_cursor_and_ipc_untouched": [
-   "scripts/test_suricata_recovery.py:3e8f8d9f52cc2f8f98090a94730d69261f0d8177b7c7d54c39b7274b440d9d46"
+   "scripts/test_suricata_recovery.py:4142266bf5a2841867b8934fd9e192a68a427a347f0e637d1cf6ec190267d661"
   ],
   "StreamTests.test_zero_pacing_fails_before_lapi_or_ipc_requests": [
-   "scripts/test_crowdsec_stream.py:bed1255a134bf577073598636c8bc8868c911b08a7c9cd3a09af65830427cfee"
+   "scripts/test_crowdsec_stream.py:311741ce9c6569f803cfbf7e1ecefc5127cc9528888b05fd7f3123c365dabac1"
   ],
   "a_capacity_refusal_preserves_retraction_intent_for_retry": [
    "orchestrator/src/block_table.rs:86ca0f32a99eaa503405937b2b1376e8bd7dbad90c85ea51c119bb3e8a551c22"
