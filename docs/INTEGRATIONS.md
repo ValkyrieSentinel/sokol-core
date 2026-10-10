@@ -369,8 +369,10 @@ claim keeps its own expiry but is enforced here for at most `--block-ttl-max`.
   (`--peer-max-active`, default 16384; more wait for a free slot), each for at most
   `--peer-max-ttl` (default `--block-ttl-max`) from when it starts. A prefix wider than /24
   (IPv4) or /64 (IPv6) is enforced only once `--quorum` distinct nodes (default 2, this node's own
-  claim included) claim it, so one compromised peer cannot cut off a network. Per peer, the peers
-  file can tighten this: `"envelope": {"max_active": 1000, "max_ttl_secs": 3600,
+  claim included) claim it, so one compromised peer cannot cut off a network. A peer's claims
+  known here at once, enforced or waiting, are capped too (`--peer-max-known`, default 65536), and
+  peers together never take the room kept for this node's own decisions (ADR-0025). Per peer, the
+  peers file can tighten this: `"envelope": {"max_active": 1000, "max_known": 4096, "max_ttl_secs": 3600,
   "min_prefix_v4": 32, "min_prefix_v6": 128}` (unknown fields are refused; `RELOAD_PEERS` applies
   changes). Held claims are audited as `MESH_BLOCK_HELD` with the reason, and are still shared,
   so the mesh state converges whatever each node enforces.
