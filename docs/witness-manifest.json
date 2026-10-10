@@ -6,15 +6,20 @@
   "AUDIT-W1": "422c3e75151a175762ef57e74130b054e3f7219c231cb24657db20db9e0ff978",
   "AUDIT-W2": "abec3420670c3c23808954fb977332d11870483ffb5ae296d9d3c16d368e7563",
   "AUDIT-W3": "f7727aa9d7ca67fa60af72d067448e8a54ffc96acbc8eeada0b8e3e6acf7d58f",
+  "CONTROL-L1": "83962842fe5c87c27c1f73144ed55d6c7d59c20750343e264a175b195e83df39",
   "CS-P1": "20c86421cdf4044134642a59a00621fbcd7356166a8643864fb02dad24cb2687",
   "CS-P2": "5dd517e4115b6735f6e7477f4118095dccc8075d384adeb95b2bbf1a0069b031",
+  "FLOWSPEC-P1": "23412916e4d4b48929c79ebd1541c49345a29b49377f67aff8ef23ac673153ce",
+  "FLOWSPEC-P2": "092a77fd366261837398647687cf247ee43845d3f66f263be8bbd108625df225",
   "IPC-A1": "6a0096b5b18b5190ee613bc7e2e3e94604665f205385b18ae074bb0b9138aafa",
+  "IPC-R1": "b9989e447aaf0ac528045bb46ae30f905b77868400866b3732711082527f9986",
   "IPC-T1": "088af71858cc841192a1cac08dd3a0cfe6f6fcded7772bf9ba5fbd3a13122cc3",
   "NODE-D1": "0765e06474e6a67f70ffa2f6ca4e0c78da7f252909be75c56a3a5c7b8740efd3",
   "NODE-R1": "4618ac4d2bb0c89369d0a8b83d84cb96e1b22f630db08c56320e0b25022bcb15",
   "NODE-R2": "3ebe18170f979f75008aa350f225e2afbb617ed4960d90b6568053bd7bc9bd71",
   "NODE-R3": "745bb8369c5b678cc8cfd1e12a53cf61b32c027792f0d9f66b915eb0913f646a",
-  "NODE-R4": "0cb87a3cc46b51aa6e3fbcbcb9ea3c9a02c0b0e631484b69b5f52c158a737ac8",
+  "NODE-R4": "8cf92b49ba813fd0f9065d7877260af8b9767edd0eb63b977928799166b467e5",
+  "NODE-R5": "9b6a8bf99e620cb06f68e6c4121c881c37d676d5be4cfa18c49626b6a389451d",
   "REPLAY-R1": "02e461a6ac12481a554c9af346378ed023100fce66f6a26224c20d8d84c68d4e",
   "REPLAY-R2": "6234809388ac9d18ef96ea855bfc54ac8fecf0527d28da8587977e2faaab0352",
   "REPLAY-R3": "3c228c7d000e878bc3643046f6b789ca25d8dd840e9dc43d1b9fe1c302986018",
@@ -22,6 +27,8 @@
   "REPLAY-R5": "5cb0e2725b64c4c0c50a90a45eec2b34aee78cdecd58fe647d7ed8f82dfc64af",
   "SHUTDOWN-S1": "20f05174abd36f01bf7b650b1dc2d099bc9c482d2bccbd9b549db27d750e5cff",
   "SHUTDOWN-S2": "4b603c1a2c197fc71e551940b80a2df275920b45405489d7e899fbeb4e1a7046",
+  "STATE-P1": "c77333a2be0f751dac1ec9ce6663e325d36efa51c8dc917ebe9cb81bd5af5561",
+  "STATE-P2": "93fa21f3199e8249b2367c1c03cfe7dc9fb86f4ac18bc32812cfb588c4a4bc52",
   "SUR-C1": "71649ca5848e6bfeec0e1cb516058d937298924631f88b0141127498686b614a",
   "SUR-C2": "7fcaf10dafce330390b4f11b6d613a8f16500cbe135bdd57382e877471c642d0",
   "SUR-D1": "0df7ecc50aad9a0ce7a4b75881a5dab0870bb4bd5947cd5ab0a7078e65554bd8",
@@ -83,6 +90,13 @@
     "feature_commands_reach_only_peers_that_announced_the_feature"
    ]
   },
+  "CONTROL-L1": {
+   "statement": "6f11db72ac45c7b287889078bd3cf30b2a3ec246ad4e2c048bd4dab36d4724fb",
+   "witnesses": [
+    "an_overlong_line_gets_one_error_and_runs_no_command",
+    "normal_lines_still_run_one_command_each"
+   ]
+  },
   "CS-P1": {
    "statement": "3a7a498491c605b9d6b136ebd1fa2c5812780d64141ddea96d051756e37650d8",
    "witnesses": [
@@ -98,6 +112,19 @@
     "ipc_pacing_intervals_are_positive_minimal_integer_budgets"
    ]
   },
+  "FLOWSPEC-P1": {
+   "statement": "7ac220fa8731711f45e0e274ad26c41f113258239e6c4fc0bb9cf01025a60059",
+   "witnesses": [
+    "a_repeated_key_inside_a_path_is_rejected_and_authorizes_no_withdrawal",
+    "a_repeated_rib_key_cannot_hide_a_foreign_path_from_the_round"
+   ]
+  },
+  "FLOWSPEC-P2": {
+   "statement": "68bc071c07fc1b38fa053512e24106b5e78c3d921f8c4118c607cef53e6a1602",
+   "witnesses": [
+    "the_default_community_is_64512_and_the_node_id_and_is_refused_above_16_bits"
+   ]
+  },
   "IPC-A1": {
    "statement": "92729d9c94dad884353091082bed03a9a49265b45baf26d170ce17883b9cc335",
    "witnesses": [
@@ -105,6 +132,14 @@
     "a_surplus_answer_does_not_settle_the_next_signal",
     "an_unterminated_ack_does_not_retire_the_signal",
     "unknown_reply_keeps_the_obligation_and_a_later_ack_retires_it"
+   ]
+  },
+  "IPC-R1": {
+   "statement": "7d16704800297f6e2d79383db3843e71721b3826d19fc4449b63acac5d6013e0",
+   "witnesses": [
+    "a_capacity_refusal_is_not_reported_as_a_protected_target",
+    "a_retraction_answers_lifted_only_when_nothing_else_blocks_the_target",
+    "a_wanted_block_not_yet_written_still_blocks"
    ]
   },
   "IPC-T1": {
@@ -151,7 +186,16 @@
   "NODE-R4": {
    "statement": "850d42cca881271d5e80b567297dcd8ee46b507d94d997ed23d16ca822da4658",
    "witnesses": [
+    "a_remaining_reason_with_the_same_end_keeps_the_block_unchanged",
     "a_shortened_block_stays_blocked_until_the_remaining_reason_ends"
+   ]
+  },
+  "NODE-R5": {
+   "statement": "8a972cd7c4d184bb521badb547482ca4b6226ad4a9d27d2f3345ca516fbd9307",
+   "witnesses": [
+    "a_block_shortened_while_protected_stays_suspended_until_the_target_is_allowed",
+    "a_retraction_at_the_claims_exact_end_finds_nothing_standing",
+    "a_retraction_while_the_target_is_protected_takes_its_claim_back_mesh_wide"
    ]
   },
   "REPLAY-R1": {
@@ -203,6 +247,21 @@
    "witnesses": [
     "a_timed_out_cleanup_worker_is_cancelled_and_joined",
     "local_decision_is_audited_before_cancellable_mesh_publication"
+   ]
+  },
+  "STATE-P1": {
+   "statement": "a5027de0f05beba50ede83e6500b13e76758392b154a5c249aadb42b243024d4",
+   "witnesses": [
+    "a_save_replaces_the_state_file_atomically_whatever_its_name",
+    "an_unreadable_state_file_is_kept_aside_and_survives_the_next_save"
+   ]
+  },
+  "STATE-P2": {
+   "statement": "9ee9047a6b6418819c3278d759fbec00be55e725792305faf8e5085b2edea53f",
+   "witnesses": [
+    "a_full_restore_merges_into_what_it_holds_and_drops_only_new_entries",
+    "a_restore_keeps_every_bounded_table_within_its_runtime_bound",
+    "operator_lifts_past_the_bound_are_counted"
    ]
   },
   "SUR-C1": {
@@ -297,6 +356,12 @@
   "StreamTests.test_zero_pacing_fails_before_lapi_or_ipc_requests": [
    "scripts/test_crowdsec_stream.py:7a9cc86a61a984b692c1294648017ff8b4d1ae018742129ce070592944dfe8ce"
   ],
+  "a_block_shortened_while_protected_stays_suspended_until_the_target_is_allowed": [
+   "orchestrator/src/block_table.rs:1ad28cc9294ab1650e9e3f01e80c00e46c73e916bdadd4a4c1def16a2c2f8687"
+  ],
+  "a_capacity_refusal_is_not_reported_as_a_protected_target": [
+   "orchestrator/src/ipc.rs:8f1ada4ba99db9273abd37c81c316cd59636ea6087480e5e02210fed7a70da5b"
+  ],
   "a_capacity_refusal_preserves_retraction_intent_for_retry": [
    "orchestrator/src/block_table.rs:2783bd17daf809d881602646b152468d3a7d2022aece47146aacb83ddbf376be"
   ],
@@ -307,7 +372,7 @@
    "orchestrator/src/bin/sokol-suricata.rs:f8b7ddcb97ad8611db54fddf2cc8164e883bab597b7aee923361fd8dadf1ef90"
   ],
   "a_damaged_cursor_rereads_the_log_instead_of_skipping_it": [
-   "orchestrator/src/bin/sokol-suricata.rs:e4bb88597143a6fbec20e29bcf0cb558143cb96c1edcc174e9dfda12f878e7f4"
+   "orchestrator/src/bin/sokol-suricata.rs:e76461ac8df66faa30b93abcdcbe74935b845340c65a5b8aecb058a53f0dcaea"
   ],
   "a_detection_after_a_same_instant_retraction_is_enforced": [
    "orchestrator/src/block_table.rs:568663d0e5acbf56de779805a11d939d0ca87c7c651cbe90adff2b06798700c6"
@@ -323,6 +388,9 @@
   ],
   "a_full_queue_drops_the_oldest_and_counts_it": [
    "orchestrator/src/delivery.rs:6c8570fd6e91b549a46de442429084c682d4e14b19eac9ea6d28634454c07603"
+  ],
+  "a_full_restore_merges_into_what_it_holds_and_drops_only_new_entries": [
+   "orchestrator/src/block_table.rs:d7011e8954e01ea208a232665e48014b768297456c0fb30d6f48647c5273a787"
   ],
   "a_full_retractor_set_preserves_support_until_its_owner_fits": [
    "orchestrator/src/block_table.rs:4552e701b668889edf07982775e2c51ec36ae473643a6a616d85efb5bf74081b"
@@ -366,11 +434,35 @@
   "a_real_source_ttl_survives_reason_decoys": [
    "orchestrator/src/replay.rs:978d1605b4b93ade5db25305d610d3a5416ac0512d8f3e4602d00e558b6320f4"
   ],
+  "a_remaining_reason_with_the_same_end_keeps_the_block_unchanged": [
+   "orchestrator/src/block_table.rs:d2cbb141deffafcd392606132acd5de97e643dc9011cc28243c32d36e33f821a"
+  ],
+  "a_repeated_key_inside_a_path_is_rejected_and_authorizes_no_withdrawal": [
+   "orchestrator/src/flowspec.rs:b0fe568fd1cde0292ea2450d1c2e49fd4cf5b5282c5d8a19b7c58af1140e72cc"
+  ],
+  "a_repeated_rib_key_cannot_hide_a_foreign_path_from_the_round": [
+   "orchestrator/src/flowspec.rs:b5d3cf31d040245ff461508926800bb080b355aa46e2537287fb2a10c3c41646"
+  ],
+  "a_restore_keeps_every_bounded_table_within_its_runtime_bound": [
+   "orchestrator/src/block_table.rs:775d036b2124ba22dc5febc7900ea5df4a9d687eb5cf521f9a618f2bdfe54c8d"
+  ],
+  "a_retraction_answers_lifted_only_when_nothing_else_blocks_the_target": [
+   "orchestrator/src/ipc.rs:be79fed2c10d060d653847b9f36ff657287dab5131ae7ff9d3bf8d09607c063f"
+  ],
+  "a_retraction_at_the_claims_exact_end_finds_nothing_standing": [
+   "orchestrator/src/block_table.rs:8e18dce33c717a93b9785ec273ddd85bdf7267025459a9de8bf4ddf37dd9889d"
+  ],
   "a_retraction_capacity_refusal_is_a_final_refusal_not_a_recorded_effect": [
    "orchestrator/src/delivery.rs:2dfa88fe20c73afa55f1ad93b0a9f26a17056d2ab0aed2ce1e16e02e0f015bc6"
   ],
   "a_retraction_capacity_refusal_is_not_an_ipc_success": [
    "orchestrator/src/main.rs:b6d2c70928903768f294f61324d5c58c47bb63e8157015ca12e690e581e03adc"
+  ],
+  "a_retraction_while_the_target_is_protected_takes_its_claim_back_mesh_wide": [
+   "orchestrator/src/block_table.rs:70cdb47750918a96fa40d43d837ae79146905c410757e9f93db59595b0198914"
+  ],
+  "a_save_replaces_the_state_file_atomically_whatever_its_name": [
+   "orchestrator/src/state_store.rs:8d1db45539c1cd4bbdbe95f896bfaae2ed1563ad2880ab462acbbc53ba8ae97e"
   ],
   "a_shortened_block_stays_blocked_until_the_remaining_reason_ends": [
    "orchestrator/src/block_table.rs:38f60345f3871a3a22b0c71a0f94d30795b0451c828d17d8a66812077395c6d6"
@@ -393,6 +485,9 @@
   "a_timed_out_cleanup_worker_is_cancelled_and_joined": [
    "orchestrator/src/shutdown.rs:54dff102e072c1246b298f0887514622ed3d7fa8c1f0fb6e8ee1bc70aff8d633"
   ],
+  "a_wanted_block_not_yet_written_still_blocks": [
+   "orchestrator/src/block_table.rs:b6a306ae70461b5aaad79f7450c6935bf1fb9030dd553f4b9767e214265b0025"
+  ],
   "a_witnessed_head_exposes_a_recomputed_rewrite_that_the_chain_alone_accepts": [
    "common/src/audit_log.rs:a49cfa0139529780e7d604e6651fabcc2a170b66102e5228463e19f2603b2d7f"
   ],
@@ -404,6 +499,12 @@
   ],
   "an_existing_record_can_accept_its_owner_at_the_global_capacity": [
    "orchestrator/src/block_table.rs:7493c55f460f87805f5b261cfceb5450fe5d20bc098dea0764823df4b802aff5"
+  ],
+  "an_overlong_line_gets_one_error_and_runs_no_command": [
+   "orchestrator/src/control.rs:0f80bb013e96d270133e98a8ff0b38d8c400768616f2a22384d2a0dfead81fd2"
+  ],
+  "an_unreadable_state_file_is_kept_aside_and_survives_the_next_save": [
+   "orchestrator/src/state_store.rs:79490b58d4d396cccbf402aabb7ca01e87f2fa683b8fa5460419d7180593c3c3"
   ],
   "an_unterminated_ack_does_not_retire_the_signal": [
    "orchestrator/src/delivery.rs:5db75f685bfb2d9940c94edcea25efcadb7e2a61269418d7ce31eb4d948d14ed"
@@ -498,8 +599,14 @@
   "lost_answer_keeps_expiry_and_later_retry_sends_its_retraction": [
    "orchestrator/src/delivery.rs:0a5d4949613481d8183ef76d002b8e2b57001accfa5390eb73566e4d86a98848"
   ],
+  "normal_lines_still_run_one_command_each": [
+   "orchestrator/src/control.rs:a63c87233a8174b0d69b33c64c9448328a2fb18bbb048fbc947061cb1d811111"
+  ],
   "only_the_canonical_line_is_a_statement": [
    "orchestrator/src/audit_anchor.rs:4666938b8edb555bc0d8a6a16cb83be5d765366264298881a0a3621c68aa70bc"
+  ],
+  "operator_lifts_past_the_bound_are_counted": [
+   "orchestrator/src/block_table.rs:8655b9032d02c23bc26a9fc6c8a0afb9610d8ddafa1a70967902946f534af01a"
   ],
   "oversized_audit_records_are_counted_and_marked_before_following_data_or_flush": [
    "orchestrator/src/main.rs:5f8238ea09e54d0084116377203678b159470a25e2ce754f919cac38e557fd60"
@@ -536,6 +643,9 @@
   ],
   "statements_confirm_the_log_and_expose_a_recomputed_rewrite": [
    "orchestrator/src/audit_anchor.rs:e0ddaf11cdfacddd7d3a3a8130597982ec297d9d6b8c100e85fd2ba5170ac4d6"
+  ],
+  "the_default_community_is_64512_and_the_node_id_and_is_refused_above_16_bits": [
+   "orchestrator/src/flowspec.rs:27a794c92127ba85cb3fe77b4af64d78db753d8bb6cb967a035e5494c5c6666b"
   ],
   "unknown_reply_keeps_the_obligation_and_a_later_ack_retires_it": [
    "orchestrator/src/delivery.rs:08eaebdf5f929438bef556b1076aa80740818212bc39bde3b0b011d68598d7d9"
