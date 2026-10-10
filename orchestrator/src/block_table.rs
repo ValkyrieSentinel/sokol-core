@@ -1052,7 +1052,7 @@ impl<B: Blocklist> BlockTable<B> {
         now_ms: u64,
         end: Option<u64>,
     ) -> Claim {
-        let claim = Claim {
+        let mut claim = Claim {
             issuer: self.node_id,
             kind,
             target: show(&net),
@@ -1060,6 +1060,16 @@ impl<B: Blocklist> BlockTable<B> {
             expires_ms: end.map(|e| self.to_wall(e)),
             reason: bounded_reason(reason),
         };
+        // A claim's id is the hash of its bytes. A new decision byte-identical to one already
+        // taken back (same target, reason and end, in the same millisecond) would be born
+        // retracted: added and reported applied, yet never in force (NODE-D1, NODE-R4). It is
+        // issued a millisecond later instead; retraction records are bounded, so is this loop.
+        for _ in 0..=MAX_KNOWN_CLAIMS {
+            if !self.retractions.contains_key(&claim.id()) {
+                break;
+            }
+            claim.issued_ms = claim.issued_ms.saturating_add(1);
+        }
         self.insert_held(
             claim.id(),
             Held {
@@ -3934,6 +3944,87 @@ mod tests {
             t.detect(target, "ids", T0 + 2 * S, Some(("ids", "e1")), None),
             Detected::Duplicate
         ));
+    }
+
+    /// A detection after a retraction of a byte-identical claim in the same millisecond is a
+    /// new claim in force, not one born retracted (NODE-D1).
+    #[test]
+    fn a_detection_after_a_same_instant_retraction_is_enforced() {
+        let mut t = table(1, 64);
+        let a = signal(&mut t, "crowdsec", "A", "203.0.113.9", T0, Some(60)).unwrap();
+        assert!(lifted(&t.retract_detection(
+            "crowdsec",
+            "A",
+            ip("203.0.113.9"),
+            T0
+        )));
+        let b = signal(&mut t, "crowdsec", "B", "203.0.113.9", T0, Some(60)).unwrap();
+        assert!(b.new && b.applied.is_ok());
+        assert_ne!(
+            b.claim.id(),
+            a.claim.id(),
+            "B reused the id A was retracted under"
+        );
+        assert!(
+            t.is_blocked(ip("203.0.113.9")),
+            "an added detection left its target unblocked"
+        );
+    }
+
+    /// The same with a permanent policy (no strikes): any two decisions with one reason in one
+    /// millisecond are byte-identical (NODE-D1).
+    #[test]
+    fn a_permanent_redetection_after_a_same_instant_retraction_is_enforced() {
+        let mut t = BlockTable::with_lists(
+            FakeLists {
+                nets: HashSet::new(),
+                capacity: 64,
+                fail_delete: false,
+                deletes: 0,
+                hits: HashMap::new(),
+            },
+            TtlPolicy {
+                base: Duration::ZERO,
+                max: Duration::ZERO,
+            },
+            1,
+        );
+        signal(&mut t, "crowdsec", "A", "203.0.113.9", T0, None).unwrap();
+        assert!(lifted(&t.retract_detection(
+            "crowdsec",
+            "A",
+            ip("203.0.113.9"),
+            T0
+        )));
+        assert!(
+            signal(&mut t, "crowdsec", "B", "203.0.113.9", T0, None)
+                .unwrap()
+                .new
+        );
+        assert!(
+            t.is_blocked(ip("203.0.113.9")),
+            "a permanent detection left its target unblocked"
+        );
+    }
+
+    /// Retracting the longer of two reasons shortens the block to the remaining reason's end:
+    /// the target stays blocked until then, and is released after (NODE-R4).
+    #[test]
+    fn a_shortened_block_stays_blocked_until_the_remaining_reason_ends() {
+        let mut t = table(1, 64);
+        signal(&mut t, "suricata", "B", "203.0.113.9", T0, Some(60)).unwrap();
+        signal(&mut t, "crowdsec", "A", "203.0.113.9", T0, Some(600)).unwrap();
+        let out = t.retract_detection("crowdsec", "A", ip("203.0.113.9"), T0);
+        assert_eq!(out.label(), "shortened");
+        assert!(
+            t.is_blocked(ip("203.0.113.9")),
+            "reported shortened, yet no longer blocked"
+        );
+        t.tick(T0 + 61 * S);
+        assert!(
+            !t.is_blocked(ip("203.0.113.9")),
+            "the shortened block outlived its reason"
+        );
     }
 
     #[test]
