@@ -18,6 +18,12 @@ exclude_re = [
     "ipc.rs:\\d+:\\d+: replace (handle_ipc_line|retract_detection) -> String with (String::new\\(\\)|\"xyzzy\".into\\(\\))$",
     # The orchestrator's process entry: the XDP smoke starts and drives it end to end.
     "orchestrator/src/main.rs:\\d+:\\d+: replace main -> Result<\\(\\), anyhow::Error> with Ok\\(\\(\\)\\)$",
+    # The restore's warning line: the counts themselves are kept in the table and checked
+    # exactly (a_restore_keeps_every_bounded_table_within_its_runtime_bound); only logging differs.
+    "in Dropped::log$",
+    # serde's "expecting" text only words an error the duplicate-key check raises either way
+    # (a_repeated_rib_key_cannot_hide_a_foreign_path_from_the_round asserts the error).
+    "UniqueKeysVisitor>::expecting -> std::fmt::Result with Ok\\(Default::default\\(\\)\\)$",
     # Directory fsync for durability; not observable without crash injection.
     "in sync_dir",
     # An offset while the clock has not stepped: 0 and +-1 ms are indistinguishable from it.
