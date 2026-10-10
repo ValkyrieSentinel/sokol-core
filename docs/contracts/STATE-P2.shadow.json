@@ -1,0 +1,19 @@
+{
+  "annotations": {
+    "status": "UNSIGNED_EXPLANATORY_DRAFT"
+  },
+  "decisions": [
+    {
+      "because": "Counterexample (hunt round 3, 2026-10-10): a state file with MAX_KNOWN_CLAIMS + 1 retraction records restored all of them, past the bound the runtime enforces (block_table MAX_KNOWN_CLAIMS doc).",
+      "previous_statement_sha256": null,
+      "proposal_sha256": "b99d970b08dbea9880e66b6bb706cedb71df6d451d6d50b642ac049165245e5f"
+    }
+  ],
+  "evidence_text": "`a_restore_keeps_every_bounded_table_within_its_runtime_bound`",
+  "id": "STATE-P2",
+  "profile": "sokol.contract-shadow.v1",
+  "statement": "After a restore every bounded table holds no more than its runtime bound (claims and retraction records MAX_KNOWN_CLAIMS, events MAX_EVENTS, support targets MAX_SUPPORT_TARGETS), whatever the file holds; operator lifts are kept first and what is dropped is counted.",
+  "witnesses": [
+    "a_restore_keeps_every_bounded_table_within_its_runtime_bound"
+  ]
+}
