@@ -401,7 +401,10 @@ impl AuditLog {
             path: path.to_path_buf(),
             next_seq: reader.next_seq(),
             chain: reader.head(),
-            unsynced: 0,
+            // Records already in the file were written by an earlier handle that may have died
+            // before syncing them: the first sync must fsync before they are offered as a
+            // durable head (AUDIT-W2).
+            unsynced: usize::from(valid_len > 0),
             rotation,
             size: valid_len,
             segment_start_seq: reader.segment_start().map(|(s, _)| s).unwrap_or(0),
@@ -696,6 +699,10 @@ pub fn check_witnesses(
     Ok(witnessed
         .iter()
         .map(|&(n, head)| {
+            if n == 0 && summary.first_seq > 0 {
+                // The start of this log is pruned: nothing retained is compared (AUDIT-W1).
+                return WitnessVerdict::Pruned;
+            }
             if n == 0 {
                 return if head == [0u8; CHAIN_LEN] {
                     WitnessVerdict::Confirmed
@@ -1198,5 +1205,59 @@ mod tests {
         log.append(b"two").unwrap();
         log.sync().unwrap();
         assert_eq!(reader.next_record().unwrap().unwrap().payload, b"two");
+    }
+
+    /// Records found on open were written by a handle that may have died before syncing them:
+    /// they count as unsynced, so the first sync fsyncs before they become a durable head
+    /// (AUDIT-W2).
+    #[test]
+    fn records_found_on_open_are_unsynced_until_the_next_sync() {
+        let dir =
+            std::env::temp_dir().join(format!("sokol-reopen-unsynced-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("audit.log");
+        {
+            let mut log = AuditLog::open(&path).unwrap();
+            log.append(b"one").unwrap();
+            log.append(b"two").unwrap();
+        }
+        let mut log = AuditLog::open(&path).unwrap();
+        assert!(
+            log.unsynced() > 0,
+            "records of an earlier handle were taken as already synced"
+        );
+        log.sync().unwrap();
+        assert_eq!(log.unsynced(), 0);
+        drop(log);
+        let empty = dir.join("empty.log");
+        assert_eq!(AuditLog::open(&empty).unwrap().unsynced(), 0);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Once the start of a log is pruned, a head witnessed for "after 0 records" compares
+    /// nothing retained: unknown, never confirmed (AUDIT-W1).
+    #[test]
+    fn a_head_for_zero_records_of_a_pruned_log_is_not_confirmed() {
+        let dir = std::env::temp_dir().join(format!("sokol-zero-pruned-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("audit.log");
+        let small = Rotation {
+            max_bytes: 200,
+            keep: 1,
+        };
+        let mut log = AuditLog::open_with(&path, Some(small)).unwrap();
+        for i in 0..20 {
+            log.append(format!("record {:02} with some padding", i).as_bytes())
+                .unwrap();
+        }
+        log.sync().unwrap();
+        let first_seq = verify_chain(&path).unwrap().first_seq;
+        assert!(
+            first_seq > 0,
+            "precondition: the oldest records were pruned"
+        );
+        let verdicts = check_witnesses(&path, &[(0, [0u8; CHAIN_LEN])]).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(verdicts, vec![WitnessVerdict::Pruned]);
     }
 }

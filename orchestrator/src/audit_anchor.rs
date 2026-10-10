@@ -46,7 +46,9 @@ pub fn parse(text: &str) -> Option<(u64, u64, [u8; CHAIN_LEN])> {
     for (byte, pair) in head.iter_mut().zip(hex.as_bytes().chunks(2)) {
         *byte = u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok()?;
     }
-    Some((node, records, head))
+    // Number parsing accepts `+1`, `0003` and upper-case hex, which `statement` never writes.
+    // Exactly one statement means exactly the line `statement` writes (AUDIT-A1).
+    (statement(node, records, &head) == text).then_some((node, records, head))
 }
 
 /// Writes the statement durably (temporary file synced, renamed, directory synced) and returns
@@ -242,6 +244,13 @@ pub fn statements_for(dir: &Path, node_id: u64) -> Result<(Vec<Found>, usize), S
             .as_deref()
             .and_then(parse)
         {
+            Some((node, records, _))
+                if file.file_name().and_then(|n| n.to_str()) != Some(&file_name(node, records)) =>
+            {
+                // A file named after another statement than the one it holds is not a
+                // statement file (AUDIT-A1).
+                malformed += 1;
+            }
             Some((node, records, head)) if node == node_id => {
                 let mut ots = file.clone().into_os_string();
                 ots.push(".ots");
@@ -592,6 +601,83 @@ mod tests {
             lines
         );
         assert!(lines.iter().any(|l| l.contains("are not one")));
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
+    fn three_records(name: &str) -> (PathBuf, PathBuf, PathBuf, u64, [u8; CHAIN_LEN]) {
+        let d = std::env::temp_dir().join(format!("sokol-anchor-{}-{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("anchors")).unwrap();
+        let own = d.join("audit.log");
+        let mut log = common::audit_log::AuditLog::open(&own).unwrap();
+        for i in 1..=3 {
+            log.append(format!("DYNAMIC_BLOCK_V4|IP:198.51.100.{}", i).as_bytes())
+                .unwrap();
+        }
+        log.sync().unwrap();
+        let (n, h) = (log.len(), log.head());
+        drop(log);
+        (d.clone(), own, d.join("anchors"), n, h)
+    }
+
+    /// Exactly one statement is exactly the line `statement` writes: a signed or zero-padded
+    /// number and upper-case or signed hex are not statements (AUDIT-A1).
+    #[test]
+    fn only_the_canonical_line_is_a_statement() {
+        let head = [0x0a; CHAIN_LEN];
+        let exact = statement(1, 3, &head);
+        assert!(parse(&exact).is_some());
+        let variants = [
+            exact.replace("node=1", "node=+1"),
+            exact.replace("records=3", "records=0003"),
+            exact.replace(&"0a".repeat(32), &"0A".repeat(32)),
+            exact.replace(&"0a".repeat(32), &"+a".repeat(32)),
+        ];
+        let parsed: Vec<_> = variants.iter().filter(|v| parse(v).is_some()).collect();
+        assert!(
+            parsed.is_empty(),
+            "not the exact line, yet parsed: {parsed:#?}"
+        );
+    }
+
+    /// The only file is named as this node's statement but holds upper-case hex: the check
+    /// counts it malformed instead of confirming it (AUDIT-A1).
+    #[test]
+    fn a_non_canonical_statement_file_fails_the_check() {
+        let (d, own, anchors, n, h) = three_records("noncanon");
+        let exact = statement(1, n, &h);
+        let upper = exact.replace(
+            &crate::p2p::to_hex(&h),
+            &crate::p2p::to_hex(&h).to_uppercase(),
+        );
+        assert_ne!(upper, exact);
+        std::fs::write(anchors.join(file_name(1, n)), upper).unwrap();
+        let (summary, lines) = verify(&own, &anchors, 1).unwrap();
+        std::fs::remove_dir_all(d).unwrap();
+        assert_ne!(summary.exit_code(), 0, "{summary:?} {lines:?}");
+    }
+
+    /// A file named for 99 records that states 3, or for another node than it states, is not
+    /// a statement file: it is counted malformed next to a valid statement that is confirmed,
+    /// so the check fails because of it (AUDIT-A1).
+    #[test]
+    fn a_statement_file_named_for_another_statement_fails_the_check() {
+        let (d, own, anchors, n, h) = three_records("misnamed");
+        std::fs::write(anchors.join(file_name(1, n)), statement(1, n, &h)).unwrap();
+        for (name, text) in [
+            (file_name(1, 99), statement(1, n, &h)),
+            (file_name(1, 2), statement(9, 2, &h)),
+        ] {
+            std::fs::write(anchors.join(&name), text).unwrap();
+            let (summary, lines) = verify(&own, &anchors, 1).unwrap();
+            std::fs::remove_file(anchors.join(&name)).unwrap();
+            assert_eq!(summary.confirmed, 1, "{name}: {summary:?} {lines:?}");
+            assert_eq!(
+                summary.contradicted, 1,
+                "{name} is not counted malformed: {summary:?}"
+            );
+            assert_ne!(summary.exit_code(), 0, "{name}: {summary:?} {lines:?}");
+        }
         std::fs::remove_dir_all(d).unwrap();
     }
 }

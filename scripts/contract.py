@@ -99,8 +99,12 @@ def propose(rid: str, because: str, statement: str | None, witnesses: list[str],
     if bad or missing:
         print('FAIL witnesses must be existing tests: ' + ', '.join(bad + missing))
         return 1
-    evidence = (current['evidence_text'] if current and names == current['witnesses']
-                else ', '.join(f'`{n}`' for n in names))
+    if current and set(current['witnesses']) <= set(names):
+        added = [n for n in names if n not in current['witnesses']]
+        evidence = ', '.join([current['evidence_text'].rstrip('. ')] + [f'`{n}`' for n in added]) \
+            if added else current['evidence_text']
+    else:
+        evidence = ', '.join(f'`{n}`' for n in names)
     body = {
         'profile': PROPOSAL_PROFILE, 'id': rid, 'status': 'UNSIGNED_INTENT', 'because': because.strip(),
         'base_contract_sha256': sha(path.read_bytes()) if current else None,
