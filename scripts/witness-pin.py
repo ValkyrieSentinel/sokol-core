@@ -83,20 +83,22 @@ def project_invariants(text: str, contract: dict) -> str:
     return ''.join(lines)
 
 
-def generated_invariants(text: str, root: pathlib.Path) -> str:
-    """Validate all source-backed slots using bounded local contract data only."""
-    marker_ids = [m.group(1) for m in GENERATED_MARKER.finditer(text)]
-    if len(marker_ids) != text.count('<!-- Generated ') or len(set(marker_ids)) != len(marker_ids):
-        raise ValueError('Malformed or duplicate generated contract marker')
+# Once a document carries this line, every invariant row is rendered from its contract and no
+# per-row marker is used: a marker line after a row in the middle of a table would end the table.
+DECLARATION = ('<!-- Every invariant row is generated from docs/contracts/<ID>.shadow.json; '
+               'change a contract with scripts/contract.py, never this table by hand. -->')
+
+
+def load_contracts(root: pathlib.Path) -> dict:
+    """Bounded local contract sources by ID; proposals live in a subdirectory and are not sources."""
     directory = root / 'docs/contracts'
     if directory.is_symlink():
         raise ValueError('Symlink contract directory refused')
     sources = list(islice(directory.glob('*.shadow.json'), MAX_CONTRACTS + 1))
     if len(sources) > MAX_CONTRACTS:
         raise ValueError('Too many contracts')
-    sources.sort()
-    source_ids = set()
-    for path in sources:
+    contracts = {}
+    for path in sorted(sources):
         if path.is_symlink():
             raise ValueError('Symlink contract source refused')
         with path.open('rb') as stream:
@@ -112,13 +114,51 @@ def generated_invariants(text: str, root: pathlib.Path) -> str:
                         if RUST_TEST.fullmatch(w) or PY_TEST.fullmatch(w)})
         if not names or names != contract['witnesses']:
             raise ValueError('Contract witness list differs from its evidence text')
-        projected = project_invariants(text, contract)
-        if projected != text:
-            raise ValueError('Generated ' + rid + ' is stale; regenerate from its contract')
-        source_ids.add(rid)
-    if source_ids != set(marker_ids):
+        contract_row(contract)
+        contracts[rid] = contract
+    return contracts
+
+
+def generated_invariants(text: str, root: pathlib.Path) -> str:
+    """Validate all source-backed rows using bounded local contract data only."""
+    marker_ids = [m.group(1) for m in GENERATED_MARKER.finditer(text)]
+    if len(marker_ids) != text.count('<!-- Generated ') or len(set(marker_ids)) != len(marker_ids):
+        raise ValueError('Malformed or duplicate generated contract marker')
+    contracts = load_contracts(root)
+    if DECLARATION in text:
+        if marker_ids or text.count(DECLARATION) != 1:
+            raise ValueError('A generated document has one declaration and no per-row markers')
+        row_ids = [m.group(1) for m in map(ROW.match, text.splitlines()) if m]
+        for rid in row_ids:
+            if rid not in contracts:
+                raise ValueError(rid + ' has no contract source; every row is generated')
+        for rid, contract in contracts.items():
+            if row_ids.count(rid) != 1:
+                raise ValueError('Contract ' + rid + ' needs exactly one row')
+            if contract_row(contract) not in text.splitlines():
+                raise ValueError('Generated ' + rid + ' is stale; regenerate from its contract')
+        return text
+    for contract in contracts.values():
+        if project_invariants(text, contract) != text:
+            raise ValueError('Generated ' + contract['id'] + ' is stale; regenerate from its contract')
+    if set(contracts) != set(marker_ids):
         raise ValueError('Generated markers and contract sources differ')
     return text
+
+
+def contract_pins(root: pathlib.Path) -> dict:
+    """What the owner accepts about each contract: the rendered row and its decision history.
+    Unsigned explanations (annotations) are left out on purpose."""
+    pins = {}
+    for rid, c in load_contracts(root).items():
+        accepted = {k: c.get(k) for k in ('statement', 'evidence_text', 'witnesses', 'decisions')}
+        pins[rid] = sha(json.dumps(accepted, sort_keys=True, ensure_ascii=False, separators=(',', ':')))
+    return pins
+
+
+def open_proposals(root: pathlib.Path) -> list[str]:
+    directory = root / 'docs/contracts/proposals'
+    return sorted(p.name for p in islice(directory.glob('*.proposal.json'), MAX_CONTRACTS)) if directory.is_dir() else []
 
 
 def rows() -> dict:
@@ -301,7 +341,8 @@ def current() -> dict:
     cited = {w for r in table.values() for w in r["witnesses"]}
     bodies = {**rust_bodies({w for w in cited if RUST_TEST.fullmatch(w)}),
               **py_bodies({w for w in cited if PY_TEST.fullmatch(w)})}
-    return {"rows": table, "witnesses": {w: sorted(bodies.get(w, [])) for w in sorted(cited)}}
+    return {"rows": table, "witnesses": {w: sorted(bodies.get(w, [])) for w in sorted(cited)},
+            "contracts": contract_pins(ROOT)}
 
 
 def verify_manifest(manifest: pathlib.Path, signature: pathlib.Path, signers: pathlib.Path) -> bool:
@@ -344,6 +385,15 @@ def check(signers: pathlib.Path) -> int:
             problems.append(f"witness {w} changed: its body is not the one the owner pinned")
     for rid in sorted(set(now["rows"]) - set(pinned["rows"])):
         notes.append(f"{rid}: new invariant row, not pinned yet")
+    for rid, pin in pinned.get("contracts", {}).items():
+        if rid not in now["contracts"]:
+            problems.append(f"{rid}: pinned contract was removed")
+        elif now["contracts"][rid] != pin:
+            problems.append(f"{rid}: contract statement, witnesses or decision history changed")
+    for rid in sorted(set(now["contracts"]) - set(pinned.get("contracts", {}))):
+        notes.append(f"{rid}: contract is not pinned yet")
+    for name in open_proposals(ROOT):
+        notes.append(f"open proposal {name}: unsigned intent, not accepted")
     for x in notes:
         print("note", x)
     for x in problems:
