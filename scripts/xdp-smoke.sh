@@ -761,7 +761,7 @@ PY_STATE
 printf 'BAN_IP:%s\n' "$HANDOFF_OLD_IP" | timeout 10 nc -U -q1 "$WORK/control.sock" >/dev/null
 check "State handoff: predecessor ban is durable before the write is held" state_handoff_matches "$HANDOFF_OLD_IP"
 check "State handoff: predecessor ban is enforced before supersession" xdp_drop "$HANDOFF_OLD_IP" 1
-STATE_TMP="${LAST_STATE%.json}.tmp"
+STATE_TMP="${LAST_STATE}.tmp"   # the state file's name plus .tmp (STATE-P1)
 sleep 1.5   # let the unbans reach the disk first
 rm -f "$STATE_TMP"; mkfifo "$STATE_TMP"
 HUNG_IP=10.231.0.15
