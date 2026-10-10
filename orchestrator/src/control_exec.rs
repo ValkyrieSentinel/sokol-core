@@ -1,10 +1,10 @@
 //! Carries out operator control-socket commands (`control.rs` parses them). Moved verbatim out of `main.rs` by the 2026-10-05 review (W3.3); behaviour unchanged.
 use super::*;
 
-pub(crate) struct ControlCtx {
+pub(crate) struct ControlCtx<B = block_table::KernelBlocklist> {
     pub(crate) state: Arc<StateStore>,
     pub(crate) peer_limits: PeerLimits,
-    pub(crate) blocks: SharedBlockTable,
+    pub(crate) blocks: SharedBlockTable<B>,
     pub(crate) policy: PolicyHandle,
     pub(crate) sntl_db: Arc<SentinelDb>,
     pub(crate) registry: PeerRegistry,
@@ -14,7 +14,10 @@ pub(crate) struct ControlCtx {
 }
 
 /// Tells the mesh that this node takes back its own claims.
-pub(crate) async fn broadcast_retraction(ctx: &ControlCtx, ids: Vec<block_table::ClaimId>) {
+pub(crate) async fn broadcast_retraction<B: block_table::Blocklist>(
+    ctx: &ControlCtx<B>,
+    ids: Vec<block_table::ClaimId>,
+) {
     if ids.is_empty() {
         return;
     }
@@ -25,7 +28,10 @@ pub(crate) async fn broadcast_retraction(ctx: &ControlCtx, ids: Vec<block_table:
     let _ = ctx.registry.broadcast(&cmd, ctx.node_id, &ctx.crypto).await;
 }
 
-pub(crate) async fn execute_control(cmd: control::ControlCommand, ctx: &ControlCtx) -> String {
+pub(crate) async fn execute_control<B: block_table::Blocklist>(
+    cmd: control::ControlCommand,
+    ctx: &ControlCtx<B>,
+) -> String {
     use control::ControlCommand;
     let (blocks, policy, sntl_db) = (&ctx.blocks, &ctx.policy.current(), &ctx.sntl_db);
     match cmd {
@@ -156,12 +162,15 @@ pub(crate) async fn execute_control(cmd: control::ControlCommand, ctx: &ControlC
                     let legacy = trust.legacy_peers().to_vec();
                     {
                         let mut table = ctx.blocks.lock().await;
-                        table.configure_peers(
+                        if !table.configure_peers(
                             ctx.peer_limits.default,
                             per_peer,
                             ctx.peer_limits.quorum,
                             block_table::local_ms(),
-                        );
+                        ) {
+                            return "ERR known-claims share below currently held claims; previous trust store kept"
+                                .to_string();
+                        }
                         // A revoked node's claims stop counting here at once.
                         table.set_pinned(trust.node_ids(), block_table::local_ms());
                     }
@@ -191,5 +200,104 @@ pub(crate) async fn execute_control(cmd: control::ControlCommand, ctx: &ControlC
             },
         },
         ControlCommand::Unsupported(why) => format!("ERR {}", why),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    struct AcceptLists;
+    impl block_table::Blocklist for AcceptLists {
+        fn add(&mut self, _: IpNet) -> Result<(), aya::maps::MapError> {
+            Ok(())
+        }
+        fn delete(&mut self, _: IpNet) -> Result<(), aya::maps::MapError> {
+            Ok(())
+        }
+        fn hits(&self, _: IpNet) -> Option<u64> {
+            Some(0)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refused_share_reload_answers_error_and_keeps_trust_then_can_be_retried() {
+        let dir = std::env::temp_dir().join(format!(
+            "sokol-reload-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("peers.json");
+        let crypto = Arc::new(NodeCrypto::generate());
+        let key = crypto.public_key_hex();
+        let peer = |id, max_known| serde_json::json!({"node_id": id, "public_key": key, "envelope": {"max_known": max_known}});
+        std::fs::write(
+            &file,
+            serde_json::to_vec(&vec![peer(2, 3), peer(3, 3)]).unwrap(),
+        )
+        .unwrap();
+        let registry = PeerRegistry::new(TrustStore::load(&file).unwrap());
+        let ttl = TtlPolicy {
+            base: Duration::from_secs(60),
+            max: Duration::from_secs(600),
+        };
+        let blocks = Arc::new(tokio::sync::Mutex::new(BlockTable::with_lists(
+            AcceptLists,
+            ttl,
+            1,
+        )));
+        let now = block_table::local_ms();
+        for i in 0..3 {
+            let claim = block_table::Claim {
+                issuer: 2,
+                kind: ClaimKind::Detector,
+                target: format!("203.0.113.{}", 10 + i),
+                issued_ms: p2p::now_ms(),
+                expires_ms: None,
+                reason: "test".into(),
+            };
+            assert!(!matches!(
+                blocks.lock().await.adopt(claim, true, now),
+                block_table::Adoption::Refused(_)
+            ));
+        }
+        let ctx = ControlCtx {
+            state: Arc::new(StateStore::new(dir.join("state.json"))),
+            peer_limits: PeerLimits {
+                default: Envelope::unlimited(ttl.max),
+                quorum: Quorum::OFF,
+            },
+            blocks,
+            policy: PolicyHandle::new(BlockPolicy::builtin()),
+            sntl_db: Arc::new(
+                SentinelDb::init(dir.join("events.sntl").to_str().unwrap(), None).unwrap(),
+            ),
+            registry,
+            peers_file: Some(file.clone()),
+            node_id: 1,
+            crypto,
+        };
+        // A candidate both lowers the share below its held count and removes another peer.
+        std::fs::write(&file, serde_json::to_vec(&vec![peer(2, 1)]).unwrap()).unwrap();
+        assert_eq!(
+            execute_control(control::ControlCommand::ReloadPeers, &ctx).await,
+            "ERR known-claims share below currently held claims; previous trust store kept"
+        );
+        assert!(
+            ctx.registry.trusts(3),
+            "failed reload removed existing trust"
+        );
+        // Equality fits. The same command can subsequently install a valid candidate.
+        std::fs::write(&file, serde_json::to_vec(&vec![peer(2, 3)]).unwrap()).unwrap();
+        assert_eq!(
+            execute_control(control::ControlCommand::ReloadPeers, &ctx).await,
+            "OK 1 pinned peers"
+        );
+        assert!(
+            !ctx.registry.trusts(3),
+            "valid reload did not apply new trust"
+        );
+        drop(ctx);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
