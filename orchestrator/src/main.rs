@@ -429,9 +429,14 @@ struct Args {
     storm_mode: defense::StormMode,
     /// A peer's claims enforced here at once (ADR-7); further ones wait for a free slot.
     /// A peer can be given its own limits in the peers file: "envelope": {"max_active": ..,
-    /// "max_ttl_secs": .., "min_prefix_v4": .., "min_prefix_v6": ..}.
+    /// "max_known": .., "max_ttl_secs": .., "min_prefix_v4": .., "min_prefix_v6": ..}.
     #[arg(long, default_value = "16384")]
     peer_max_active: usize,
+
+    /// A peer's claims known here at once, enforced or waiting (ADR-0025); further ones are
+    /// refused. Peers together never take the room kept for this node's own decisions.
+    #[arg(long, default_value = "65536")]
+    peer_max_known: usize,
 
     /// Longest a peer's claim is enforced here, in seconds (default: --block-ttl-max).
     #[arg(long)]
@@ -707,6 +712,7 @@ impl PeerLimits {
         Self {
             default: Envelope {
                 max_active: args.peer_max_active,
+                max_known: args.peer_max_known,
                 max_ttl: Duration::from_secs(args.peer_max_ttl.unwrap_or(args.block_ttl_max)),
                 min_prefix_v4: 0,
                 min_prefix_v6: 0,
@@ -728,6 +734,7 @@ impl PeerLimits {
                     *id,
                     Envelope {
                         max_active: spec.max_active.unwrap_or(self.default.max_active),
+                        max_known: spec.max_known.unwrap_or(self.default.max_known),
                         max_ttl: spec
                             .max_ttl_secs
                             .map_or(self.default.max_ttl, Duration::from_secs),

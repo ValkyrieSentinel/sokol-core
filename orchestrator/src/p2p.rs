@@ -453,6 +453,7 @@ struct PeerEntry {
 #[serde(deny_unknown_fields)]
 pub struct EnvelopeSpec {
     pub max_active: Option<usize>,
+    pub max_known: Option<usize>,
     pub max_ttl_secs: Option<u64>,
     pub min_prefix_v4: Option<u8>,
     pub min_prefix_v6: Option<u8>,
