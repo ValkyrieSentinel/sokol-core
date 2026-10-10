@@ -14,7 +14,7 @@
   "IPC-A1": "6a0096b5b18b5190ee613bc7e2e3e94604665f205385b18ae074bb0b9138aafa",
   "IPC-R1": "07a01de5339ebf18834a4c377965c9b4ea9763835cabed6e46f7db5f1a39f2f1",
   "IPC-T1": "088af71858cc841192a1cac08dd3a0cfe6f6fcded7772bf9ba5fbd3a13122cc3",
-  "MESH-K1": "8975b1afa6741440e11aec783271a54234761b0977bceddc275c7896e1dd81f9",
+  "MESH-K1": "5c201abbf7c5b5facd6e34027206c41e0aefbaf3c75ae249eb416110c3248653",
   "NODE-D1": "0765e06474e6a67f70ffa2f6ca4e0c78da7f252909be75c56a3a5c7b8740efd3",
   "NODE-R1": "4618ac4d2bb0c89369d0a8b83d84cb96e1b22f630db08c56320e0b25022bcb15",
   "NODE-R2": "3ebe18170f979f75008aa350f225e2afbb617ed4960d90b6568053bd7bc9bd71",
@@ -156,6 +156,7 @@
    "witnesses": [
     "a_one_slot_peer_cannot_deny_this_nodes_own_detections_by_volume",
     "a_peer_beyond_its_known_claims_share_is_refused_alone",
+    "a_peers_share_frees_exactly_as_its_claims_end",
     "peers_together_leave_the_room_kept_for_this_nodes_own_decisions"
    ]
   },
@@ -425,6 +426,9 @@
   ],
   "a_peers_audit_head_is_witnessed_once_per_interval": [
    "orchestrator/src/mesh_dispatch.rs:07715d75cbe271d25f56fa81a48021df6e80ad9cf85aca77c9315dfa880cd5ff"
+  ],
+  "a_peers_share_frees_exactly_as_its_claims_end": [
+   "orchestrator/src/block_table.rs:32fa0caa9b0fe951bdb5c844572ad724eb40cbaabf9d451da1ed427aa85bb09d"
   ],
   "a_peers_witness_confirms_the_log_and_exposes_a_recomputed_rewrite": [
    "orchestrator/src/audit_witness.rs:be38ba3c3a78c5957cf3ac657e65e8fac0a3cb4935d0f6575d68f9e14f97b8c3"
