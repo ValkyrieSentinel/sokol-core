@@ -117,16 +117,33 @@ def rust_bodies(names: set[str]) -> dict[str, list[str]]:
     return bodies
 
 
+def strip_py(code: str) -> str:
+    """Source without comments. Comment tokens are the same in every Python version; the text
+    that ast.unparse prints is not (3.9 and 3.12 differ), so a hash of it differed in CI."""
+    import io
+    import textwrap
+    import tokenize
+    code = textwrap.dedent(code)
+    lines = code.splitlines(keepends=True)
+    for tok in reversed(list(tokenize.generate_tokens(io.StringIO(code).readline))):
+        if tok.type == tokenize.COMMENT:
+            (row, col), (_, end) = tok.start, tok.end
+            lines[row - 1] = lines[row - 1][:col] + lines[row - 1][end:]
+    return "".join(lines)
+
+
 def py_bodies(names: set[str]) -> dict[str, list[str]]:
     bodies: dict[str, list[str]] = {}
     for path in git_files("*.py"):
-        tree = ast.parse(path.read_text())
-        for cls in (n for n in ast.walk(tree) if isinstance(n, ast.ClassDef)):
+        text = path.read_text()
+        lines = text.splitlines(keepends=True)
+        for cls in (n for n in ast.walk(ast.parse(text)) if isinstance(n, ast.ClassDef)):
             for fn in cls.body:
                 key = f"{cls.name}.{getattr(fn, 'name', '')}"
                 if key in names and isinstance(fn, ast.FunctionDef):
                     rel = path.relative_to(ROOT).as_posix()
-                    bodies.setdefault(key, []).append(f"{rel}:{sha(ast.unparse(fn))}")
+                    code = strip_py("".join(lines[fn.lineno - 1:fn.end_lineno]))
+                    bodies.setdefault(key, []).append(f"{rel}:{sha(squeeze(code))}")
     return bodies
 
 
