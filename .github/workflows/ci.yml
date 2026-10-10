@@ -282,6 +282,7 @@ jobs:
           python3 scripts/test_check_agents_rules.py
           python3 scripts/test_check_claims.py
           python3 scripts/test_witness_pin.py
+          python3 scripts/test_outbox_task.py
 
       - name: CrowdSec stream recovery regression
         if: matrix.part == 'test'

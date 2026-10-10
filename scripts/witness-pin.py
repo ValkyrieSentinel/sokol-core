@@ -56,8 +56,8 @@ def rows() -> dict:
     return found
 
 
-def strip_rust(src: str) -> str:
-    """Source without comments; string and char literals kept byte for byte."""
+def rust_parts(src: str) -> list[tuple[bool, str]]:
+    """Comment-free code/literal segments; literal bytes never enter layout normalization."""
     out, i, n = [], 0, len(src)
     while i < n:
         c = src[i]
@@ -76,21 +76,38 @@ def strip_rust(src: str) -> str:
         elif (m := re.match(r'b?r(#*)"', src[i:])) and (i == 0 or not (src[i - 1].isalnum() or src[i - 1] == "_")):
             end = src.find('"' + m.group(1), i + m.end())
             end = n if end < 0 else end + 1 + len(m.group(1))
-            out.append(src[i:end])
+            out.append((True, src[i:end]))
             i = end
         elif c == '"':
             j = i + 1
             while j < n and src[j] != '"':
                 j += 2 if src[j] == "\\" else 1
-            out.append(src[i:j + 1])
+            out.append((True, src[i:j + 1]))
             i = j + 1
         elif c == "'" and (m := re.match(r"'(\\.[^']*|[^\\'])'", src[i:])):
-            out.append(m.group(0))
+            out.append((True, m.group(0)))
             i += m.end()
         else:
-            out.append(c)
+            if out and not out[-1][0]:
+                out[-1] = (False, out[-1][1] + c)
+            else:
+                out.append((False, c))
             i += 1
-    return "".join(out)
+    return out
+
+
+def strip_rust(src: str) -> str:
+    return "".join(text for _, text in rust_parts(src))
+
+
+def rust_layout(code: str) -> str:
+    return json.dumps([(literal, text if literal else squeeze(text))
+                       for literal, text in rust_parts(code)], ensure_ascii=True, separators=(",", ":"))
+
+
+def rust_mask(code: str) -> str:
+    # Preserve offsets, but literal braces and function-looking text are not code.
+    return "".join(" " * len(text) if literal else text for literal, text in rust_parts(code))
 
 
 def squeeze(code: str) -> str:
@@ -103,17 +120,18 @@ def rust_bodies(names: set[str]) -> dict[str, list[str]]:
     bodies: dict[str, list[str]] = {}
     for path in git_files("*.rs"):
         src = strip_rust(path.read_text())
-        for m in re.finditer(r"\bfn ([a-z][a-z0-9_]*)\s*[(<]", src):
+        masked = rust_mask(src)
+        for m in re.finditer(r"\bfn ([a-z][a-z0-9_]*)\s*[(<]", masked):
             if m.group(1) not in names:
                 continue
-            start = src.find("{", m.end())
+            start = masked.find("{", m.end())
             depth, j = 0, start
             for j in range(start, len(src)):
-                depth += {"{": 1, "}": -1}.get(src[j], 0)
+                depth += {"{": 1, "}": -1}.get(masked[j], 0)
                 if depth == 0:
                     break
             rel = path.relative_to(ROOT).as_posix()
-            bodies.setdefault(m.group(1), []).append(f"{rel}:{sha(squeeze(src[m.start():j + 1]))}")
+            bodies.setdefault(m.group(1), []).append(f"{rel}:{sha(rust_layout(src[m.start():j + 1]))}")
     return bodies
 
 
@@ -143,8 +161,21 @@ def py_bodies(names: set[str]) -> dict[str, list[str]]:
                 if key in names and isinstance(fn, ast.FunctionDef):
                     rel = path.relative_to(ROOT).as_posix()
                     code = strip_py("".join(lines[fn.lineno - 1:fn.end_lineno]))
-                    bodies.setdefault(key, []).append(f"{rel}:{sha(squeeze(code))}")
+                    bodies.setdefault(key, []).append(f"{rel}:{sha(py_layout(code))}")
     return bodies
+
+
+def py_layout(code: str) -> str:
+    import io
+    import textwrap
+    import tokenize
+    tokens = []
+    for token in tokenize.generate_tokens(io.StringIO(textwrap.dedent(code)).readline):
+        if token.type in (tokenize.COMMENT, tokenize.NL, tokenize.ENDMARKER):
+            continue
+        value = "" if token.type in (tokenize.INDENT, tokenize.DEDENT, tokenize.NEWLINE) else token.string
+        tokens.append((token.type, value))
+    return json.dumps(tokens, ensure_ascii=True, separators=(",", ":"))
 
 
 def current() -> dict:
