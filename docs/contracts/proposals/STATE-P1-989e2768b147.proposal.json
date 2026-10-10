@@ -1,0 +1,14 @@
+{
+  "after": "SHUTDOWN-S2",
+  "base_contract_sha256": null,
+  "because": "Counterexamples (hunt round 3, 2026-10-10): a state file named *.tmp was its own temporary file and rewritten in place (the twin of SUR-C2 missed in round 1); an unreadable state file was not kept aside (ADR-0004) and was lost on the next write.",
+  "evidence_text": "`a_save_replaces_the_state_file_atomically_whatever_its_name`, `an_unreadable_state_file_is_kept_aside_and_survives_the_next_save`",
+  "id": "STATE-P1",
+  "profile": "sokol.contract-proposal.v1",
+  "statement": "The state file is replaced atomically through a temporary file named after it (its name plus .tmp), whatever its name; an unreadable or unparseable regular state file is kept aside under the first free .corrupt name before any later write.",
+  "status": "UNSIGNED_INTENT",
+  "witnesses": [
+    "a_save_replaces_the_state_file_atomically_whatever_its_name",
+    "an_unreadable_state_file_is_kept_aside_and_survives_the_next_save"
+  ]
+}
