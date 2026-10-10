@@ -1,0 +1,12 @@
+{
+  "annotations": {
+    "status": "UNSIGNED_EXPLANATORY_DRAFT"
+  },
+  "evidence_text": "`a_damaged_cursor_rereads_the_log_instead_of_skipping_it` (empty, truncated and non-JSON cursors; mutation \"damaged = missing\" fails it).",
+  "id": "SUR-C2",
+  "profile": "sokol.contract-shadow.v1",
+  "statement": "The saved cursor is replaced durably (temporary file synced, renamed, directory synced). A cursor file that exists but cannot be read or parsed starts reading the current file from its start, never its end; a missing cursor follows `--from-start`. Re-read alerts are bounded by the forwarding age and deduplicated by event id at the node.",
+  "witnesses": [
+    "a_damaged_cursor_rereads_the_log_instead_of_skipping_it"
+  ]
+}

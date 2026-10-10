@@ -1,0 +1,14 @@
+{
+  "annotations": {
+    "status": "UNSIGNED_EXPLANATORY_DRAFT"
+  },
+  "evidence_text": "`detected_truncation_fences_offsets_from_previous_contents`, `resume_retains_its_anchor_while_the_source_is_missing`, `failed_install_does_not_erase_the_selected_resume_anchor`; process cases below.",
+  "id": "SUR-C1",
+  "profile": "sokol.contract-shadow.v1",
+  "statement": "A queued offset is usable only for the same observed content token and inode. Otherwise checkpoint position is zero in the current file. A loaded resume anchor survives failed source open/seek until successful installation.",
+  "witnesses": [
+    "detected_truncation_fences_offsets_from_previous_contents",
+    "failed_install_does_not_erase_the_selected_resume_anchor",
+    "resume_retains_its_anchor_while_the_source_is_missing"
+  ]
+}

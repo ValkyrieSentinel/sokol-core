@@ -1,0 +1,13 @@
+{
+  "annotations": {
+    "status": "UNSIGNED_EXPLANATORY_DRAFT"
+  },
+  "evidence_text": "`a_witnessed_head_exposes_a_recomputed_rewrite_that_the_chain_alone_accepts`, `a_peers_witness_confirms_the_log_and_exposes_a_recomputed_rewrite` (mutation \"compare without the head\" fails both).",
+  "id": "AUDIT-W1",
+  "profile": "sokol.contract-shadow.v1",
+  "statement": "A head witnessed for \"after N records\" is compared with this log's record N-1 after both chains verify. A different chain value is a contradiction even when the rewritten chain verifies on its own; fewer records than witnessed is missing; a pruned record is unknown, never confirmed.",
+  "witnesses": [
+    "a_peers_witness_confirms_the_log_and_exposes_a_recomputed_rewrite",
+    "a_witnessed_head_exposes_a_recomputed_rewrite_that_the_chain_alone_accepts"
+  ]
+}

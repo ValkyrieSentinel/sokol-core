@@ -1,0 +1,14 @@
+{
+  "annotations": {
+    "status": "UNSIGNED_EXPLANATORY_DRAFT"
+  },
+  "evidence_text": "`an_existing_record_can_accept_its_owner_at_the_global_capacity`, `an_event_still_held_needs_no_new_retraction_storage`, `a_plain_lift_needs_no_free_claim_slot`",
+  "id": "NODE-R2",
+  "profile": "sokol.contract-shadow.v1",
+  "statement": "Admission counts missing records, not all claims: a full global record table can update a suitable existing record. A still-held event requires no new claim/tombstone storage.",
+  "witnesses": [
+    "a_plain_lift_needs_no_free_claim_slot",
+    "an_event_still_held_needs_no_new_retraction_storage",
+    "an_existing_record_can_accept_its_owner_at_the_global_capacity"
+  ]
+}

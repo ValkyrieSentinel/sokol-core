@@ -1,0 +1,14 @@
+{
+  "annotations": {
+    "status": "UNSIGNED_EXPLANATORY_DRAFT"
+  },
+  "evidence_text": "`a_statement_is_one_exact_line_and_parses_back`, `a_statement_is_written_once_and_never_rewritten`, `statements_confirm_the_log_and_expose_a_recomputed_rewrite`.",
+  "id": "AUDIT-A1",
+  "profile": "sokol.contract-shadow.v1",
+  "statement": "(ADR-0022, opt-in) A head statement is one exact line, written durably once and never rewritten; the node contacts nothing. `--verify-anchors` checks the log against every statement for this node; a file named like a statement that is not one fails the check.",
+  "witnesses": [
+    "a_statement_is_one_exact_line_and_parses_back",
+    "a_statement_is_written_once_and_never_rewritten",
+    "statements_confirm_the_log_and_expose_a_recomputed_rewrite"
+  ]
+}

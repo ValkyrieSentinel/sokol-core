@@ -1,0 +1,12 @@
+{
+  "annotations": {
+    "status": "UNSIGNED_EXPLANATORY_DRAFT"
+  },
+  "evidence_text": "Code structure plus mixed renewal/refusal history in `gate_generated_history_preserves_cooldown_and_bounded_unique_memory`; this is accounting, not a timing benchmark.",
+  "id": "SUR-G3",
+  "profile": "sokol.contract-shadow.v1",
+  "statement": "Expiry inspection is an ordered prefix, with no full-set scan on each hot-cache refusal. Each admitted tuple is appended once and popped at most once. Thus total expiry pops cannot exceed prior successful admissions; each attempt adds at most one stopping head inspection.",
+  "witnesses": [
+    "gate_generated_history_preserves_cooldown_and_bounded_unique_memory"
+  ]
+}

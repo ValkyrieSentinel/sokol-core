@@ -1,0 +1,13 @@
+{
+  "annotations": {
+    "status": "UNSIGNED_EXPLANATORY_DRAFT"
+  },
+  "evidence_text": "`gate_capacity_refusal_keeps_live_cooldowns_and_releases_only_expired_slots`, `gate_rate_refusal_does_not_start_cooldown_and_zero_policies_are_defined`, generated history above",
+  "id": "SUR-G2",
+  "profile": "sokol.contract-shadow.v1",
+  "statement": "Successful admissions of one source IP are separated by at least cooldown. A capacity or rate refusal creates neither a new cooldown nor an admitted-rate slot. Only successful admission inserts an expiry tuple and increments the quota.",
+  "witnesses": [
+    "gate_capacity_refusal_keeps_live_cooldowns_and_releases_only_expired_slots",
+    "gate_rate_refusal_does_not_start_cooldown_and_zero_policies_are_defined"
+  ]
+}
