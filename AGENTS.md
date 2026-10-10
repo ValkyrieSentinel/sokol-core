@@ -83,6 +83,11 @@ on a rule here that does neither, and on a cited test, path or flag that does no
 - Documentation claims only what a named test, metric, flag or path shows. *Checked by:*
   `scripts/check-claims.sh`, which checks that what is cited exists (a test in the compiler's
   own list of tests, a proof with `#[kani::proof]` attached), not that it proves the claim.
+- A witness named in [docs/INVARIANTS.md](docs/INVARIANTS.md) is not weakened, renamed or dropped,
+  and an invariant row is not reworded or removed, without the owner re-pinning it (ADR-0023).
+  If a witness is in the way, stop and describe the counterexample in the pull request.
+  *Checked by:* `scripts/witness-pin.py check`, run from the base branch in CI
+  (`scripts/test_witness_pin.py` for the checker itself).
 - A retired subject stays retired. *Checked by:* `scripts/check-retired.sh` (see
   [Removing things](#removing-things)).
 
