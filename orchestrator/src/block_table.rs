@@ -4214,6 +4214,31 @@ mod tests {
         ));
     }
 
+    /// A claim ends at its exact end (cf. an_enforced_peer_claim_ends_at_its_exact_end): a
+    /// retraction at that instant finds nothing standing to take back (NODE-R5 boundary).
+    #[test]
+    fn a_retraction_at_the_claims_exact_end_finds_nothing_standing() {
+        let mut t = table(1, 64);
+        let claim = signal(&mut t, "crowdsec", "A", "203.0.113.9", T0, Some(60))
+            .unwrap()
+            .claim;
+        let out = t.retract_detection("crowdsec", "A", ip("203.0.113.9"), T0 + 60 * S);
+        assert_eq!(out.label(), "not_holding");
+        assert!(!t.retractions.contains_key(&claim.id()));
+    }
+
+    /// Another reason that ends exactly when the longest own claim ends leaves the block as it
+    /// is: still held, not shortened to the same end (NODE-R4 boundary).
+    #[test]
+    fn a_remaining_reason_with_the_same_end_keeps_the_block_unchanged() {
+        let mut t = table(1, 64);
+        signal(&mut t, "suricata", "B", "203.0.113.9", T0, Some(60)).unwrap();
+        signal(&mut t, "crowdsec", "A", "203.0.113.9", T0, Some(60)).unwrap();
+        let out = t.retract_detection("crowdsec", "A", ip("203.0.113.9"), T0 + S);
+        assert_eq!(out.label(), "still_held");
+        assert!(t.is_blocked(ip("203.0.113.9")));
+    }
+
     /// A detection after a retraction of a byte-identical claim in the same millisecond is a
     /// new claim in force, not one born retracted (NODE-D1).
     #[test]
