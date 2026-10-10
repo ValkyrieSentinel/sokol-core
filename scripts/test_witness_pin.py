@@ -115,6 +115,28 @@ class WitnessPin(unittest.TestCase):
         self.edit("scripts/test_recovery.py", "self.assertEqual(cursor(), 7)", "cursor()")
         self.assert_refused("witness RecoveryTests.test_recovery_keeps_the_cursor changed")
 
+    def test_rust_literal_whitespace_is_not_formatting(self):
+        self.edit("src/gate.rs", 'let url = "http://x";', 'let url = "http:// x";')
+        self.assert_refused("witness a_refusal_creates_no_cooldown changed")
+
+    def test_python_literal_whitespace_is_not_formatting(self):
+        self.edit("scripts/test_recovery.py", "self.assertEqual(cursor(), 7)", 'self.assertEqual(cursor("a b"), 7)')
+        self.assertEqual(self.pin(self.key).returncode, 0)
+        self.edit("scripts/test_recovery.py", 'cursor("a b")', 'cursor("a  b")')
+        self.assert_refused("witness RecoveryTests.test_recovery_keeps_the_cursor changed")
+
+    def test_literal_braces_cannot_hide_following_assertions(self):
+        self.edit("src/gate.rs", 'let url = "http://x";', 'let url = "}";')
+        self.assertEqual(self.pin(self.key).returncode, 0)
+        self.edit("src/gate.rs", "assert_eq!(gate(url), 0);", "let _ = gate(url);")
+        self.assert_refused("witness a_refusal_creates_no_cooldown changed")
+
+    def test_raw_literal_whitespace_is_not_formatting(self):
+        self.edit("src/gate.rs", 'let url = "http://x";', 'let url = r#"a b"#;')
+        self.assertEqual(self.pin(self.key).returncode, 0)
+        self.edit("src/gate.rs", 'r#"a b"#', 'r#"a  b"#')
+        self.assert_refused("witness a_refusal_creates_no_cooldown changed")
+
     def test_python_comments_and_indentation_do_not_count(self):
         self.edit("scripts/test_recovery.py", "        self.assertEqual(cursor(), 7)",
                   "        # The cursor survives a restart.\n        self.assertEqual(cursor(), 7)  # seven")
