@@ -21,6 +21,7 @@ exclude_re = [
     # The restore's warning line: the counts themselves are kept in the table and checked
     # exactly (a_restore_keeps_every_bounded_table_within_its_runtime_bound); only logging differs.
     "in Dropped::log$",
+    "replace Dropped::log with \\(\\)$",
     # serde's "expecting" text only words an error the duplicate-key check raises either way
     # (a_repeated_rib_key_cannot_hide_a_foreign_path_from_the_round asserts the error).
     "UniqueKeysVisitor>::expecting -> std::fmt::Result with Ok\\(Default::default\\(\\)\\)$",
