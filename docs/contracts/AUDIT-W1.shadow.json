@@ -2,11 +2,19 @@
   "annotations": {
     "status": "UNSIGNED_EXPLANATORY_DRAFT"
   },
-  "evidence_text": "`a_witnessed_head_exposes_a_recomputed_rewrite_that_the_chain_alone_accepts`, `a_peers_witness_confirms_the_log_and_exposes_a_recomputed_rewrite` (mutation \"compare without the head\" fails both).",
+  "decisions": [
+    {
+      "because": "Counterexample (hunt 2026-10-10): a head witnessed for 0 records of a log whose start is pruned was reported confirmed although nothing retained was compared. Fix: it is Pruned (unknown).",
+      "previous_statement_sha256": "aefdcda6f406b2affd58293ad575f5af3cb25f839961e43c12a047fad892e158",
+      "proposal_sha256": "b0d411984700f559fe3e471f54c5612605544366d99b814483e3773f65f37bce"
+    }
+  ],
+  "evidence_text": "`a_witnessed_head_exposes_a_recomputed_rewrite_that_the_chain_alone_accepts`, `a_peers_witness_confirms_the_log_and_exposes_a_recomputed_rewrite` (mutation \"compare without the head\" fails both), `a_head_for_zero_records_of_a_pruned_log_is_not_confirmed`",
   "id": "AUDIT-W1",
   "profile": "sokol.contract-shadow.v1",
   "statement": "A head witnessed for \"after N records\" is compared with this log's record N-1 after both chains verify. A different chain value is a contradiction even when the rewritten chain verifies on its own; fewer records than witnessed is missing; a pruned record is unknown, never confirmed.",
   "witnesses": [
+    "a_head_for_zero_records_of_a_pruned_log_is_not_confirmed",
     "a_peers_witness_confirms_the_log_and_exposes_a_recomputed_rewrite",
     "a_witnessed_head_exposes_a_recomputed_rewrite_that_the_chain_alone_accepts"
   ]

@@ -1,14 +1,14 @@
 {
  "contracts": {
-  "AUDIT-A1": "5977a6b1faa9bb325112c45e5aa405c955ab0cbc0f7ba559a7fa00d07b6bc894",
+  "AUDIT-A1": "46e30344f597862a3f8e8c0e4ec964aa3a1b749cb43db536c1fab43032636b3d",
   "AUDIT-R1": "d9359f45dd60250020e38761884e7e0e80b688c6bf05e2c3c59b1f66685c368f",
   "AUDIT-R2": "a2128cfe68dae5fa314e1159c902340de70d3a5c577e0b0bedd00b0a0eda05bb",
-  "AUDIT-W1": "161afa24fdb825fbecac4aa9d2c70c649610ee6ba0f5545244719dd148b28d21",
-  "AUDIT-W2": "eb565b5cb03b920019478abdfb8854dc88472136ab7e13278903aab534888653",
+  "AUDIT-W1": "422c3e75151a175762ef57e74130b054e3f7219c231cb24657db20db9e0ff978",
+  "AUDIT-W2": "abec3420670c3c23808954fb977332d11870483ffb5ae296d9d3c16d368e7563",
   "AUDIT-W3": "f7727aa9d7ca67fa60af72d067448e8a54ffc96acbc8eeada0b8e3e6acf7d58f",
   "CS-P1": "20c86421cdf4044134642a59a00621fbcd7356166a8643864fb02dad24cb2687",
   "CS-P2": "5dd517e4115b6735f6e7477f4118095dccc8075d384adeb95b2bbf1a0069b031",
-  "IPC-A1": "003ac4a1a48d4415c8aabb68220db26b6a8999541da2969cffc2903ed551f3fb",
+  "IPC-A1": "6a0096b5b18b5190ee613bc7e2e3e94604665f205385b18ae074bb0b9138aafa",
   "IPC-T1": "088af71858cc841192a1cac08dd3a0cfe6f6fcded7772bf9ba5fbd3a13122cc3",
   "NODE-D1": "e89eebfd4b5e4283a70f2af56f3f7c13219cde80d09b667d5215987eb6d332b5",
   "NODE-R1": "4618ac4d2bb0c89369d0a8b83d84cb96e1b22f630db08c56320e0b25022bcb15",
@@ -22,7 +22,7 @@
   "SHUTDOWN-S1": "20f05174abd36f01bf7b650b1dc2d099bc9c482d2bccbd9b549db27d750e5cff",
   "SHUTDOWN-S2": "4b603c1a2c197fc71e551940b80a2df275920b45405489d7e899fbeb4e1a7046",
   "SUR-C1": "71649ca5848e6bfeec0e1cb516058d937298924631f88b0141127498686b614a",
-  "SUR-C2": "9546371463e50dd323c16896be93d5edf8eb0044e988040a7c4759591f795078",
+  "SUR-C2": "7fcaf10dafce330390b4f11b6d613a8f16500cbe135bdd57382e877471c642d0",
   "SUR-D1": "0df7ecc50aad9a0ce7a4b75881a5dab0870bb4bd5947cd5ab0a7078e65554bd8",
   "SUR-G1": "812cf4e7d434265b5a94250aaef909f4f5cc814308f1bcaddd4fbd806bacabcf",
   "SUR-G2": "5edcb19a8a40752f7b4cdd3d67fcf3f6857fa9d0985f3304934ebf42258e7b25",
@@ -37,8 +37,11 @@
   "AUDIT-A1": {
    "statement": "526ef1b1df64b24ac7f86c6e24ee5022b773dc2c6f40ac9892b9ddf340959b15",
    "witnesses": [
+    "a_non_canonical_statement_file_fails_the_check",
+    "a_statement_file_named_for_another_statement_fails_the_check",
     "a_statement_is_one_exact_line_and_parses_back",
     "a_statement_is_written_once_and_never_rewritten",
+    "only_the_canonical_line_is_a_statement",
     "statements_confirm_the_log_and_expose_a_recomputed_rewrite"
    ]
   },
@@ -60,6 +63,7 @@
   "AUDIT-W1": {
    "statement": "aefdcda6f406b2affd58293ad575f5af3cb25f839961e43c12a047fad892e158",
    "witnesses": [
+    "a_head_for_zero_records_of_a_pruned_log_is_not_confirmed",
     "a_peers_witness_confirms_the_log_and_exposes_a_recomputed_rewrite",
     "a_witnessed_head_exposes_a_recomputed_rewrite_that_the_chain_alone_accepts"
    ]
@@ -67,7 +71,8 @@
   "AUDIT-W2": {
    "statement": "2cf25fe8278d40505363c386bc23871f34d6aca2f604c0d016616f54c694e300",
    "witnesses": [
-    "a_peers_audit_head_is_witnessed_once_per_interval"
+    "a_peers_audit_head_is_witnessed_once_per_interval",
+    "records_found_on_open_are_unsynced_until_the_next_sync"
    ]
   },
   "AUDIT-W3": {
@@ -95,6 +100,8 @@
   "IPC-A1": {
    "statement": "92729d9c94dad884353091082bed03a9a49265b45baf26d170ce17883b9cc335",
    "witnesses": [
+    "a_line_sent_before_the_request_does_not_retire_it",
+    "a_surplus_answer_does_not_settle_the_next_signal",
     "an_unterminated_ack_does_not_retire_the_signal",
     "unknown_reply_keeps_the_obligation_and_a_later_ack_retires_it"
    ]
@@ -200,6 +207,7 @@
   "SUR-C2": {
    "statement": "550458b9edaa62becdee95c100eff68b143feaef85fc9cca4bc28b4a022064df",
    "witnesses": [
+    "a_cursor_is_replaced_not_rewritten_in_place_whatever_its_name",
     "a_damaged_cursor_rereads_the_log_instead_of_skipping_it"
    ]
   },
@@ -285,6 +293,9 @@
   "a_closed_owner_refuses_late_child_registration": [
    "orchestrator/src/shutdown.rs:42cd58f69062cfec51699e7f019e70a92cf3a2be1bd5f850188dc132c11238d8"
   ],
+  "a_cursor_is_replaced_not_rewritten_in_place_whatever_its_name": [
+   "orchestrator/src/bin/sokol-suricata.rs:f8b7ddcb97ad8611db54fddf2cc8164e883bab597b7aee923361fd8dadf1ef90"
+  ],
   "a_damaged_cursor_rereads_the_log_instead_of_skipping_it": [
    "orchestrator/src/bin/sokol-suricata.rs:e4bb88597143a6fbec20e29bcf0cb558143cb96c1edcc174e9dfda12f878e7f4"
   ],
@@ -308,6 +319,15 @@
   ],
   "a_handshake_without_features_still_parses": [
    "orchestrator/src/p2p.rs:4e29aebd1be0f034e734c63ea7e7b03a6a5468c9a010e0d5d2c024009deb8bb4"
+  ],
+  "a_head_for_zero_records_of_a_pruned_log_is_not_confirmed": [
+   "common/src/audit_log.rs:f0eb4c1b64df55e67c354be31f9b6d6bdac8056235eabd5e5875dff46150ebf0"
+  ],
+  "a_line_sent_before_the_request_does_not_retire_it": [
+   "orchestrator/src/delivery.rs:3f476f8638b77d4c2ea93c1097033d7db48bec0ef154ee5716c9b42ac3f7dd7f"
+  ],
+  "a_non_canonical_statement_file_fails_the_check": [
+   "orchestrator/src/audit_anchor.rs:0ca8fde409b31f9014a6f568436fb66daa4d08892859baf1deb322990ed972d8"
   ],
   "a_partially_reproduced_audit_is_not_a_successful_cli_result": [
    "orchestrator/src/replay.rs:43f88ca49b4e414a74aafb77d397e7f5df0b297ff43e58778240e4482feb0293"
@@ -336,11 +356,17 @@
   "a_shortening_capacity_refusal_keeps_both_event_supports": [
    "orchestrator/src/block_table.rs:5c95f1954bd8cf22b4d899bde6a76e0cf89974b83ac51666c71fed8629307a31"
   ],
+  "a_statement_file_named_for_another_statement_fails_the_check": [
+   "orchestrator/src/audit_anchor.rs:a11d174dcfe74139aa8bafa99c98937ac11aa135b0c9f03a687176ab3afb11f1"
+  ],
   "a_statement_is_one_exact_line_and_parses_back": [
    "orchestrator/src/audit_anchor.rs:c5bf55d30ef440b9b156359c89fb509be4dd74cec6b8d177a07cd59226c5ebe6"
   ],
   "a_statement_is_written_once_and_never_rewritten": [
    "orchestrator/src/audit_anchor.rs:1bc1e4a25b7b85d45fbef81aec1821e457bb3bf2fca2d73d4d5c912672a9b61e"
+  ],
+  "a_surplus_answer_does_not_settle_the_next_signal": [
+   "orchestrator/src/delivery.rs:643e6766f595a373780472e6bfd89fec55d00d1329a6c0a63df730a9ade5b9ff"
   ],
   "a_timed_out_cleanup_worker_is_cancelled_and_joined": [
    "orchestrator/src/shutdown.rs:54dff102e072c1246b298f0887514622ed3d7fa8c1f0fb6e8ee1bc70aff8d633"
@@ -450,6 +476,9 @@
   "lost_answer_keeps_expiry_and_later_retry_sends_its_retraction": [
    "orchestrator/src/delivery.rs:0a5d4949613481d8183ef76d002b8e2b57001accfa5390eb73566e4d86a98848"
   ],
+  "only_the_canonical_line_is_a_statement": [
+   "orchestrator/src/audit_anchor.rs:4666938b8edb555bc0d8a6a16cb83be5d765366264298881a0a3621c68aa70bc"
+  ],
   "oversized_audit_records_are_counted_and_marked_before_following_data_or_flush": [
    "orchestrator/src/main.rs:5f8238ea09e54d0084116377203678b159470a25e2ce754f919cac38e557fd60"
   ],
@@ -467,6 +496,9 @@
   ],
   "reason_fields_cannot_hide_a_wrong_detector_ttl": [
    "orchestrator/src/replay.rs:57f268576ad5be1fbf0b9e5d94598a0232c4169eed75f33f8f67e0a62204f4bc"
+  ],
+  "records_found_on_open_are_unsynced_until_the_next_sync": [
+   "common/src/audit_log.rs:33fb6a7bda2909cdd37a007a68cde06a2a6f502b40b4a84832281bacee6c7059"
   ],
   "refusal_diagnostics_do_not_wrap_or_reemit_saturated_totals": [
    "orchestrator/src/bin/sokol-suricata.rs:4c7ff0a7f7e5becd7a73f3b5ed19f3124325b7fbd35daa2ee921648aa6f635e6"
