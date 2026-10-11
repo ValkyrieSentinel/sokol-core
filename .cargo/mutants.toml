@@ -1,6 +1,12 @@
 # cargo-mutants: mutants that are equivalent or cannot be observed by a unit test.
 # Every entry says why. Commands, baseline and open survivors: docs/MUTATION.md.
 exclude_re = [
+    # This verification harness is cfg(kani), absent from the unit-test binary, like tests
+    # themselves. Native mutants of valid_segment_start remain in scope. Its ==/!= mutant
+    # was rejected by cargo kani --harness a_zero_sequence_segment_has_the_fixed_genesis_chain
+    # (2026-10-11); the harness's non-vacuous assertions remain a review obligation.
+    "in proofs::a_zero_sequence_segment_has_the_fixed_genesis_chain$",
+    "replace proofs::a_zero_sequence_segment_has_the_fixed_genesis_chain with \\(\\)$",
     # Disjoint bits: `|` and `^` give the same value.
     "replace \\| with \\^ in from_hex$",
     "replace \\| with \\^ in tcp_flags::is_invalid$",
@@ -45,7 +51,7 @@ exclude_re = [
     "replace (> with ==|> with >=|\\* with \\+) in BlockTable<B>::strike_order_due$",
     # Replay compares a detector's TTL and claim; a static or operator block does not change
     # either on the current table (probed 2026-10-07).
-    "match guard t.starts_with\\(\"(STATIC_BLOCK_|OPERATOR_BAN_)\"\\) with false in replay_records",
+    "match guard t.starts_with\\(\"(STATIC_BLOCK_|OPERATOR_BAN_)\"\\) with false in (replay_records|Replay<'a>::consume)",
     # keep_aside keeps nothing either way when the link fails for another reason.
     "replace match guard e.kind\\(\\) == std::io::ErrorKind::AlreadyExists with true in keep_aside$",
     # serde refuses repeated fields and a second top-level key on its own; the strict check

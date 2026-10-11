@@ -35,6 +35,7 @@ RUN_TIMEOUT = 900
 RECIPES = {
     'delivery': ['bash', 'scripts/check-delivery.sh'],
     'orchestrator-unit': ['cargo', 'test', '--release', '--locked', '-p', 'orchestrator', '--bins', '{witness}', '--', '--color', 'never'],
+    'workspace-unit': ['cargo', 'test', '--release', '--locked', '-p', 'orchestrator', '-p', 'common', '--lib', '--bins', '{witness}', '--', '--color', 'never'],
     'common-unit': ['cargo', 'test', '--release', '--locked', '-p', 'common', '--lib', '{witness}', '--', '--color', 'never'],
 }
 
@@ -228,6 +229,8 @@ def prepare(root, rid, signers=None, proposal=None):
         recipe = 'orchestrator-unit'
     elif all(file.startswith('common/src/') for file in files) and not any('.' in w for w in witnesses):
         recipe = 'common-unit'
+    elif all(file.startswith(('orchestrator/src/', 'common/src/')) for file in files) and not any('.' in w for w in witnesses):
+        recipe = 'workspace-unit'
     else:
         recipe = None
     config = configuration()
