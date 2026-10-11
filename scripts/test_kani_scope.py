@@ -70,7 +70,9 @@ class Scope(unittest.TestCase):
 
     def test_every_input_proves(self):
         for name in ('common/src/lib.rs', 'Cargo.lock', 'rust-toolchain.toml',
-                     '.cargo/config.toml', '.github/workflows/ci.yml', 'scripts/kani-scope.sh'):
+                     '.cargo/config.toml', '.github/workflows/ci.yml', 'scripts/kani-scope.sh',
+                     'scripts/proof-task.py', 'scripts/proof-challenges.json',
+                     'scripts/contract-task.py', 'scripts/test_proof_task.py'):
             with self.subTest(name):
                 self.append(name, '\n# changed\n')
                 self.assertEqual(self.scope(), 'prove')

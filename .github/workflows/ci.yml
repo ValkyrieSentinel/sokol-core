@@ -106,9 +106,16 @@ jobs:
           rustup toolchain install stable --profile minimal
           cargo +stable install --locked kani-verifier --version "$KANI_VERSION"
           cargo +stable kani setup
-      - name: Proofs (cargo kani -p common)
+      - name: Proofs and assertion counterexamples
         if: steps.scope.outputs.prove == 'true'
-        run: cargo kani -p common
+        run: python3 scripts/proof-task.py run
+      - name: Proof evidence and concrete playback candidates
+        if: always() && steps.scope.outputs.prove == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: proof-calibration
+          path: /tmp/sokol-proof-run-*/
+          if-no-files-found: error
 
   # Both architectures run the whole suite, XDP smoke and demo included: an arm64 kernel faults
   # on things x86 tolerates (a misaligned 64-bit atomic in a map value hung one, ADR-0014).
@@ -278,6 +285,7 @@ jobs:
           python3 scripts/test_runbook_preflight.py
           python3 scripts/test_anchor_scripts.py
           python3 scripts/test_kani_scope.py
+          python3 scripts/test_proof_task.py
           python3 scripts/test_mutants_diff.py
           python3 scripts/test_check_agents_rules.py
           python3 scripts/test_check_claims.py
