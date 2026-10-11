@@ -1,12 +1,18 @@
 {
-  "after": "NODE-R5",
-  "base_contract_sha256": null,
-  "because": "Assertion-red restore regression accepted a saved claim reason longer than the writer can emit. Replace whole-file allocation with a buffered streaming decoder, enforce token/record/collection budgets, retain rejected bytes and preserve failed restore status.",
+  "annotations": {
+    "status": "UNSIGNED_EXPLANATORY_DRAFT"
+  },
+  "decisions": [
+    {
+      "because": "Assertion-red restore regression accepted a saved claim reason longer than the writer can emit. Replace whole-file allocation with a buffered streaming decoder, enforce token/record/collection budgets, retain rejected bytes and preserve failed restore status.",
+      "previous_statement_sha256": null,
+      "proposal_sha256": "fd25debee5fa49d3da117f018471b27314611667d651a1998dcb82934443a7d3"
+    }
+  ],
   "evidence_text": "`a_byte_budget_counts_whitespace_and_refuses_a_growing_stream`, `a_failed_restore_keeps_the_node_degraded_until_the_loss_is_accepted`, `a_file_over_the_writer_byte_budget_is_refused_without_reading_or_replacing_it`, `an_overlong_saved_reason_is_refused_and_the_original_bytes_are_kept`, `maximal_writer_records_roundtrip_with_escaped_reasons_and_all_tables`, `oversized_state_fields_are_refused_in_each_table`, `sequences_refuse_cardinality_and_invalid_records_without_eviction`, `wire_string_and_atom_bounds_apply_before_serde_allocates`",
   "id": "STATE-B1",
-  "profile": "sokol.contract-proposal.v1",
+  "profile": "sokol.contract-shadow.v1",
   "statement": "State restore checks the writer-derived MAX_STATE_BYTES budget and JSON string/atom wire budgets while streaming, before unrestricted serde string allocation. Every retained input collection and string fits its named writer/runtime limit; nested support reasons are bounded too. Over-limit input is Failed, never Fresh, and original bytes are kept aside where possible. One extra bounded record may be decoded at a collection boundary. These bounds do not establish an RSS limit or a filesystem latency guarantee.",
-  "status": "UNSIGNED_INTENT",
   "witnesses": [
     "a_byte_budget_counts_whitespace_and_refuses_a_growing_stream",
     "a_failed_restore_keeps_the_node_degraded_until_the_loss_is_accepted",
