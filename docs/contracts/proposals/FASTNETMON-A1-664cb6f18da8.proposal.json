@@ -1,0 +1,17 @@
+{
+  "after": null,
+  "base_contract_sha256": "05cf4140ec7b0ca526b622cec434293171bdfa3586984bafb88f6aa5aed0fbcc",
+  "because": "Mutation check (CI, PR #14): the delivery deadline could become 'now - budget' (one attempt, no retry) and no witness failed. The new witness pins that the hook retries within its budget.",
+  "evidence_text": "`a_node_that_never_answers_makes_the_hook_fail_within_its_budget_without_claiming_delivery`, `a_node_that_records_the_report_makes_the_hook_report_delivery_and_exit_zero`, `a_report_the_node_rejects_is_not_called_delivered`, `the_first_line_the_node_sees_is_the_ack_handshake`, `a_node_that_comes_up_within_the_budget_still_gets_the_report`",
+  "id": "FASTNETMON-A1",
+  "profile": "sokol.contract-proposal.v1",
+  "statement": "The FastNetMon hook sends its report through the ACK-mode outbox within a bounded wait and reports delivery only after the node's recognized answer; no answer within the bound is a non-zero exit that says the report is lost.",
+  "status": "UNSIGNED_INTENT",
+  "witnesses": [
+    "a_node_that_comes_up_within_the_budget_still_gets_the_report",
+    "a_node_that_never_answers_makes_the_hook_fail_within_its_budget_without_claiming_delivery",
+    "a_node_that_records_the_report_makes_the_hook_report_delivery_and_exit_zero",
+    "a_report_the_node_rejects_is_not_called_delivered",
+    "the_first_line_the_node_sees_is_the_ack_handshake"
+  ]
+}
