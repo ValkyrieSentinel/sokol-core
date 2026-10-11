@@ -342,8 +342,8 @@ fn state_tmp(path: &Path) -> PathBuf {
 
 /// `Ok(None)`: no state file (a first start).
 pub fn read_state(path: &Path) -> Result<Option<Persisted>, Restore> {
-    let bytes = match std::fs::read(path) {
-        Ok(bytes) => bytes,
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => {
             // An unreadable regular file (EACCES, EIO) is not a first start either, and the next
@@ -357,28 +357,16 @@ pub fn read_state(path: &Path) -> Result<Option<Persisted>, Restore> {
             });
         }
     };
-    // The layout is checked first, so a file of another schema is named as such, not as corrupt.
-    #[derive(serde::Deserialize)]
-    struct Head {
-        schema: Option<u32>,
-    }
-    if let Ok(Head {
-        schema: Some(schema),
-    }) = serde_json::from_slice::<Head>(&bytes)
+    if file
+        .metadata()
+        .is_ok_and(|m| m.len() > crate::state_input::MAX_STATE_BYTES as u64)
     {
-        if schema != crate::block_table::STATE_SCHEMA {
-            return Err(Restore::Failed {
-                why: format!(
-                    "{} has state schema {}, this build reads {} (no migration)",
-                    path.display(),
-                    schema,
-                    crate::block_table::STATE_SCHEMA
-                ),
-                kept: keep_aside(path),
-            });
-        }
+        return Err(Restore::Failed {
+            why: format!("{} exceeds state byte limit", path.display()),
+            kept: keep_aside(path),
+        });
     }
-    serde_json::from_slice::<Persisted>(&bytes)
+    crate::state_input::parse(file)
         .map(Some)
         .map_err(|e| Restore::Failed {
             why: format!("{} is not a valid state file: {}", path.display(), e),
@@ -407,6 +395,62 @@ fn keep_aside(path: &Path) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_file_over_the_writer_byte_budget_is_refused_without_reading_or_replacing_it() {
+        // Equality reaches the decoder: corruption at the bound is not mislabeled as
+        // excess input. A sparse NUL file fails on its first byte, without reading 1 GiB.
+        let exact = temp("sparse-exact-budget");
+        let file = std::fs::File::create(&exact).unwrap();
+        file.set_len(crate::state_input::MAX_STATE_BYTES as u64)
+            .unwrap();
+        match read_state(&exact) {
+            Err(Restore::Failed { why, .. }) => {
+                assert!(why.contains("not a valid state file"), "{why}");
+            }
+            other => panic!("expected decoder refusal at exact byte budget: {other:?}"),
+        }
+        let path = temp("sparse-oversized");
+        let file = std::fs::File::create(&path).unwrap();
+        let bytes = crate::state_input::MAX_STATE_BYTES as u64 + 1;
+        file.set_len(bytes).unwrap();
+        match read_state(&path) {
+            Err(Restore::Failed {
+                why,
+                kept: Some(kept),
+            }) => {
+                assert!(why.contains("state byte limit"), "{why}");
+                assert_eq!(std::fs::metadata(kept).unwrap().len(), bytes);
+                assert_eq!(std::fs::metadata(path).unwrap().len(), bytes);
+            }
+            other => panic!("oversized file was accepted: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_overlong_saved_reason_is_refused_and_the_original_bytes_are_kept() {
+        let path = temp("oversized-reason");
+        let mut saved = state(1);
+        saved.claims.push(crate::block_table::Claim {
+            issuer: 1,
+            kind: crate::block_table::ClaimKind::Operator,
+            target: "198.51.100.1".into(),
+            issued_ms: 0,
+            expires_ms: None,
+            reason: "x".repeat(crate::block_table::MAX_REASON_BYTES + 1),
+        });
+        save_state(&path, &saved).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        match read_state(&path) {
+            Err(Restore::Failed {
+                kept: Some(kept), ..
+            }) => {
+                assert_eq!(std::fs::read(kept).unwrap(), bytes);
+                assert_eq!(std::fs::read(path).unwrap(), bytes);
+            }
+            other => panic!("an impossible writer state was admitted: {other:?}"),
+        }
+    }
+
     use super::*;
 
     fn state(n: usize) -> Persisted {

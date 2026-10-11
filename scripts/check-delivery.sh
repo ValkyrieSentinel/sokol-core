@@ -5,6 +5,7 @@ cd "$(dirname "$0")/.."
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 rustc --edition=2021 --test orchestrator/src/delivery.rs -o "$work/tests"
+"$work/tests" --list --format terse
 "$work/tests"
 rustc --edition=2021 scripts/stargate_delivery_probe.rs -o "$work/probe"
 "$work/probe"

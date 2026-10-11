@@ -78,6 +78,15 @@ exit {status}
         for call in calls:
             self.assertIn('--shard 2/4', call)
 
+    def test_shared_cargo_directories_cannot_override_mutant_sandboxes(self):
+        self.cargo(0)
+        path = self.stubs / 'cargo'
+        path.write_text(path.read_text().replace('exit 0',
+            '[ -z "${CARGO_TARGET_DIR+x}${CARGO_BUILD_TARGET_DIR+x}${CARGO_BUILD_BUILD_DIR+x}" ] || exit 73\nexit 0'))
+        result = self.run_check(CARGO_TARGET_DIR='/shared/target', CARGO_BUILD_TARGET_DIR='/shared/other',
+                                CARGO_BUILD_BUILD_DIR='/shared/build')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_a_missed_mutant_fails_and_is_named(self):
         self.cargo(2, 'orchestrator/lib.rs:2:1: replace g with ()\n')
         result = self.run_check()
