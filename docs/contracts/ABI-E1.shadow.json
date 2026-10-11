@@ -1,0 +1,19 @@
+{
+  "annotations": {
+    "status": "UNSIGNED_EXPLANATORY_DRAFT"
+  },
+  "decisions": [
+    {
+      "because": "Counterexample (hunt round 4, 2026-10-12): emit_drop_event_sampled never wrote payload (256 of 300 bytes); bpf_ringbuf_reserve does not zero, so after the ring wrapped the field carried other packets' bytes, against the ABI comment 'the kernel side sets them all'.",
+      "previous_statement_sha256": null,
+      "proposal_sha256": "2dbdf5d3261834baf2704b0574a18e242756fbbe3afc75716b61085b725b5564"
+    }
+  ],
+  "evidence_text": "`the_xdp_program_writes_every_field_of_a_drop_event_before_submitting_it`",
+  "id": "ABI-E1",
+  "profile": "sokol.contract-shadow.v1",
+  "statement": "Every byte of a DropEvent record the XDP program submits to the events ring is written between reserve and submit, so no record carries bytes of an earlier one.",
+  "witnesses": [
+    "the_xdp_program_writes_every_field_of_a_drop_event_before_submitting_it"
+  ]
+}
