@@ -153,6 +153,83 @@ pub mod abi {
         assert!(192 + 8 * DROP_REASON_SLOTS == PACKET_STATS_SIZE);
         assert!(super::EVENTS_RING_BYTES.is_power_of_two());
     };
+
+    #[cfg(test)]
+    mod tests {
+        extern crate std;
+        use super::DropEvent;
+        use std::{string::String, vec::Vec};
+
+        /// Every field of `DropEvent`. The pattern has no `..`, so a field added to the struct
+        /// does not compile here until it is listed.
+        fn fields(e: &DropEvent) -> [&'static str; 9] {
+            let DropEvent {
+                src_ip: _,
+                dst_ip: _,
+                pkt_len: _,
+                reason: _,
+                protocol: _,
+                ip_version: _,
+                payload_len: _,
+                _pad: _,
+                payload: _,
+            } = e;
+            [
+                "src_ip",
+                "dst_ip",
+                "pkt_len",
+                "reason",
+                "protocol",
+                "ip_version",
+                "payload_len",
+                "_pad",
+                "payload",
+            ]
+        }
+
+        /// `bpf_ringbuf_reserve` does not zero the space it hands out: a field the XDP program
+        /// leaves unwritten carries the bytes of an earlier record (another packet's addresses)
+        /// once the ring wraps. Between reserve and submit, every field is assigned.
+        #[test]
+        fn the_xdp_program_writes_every_field_of_a_drop_event_before_submitting_it() {
+            let src = include_str!("../../ebpf/src/main.rs");
+            let flat: String = src.split_whitespace().collect();
+            let records: Vec<&str> = flat
+                .match_indices("EVENTS.reserve::<DropEvent>")
+                .filter_map(|(i, _)| {
+                    let rest = &flat[i..];
+                    rest.find(".submit(").map(|e| &rest[..e])
+                })
+                .collect();
+            assert!(
+                !records.is_empty(),
+                "no reserve..submit of a DropEvent found: the scan is broken"
+            );
+            let all = fields(&DropEvent {
+                src_ip: [0; 16],
+                dst_ip: [0; 16],
+                pkt_len: 0,
+                reason: 0,
+                protocol: 0,
+                ip_version: 0,
+                payload_len: 0,
+                _pad: 0,
+                payload: [0; super::MAX_PAYLOAD],
+            });
+            for record in &records {
+                for f in all {
+                    let assign = std::format!(".{f}=");
+                    let written = record
+                        .match_indices(assign.as_str())
+                        .any(|(i, _)| !record[i + assign.len()..].starts_with('='));
+                    assert!(
+                        written,
+                        "DropEvent.{f} is submitted without being written: it carries ring garbage"
+                    );
+                }
+            }
+        }
+    }
 }
 
 #[repr(C)]

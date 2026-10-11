@@ -623,8 +623,9 @@ struct Args {
     #[arg(long, default_value = "48")]
     min_block_prefix_v6: u8,
 
-    /// Share of live nodes under attack above which the cluster is in a distributed storm.
-    #[arg(long, default_value = "0.5")]
+    /// Share of live nodes under attack above which the cluster is in a distributed storm;
+    /// finite and in [0, 1), anything else is refused at startup.
+    #[arg(long, default_value = "0.5", value_parser = cluster_state::parse_storm_threshold)]
     storm_threshold: f64,
 }
 
@@ -2388,6 +2389,29 @@ async fn main() -> Result<(), anyhow::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_storm_threshold_outside_zero_to_one_is_refused_at_startup() {
+        for bad in ["-0.1", "1.0", "50", "NaN", "inf"] {
+            let arg = format!("--storm-threshold={}", bad);
+            assert!(
+                Args::try_parse_from(["sokol-core", arg.as_str()]).is_err(),
+                "{} must be refused",
+                arg
+            );
+        }
+        for good in ["0.0", "0.5", "0.99"] {
+            let arg = format!("--storm-threshold={}", good);
+            let args = Args::try_parse_from(["sokol-core", arg.as_str()]).unwrap();
+            assert_eq!(args.storm_threshold, good.parse::<f64>().unwrap());
+        }
+        assert_eq!(
+            Args::try_parse_from(["sokol-core"])
+                .unwrap()
+                .storm_threshold,
+            0.5
+        );
+    }
 
     #[test]
     fn a_retraction_capacity_refusal_is_not_an_ipc_success() {
