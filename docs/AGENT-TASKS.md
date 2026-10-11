@@ -11,8 +11,8 @@ The packet gives the statement, witness names and source files, a fixed local ve
 command when supported, edit constraints and unknowns. It does not execute annotation text.
 Mixed Rust witnesses from common/orchestrator use one fixed Cargo command for both packages.
 Python and witnesses outside these supported Rust paths have no fixed native runner here;
-the established CI tools remain their verifier. A Kani proof needs its proof runner: it is
-not a native unit test, so a unit recipe cannot record it as passed. An unsupported runner refuses a run instead of issuing a pass.
+the established CI tools remain their verifier. Kani proofs use `python3 scripts/proof-task.py context` and the
+calibration runner in [VERIFICATION.md](VERIFICATION.md); a unit recipe cannot record them as passed. An unsupported runner refuses a run instead of issuing a pass.
 
 ## Execution and replay
 

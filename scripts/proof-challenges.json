@@ -1,0 +1,56 @@
+{
+  "profile": "sokol.proof-challenges.v1",
+  "authority": "UNSIGNED_NEGATIVE_CONTROLS",
+  "cases": [
+    {
+      "id": "genesis",
+      "file": "common/src/audit_log.rs",
+      "harness": "audit_log::proofs::a_zero_sequence_segment_has_the_fixed_genesis_chain",
+      "replace": {
+        "before": "start != 0 || *previous == [0; CHAIN_LEN]",
+        "after": "start != 0 || *previous != [0; CHAIN_LEN]"
+      },
+      "assertion": "assertion failed: accepted == previous == [0; CHAIN_LEN]"
+    },
+    {
+      "id": "payload-bound",
+      "file": "common/src/audit_log.rs",
+      "harness": "audit_log::proofs::a_record_header_never_admits_more_than_max_payload",
+      "replace": {
+        "before": "if len > MAX_PAYLOAD {",
+        "after": "if false {"
+      },
+      "assertion": "assertion failed: len <= MAX_PAYLOAD"
+    },
+    {
+      "id": "header-roundtrip",
+      "file": "common/src/audit_log.rs",
+      "harness": "audit_log::proofs::an_encoded_header_parses_back",
+      "replace": {
+        "before": "h[4..8].copy_from_slice(&len.to_le_bytes());",
+        "after": "h[4..8].copy_from_slice(&0u32.to_le_bytes());"
+      },
+      "assertion": "assertion failed: parse_record_header(&encode_header(len, seq, timestamp_ms)) ==\nOk((len as usize, seq, timestamp_ms))"
+    },
+    {
+      "id": "advance-overflow",
+      "file": "common/src/audit_log.rs",
+      "harness": "audit_log::proofs::advancing_never_wraps",
+      "replace": {
+        "before": "Some((next_seq.checked_add(1)?, offset.checked_add(size)?))",
+        "after": "Some((next_seq.wrapping_add(1), offset.wrapping_add(size)))"
+      },
+      "assertion": "assertion failed: next > seq && next - seq == 1"
+    },
+    {
+      "id": "json-framing",
+      "file": "common/src/canonical.rs",
+      "harness": "canonical::proofs::the_strict_validator_returns_on_every_short_input",
+      "replace": {
+        "before": "    pub fn validate_strict_json_object(input: &str) -> Result<(), CanonicalError> {\n        let bytes = input.as_bytes();\n        if bytes.is_empty() {\n            return Err(CanonicalError::EmptyPayload);\n        }\n        let trimmed = bytes.trim_ascii();\n        match trimmed {\n            [b'{', inner @ .., b'}'] => Self::parse_and_check_keys(inner),\n            _ => Err(CanonicalError::InvalidFraming),\n        }\n    }",
+        "after": "    pub fn validate_strict_json_object(_input: &str) -> Result<(), CanonicalError> {\n        Ok(())\n    }"
+      },
+      "assertion": "assertion failed: trimmed.starts_with('{') && trimmed.ends_with('}')"
+    }
+  ]
+}
