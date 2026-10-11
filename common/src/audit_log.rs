@@ -29,6 +29,8 @@ pub const MAGIC: [u8; 4] = *b"SAL2";
 pub const HEADER_LEN: usize = 4 + 4 + 8 + 8;
 pub const CHAIN_LEN: usize = 32;
 pub const MAX_PAYLOAD: usize = 64 * 1024;
+/// Refuse a directory beyond this retained-segment budget before growing its inventory.
+pub const MAX_RETAINED_SEGMENTS: usize = 4096;
 pub const SEGMENT_MAGIC: [u8; 4] = *b"SALS";
 pub const SEGMENT_HEADER_LEN: usize = 4 + 8 + CHAIN_LEN;
 
@@ -161,6 +163,12 @@ impl<R: Read + Seek> AuditReader<R> {
             });
         };
         let start = u64::from_le_bytes(start);
+        if !valid_segment_start(start, &prev) {
+            return Err(AuditError::Corrupt {
+                offset: 0,
+                reason: "non-zero genesis chain",
+            });
+        }
         self.segment_start = Some((start, prev));
         self.next_seq = start;
         self.chain = prev;
@@ -227,6 +235,12 @@ impl<R: Read + Seek> AuditReader<R> {
             chain,
         }))
     }
+}
+
+/// Record zero has the fixed zero predecessor; a retained prefix above zero has a pruned
+/// predecessor, which cannot be authenticated from the retained file alone.
+fn valid_segment_start(start: u64, previous: &[u8; CHAIN_LEN]) -> bool {
+    start != 0 || *previous == [0; CHAIN_LEN]
 }
 
 /// (payload length, seq, timestamp) of a record header, with the length within MAX_PAYLOAD
@@ -327,6 +341,9 @@ pub fn rotated_segments(path: &Path) -> io::Result<Vec<(u64, PathBuf)>> {
             // Twenty digits can still exceed u64 (a stray file must not stop the node).
             if suffix.len() == 20 && suffix.bytes().all(|b| b.is_ascii_digit()) {
                 if let Ok(start) = suffix.parse() {
+                    if out.len() >= MAX_RETAINED_SEGMENTS {
+                        return Err(io::Error::other("retained audit segment budget exceeded"));
+                    }
                     out.push((start, entry.path()));
                 }
             }
@@ -545,6 +562,8 @@ impl AuditLog {
 #[derive(Debug, PartialEq, Eq)]
 pub struct ChainSummary {
     pub segments: usize,
+    /// Incomplete bytes after the verified active prefix, present at open time.
+    pub trailing_bytes: u64,
     /// Sequence number of the oldest record still on disk (older segments may be pruned).
     pub first_seq: u64,
     pub next_seq: u64,
@@ -592,6 +611,19 @@ impl std::error::Error for ChainVerifyError {}
 
 /// Verifies every retained segment and the active file as one chain.
 pub fn verify_chain(path: &Path) -> Result<ChainSummary, ChainVerifyError> {
+    visit_chain(path, |_| {})
+}
+
+/// Consume the same records whose chain and segment joins are verified, once, in order.
+/// Callback results are tentative until this function returns Ok: a later segment can fail.
+/// Only records ending within each opened file's initial length are offered; crossing that
+/// boundary refuses the scan. A torn active tail is tolerated, as in verify_chain. Metadata comes from
+/// the open descriptor, so a pathname replacement cannot describe different bytes. The summary
+/// identifies the consumed prefix, not an authenticated writer or an atomic filesystem snapshot.
+pub fn visit_chain(
+    path: &Path,
+    mut visit: impl FnMut(&Record),
+) -> Result<ChainSummary, ChainVerifyError> {
     let mut files: Vec<PathBuf> = rotated_segments(path)
         .map_err(|e| ChainVerifyError::unverified(path, e))?
         .into_iter()
@@ -602,47 +634,84 @@ pub fn verify_chain(path: &Path) -> Result<ChainSummary, ChainVerifyError> {
 
     let mut expected: Option<(u64, [u8; CHAIN_LEN])> = None;
     let mut first_seq = None;
+    let mut trailing_bytes = 0;
     for (i, file) in files.iter().enumerate() {
         let mut reader =
             AuditReader::open(file).map_err(|e| ChainVerifyError::unverified(file, e))?;
-        while reader
+        let initial_len = reader
+            .inner
+            .get_ref()
+            .metadata()
+            .map_err(|e| ChainVerifyError::unverified(file, e))?
+            .len();
+        let mut record = reader
             .next_record()
-            .map_err(|e| ChainVerifyError::record(file, e))?
-            .is_some()
-        {}
+            .map_err(|e| ChainVerifyError::record(file, e))?;
+        // Even an empty segment initializes its header before the join is checked.
         let start = reader.segment_start().unwrap_or((0, [0u8; CHAIN_LEN]));
         if let Some(exp) = expected {
             if start != exp {
                 return Err(ChainVerifyError::Broken {
                     path: file.to_path_buf(),
-                    reason: format!("does not continue the previous segment (starts at seq {}, expected {}); a segment is missing, reordered or edited", start.0, exp.0),
+                    reason: format!(
+                        "does not continue the previous segment (starts at seq {}, expected {}); a segment is missing, reordered or edited",
+                        start.0, exp.0,
+                    ),
                 });
             }
         }
-        let len = std::fs::metadata(file)
+        loop {
+            if reader.offset() > initial_len {
+                return Err(ChainVerifyError::unverified(
+                    file,
+                    "record crosses the initial file length",
+                ));
+            }
+            let Some(current) = record else { break };
+            visit(&current);
+            if reader.offset() == initial_len {
+                break;
+            }
+            record = reader
+                .next_record()
+                .map_err(|e| ChainVerifyError::record(file, e))?;
+        }
+        let start = reader.segment_start().unwrap_or((0, [0u8; CHAIN_LEN]));
+        let len = reader
+            .inner
+            .get_ref()
+            .metadata()
             .map_err(|e| ChainVerifyError::unverified(file, e))?
             .len();
-        if len < reader.offset() {
+        if len < initial_len {
             return Err(ChainVerifyError::unverified(
                 file,
                 "file shortened during verification",
             ));
         }
-        if i < rotated && len != reader.offset() {
+        if i < rotated && len != initial_len {
+            return Err(ChainVerifyError::unverified(
+                file,
+                "rotated segment changed length during verification",
+            ));
+        }
+        if i < rotated && initial_len != reader.offset() {
             return Err(ChainVerifyError::Broken {
                 path: file.to_path_buf(),
                 reason: format!(
                     "rotated segment has {} trailing bytes",
-                    len - reader.offset()
+                    initial_len - reader.offset()
                 ),
             });
         }
+        trailing_bytes = initial_len - reader.offset();
         first_seq.get_or_insert(start.0);
         expected = Some((reader.next_seq(), reader.head()));
     }
     let (next_seq, head) = expected.unwrap_or((0, [0u8; CHAIN_LEN]));
     Ok(ChainSummary {
         segments: files.len(),
+        trailing_bytes,
         first_seq: first_seq.unwrap_or(0),
         next_seq,
         head,
@@ -664,38 +733,23 @@ pub enum WitnessVerdict {
 }
 
 /// Checks heads that peers witnessed for the log at `path`: each `(records, head)` says "after
-/// `records` records the chain was `head`". The log's own chain is verified first; a log that
-/// does not verify is not checked at all. A recomputed chain verifies on its own; only a head
+/// `records` records the chain was `head`". Heads and joins are verified in the same pass;
+/// no verdict is returned if any retained segment fails. A recomputed chain verifies on its own; only a head
 /// kept somewhere its writer could not change exposes it.
 pub fn check_witnesses(
     path: &Path,
     witnessed: &[(u64, [u8; CHAIN_LEN])],
 ) -> Result<Vec<WitnessVerdict>, ChainVerifyError> {
-    let summary = verify_chain(path)?;
     let wanted: std::collections::HashSet<u64> = witnessed
         .iter()
-        .filter(|(n, _)| *n > 0 && *n <= summary.next_seq && *n > summary.first_seq)
-        .map(|(n, _)| n - 1)
+        .filter_map(|(n, _)| n.checked_sub(1))
         .collect();
     let mut found = std::collections::HashMap::new();
-    let mut files: Vec<PathBuf> = rotated_segments(path)
-        .map_err(|e| ChainVerifyError::unverified(path, e))?
-        .into_iter()
-        .map(|(_, p)| p)
-        .collect();
-    files.push(path.to_path_buf());
-    for file in &files {
-        let mut reader =
-            AuditReader::open(file).map_err(|e| ChainVerifyError::unverified(file, e))?;
-        while let Some(record) = reader
-            .next_record()
-            .map_err(|e| ChainVerifyError::record(file, e))?
-        {
-            if wanted.contains(&record.seq) {
-                found.insert(record.seq, record.chain);
-            }
+    let summary = visit_chain(path, |record| {
+        if wanted.contains(&record.seq) {
+            found.insert(record.seq, record.chain);
         }
-    }
+    })?;
     Ok(witnessed
         .iter()
         .map(|&(n, head)| {
@@ -727,6 +781,19 @@ pub fn check_witnesses(
 #[cfg(kani)]
 mod proofs {
     use super::*;
+
+    /// A segment beginning at zero can only use the protocol's genesis chain. Every
+    /// predecessor at a non-zero sequence remains allowed, because its prefix may be pruned.
+    #[kani::proof]
+    fn a_zero_sequence_segment_has_the_fixed_genesis_chain() {
+        let (start, previous): (u64, [u8; CHAIN_LEN]) = (kani::any(), kani::any());
+        let accepted = valid_segment_start(start, &previous);
+        if start == 0 {
+            assert_eq!(accepted, previous == [0; CHAIN_LEN]);
+        } else {
+            assert!(accepted);
+        }
+    }
 
     /// Whatever the 24 bytes of a record header (a damaged or crafted file), a parsed header
     /// admits at most MAX_PAYLOAD bytes, so the reader never allocates more than
@@ -797,6 +864,210 @@ mod tests {
         }
         log.sync().unwrap();
         (log.len(), log.head())
+    }
+
+    #[test]
+    fn chain_consumers_validate_the_next_segment_before_offering_it() {
+        let path = temp_path("consumer-join");
+        let mut writer = AuditLog::open_with(
+            &path,
+            Some(Rotation {
+                max_bytes: 1,
+                keep: 10,
+            }),
+        )
+        .unwrap();
+        writer.append(b"first").unwrap();
+        writer.append(b"second").unwrap();
+        drop(writer);
+        let expected = verify_chain(&path).unwrap();
+        let mut offered = Vec::new();
+        let summary = visit_chain(&path, |r| offered.push((r.seq, r.payload.clone()))).unwrap();
+        assert_eq!(summary, expected);
+        assert_eq!(
+            offered,
+            vec![(0, b"first".to_vec()), (1, b"second".to_vec())]
+        );
+        let mut offered = Vec::new();
+        let result = visit_chain(&path, |r| {
+            offered.push(r.seq);
+            if r.seq == 0 {
+                let mut bytes = std::fs::read(&path).unwrap();
+                bytes[12..SEGMENT_HEADER_LEN].fill(9);
+                let header: [u8; HEADER_LEN] = bytes
+                    [SEGMENT_HEADER_LEN..SEGMENT_HEADER_LEN + HEADER_LEN]
+                    .try_into()
+                    .unwrap();
+                let payload_end = bytes.len() - CHAIN_LEN;
+                let head = next_chain(
+                    &[9; CHAIN_LEN],
+                    &header,
+                    &bytes[SEGMENT_HEADER_LEN + HEADER_LEN..payload_end],
+                );
+                bytes[payload_end..].copy_from_slice(&head);
+                std::fs::write(&path, bytes).unwrap();
+                // The replacement is internally valid; only the cross-segment join exposes it.
+                assert!(AuditReader::open(&path)
+                    .unwrap()
+                    .next_record()
+                    .unwrap()
+                    .is_some());
+            }
+        });
+        assert!(matches!(result, Err(ChainVerifyError::Broken { .. })));
+        assert_eq!(offered, vec![0]);
+    }
+
+    #[test]
+    fn a_scan_keeps_the_open_file_identity_and_initial_complete_prefix() {
+        for replace in [false, true] {
+            let path = temp_path(if replace {
+                "scan-replace"
+            } else {
+                "scan-append"
+            });
+            let mut writer = AuditLog::open(&path).unwrap();
+            writer.append(b"first").unwrap();
+            let expected_head = writer.head();
+            drop(writer);
+            let mut seqs = Vec::new();
+            let summary = visit_chain(&path, |r| {
+                seqs.push(r.seq);
+                if replace {
+                    // The named file becomes shorter; the open descriptor still owns first.
+                    let alternate = path.with_extension("replacement");
+                    std::fs::write(&alternate, b"").unwrap();
+                    std::fs::rename(alternate, &path).unwrap();
+                } else {
+                    let mut writer = AuditLog::open(&path).unwrap();
+                    writer.append(b"later").unwrap();
+                }
+            })
+            .unwrap();
+            assert_eq!(seqs, vec![0]);
+            assert_eq!(summary.next_seq, 1);
+            assert_eq!(summary.head, expected_head);
+            assert_eq!(summary.trailing_bytes, 0);
+        }
+    }
+
+    #[test]
+    fn shortening_or_completing_a_torn_record_during_scan_is_unverified() {
+        for complete in [true, false] {
+            let path = temp_path(if complete {
+                "scan-complete"
+            } else {
+                "scan-shorten"
+            });
+            let mut writer = AuditLog::open(&path).unwrap();
+            writer.append(b"first").unwrap();
+            writer.append(&vec![0; MAX_PAYLOAD]).unwrap();
+            drop(writer);
+            let bytes = std::fs::read(&path).unwrap();
+            if complete {
+                std::fs::write(&path, &bytes[..bytes.len() - 5]).unwrap();
+            }
+            let result = visit_chain(&path, |r| {
+                if r.seq == 0 {
+                    if complete {
+                        std::fs::write(&path, &bytes).unwrap();
+                    } else {
+                        std::fs::OpenOptions::new()
+                            .write(true)
+                            .open(&path)
+                            .unwrap()
+                            .set_len(0)
+                            .unwrap();
+                    }
+                }
+            });
+            assert!(
+                matches!(result, Err(ChainVerifyError::Unverified { .. })),
+                "{result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_sealed_segment_cannot_grow_while_consumers_scan_it() {
+        let path = temp_path("scan-sealed-growth");
+        let mut writer = AuditLog::open_with(
+            &path,
+            Some(Rotation {
+                max_bytes: 1,
+                keep: 10,
+            }),
+        )
+        .unwrap();
+        writer.append(b"first").unwrap();
+        writer.append(b"second").unwrap();
+        drop(writer);
+        let sealed = rotated_segments(&path).unwrap()[0].1.clone();
+        let result = visit_chain(&path, |r| {
+            if r.seq == 0 {
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&sealed)
+                    .unwrap()
+                    .write_all(b"tail")
+                    .unwrap();
+            }
+        });
+        assert!(
+            matches!(result, Err(ChainVerifyError::Unverified { .. })),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn a_zero_sequence_segment_cannot_replace_the_genesis_chain() {
+        let path = temp_path("false-genesis");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        for (seq, previous, valid) in [
+            (0, [9; CHAIN_LEN], false),
+            (0, [0; CHAIN_LEN], true),
+            (1, [9; CHAIN_LEN], true),
+        ] {
+            let header = encode_header(5, seq, 1);
+            let payload = b"first";
+            let mut bytes = segment_header(seq, &previous).to_vec();
+            bytes.extend_from_slice(&header);
+            bytes.extend_from_slice(payload);
+            bytes.extend_from_slice(&next_chain(&previous, &header, payload));
+            std::fs::write(&path, &bytes).unwrap();
+            assert_eq!(verify_chain(&path).is_ok(), valid, "seq={seq}");
+            assert_eq!(
+                AuditReader::open(&path).unwrap().next_record().is_ok(),
+                valid
+            );
+            assert_eq!(
+                check_witnesses(&path, &[(0, [0; CHAIN_LEN])]).is_ok(),
+                valid
+            );
+            assert_eq!(AuditLog::open(&path).is_ok(), valid);
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                bytes,
+                "refusal must preserve evidence"
+            );
+        }
+    }
+
+    #[test]
+    fn retained_segment_inventory_refuses_limit_plus_one() {
+        let dir = temp_path("inventory-directory");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("audit.log");
+        for seq in 0..MAX_RETAINED_SEGMENTS as u64 {
+            std::fs::write(rotated_path(&path, seq), b"").unwrap();
+        }
+        assert_eq!(
+            rotated_segments(&path).unwrap().len(),
+            MAX_RETAINED_SEGMENTS
+        );
+        std::fs::write(rotated_path(&path, MAX_RETAINED_SEGMENTS as u64), b"").unwrap();
+        assert!(rotated_segments(&path).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// ADR-0021: a writer who rewrites the log and recomputes every later record passes

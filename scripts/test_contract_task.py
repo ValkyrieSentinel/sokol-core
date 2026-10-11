@@ -24,7 +24,8 @@ class ContractTask(unittest.TestCase):
         sources = ['scripts/witness-pin.py', 'scripts/contract-task.py', 'docs/INVARIANTS.md',
                    'docs/witness-manifest.json', 'docs/witness-manifest.json.sig', '.github/witness-signers',
                    'orchestrator/src/delivery.rs', 'orchestrator/src/block_table.rs',
-                   'orchestrator/src/state_input.rs', 'orchestrator/src/state_store.rs']
+                   'orchestrator/src/state_input.rs', 'orchestrator/src/state_store.rs',
+                   'orchestrator/src/replay.rs', 'common/src/audit_log.rs']
         sources += [p.relative_to(ROOT).as_posix() for p in (ROOT / 'docs/contracts').glob('*.shadow.json')]
         sources += [p.relative_to(ROOT).as_posix() for p in (ROOT / 'docs/contracts/proposals').glob('*.proposal.json')]
         for name in sources:
@@ -80,6 +81,34 @@ class ContractTask(unittest.TestCase):
         self.assertEqual(value['body']['binding']['proposal_acceptance'], 'NOT_ESTABLISHED')
         self.assertEqual(value['body']['recipe'], 'orchestrator-unit')
         self.assertFalse((self.root / 'docs/contracts/STATE-B1.shadow.json').exists())
+
+    def test_replay_proposal_uses_one_fixed_runner_for_both_rust_packages(self):
+        proposal = next((self.root / 'docs/contracts/proposals').glob('REPLAY-B1-*.proposal.json'))
+        value, _ = tool.prepare(self.root, 'REPLAY-B1', proposal=proposal.relative_to(self.root).as_posix())
+        self.assertEqual(value['body']['binding']['correspondence'], 'UNSIGNED_PROPOSAL')
+        self.assertEqual(value['body']['execution'], 'UNKNOWN')
+        self.assertEqual(value['body']['recipe'], 'workspace-unit')
+        command = value['body']['command']
+        self.assertEqual(command, tool.RECIPES['workspace-unit'])
+        self.assertIn('--lib', command)
+        self.assertIn('--bins', command)
+        packages = [command[i + 1] for i, arg in enumerate(command) if arg == '-p']
+        self.assertEqual(packages, ['orchestrator', 'common'])
+
+    def test_two_compiled_matches_require_two_successes_in_the_mixed_runner(self):
+        packet, _ = self.context()
+        packet['body']['recipe'] = 'workspace-unit'
+        packet['body']['command'] = tool.RECIPES['workspace-unit']
+        packet['body']['witnesses'] = ['shared']
+        for count in [1, 2]:
+            def runner(_root, command, **_options):
+                if '--list' in command:
+                    return 0, b'tests::shared: test\ntests::shared: test\n'
+                return 0, b'test tests::shared ... ok\n' * count
+            with patch.object(tool.platform, 'system', return_value='Linux'), patch.object(tool, 'run_bounded', side_effect=runner):
+                execution, _ = tool.execute(self.root, packet)
+            self.assertEqual(execution['status'], 'RECORDED_PASS' if count == 2 else 'RECORDED_FAIL')
+            self.assertEqual(execution['compiled_match_counts']['shared'], 2)
 
     def test_invalid_id_and_proposal_paths_are_refused(self):
         for rid in ('../IPC-A1', 'IPC-A1/../../x', ''):

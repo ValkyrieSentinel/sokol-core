@@ -11,7 +11,7 @@
 
 use crate::block_table::{parse_target, BlockTable, Blocklist, ClaimKind, TtlPolicy};
 use aya::maps::MapError;
-use common::audit_log::{rotated_segments, verify_chain, AuditReader};
+use common::audit_log::{visit_chain, ChainSummary};
 use ipnet::IpNet;
 use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
@@ -152,9 +152,28 @@ fn split(payload: &str) -> (&str, Fields<'_>) {
     (tag, fields)
 }
 
+pub const MAX_MISMATCH_EXAMPLES: usize = 128;
+pub const MAX_INSUFFICIENT_REASONS: usize = 32;
+pub const MAX_DIAGNOSTIC_BYTES: usize = 512;
+
+fn diagnostic(text: &str) -> String {
+    let mut end = text.len().min(MAX_DIAGNOSTIC_BYTES);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.get(..end).unwrap_or_default().to_string()
+}
+
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Report {
     pub reproduced: u64,
+    pub mismatch_count: u64,
+    pub trailing_bytes: u64,
+    pub non_text_records: u64,
+    /// Decisions whose insufficient reason was beyond the retained-category budget.
+    pub omitted_insufficient: u64,
+    /// Present only for a successful file scan; binds the result to the consumed chain prefix.
+    pub chain: Option<ChainSummary>,
     /// (record seq, what was recorded, what the replay decided)
     pub mismatched: Vec<(u64, String, String)>,
     /// reason -> decisions not replayed for it
@@ -166,8 +185,41 @@ pub struct Report {
 }
 
 impl Report {
+    fn mismatch(&mut self, seq: u64, recorded: String, replayed: String) {
+        self.mismatch_count += 1;
+        if self.mismatched.len() < MAX_MISMATCH_EXAMPLES {
+            self.mismatched
+                .push((seq, diagnostic(&recorded), diagnostic(&replayed)));
+        }
+    }
+
+    fn exit_status(&self) -> i32 {
+        if self.mismatch_count > 0 {
+            1
+        } else if self.reproduced == 0
+            || self.insufficient_count() > 0
+            || !self.audit_gaps.is_empty()
+            || self.trailing_bytes > 0
+            || self.non_text_records > 0
+        {
+            2
+        } else {
+            0
+        }
+    }
+    fn insufficient_count(&self) -> u64 {
+        self.insufficient.values().sum::<u64>() + self.omitted_insufficient
+    }
+
     fn insufficient(&mut self, why: &str) {
-        *self.insufficient.entry(why.to_string()).or_default() += 1;
+        let why = diagnostic(why);
+        if let Some(count) = self.insufficient.get_mut(&why) {
+            *count += 1;
+        } else if self.insufficient.len() < MAX_INSUFFICIENT_REASONS {
+            self.insufficient.insert(why, 1);
+        } else {
+            self.omitted_insufficient += 1;
+        }
     }
 }
 
@@ -194,18 +246,44 @@ fn is_decision(tag: &str) -> bool {
 
 /// Replays records (seq, payload) in order. `this_build` is the replaying binary's build: a
 /// run made by another build is not replayed, its code may decide differently.
+#[cfg(test)]
 pub fn replay_records<'a>(
     records: impl IntoIterator<Item = (u64, &'a str)>,
     this_build: &str,
 ) -> Report {
-    let mut report = Report::default();
-    let mut run = Run::Blind("no start record: the log begins inside a run".into());
+    let mut replay = Replay::new(this_build);
     for (seq, payload) in records {
+        replay.consume(seq, payload);
+    }
+    replay.report
+}
+
+struct Replay<'a> {
+    report: Report,
+    run: Run,
+    this_build: &'a str,
+}
+
+impl<'a> Replay<'a> {
+    fn new(this_build: &'a str) -> Self {
+        Self {
+            report: Report::default(),
+            run: Run::Blind("no start record: the log begins inside a run".into()),
+            this_build,
+        }
+    }
+
+    fn consume(&mut self, seq: u64, payload: &str) {
+        let Self {
+            report,
+            run,
+            this_build,
+        } = self;
         let (tag, f) = split(payload);
         if tag == "NODE_START" {
-            run = match StartContext::parse(&f) {
+            *run = match StartContext::parse(&f) {
                 Err(why) => Run::Blind(why),
-                Ok(ctx) if ctx.build != this_build || ctx.build == "unknown" => {
+                Ok(ctx) if ctx.build != *this_build || ctx.build == "unknown" => {
                     Run::Blind(format!(
                         "run made by build {}, this is build {}",
                         ctx.build, this_build
@@ -219,36 +297,36 @@ pub fn replay_records<'a>(
                     ctx.node,
                 ))),
             };
-            continue;
+            return;
         }
         if matches!(tag, "AUDIT_LOST" | "AUDIT_QUEUE_OVERFLOW") {
             // Even a tail gap or a gap before usable context prevents a complete result.
             // Treat malformed/zero counters conservatively: the marker declares missing data.
             *report.audit_gaps.entry(tag.to_string()).or_default() += 1;
-            run = Run::Blind(format!(
+            *run = Run::Blind(format!(
                 "audit gap ({tag}): omitted records may have changed decision state"
             ));
-            continue;
+            return;
         }
         // The protected set is not a replay input, regardless of run context.
         if is_protected_refusal(tag, payload) {
             report.policy_refusals += 1;
-            continue;
+            return;
         }
-        let table = match &mut run {
+        let table = match run {
             Run::Live(table) => table,
             Run::Blind(why) => {
                 if is_decision(tag) {
                     let why = why.clone();
                     report.insufficient(&why);
                 }
-                continue;
+                return;
             }
         };
         let net = f.get("IP").and_then(|v| parse_target(v));
         match tag {
             "STATE_RESTORED" => {
-                run = Run::Blind(
+                *run = Run::Blind(
                     "the run restored earlier decisions from a state file the log does not hold"
                         .into(),
                 );
@@ -282,7 +360,7 @@ pub fn replay_records<'a>(
                 let event = f.get("Event").and_then(|e| e.split_once('/'));
                 let (Some(net), Some(at), Some((source, id))) = (net, at(&f), event) else {
                     report.insufficient("retraction record without its context");
-                    continue;
+                    return;
                 };
                 table.tick(at);
                 let recorded = f.get("Result").copied().unwrap_or_default().to_string();
@@ -298,17 +376,17 @@ pub fn replay_records<'a>(
                     // can establish a new replay context.
                     let why = "unverified retraction capacity refusal: recorded resource state cannot be established";
                     report.insufficient(why);
-                    run = Run::Blind(why.into());
+                    *run = Run::Blind(why.into());
                 } else if recorded == replayed {
                     report.reproduced += 1;
                 } else {
-                    report.mismatched.push((seq, recorded, replayed));
+                    report.mismatch(seq, recorded, replayed);
                 }
             }
             t if is_decision(t) => {
                 let (Some(net), Some(at)) = (net, at(&f)) else {
                     report.insufficient("decision record without its time (older format)");
-                    continue;
+                    return;
                 };
                 let recorded = recorded_outcome(tag, &f);
                 let reason = f.get("Reason").copied().unwrap_or_default();
@@ -320,13 +398,12 @@ pub fn replay_records<'a>(
                 if recorded == replayed {
                     report.reproduced += 1;
                 } else {
-                    report.mismatched.push((seq, recorded, replayed));
+                    report.mismatch(seq, recorded, replayed);
                 }
             }
             _ => {}
         }
     }
-    report
 }
 
 fn at(f: &Fields) -> Option<u64> {
@@ -368,31 +445,21 @@ fn decide(
     }
 }
 
-/// Replays the audit log at `path` (its rotated segments first). The whole chain is verified
-/// first: a log that does not verify is not replayed at all.
+/// Replay only the records verified in the same pass. Nothing is published if any later
+/// chain check fails. Retains one bounded payload plus the table and bounded diagnostics.
 pub fn replay_file(path: &Path, this_build: &str) -> Result<Report, String> {
-    verify_chain(path).map_err(|e| e.to_string())?;
-    let mut files: Vec<std::path::PathBuf> = rotated_segments(path)
-        .map_err(|e| e.to_string())?
-        .into_iter()
-        .map(|(_, p)| p)
-        .collect();
-    files.push(path.to_path_buf());
-    let mut records = Vec::new();
-    for file in files {
-        let mut reader =
-            AuditReader::open(&file).map_err(|e| format!("{}: {}", file.display(), e))?;
-        while let Some(r) = reader
-            .next_record()
-            .map_err(|e| format!("{}: {}", file.display(), e))?
-        {
-            records.push((r.seq, String::from_utf8_lossy(&r.payload).into_owned()));
+    let mut replay = Replay::new(this_build);
+    let chain = visit_chain(path, |record| match std::str::from_utf8(&record.payload) {
+        Ok(payload) => replay.consume(record.seq, payload),
+        Err(_) => {
+            replay.report.non_text_records += 1;
+            replay.run = Run::Blind("non-text audit record: decision state is unknown".into());
         }
-    }
-    Ok(replay_records(
-        records.iter().map(|(s, p)| (*s, p.as_str())),
-        this_build,
-    ))
+    })
+    .map_err(|e| e.to_string())?;
+    replay.report.trailing_bytes = chain.trailing_bytes;
+    replay.report.chain = Some(chain);
+    Ok(replay.report)
 }
 
 /// `--replay`: prints the report and returns the exit status.
@@ -416,25 +483,48 @@ pub fn print_report(path: &Path, this_build: &str) -> i32 {
     for (tag, n) in &report.audit_gaps {
         println!("AUDIT GAP {} marker(s): {}", n, tag);
     }
+    if report.mismatch_count > report.mismatched.len() as u64 {
+        println!(
+            "DETAILS OMITTED {} mismatch example(s)",
+            report.mismatch_count - report.mismatched.len() as u64
+        );
+    }
+    if report.omitted_insufficient > 0 {
+        println!(
+            "INSUFFICIENT {} decision(s): additional reason categories omitted",
+            report.omitted_insufficient
+        );
+    }
+    if report.trailing_bytes > 0 {
+        println!(
+            "INCOMPLETE TAIL {} byte(s): not verified or replayed",
+            report.trailing_bytes
+        );
+    }
+    if report.non_text_records > 0 {
+        println!(
+            "NON-TEXT RECORDS {}: not replayed, dependent context unknown",
+            report.non_text_records
+        );
+    }
+    if let Some(chain) = &report.chain {
+        println!(
+            "VERIFIED PREFIX first_seq={} next_seq={} head={}",
+            chain.first_seq,
+            chain.next_seq,
+            blake3::Hash::from(chain.head).to_hex()
+        );
+    }
     println!(
         "replayed with build {}: {} reproduced, {} mismatched, {} without enough context, {} refused by the protected set (not replayed), {} audit gap marker(s)",
         this_build,
         report.reproduced,
-        report.mismatched.len(),
-        report.insufficient.values().sum::<u64>(),
+        report.mismatch_count,
+        report.insufficient_count(),
         report.policy_refusals,
         report.audit_gaps.values().sum::<u64>()
     );
-    if !report.mismatched.is_empty() {
-        1
-    } else if report.reproduced == 0
-        || !report.insufficient.is_empty()
-        || !report.audit_gaps.is_empty()
-    {
-        2
-    } else {
-        0
-    }
+    report.exit_status()
 }
 
 #[cfg(test)]
@@ -443,6 +533,309 @@ mod tests {
     use proptest::strategy::Strategy;
 
     const BUILD: &str = "test-build";
+
+    #[test]
+    fn mismatch_examples_are_bounded_without_stopping_replay() {
+        let lines = (0..257)
+            .flat_map(|_| {
+                [
+                    start(60, 600),
+                    decision("198.51.100.7", "600s", "new", 1, "-"),
+                ]
+            })
+            .collect::<Vec<_>>();
+        let report = run(&lines);
+        assert_eq!(report.mismatched.len(), 128);
+        assert_eq!(report.mismatch_count, 257);
+        assert_eq!(report.exit_status(), 1);
+    }
+
+    #[test]
+    fn foreign_build_diagnostics_cannot_grow_with_each_run() {
+        let lines = (0..65)
+            .flat_map(|i| {
+                let context = StartContext {
+                    build: format!("foreign-{i}"),
+                    node: 1,
+                    ttl_base_secs: 60,
+                    ttl_max_secs: 600,
+                };
+                [
+                    context.record(),
+                    decision("198.51.100.7", "60s", "new", 1, "-"),
+                ]
+            })
+            .collect::<Vec<_>>();
+        let report = run(&lines);
+        assert_eq!(report.insufficient.len(), 32);
+        assert_eq!(report.omitted_insufficient, 33);
+        assert_eq!(
+            report.insufficient.values().sum::<u64>() + report.omitted_insufficient,
+            65
+        );
+        assert_eq!(report.exit_status(), 2);
+    }
+
+    #[test]
+    fn a_torn_or_non_text_tail_never_certifies_a_complete_replay() {
+        use common::audit_log::AuditLog;
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!(
+            "sokol-replay-tail-{}-{}",
+            std::process::id(),
+            crate::p2p::now_ms()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        for torn in [true, false] {
+            let path = dir.join(format!("{torn}.log"));
+            let mut writer = AuditLog::open(&path).unwrap();
+            writer.append(start(60, 600).as_bytes()).unwrap();
+            writer
+                .append(decision("198.51.100.7", "60s", "new", 1, "-").as_bytes())
+                .unwrap();
+            if !torn {
+                writer.append(&[0xff]).unwrap();
+            }
+            drop(writer);
+            if torn {
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&path)
+                    .unwrap()
+                    .write_all(b"SAL2 partial")
+                    .unwrap();
+            }
+            let report = replay_file(&path, BUILD).unwrap();
+            assert_eq!(report.reproduced, 1);
+            assert_eq!(report.trailing_bytes, if torn { 12 } else { 0 });
+            assert_eq!(report.insufficient_count(), 0);
+            assert_eq!(report.non_text_records, if torn { 0 } else { 1 });
+            assert_eq!(print_report(&path, BUILD), 2, "torn={torn}");
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn retained_diagnostics_preserve_counts_and_utf8_at_the_exact_budget() {
+        let mut report = Report::default();
+        for i in 0..MAX_INSUFFICIENT_REASONS {
+            report.insufficient(&format!("why-{i}"));
+        }
+        report.insufficient("overflow");
+        report.insufficient("why-0");
+        assert_eq!(report.insufficient.len(), MAX_INSUFFICIENT_REASONS);
+        assert_eq!(report.insufficient.get("why-0"), Some(&2));
+        assert_eq!(report.omitted_insufficient, 1);
+        for text in [
+            "x".repeat(511),
+            "x".repeat(512),
+            "x".repeat(513),
+            format!("{}🦅", "x".repeat(511)),
+        ] {
+            let stored = diagnostic(&text);
+            assert!(stored.len() <= MAX_DIAGNOSTIC_BYTES);
+            assert!(text.starts_with(&stored));
+            if text.len() <= MAX_DIAGNOSTIC_BYTES {
+                assert_eq!(stored, text);
+            }
+        }
+        let oversized = "x".repeat(513);
+        report.mismatch(7, oversized.clone(), oversized);
+        assert_eq!(report.mismatched[0].1.len(), MAX_DIAGNOSTIC_BYTES);
+        assert_eq!(report.mismatched[0].2.len(), MAX_DIAGNOSTIC_BYTES);
+        assert_eq!(report.exit_status(), 1);
+    }
+
+    #[test]
+    fn late_chain_failure_discards_the_tentative_file_replay() {
+        use common::audit_log::{AuditLog, Rotation, CHAIN_LEN};
+        let dir = std::env::temp_dir().join(format!(
+            "sokol-replay-late-{}-{}",
+            std::process::id(),
+            crate::p2p::now_ms()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("audit.log");
+        let mut writer = AuditLog::open_with(
+            &path,
+            Some(Rotation {
+                max_bytes: 1,
+                keep: 10,
+            }),
+        )
+        .unwrap();
+        writer.append(start(60, 600).as_bytes()).unwrap();
+        writer
+            .append(decision("198.51.100.7", "60s", "new", 1, "-").as_bytes())
+            .unwrap();
+        writer.append(b"NODE_STOP").unwrap();
+        drop(writer);
+        let report = replay_file(&path, BUILD).unwrap();
+        assert_eq!(report.reproduced, 1);
+        let chain = report.chain.unwrap();
+        assert_eq!(chain.first_seq, 0);
+        assert_eq!(chain.next_seq, 3);
+        assert_eq!(chain.segments, 3);
+        let mut bytes = std::fs::read(&path).unwrap();
+        let tail = bytes.len() - CHAIN_LEN;
+        bytes[tail] ^= 1;
+        std::fs::write(&path, bytes).unwrap();
+        assert!(replay_file(&path, BUILD).is_err());
+        assert_eq!(print_report(&path, BUILD), 2);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn cli_totals_and_omission_markers_agree_with_the_complete_input() {
+        const CHILD: &str = "SOKOL_REPLAY_TEST_PATH";
+        if let Ok(path) = std::env::var(CHILD) {
+            std::process::exit(print_report(Path::new(&path), BUILD));
+        }
+        use common::audit_log::AuditLog;
+        let dir = std::env::temp_dir().join(format!(
+            "sokol-replay-output-{}-{}",
+            std::process::id(),
+            crate::p2p::now_ms()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        for case in ["match", "mismatches", "foreign", "torn", "non-text"] {
+            let path = dir.join(case);
+            let mut writer = AuditLog::open(&path).unwrap();
+            match case {
+                "mismatches" => {
+                    for _ in 0..257 {
+                        writer.append(start(60, 600).as_bytes()).unwrap();
+                        writer
+                            .append(decision("198.51.100.7", "600s", "new", 1, "-").as_bytes())
+                            .unwrap();
+                    }
+                }
+                "foreign" => {
+                    for i in 0..65 {
+                        let context = StartContext {
+                            build: format!("foreign-{i}"),
+                            node: 1,
+                            ttl_base_secs: 60,
+                            ttl_max_secs: 600,
+                        };
+                        writer.append(context.record().as_bytes()).unwrap();
+                        writer
+                            .append(decision("198.51.100.7", "60s", "new", 1, "-").as_bytes())
+                            .unwrap();
+                    }
+                }
+                _ => {
+                    writer.append(start(60, 600).as_bytes()).unwrap();
+                    writer
+                        .append(decision("198.51.100.7", "60s", "new", 1, "-").as_bytes())
+                        .unwrap();
+                }
+            }
+            if case == "non-text" {
+                writer.append(&[0xff]).unwrap();
+                writer
+                    .append(decision("198.51.100.8", "60s", "new", 2, "-").as_bytes())
+                    .unwrap();
+                writer.append(start(60, 600).as_bytes()).unwrap();
+                writer
+                    .append(decision("198.51.100.7", "60s", "new", 1, "-").as_bytes())
+                    .unwrap();
+            }
+            drop(writer);
+            if case == "torn" {
+                use std::io::Write;
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&path)
+                    .unwrap()
+                    .write_all(b"SAL2 partial")
+                    .unwrap();
+            }
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "replay::tests::cli_totals_and_omission_markers_agree_with_the_complete_input",
+                    "--nocapture",
+                ])
+                .env(CHILD, &path)
+                .output()
+                .unwrap();
+            let text = String::from_utf8(output.stdout).unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(match case {
+                    "mismatches" => 1,
+                    "foreign" | "torn" | "non-text" => 2,
+                    _ => 0,
+                }),
+                "{text}"
+            );
+            assert_eq!(
+                text.contains("DETAILS OMITTED"),
+                case == "mismatches",
+                "{text}"
+            );
+            assert_eq!(
+                text.contains("additional reason categories omitted"),
+                case == "foreign",
+                "{text}"
+            );
+            assert_eq!(text.contains("INCOMPLETE TAIL"), case == "torn", "{text}");
+            assert_eq!(
+                text.contains("NON-TEXT RECORDS"),
+                case == "non-text",
+                "{text}"
+            );
+            assert!(text.contains("VERIFIED PREFIX first_seq=0"), "{text}");
+            match case {
+                "mismatches" => {
+                    assert_eq!(
+                        text.lines()
+                            .filter(|line| line.starts_with("MISMATCH record"))
+                            .count(),
+                        128
+                    );
+                    assert!(
+                        text.contains("DETAILS OMITTED 129 mismatch example(s)"),
+                        "{text}"
+                    );
+                    assert!(
+                        text.contains("0 reproduced, 257 mismatched, 0 without enough context"),
+                        "{text}"
+                    );
+                }
+                "foreign" => {
+                    assert!(
+                        text.contains(
+                            "INSUFFICIENT 33 decision(s): additional reason categories omitted"
+                        ),
+                        "{text}"
+                    );
+                    assert!(
+                        text.contains("0 reproduced, 0 mismatched, 65 without enough context"),
+                        "{text}"
+                    );
+                }
+                "torn" => {
+                    assert!(text.contains("INCOMPLETE TAIL 12 byte(s)"), "{text}");
+                }
+                "non-text" => {
+                    assert!(text.contains("NON-TEXT RECORDS 1: not replayed"), "{text}");
+                    assert!(
+                        text.contains("2 reproduced, 0 mismatched, 1 without enough context"),
+                        "{text}"
+                    );
+                }
+                _ => {
+                    assert!(
+                        text.contains("1 reproduced, 0 mismatched, 0 without enough context"),
+                        "{text}"
+                    );
+                }
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     fn start(base: u64, max: u64) -> String {
         StartContext {
