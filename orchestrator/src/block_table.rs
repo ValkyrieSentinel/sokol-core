@@ -4595,6 +4595,33 @@ mod tests {
     }
 
     #[test]
+    fn an_explicit_large_peer_share_can_exhaust_the_shared_peer_budget() {
+        let mut t = table(1, 64);
+        let budget = MAX_KNOWN_CLAIMS - OWN_RESERVE;
+        let envelope = Envelope {
+            max_known: budget,
+            max_active: 1,
+            ..Envelope::unlimited(POLICY.max)
+        };
+        assert!(t.configure_peers(envelope, HashMap::new(), Quorum::OFF, T0));
+        for i in 0..budget as u32 {
+            let target = std::net::Ipv4Addr::from(0x0a00_0000u32 + i).to_string();
+            assert!(!matches!(
+                t.adopt(peer_claim(2, &target, T0), true, T0),
+                Adoption::Refused(_)
+            ));
+        }
+        assert_eq!(t.known_of(2), budget);
+        assert_eq!(
+            t.adopt(peer_claim(3, "198.51.100.7", T0), true, T0),
+            Adoption::Refused(TOO_MANY_CLAIMS)
+        );
+        assert!(t
+            .add_local(ip("198.51.100.8"), ClaimKind::Detector, "own", T0)
+            .is_ok());
+    }
+
+    #[test]
     fn a_reload_below_held_known_claims_keeps_the_previous_envelopes() {
         let mut t = table(1, 64);
         for i in 0..3 {

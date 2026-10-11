@@ -12,6 +12,10 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 base=${1:?usage: mutants-diff.sh <base commit>}
+# Each mutant needs its own Cargo artifacts. An inherited absolute target/build directory
+# overrides cargo-mutants' scratch directories, sharing binaries and serializing builds.
+# The output directory below is unchanged; only the child Cargo build directories isolate.
+unset CARGO_TARGET_DIR CARGO_BUILD_TARGET_DIR CARGO_BUILD_BUILD_DIR
 out=${MUTANTS_OUT:-target/mutants-diff}
 jobs=${MUTANTS_JOBS:-2}
 shard=()

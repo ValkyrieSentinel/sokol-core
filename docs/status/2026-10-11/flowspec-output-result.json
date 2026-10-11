@@ -1,0 +1,14 @@
+{
+  "profile": "sokol.review.flowspec-output.v1",
+  "reviewed_commit": "4c6cc75631dd4d9341627172578d4d19410d8eb8",
+  "source_sha256": "d1d0dfd1d60f08c5d66f8362e3d07ebddc02cda89b9238a03eab971c3571dfc2",
+  "cargo_lock_sha256": "a5776c0dcad4bd844cf6e9c4de9126fd2a9561418671d1e75b853e1aaa8ef683",
+  "environment": "Ubuntu 24.04 Linux ARM64 Lima sokol-lab; standalone offline dependency subset; actual flowspec source with appended private-method probe wrapper",
+  "stdout_bytes_returned": 67108864,
+  "stderr_diagnostic_bytes_returned": 67108864,
+  "padded_empty_rib_accepted_for_both_families": true,
+  "repeat_elapsed_ms": 1564,
+  "repeat_peak_rss_kib": 140416,
+  "exit_code": 0,
+  "scope": "Current subprocess-output and RIB-reading methods; controlled producer, no live GoBGP, no full node, no demonstrated remote exploit or OOM"
+}
