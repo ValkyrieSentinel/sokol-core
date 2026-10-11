@@ -1,0 +1,16 @@
+{
+  "after": "IPC-A1",
+  "base_contract_sha256": null,
+  "because": "Counterexample (hunt round 4, 2026-10-12): sokol-fastnetmon-notify connected, wrote and logged 'sent' with no ACK handshake and no answer read, against AGENTS.md (detector input goes through delivery::Outbox in ACK mode).",
+  "evidence_text": "`a_node_that_never_answers_makes_the_hook_fail_within_its_budget_without_claiming_delivery`, `a_node_that_records_the_report_makes_the_hook_report_delivery_and_exit_zero`, `a_report_the_node_rejects_is_not_called_delivered`, `the_first_line_the_node_sees_is_the_ack_handshake`",
+  "id": "FASTNETMON-A1",
+  "profile": "sokol.contract-proposal.v1",
+  "statement": "The FastNetMon hook sends its report through the ACK-mode outbox within a bounded wait and reports delivery only after the node's recognized answer; no answer within the bound is a non-zero exit that says the report is lost.",
+  "status": "UNSIGNED_INTENT",
+  "witnesses": [
+    "a_node_that_never_answers_makes_the_hook_fail_within_its_budget_without_claiming_delivery",
+    "a_node_that_records_the_report_makes_the_hook_report_delivery_and_exit_zero",
+    "a_report_the_node_rejects_is_not_called_delivered",
+    "the_first_line_the_node_sees_is_the_ack_handshake"
+  ]
+}

@@ -1,0 +1,14 @@
+{
+  "after": "MESH-K1",
+  "base_contract_sha256": null,
+  "because": "Counterexample (hunt round 4, 2026-10-12): --storm-threshold=-0.1 made 0 of 3 attacked nodes a DistributedStorm and the latch kept strict mode on for good (ADR-0006); 50 or NaN silently disabled storm defense.",
+  "evidence_text": "`a_storm_threshold_outside_zero_to_one_is_refused`, `a_storm_threshold_outside_zero_to_one_is_refused_at_startup`",
+  "id": "STORM-T1",
+  "profile": "sokol.contract-proposal.v1",
+  "statement": "The storm threshold is a share of live nodes, finite and in [0, 1); any other value is refused at startup, so a cluster with no attacked node is never a distributed storm.",
+  "status": "UNSIGNED_INTENT",
+  "witnesses": [
+    "a_storm_threshold_outside_zero_to_one_is_refused",
+    "a_storm_threshold_outside_zero_to_one_is_refused_at_startup"
+  ]
+}
