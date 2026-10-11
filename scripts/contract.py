@@ -90,6 +90,9 @@ def propose(rid: str, because: str, statement: str | None, witnesses: list[str],
     if current is not None and after:
         print('FAIL --after places a new row; ' + rid + ' already has one')
         return 1
+    if after and not any(line.startswith('| ' + after + ' |') for line in INVARIANTS.read_text().splitlines()):
+        print('FAIL --after ' + after + ' is not a row of ' + str(INVARIANTS.relative_to(ROOT)))
+        return 1
     if not because.strip():
         print('FAIL a proposal names its reason (--because)')
         return 1
