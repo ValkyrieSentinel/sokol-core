@@ -268,6 +268,9 @@ const MAX_RETRACTORS: usize = 4;
 pub struct Envelope {
     /// The peer's claims enforced here at once; further ones wait for a free slot.
     pub max_active: usize,
+    /// The peer's claims known here at once, enforced or waiting (ADR-0025); further ones are
+    /// refused, so one peer cannot fill the memory every issuer shares.
+    pub max_known: usize,
     /// Longest a claim of the peer is enforced here, from when its enforcement starts.
     pub max_ttl: Duration,
     /// Widest prefixes (shortest length) the peer may block here at all.
@@ -279,6 +282,7 @@ impl Envelope {
     pub fn unlimited(max_ttl: Duration) -> Self {
         Self {
             max_active: usize::MAX,
+            max_known: usize::MAX,
             max_ttl,
             min_prefix_v4: 0,
             min_prefix_v6: 0,
@@ -320,6 +324,18 @@ impl Quorum {
 
 /// Known claims (and retraction records) beyond this are refused (a flooding peer cannot exhaust memory).
 pub const MAX_KNOWN_CLAIMS: usize = 4 * common::BLOCKLIST_CAPACITY as usize;
+
+/// Known-claims room only this node's own decisions may use (ADR-0025): peers' claims together
+/// stop at `MAX_KNOWN_CLAIMS - OWN_RESERVE`, so a full table of peer claims never refuses this
+/// node's own detections. One blocklist's worth: more than this node can enforce at once.
+pub const OWN_RESERVE: usize = common::BLOCKLIST_CAPACITY as usize;
+
+/// Default known-claims share of one peer (ADR-0025): its claims held here, enforced or not.
+/// Its envelope bounds what it enforces (`max_active`); this bounds what it makes this node keep.
+pub const PEER_MAX_KNOWN_DEFAULT: usize = common::BLOCKLIST_CAPACITY as usize;
+
+/// Why `adopt` refuses a claim of a peer that has used its known-claims share (ADR-0025).
+pub const PEER_SHARE_FULL: &str = "peer known-claims share full";
 
 /// Why a new claim is refused at MAX_KNOWN_CLAIMS; the IPC answer names it (`ipc::enforcement_reply`).
 pub const TOO_MANY_CLAIMS: &str = "too many known claims";
@@ -521,6 +537,8 @@ pub struct BlockTable<B = KernelBlocklist> {
     restore_dropped: Dropped,
     default_envelope: Envelope,
     envelopes: HashMap<u64, Envelope>,
+    /// Claims held per issuer, this node included (ADR-0025); kept with `claims`.
+    known_by_issuer: HashMap<u64, usize>,
     quorum: Quorum,
     active_by_issuer: HashMap<u64, usize>,
     waiting: HashMap<u64, std::collections::VecDeque<ClaimId>>,
@@ -600,6 +618,7 @@ impl<B: Blocklist> BlockTable<B> {
             restore_dropped: Dropped::default(),
             default_envelope: Envelope::unlimited(policy.max),
             envelopes: HashMap::new(),
+            known_by_issuer: HashMap::new(),
             quorum: Quorum::OFF,
             active_by_issuer: HashMap::new(),
             waiting: HashMap::new(),
@@ -662,19 +681,62 @@ impl<B: Blocklist> BlockTable<B> {
 
     /// Sets what peers may impose (ADR-7): `default` for every peer, `per_peer` overrides, and
     /// the quorum for wide prefixes. Applies to enforcement from now on; slot counts and local
-    /// ends of claims already adopted are kept.
+    /// ends of claims already adopted are kept. Returns false without changing anything if a
+    /// new known-claims share is below what a peer already holds: a reload cannot silently
+    /// violate the share or discard claims and their remembered leases.
     pub fn configure_peers(
         &mut self,
         default: Envelope,
         per_peer: HashMap<u64, Envelope>,
         quorum: Quorum,
         now_ms: u64,
-    ) {
+    ) -> bool {
+        self.configure_peer_state(default, per_peer, quorum, None, now_ms)
+    }
+
+    /// Installs trust and envelopes together. A revoked issuer's old envelope is retained only
+    /// for its held records: an implicit fallback to a smaller default must not block revocation.
+    /// Its claims stop counting immediately, and their lease/retraction memory is preserved.
+    pub fn configure_trusted_peers(
+        &mut self,
+        default: Envelope,
+        per_peer: HashMap<u64, Envelope>,
+        quorum: Quorum,
+        pinned: HashSet<u64>,
+        now_ms: u64,
+    ) -> bool {
+        self.configure_peer_state(default, per_peer, quorum, Some(pinned), now_ms)
+    }
+
+    fn configure_peer_state(
+        &mut self,
+        default: Envelope,
+        mut per_peer: HashMap<u64, Envelope>,
+        quorum: Quorum,
+        pinned: Option<HashSet<u64>>,
+        now_ms: u64,
+    ) -> bool {
+        if let Some(trusted) = &pinned {
+            for issuer in self.known_by_issuer.keys() {
+                if *issuer != self.node_id && !trusted.contains(issuer) {
+                    per_peer.insert(*issuer, *self.envelope(*issuer));
+                }
+            }
+        }
+        if self.known_by_issuer.iter().any(|(issuer, known)| {
+            *issuer != self.node_id && *known > per_peer.get(issuer).unwrap_or(&default).max_known
+        }) {
+            return false;
+        }
         self.default_envelope = default;
         self.envelopes = per_peer;
         self.quorum = quorum;
+        if let Some(pinned) = pinned {
+            self.pinned = Some(pinned);
+        }
         let nets: Vec<IpNet> = self.by_target.keys().copied().collect();
         self.settle(nets, now_ms);
+        true
     }
 
     fn envelope(&self, issuer: u64) -> &Envelope {
@@ -1072,7 +1134,24 @@ impl<B: Blocklist> BlockTable<B> {
             .entry(held.net)
             .or_default()
             .insert(id.clone());
-        self.claims.insert(id, held);
+        let issuer = held.claim.issuer;
+        if let Some(old) = self.claims.insert(id, held) {
+            self.forget_known(old.claim.issuer);
+        }
+        *self.known_by_issuer.entry(issuer).or_insert(0) += 1;
+    }
+
+    fn forget_known(&mut self, issuer: u64) {
+        if let Some(n) = self.known_by_issuer.get_mut(&issuer) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                self.known_by_issuer.remove(&issuer);
+            }
+        }
+    }
+
+    fn known_of(&self, issuer: u64) -> usize {
+        self.known_by_issuer.get(&issuer).copied().unwrap_or(0)
     }
 
     /// Creates and holds a new claim of this node's (the caller checked MAX_KNOWN_CLAIMS).
@@ -1488,7 +1567,19 @@ impl<B: Blocklist> BlockTable<B> {
         if self.claims.len() >= MAX_KNOWN_CLAIMS {
             return Adoption::Refused(TOO_MANY_CLAIMS);
         }
+        // ADR-0025: peers together leave this node's own room free, and each peer stays within
+        // its share; a refused claim is not held, so its issuer may resend it once room frees.
+        let peers_known = self
+            .claims
+            .len()
+            .saturating_sub(self.known_of(self.node_id));
+        if peers_known >= MAX_KNOWN_CLAIMS - OWN_RESERVE {
+            return Adoption::Refused(TOO_MANY_CLAIMS);
+        }
         let envelope = *self.envelope(claim.issuer);
+        if self.known_of(claim.issuer) >= envelope.max_known {
+            return Adoption::Refused(PEER_SHARE_FULL);
+        }
         let cap = now_ms.saturating_add(ms(self.policy.max.min(envelope.max_ttl)));
         // A claim already given a lease here (before a restart) keeps that lease's end: the
         // local cap bounds a claim's total effect, not each lifetime of this process (R26-07).
@@ -1613,7 +1704,9 @@ impl<B: Blocklist> BlockTable<B> {
             if h.claim.kind == ClaimKind::Operator {
                 // Local only: no copy exists anywhere else, so it can simply go.
                 let net = h.net;
-                self.claims.remove(&id);
+                if let Some(gone) = self.claims.remove(&id) {
+                    self.forget_known(gone.claim.issuer);
+                }
                 if let Some(set) = self.by_target.get_mut(&net) {
                     set.remove(&id);
                     if set.is_empty() {
@@ -1772,6 +1865,7 @@ impl<B: Blocklist> BlockTable<B> {
         for id in dead {
             self.release_slot(&id);
             if let Some(h) = self.claims.remove(&id) {
+                self.forget_known(h.claim.issuer);
                 if let Some(set) = self.by_target.get_mut(&h.net) {
                     set.remove(&id);
                     if set.is_empty() {
@@ -3918,6 +4012,7 @@ mod tests {
         let wide = detect(&mut n2, "203.0.113.0/24", T0);
         let tight = Envelope {
             max_active: 2,
+            max_known: PEER_MAX_KNOWN_DEFAULT,
             max_ttl: Duration::from_secs(30),
             min_prefix_v4: 32,
             min_prefix_v6: 128,
@@ -3955,6 +4050,7 @@ mod tests {
         );
         let one = Envelope {
             max_active: 1,
+            max_known: PEER_MAX_KNOWN_DEFAULT,
             ..Envelope::unlimited(POLICY.max)
         };
         let mut n1 = limited(1, one, &[]);
@@ -4461,10 +4557,203 @@ mod tests {
             issuer,
             Envelope {
                 max_active: 1,
+                max_known: PEER_MAX_KNOWN_DEFAULT,
                 ..Envelope::unlimited(POLICY.max)
             },
         );
         t.configure_peers(Envelope::unlimited(POLICY.max), per_peer, Quorum::OFF, now);
+    }
+
+    /// ADR-0007: a compromised node must not have unlimited power over others. A peer confined
+    /// to one enforcement slot floods 262 144 non-expiring claims; a month later this node's own
+    /// detection and a third node's claim are still admitted (ADR-0025).
+    #[test]
+    fn a_one_slot_peer_cannot_deny_this_nodes_own_detections_by_volume() {
+        let mut n1 = table(1, 64);
+        one_slot(&mut n1, 2, T0);
+        for i in 0..MAX_KNOWN_CLAIMS as u32 {
+            let target = std::net::Ipv4Addr::from(0x0a00_0000u32 + i).to_string();
+            n1.adopt(peer_claim(2, &target, T0), true, T0);
+        }
+        assert!(n1.active() <= 1, "the envelope holds");
+        assert_eq!(
+            n1.known_of(2),
+            PEER_MAX_KNOWN_DEFAULT,
+            "the peer stops at its share"
+        );
+        let later = T0 + 30 * 24 * 3600 * S;
+        n1.tick(later);
+        let mut n3 = table(3, 64);
+        let other = detect(&mut n3, "198.51.100.7", later);
+        assert!(!matches!(
+            n1.adopt(other, true, later),
+            Adoption::Refused(_)
+        ));
+        assert!(n1
+            .add_local(ip("198.51.100.8"), ClaimKind::Detector, "own", later)
+            .is_ok());
+    }
+
+    #[test]
+    fn a_reload_below_held_known_claims_keeps_the_previous_envelopes() {
+        let mut t = table(1, 64);
+        for i in 0..3 {
+            assert!(!matches!(
+                t.adopt(
+                    peer_claim(2, &format!("203.0.113.{}", 10 + i), T0),
+                    true,
+                    T0
+                ),
+                Adoption::Refused(_)
+            ));
+        }
+        let before = t.envelope(2).max_known;
+        let one = Envelope {
+            max_known: 1,
+            ..Envelope::unlimited(POLICY.max)
+        };
+        assert!(
+            !t.configure_peers(one, HashMap::new(), Quorum::OFF, T0 + S),
+            "reload accepted a share below its three held claims"
+        );
+        assert_eq!(t.envelope(2).max_known, before);
+        assert_eq!(t.known_of(2), 3);
+        assert!(t.is_blocked(ip("203.0.113.10")), "no claim is discarded");
+        // The same check applies to an explicit per-peer override, not just the default.
+        assert!(!t.configure_peers(
+            Envelope::unlimited(POLICY.max),
+            HashMap::from([(2, one)]),
+            Quorum::OFF,
+            T0 + S
+        ));
+        assert_eq!(t.envelope(2).max_known, before);
+    }
+
+    #[test]
+    fn a_reload_at_the_held_known_claims_bound_applies_and_ignores_own_claims() {
+        let mut t = table(1, 64);
+        for i in 0..3 {
+            detect(&mut t, &format!("198.51.100.{}", 10 + i), T0);
+        }
+        assert!(!matches!(
+            t.adopt(peer_claim(2, "203.0.113.10", T0), true, T0),
+            Adoption::Refused(_)
+        ));
+        let one = Envelope {
+            max_known: 1,
+            ..Envelope::unlimited(POLICY.max)
+        };
+        assert!(t.configure_peers(one, HashMap::new(), Quorum::OFF, T0 + S));
+        assert_eq!(t.envelope(2).max_known, 1);
+        assert_eq!(t.known_of(1), 3, "own reserve is not a peer share");
+        assert_eq!(
+            t.adopt(peer_claim(2, "203.0.113.11", T0), true, T0 + S),
+            Adoption::Refused(PEER_SHARE_FULL)
+        );
+        assert!(!matches!(
+            t.adopt(peer_claim(3, "203.0.113.12", T0), true, T0 + S),
+            Adoption::Refused(_)
+        ));
+        let zero = Envelope {
+            max_known: 0,
+            ..one
+        };
+        assert!(t.configure_peers(one, HashMap::from([(4, zero)]), Quorum::OFF, T0 + S));
+        assert_eq!(
+            t.adopt(peer_claim(4, "203.0.113.13", T0), true, T0 + S),
+            Adoption::Refused(PEER_SHARE_FULL)
+        );
+    }
+
+    /// A peer at its known-claims share is refused with its own reason, and the refused claim
+    /// is not held; another peer's claim still fits (ADR-0025).
+    #[test]
+    fn a_peer_beyond_its_known_claims_share_is_refused_alone() {
+        let three = Envelope {
+            max_known: 3,
+            ..Envelope::unlimited(POLICY.max)
+        };
+        let mut t = limited(1, Envelope::unlimited(POLICY.max), &[(2, three)]);
+        for i in 0..3 {
+            let target = format!("203.0.113.{}", 10 + i);
+            assert!(!matches!(
+                t.adopt(peer_claim(2, &target, T0), true, T0),
+                Adoption::Refused(_)
+            ));
+        }
+        assert_eq!(
+            t.adopt(peer_claim(2, "203.0.113.20", T0), true, T0),
+            Adoption::Refused(PEER_SHARE_FULL)
+        );
+        assert_eq!(t.known_of(2), 3);
+        assert!(!matches!(
+            t.adopt(peer_claim(3, "203.0.113.21", T0), true, T0),
+            Adoption::Refused(_)
+        ));
+    }
+
+    /// A peer's share frees exactly as its claims go: one expired claim of two makes room for
+    /// one more, not for two (ADR-0025).
+    #[test]
+    fn a_peers_share_frees_exactly_as_its_claims_end() {
+        let two = Envelope {
+            max_known: 2,
+            ..Envelope::unlimited(POLICY.max)
+        };
+        let mut t = limited(1, Envelope::unlimited(POLICY.max), &[(2, two)]);
+        let ending = |target: &str, secs: u64| Claim {
+            expires_ms: Some(T0 + secs * S),
+            ..peer_claim(2, target, T0)
+        };
+        assert!(!matches!(
+            t.adopt(ending("203.0.113.30", 60), true, T0),
+            Adoption::Refused(_)
+        ));
+        assert!(!matches!(
+            t.adopt(ending("203.0.113.31", 600), true, T0),
+            Adoption::Refused(_)
+        ));
+        let later = T0 + 61 * S;
+        t.tick(later);
+        assert_eq!(
+            t.known_of(2),
+            1,
+            "the ended claim still counts against the share"
+        );
+        assert!(!matches!(
+            t.adopt(ending("203.0.113.32", 600), true, later),
+            Adoption::Refused(_)
+        ));
+        assert_eq!(t.known_of(2), 2);
+        assert_eq!(
+            t.adopt(ending("203.0.113.33", 600), true, later),
+            Adoption::Refused(PEER_SHARE_FULL),
+            "the share freed more room than the claims that ended"
+        );
+    }
+
+    /// Peers with no share limit together stop at the room kept for this node's own decisions:
+    /// the table is never so full of peer claims that an own detection is refused (ADR-0025).
+    #[test]
+    fn peers_together_leave_the_room_kept_for_this_nodes_own_decisions() {
+        let mut t = table(1, 64);
+        let mut refused = 0;
+        for i in 0..MAX_KNOWN_CLAIMS as u32 {
+            let issuer = 2 + u64::from(i % 4);
+            let target = std::net::Ipv4Addr::from(0x0a00_0000u32 + i).to_string();
+            if matches!(
+                t.adopt(peer_claim(issuer, &target, T0), true, T0),
+                Adoption::Refused(_)
+            ) {
+                refused += 1;
+            }
+        }
+        assert_eq!(t.claims.len(), MAX_KNOWN_CLAIMS - OWN_RESERVE);
+        assert_eq!(refused, OWN_RESERVE);
+        for i in 0..8u8 {
+            let own = ip(&format!("198.51.100.{}", i + 1));
+            assert!(t.add_local(own, ClaimKind::Detector, "own", T0).is_ok());
+        }
     }
 
     #[test]
@@ -4772,6 +5061,7 @@ mod tests {
                 3,
                 Envelope {
                     max_active: 2,
+                    max_known: PEER_MAX_KNOWN_DEFAULT,
                     max_ttl: Duration::from_secs(300),
                     min_prefix_v4: 24,
                     min_prefix_v6: 48,

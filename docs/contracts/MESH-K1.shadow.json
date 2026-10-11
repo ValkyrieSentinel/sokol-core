@@ -1,0 +1,27 @@
+{
+  "annotations": {
+    "status": "UNSIGNED_EXPLANATORY_DRAFT"
+  },
+  "decisions": [
+    {
+      "because": "Counterexample (hunt round 3, 2026-10-10): a one-slot peer flooded 262144 non-expiring claims into the shared MAX_KNOWN_CLAIMS memory; its envelope held, yet this node's own detection and a third node's claim were refused for good. Owner chose design A (ADR-0025).",
+      "previous_statement_sha256": null,
+      "proposal_sha256": "a438c2551f5e2d95d8f10e6a10a7bcafb7db8fd78b8cb2575dbe444e3f990c07"
+    },
+    {
+      "because": "Mutation check (CI, PR #8): forget_known could be replaced by () or its == 0 by != and no witness failed, so the per-issuer count could drift silently. The new witness pins that a share frees exactly as the claims of a peer end.",
+      "previous_statement_sha256": "e092a7415d3bf45595fda0e186330327776810be438fbee72fea914e7ee1d8e9",
+      "proposal_sha256": "0c6b7037c9f33dff9b93594fe286298f3d0d38284862b3b6305fcf70064ab18e"
+    }
+  ],
+  "evidence_text": "`a_one_slot_peer_cannot_deny_this_nodes_own_detections_by_volume`, `a_peer_beyond_its_known_claims_share_is_refused_alone`, `peers_together_leave_the_room_kept_for_this_nodes_own_decisions`, `a_peers_share_frees_exactly_as_its_claims_end`",
+  "id": "MESH-K1",
+  "profile": "sokol.contract-shadow.v1",
+  "statement": "A peer's claims known here, enforced or waiting, never exceed its envelope's known-claims share, and peers' claims together leave the room kept for this node's own decisions: no volume from one peer makes this node refuse its own detections or another peer's claims.",
+  "witnesses": [
+    "a_one_slot_peer_cannot_deny_this_nodes_own_detections_by_volume",
+    "a_peer_beyond_its_known_claims_share_is_refused_alone",
+    "a_peers_share_frees_exactly_as_its_claims_end",
+    "peers_together_leave_the_room_kept_for_this_nodes_own_decisions"
+  ]
+}
