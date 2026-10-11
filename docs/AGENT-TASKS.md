@@ -9,8 +9,10 @@ The proposal must be staged so its bytes are included in the checkout snapshot.
 
 The packet gives the statement, witness names and source files, a fixed local verification
 command when supported, edit constraints and unknowns. It does not execute annotation text.
-Python/Kani/mixed witness sets currently have no fixed native runner here; the established
-CI tools remain their verifier. An unsupported runner refuses a run instead of issuing a pass.
+Mixed Rust witnesses from common/orchestrator use one fixed Cargo command for both packages.
+Python and witnesses outside these supported Rust paths have no fixed native runner here;
+the established CI tools remain their verifier. A Kani proof needs its proof runner: it is
+not a native unit test, so a unit recipe cannot record it as passed. An unsupported runner refuses a run instead of issuing a pass.
 
 ## Execution and replay
 
@@ -22,7 +24,7 @@ python3 scripts/contract-task.py verify /tmp/sokol-witness-run-EXAMPLE/report.js
 ```
 
 `run` invokes the existing std-only delivery verifier for delivery witnesses, or Linux Cargo
-unit tests for wholly orchestrator/common witness sets. Cargo first queries the compiler's
+unit tests for orchestrator/common witness sets, including sets spanning both packages. Cargo first queries the compiler's
 list, then executes its fully qualified names with exact filters. `{witness}` in the packet's
 fixed template is used only for validated names. The commands must exit zero and every
 compiled match of a requested witness must appear in successful test output. A zero-test
