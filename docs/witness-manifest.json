@@ -14,12 +14,14 @@
   "IPC-A1": "6a0096b5b18b5190ee613bc7e2e3e94604665f205385b18ae074bb0b9138aafa",
   "IPC-R1": "b9989e447aaf0ac528045bb46ae30f905b77868400866b3732711082527f9986",
   "IPC-T1": "088af71858cc841192a1cac08dd3a0cfe6f6fcded7772bf9ba5fbd3a13122cc3",
+  "MESH-K1": "b5c64769a38d45f8829f1df5214c8898179b2641dae6f415d36cb3e35ee4e629",
   "NODE-D1": "0765e06474e6a67f70ffa2f6ca4e0c78da7f252909be75c56a3a5c7b8740efd3",
   "NODE-R1": "4618ac4d2bb0c89369d0a8b83d84cb96e1b22f630db08c56320e0b25022bcb15",
   "NODE-R2": "3ebe18170f979f75008aa350f225e2afbb617ed4960d90b6568053bd7bc9bd71",
   "NODE-R3": "745bb8369c5b678cc8cfd1e12a53cf61b32c027792f0d9f66b915eb0913f646a",
   "NODE-R4": "8cf92b49ba813fd0f9065d7877260af8b9767edd0eb63b977928799166b467e5",
   "NODE-R5": "9b6a8bf99e620cb06f68e6c4121c881c37d676d5be4cfa18c49626b6a389451d",
+  "REPLAY-B1": "2cdd2edca0bb7095e670dac6b199e1915618333a4fd2401b9e97fd51ea3e0394",
   "REPLAY-R1": "02e461a6ac12481a554c9af346378ed023100fce66f6a26224c20d8d84c68d4e",
   "REPLAY-R2": "6234809388ac9d18ef96ea855bfc54ac8fecf0527d28da8587977e2faaab0352",
   "REPLAY-R3": "3c228c7d000e878bc3643046f6b789ca25d8dd840e9dc43d1b9fe1c302986018",
@@ -27,6 +29,7 @@
   "REPLAY-R5": "5cb0e2725b64c4c0c50a90a45eec2b34aee78cdecd58fe647d7ed8f82dfc64af",
   "SHUTDOWN-S1": "20f05174abd36f01bf7b650b1dc2d099bc9c482d2bccbd9b549db27d750e5cff",
   "SHUTDOWN-S2": "4b603c1a2c197fc71e551940b80a2df275920b45405489d7e899fbeb4e1a7046",
+  "STATE-B1": "2e14f012cd4c37689c4d6a7ec815e40fd12cc714b2cdc2a8b1518d3a1d5fda4f",
   "STATE-P1": "c77333a2be0f751dac1ec9ce6663e325d36efa51c8dc917ebe9cb81bd5af5561",
   "STATE-P2": "93fa21f3199e8249b2367c1c03cfe7dc9fb86f4ac18bc32812cfb588c4a4bc52",
   "SUR-C1": "71649ca5848e6bfeec0e1cb516058d937298924631f88b0141127498686b614a",
@@ -151,6 +154,19 @@
     "lost_answer_keeps_expiry_and_later_retry_sends_its_retraction"
    ]
   },
+  "MESH-K1": {
+   "statement": "32f95310c1f2e76c1b172501d10bbdaacc8c6820e0cc9c58e0c574e0f50f04fc",
+   "witnesses": [
+    "a_one_slot_peer_cannot_deny_this_nodes_own_detections_by_volume",
+    "a_peer_beyond_its_known_claims_share_is_refused_alone",
+    "a_peers_share_frees_exactly_as_its_claims_end",
+    "a_refused_share_reload_answers_error_and_keeps_trust_then_can_be_retried",
+    "a_reload_at_the_held_known_claims_bound_applies_and_ignores_own_claims",
+    "a_reload_below_held_known_claims_keeps_the_previous_envelopes",
+    "an_explicit_large_peer_share_can_exhaust_the_shared_peer_budget",
+    "peers_together_leave_the_room_kept_for_this_nodes_own_decisions"
+   ]
+  },
   "NODE-D1": {
    "statement": "7a65cae6a697519d005fe57189f0611ec6cf3659269209fafd3e7dcf2d9c2f07",
    "witnesses": [
@@ -196,6 +212,23 @@
     "a_block_shortened_while_protected_stays_suspended_until_the_target_is_allowed",
     "a_retraction_at_the_claims_exact_end_finds_nothing_standing",
     "a_retraction_while_the_target_is_protected_takes_its_claim_back_mesh_wide"
+   ]
+  },
+  "REPLAY-B1": {
+   "statement": "095b625bf251303d0008c4f31ff378325a8a4c3ab621a506d2c594f5126c82a0",
+   "witnesses": [
+    "a_scan_keeps_the_open_file_identity_and_initial_complete_prefix",
+    "a_sealed_segment_cannot_grow_while_consumers_scan_it",
+    "a_torn_or_non_text_tail_never_certifies_a_complete_replay",
+    "a_zero_sequence_segment_cannot_replace_the_genesis_chain",
+    "chain_consumers_validate_the_next_segment_before_offering_it",
+    "cli_totals_and_omission_markers_agree_with_the_complete_input",
+    "foreign_build_diagnostics_cannot_grow_with_each_run",
+    "late_chain_failure_discards_the_tentative_file_replay",
+    "mismatch_examples_are_bounded_without_stopping_replay",
+    "retained_diagnostics_preserve_counts_and_utf8_at_the_exact_budget",
+    "retained_segment_inventory_refuses_limit_plus_one",
+    "shortening_or_completing_a_torn_record_during_scan_is_unverified"
    ]
   },
   "REPLAY-R1": {
@@ -247,6 +280,19 @@
    "witnesses": [
     "a_timed_out_cleanup_worker_is_cancelled_and_joined",
     "local_decision_is_audited_before_cancellable_mesh_publication"
+   ]
+  },
+  "STATE-B1": {
+   "statement": "2f0da61604a0caf4bad51d7b605c6a3a68008de8fce66699075458b3819d48ef",
+   "witnesses": [
+    "a_byte_budget_counts_whitespace_and_refuses_a_growing_stream",
+    "a_failed_restore_keeps_the_node_degraded_until_the_loss_is_accepted",
+    "a_file_over_the_writer_byte_budget_is_refused_without_reading_or_replacing_it",
+    "an_overlong_saved_reason_is_refused_and_the_original_bytes_are_kept",
+    "maximal_writer_records_roundtrip_with_escaped_reasons_and_all_tables",
+    "oversized_state_fields_are_refused_in_each_table",
+    "sequences_refuse_cardinality_and_invalid_records_without_eviction",
+    "wire_string_and_atom_bounds_apply_before_serde_allocates"
    ]
   },
   "STATE-P1": {
@@ -359,6 +405,9 @@
   "a_block_shortened_while_protected_stays_suspended_until_the_target_is_allowed": [
    "orchestrator/src/block_table.rs:1ad28cc9294ab1650e9e3f01e80c00e46c73e916bdadd4a4c1def16a2c2f8687"
   ],
+  "a_byte_budget_counts_whitespace_and_refuses_a_growing_stream": [
+   "orchestrator/src/state_input.rs:5000399284a83d0988917490720f410ecd7089ddb559214c7f24ef2a517fe295"
+  ],
   "a_capacity_refusal_is_not_reported_as_a_protected_target": [
    "orchestrator/src/ipc.rs:8f1ada4ba99db9273abd37c81c316cd59636ea6087480e5e02210fed7a70da5b"
   ],
@@ -382,6 +431,12 @@
   ],
   "a_failed_loss_notice_retains_its_count_until_recovery": [
    "orchestrator/src/main.rs:e9c701e40b514fee6dbf20fce74d11cc56e5c1f2f6ddac4c20ea760dd1fbc6af"
+  ],
+  "a_failed_restore_keeps_the_node_degraded_until_the_loss_is_accepted": [
+   "orchestrator/src/state_store.rs:a8a7d22f2638ec79af51d6a380125272442dd984d118548f1b22191b39a5e0d3"
+  ],
+  "a_file_over_the_writer_byte_budget_is_refused_without_reading_or_replacing_it": [
+   "orchestrator/src/state_store.rs:f730d7d9593b5a07f7d349345ca355f3608a3f16adf7573f239fb6d44075d989"
   ],
   "a_flush_records_real_queue_overflow_without_a_following_record": [
    "orchestrator/src/main.rs:647c2d250aa2f6a1f356dc0f5e9a89798908d7985293a090cccfc7a2040e5385"
@@ -413,11 +468,20 @@
   "a_non_canonical_statement_file_fails_the_check": [
    "orchestrator/src/audit_anchor.rs:0ca8fde409b31f9014a6f568436fb66daa4d08892859baf1deb322990ed972d8"
   ],
+  "a_one_slot_peer_cannot_deny_this_nodes_own_detections_by_volume": [
+   "orchestrator/src/block_table.rs:fa4959307bd1fcfe0e7af8c6a5d4d75e3d70a9af837c1f59e75842f4c2cb31ed"
+  ],
   "a_partially_reproduced_audit_is_not_a_successful_cli_result": [
    "orchestrator/src/replay.rs:43f88ca49b4e414a74aafb77d397e7f5df0b297ff43e58778240e4482feb0293"
   ],
+  "a_peer_beyond_its_known_claims_share_is_refused_alone": [
+   "orchestrator/src/block_table.rs:1f5e371c2dc361bbe7ef8d682ba6c58377ed12451ca7e7d5cb123ad67716e64f"
+  ],
   "a_peers_audit_head_is_witnessed_once_per_interval": [
    "orchestrator/src/mesh_dispatch.rs:07715d75cbe271d25f56fa81a48021df6e80ad9cf85aca77c9315dfa880cd5ff"
+  ],
+  "a_peers_share_frees_exactly_as_its_claims_end": [
+   "orchestrator/src/block_table.rs:32fa0caa9b0fe951bdb5c844572ad724eb40cbaabf9d451da1ed427aa85bb09d"
   ],
   "a_peers_witness_confirms_the_log_and_exposes_a_recomputed_rewrite": [
    "orchestrator/src/audit_witness.rs:be38ba3c3a78c5957cf3ac657e65e8fac0a3cb4935d0f6575d68f9e14f97b8c3"
@@ -433,6 +497,15 @@
   ],
   "a_real_source_ttl_survives_reason_decoys": [
    "orchestrator/src/replay.rs:978d1605b4b93ade5db25305d610d3a5416ac0512d8f3e4602d00e558b6320f4"
+  ],
+  "a_refused_share_reload_answers_error_and_keeps_trust_then_can_be_retried": [
+   "orchestrator/src/control_exec.rs:08a929357f6d78bd2b9e29e7bbf7b98b2a5cd0f3f831873ee3c049ab70253371"
+  ],
+  "a_reload_at_the_held_known_claims_bound_applies_and_ignores_own_claims": [
+   "orchestrator/src/block_table.rs:9ad97da627ea7fdfa29aeef7fee7f76b4fddfb9bff7c7c1982f60017d90a17ca"
+  ],
+  "a_reload_below_held_known_claims_keeps_the_previous_envelopes": [
+   "orchestrator/src/block_table.rs:ee10bbd9662da0b2e4c6e5b5f7141a8c18922b30eb2bf238f6a66a109a9352a5"
   ],
   "a_remaining_reason_with_the_same_end_keeps_the_block_unchanged": [
    "orchestrator/src/block_table.rs:d2cbb141deffafcd392606132acd5de97e643dc9011cc28243c32d36e33f821a"
@@ -464,6 +537,12 @@
   "a_save_replaces_the_state_file_atomically_whatever_its_name": [
    "orchestrator/src/state_store.rs:8d1db45539c1cd4bbdbe95f896bfaae2ed1563ad2880ab462acbbc53ba8ae97e"
   ],
+  "a_scan_keeps_the_open_file_identity_and_initial_complete_prefix": [
+   "common/src/audit_log.rs:af7684cd23a452c50e8c9a5c23cf3b98083c9c66fe8757caeea43815e755b7f4"
+  ],
+  "a_sealed_segment_cannot_grow_while_consumers_scan_it": [
+   "common/src/audit_log.rs:e02d9a6c9d056f28d800c7ee85a9306c2202dfa5aebc421c99cac89eda235e16"
+  ],
   "a_shortened_block_stays_blocked_until_the_remaining_reason_ends": [
    "orchestrator/src/block_table.rs:38f60345f3871a3a22b0c71a0f94d30795b0451c828d17d8a66812077395c6d6"
   ],
@@ -485,6 +564,9 @@
   "a_timed_out_cleanup_worker_is_cancelled_and_joined": [
    "orchestrator/src/shutdown.rs:54dff102e072c1246b298f0887514622ed3d7fa8c1f0fb6e8ee1bc70aff8d633"
   ],
+  "a_torn_or_non_text_tail_never_certifies_a_complete_replay": [
+   "orchestrator/src/replay.rs:e049fdb355842595e7729faba9bcfb3f0f7c355660738165c5ab238b5d9e38ed"
+  ],
   "a_wanted_block_not_yet_written_still_blocks": [
    "orchestrator/src/block_table.rs:b6a306ae70461b5aaad79f7450c6935bf1fb9030dd553f4b9767e214265b0025"
   ],
@@ -494,14 +576,23 @@
   "a_wrong_retraction_outcome_remains_a_mismatch": [
    "orchestrator/src/replay.rs:8739442458927b8860e5da12b3f3249e3a49d714a79eab7dd2bae2981a70a4fb"
   ],
+  "a_zero_sequence_segment_cannot_replace_the_genesis_chain": [
+   "common/src/audit_log.rs:411a24a11982eb4f4e9acc13980413cd35bf671ebf691745309d0c7304bddc79"
+  ],
   "an_event_still_held_needs_no_new_retraction_storage": [
    "orchestrator/src/block_table.rs:3a8245282ee23211dba2ba18b4d10ac5e18f759feaab1ba4c14a2f1f6b2b5ef2"
   ],
   "an_existing_record_can_accept_its_owner_at_the_global_capacity": [
    "orchestrator/src/block_table.rs:7493c55f460f87805f5b261cfceb5450fe5d20bc098dea0764823df4b802aff5"
   ],
+  "an_explicit_large_peer_share_can_exhaust_the_shared_peer_budget": [
+   "orchestrator/src/block_table.rs:abaea139c992b7d7658c04c1aa4cdcf6eafc9c427ec482c4c9a976a19018d08f"
+  ],
   "an_overlong_line_gets_one_error_and_runs_no_command": [
    "orchestrator/src/control.rs:0f80bb013e96d270133e98a8ff0b38d8c400768616f2a22384d2a0dfead81fd2"
+  ],
+  "an_overlong_saved_reason_is_refused_and_the_original_bytes_are_kept": [
+   "orchestrator/src/state_store.rs:53b8bfd8e656a4d01c170ce0aa52fca07ee2e019db0051a09ea45b5401ee5b9b"
   ],
   "an_unreadable_state_file_is_kept_aside_and_survives_the_next_save": [
    "orchestrator/src/state_store.rs:79490b58d4d396cccbf402aabb7ca01e87f2fa683b8fa5460419d7180593c3c3"
@@ -511,6 +602,9 @@
   ],
   "an_unverified_capacity_refusal_fences_dependent_replay_until_a_fresh_start": [
    "orchestrator/src/replay.rs:1ee635f3c72d0c00ea20f7e358527fcbc7201cc1bba4f670fd281760c8c67547"
+  ],
+  "chain_consumers_validate_the_next_segment_before_offering_it": [
+   "common/src/audit_log.rs:6d36ced02f025dc8ed82dab6f79165057dd7534e07c0b96150b18eeba3a59c5d"
   ],
   "child_handlers_are_joined_with_their_listener": [
    "orchestrator/src/shutdown.rs:ba6d284a7b53a98cfde10939e255aeaee185c8fec949d666fdf17cdae1717293"
@@ -526,6 +620,9 @@
   ],
   "cli_rejects_zero_ipc_pacing_before_startup": [
    "orchestrator/src/bin/sokol-crowdsec.rs:3b0c4dc584caf1a7fc99c228969399f3ce80ee1bb14181ea00898bae831dc3ac"
+  ],
+  "cli_totals_and_omission_markers_agree_with_the_complete_input": [
+   "orchestrator/src/replay.rs:f1ed107816a52cedae74d8922367dbb5bfec4a464888de15f738bd2bcc5d6b90"
   ],
   "client_logs_cannot_supply_replay_authority": [
    "orchestrator/src/main.rs:d7f9fb6fdf61fdd2e10ce75f6570ad35d0ad219edfcff3cfd74ca0131fd4999c"
@@ -547,6 +644,9 @@
   ],
   "feature_commands_reach_only_peers_that_announced_the_feature": [
    "orchestrator/src/p2p.rs:dc39fe5ca27e4e865bb5b7cb836b6111a3651f3a2df42c8c09c2a421654d997b"
+  ],
+  "foreign_build_diagnostics_cannot_grow_with_each_run": [
+   "orchestrator/src/replay.rs:7007ecc895c05bb7c93f388adcadedc31494b1f4ead97d2363f3f003478024ed"
   ],
   "forwarding_budget_ages_exactly_and_future_timestamps_cannot_enlarge_it": [
    "orchestrator/src/bin/sokol-suricata.rs:c42d227a868671c9cd34fe83d6ece8982fd4163a63b6b4480d2c27fe7ed1b07a"
@@ -590,6 +690,9 @@
   "ipc_pacing_intervals_are_positive_minimal_integer_budgets": [
    "orchestrator/src/bin/sokol-crowdsec.rs:61e565050b8aedb2117e8cffa944ac5790a08da2fe12898eb2c0d4de3c686720"
   ],
+  "late_chain_failure_discards_the_tentative_file_replay": [
+   "orchestrator/src/replay.rs:fed659c7d865954719378be5974fc4bb4b5437e1b645297643667e4ad8a36787"
+  ],
   "local_decision_is_audited_before_cancellable_mesh_publication": [
    "orchestrator/src/main.rs:60f15be671476e5113c9e4a5e8a37fa351650216add7874bdacdc029415f0126"
   ],
@@ -598,6 +701,12 @@
   ],
   "lost_answer_keeps_expiry_and_later_retry_sends_its_retraction": [
    "orchestrator/src/delivery.rs:0a5d4949613481d8183ef76d002b8e2b57001accfa5390eb73566e4d86a98848"
+  ],
+  "maximal_writer_records_roundtrip_with_escaped_reasons_and_all_tables": [
+   "orchestrator/src/state_input.rs:6a004172c934fe3c45f5050708af44fce1b7b800d618c4d18872f1dfe55be3a0"
+  ],
+  "mismatch_examples_are_bounded_without_stopping_replay": [
+   "orchestrator/src/replay.rs:65f38ae11e1d8e638323631bcf8ebbe7936ffa9fd75aaa0159fb4eae8eca3107"
   ],
   "normal_lines_still_run_one_command_each": [
    "orchestrator/src/control.rs:a63c87233a8174b0d69b33c64c9448328a2fb18bbb048fbc947061cb1d811111"
@@ -610,6 +719,12 @@
   ],
   "oversized_audit_records_are_counted_and_marked_before_following_data_or_flush": [
    "orchestrator/src/main.rs:5f8238ea09e54d0084116377203678b159470a25e2ce754f919cac38e557fd60"
+  ],
+  "oversized_state_fields_are_refused_in_each_table": [
+   "orchestrator/src/state_input.rs:486d9b1ba0f4090faf4bc97f0136bb2adf5ad38c0a8853ad9838a53fefcc494e"
+  ],
+  "peers_together_leave_the_room_kept_for_this_nodes_own_decisions": [
+   "orchestrator/src/block_table.rs:6c5485ea850b7de205b17b32cc1a9abe1163b63932e2a4c5bbf20cbd38453fa6"
   ],
   "producer_quiescence_keeps_shutdown_record_last": [
    "orchestrator/src/main.rs:6fc7156a6e4465af5181e53d689d5036d1253615f41d16a3ba355db21ed55fb0"
@@ -638,8 +753,20 @@
   "resume_retains_its_anchor_while_the_source_is_missing": [
    "orchestrator/src/bin/sokol-suricata.rs:d61ca20adab36212c565f1881670dff1788e793e5510f06ddd269dae3f0070d7"
   ],
+  "retained_diagnostics_preserve_counts_and_utf8_at_the_exact_budget": [
+   "orchestrator/src/replay.rs:ee049952e4f0d1239bd63fc62d06cf5c236993d09e421482a80ef237cc654b5e"
+  ],
+  "retained_segment_inventory_refuses_limit_plus_one": [
+   "common/src/audit_log.rs:700bce877aae81fb3bef5f60f67887441772154f2261c6fa1caa11dbe50af1e5"
+  ],
   "retraction_admission_reserves_every_needed_record": [
    "orchestrator/src/block_table.rs:4c02a188abd2794498f179c5003caf1ff72f43017cd2a838c40a28b242b9bdc9"
+  ],
+  "sequences_refuse_cardinality_and_invalid_records_without_eviction": [
+   "orchestrator/src/state_input.rs:e74448d4408f367fad02342e5f49d1460f75a3dd6903452d9496fbca03532aa7"
+  ],
+  "shortening_or_completing_a_torn_record_during_scan_is_unverified": [
+   "common/src/audit_log.rs:56b359efa5c2d41052afb64f3e8f2f52846c5caa35b9b428aeedb60e61b7004f"
   ],
   "statements_confirm_the_log_and_expose_a_recomputed_rewrite": [
    "orchestrator/src/audit_anchor.rs:e0ddaf11cdfacddd7d3a3a8130597982ec297d9d6b8c100e85fd2ba5170ac4d6"
@@ -649,6 +776,9 @@
   ],
   "unknown_reply_keeps_the_obligation_and_a_later_ack_retires_it": [
    "orchestrator/src/delivery.rs:08eaebdf5f929438bef556b1076aa80740818212bc39bde3b0b011d68598d7d9"
+  ],
+  "wire_string_and_atom_bounds_apply_before_serde_allocates": [
+   "orchestrator/src/state_input.rs:f323d0f1a2dc3df69d710be71a29758f4e25a4c1ff18ef65ba75dfe975b3d00f"
   ]
  }
 }
