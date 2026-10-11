@@ -23,9 +23,11 @@ class ContractTask(unittest.TestCase):
         self.root = Path(self.temp.name).resolve()
         sources = ['scripts/witness-pin.py', 'scripts/contract-task.py', 'docs/INVARIANTS.md',
                    'docs/witness-manifest.json', 'docs/witness-manifest.json.sig', '.github/witness-signers',
-                   'orchestrator/src/delivery.rs', 'orchestrator/src/block_table.rs',
-                   'orchestrator/src/state_input.rs', 'orchestrator/src/state_store.rs',
-                   'orchestrator/src/replay.rs', 'common/src/audit_log.rs']
+                   ]
+        # Every Rust source: a witness may live in any module (MESH-K1's reload witnesses are in
+        # control_exec.rs), and a fixture that copies a hand-picked list breaks when one moves.
+        sources += subprocess.run(['git', 'ls-files', '*.rs'], cwd=ROOT, capture_output=True,
+                                  text=True, check=True).stdout.split()
         sources += [p.relative_to(ROOT).as_posix() for p in (ROOT / 'docs/contracts').glob('*.shadow.json')]
         sources += [p.relative_to(ROOT).as_posix() for p in (ROOT / 'docs/contracts/proposals').glob('*.proposal.json')]
         for name in sources:
@@ -37,6 +39,37 @@ class ContractTask(unittest.TestCase):
 
     def tearDown(self):
         self.temp.cleanup()
+
+    def synthetic_proposal(self, from_id, new_id):
+        """An unsigned proposal for a new row, built from an adopted contract's witnesses, so the
+        tests do not depend on which proposals happen to be open in the repository."""
+        contract = json.loads((self.root / f'docs/contracts/{from_id}.shadow.json').read_text())
+        proposal = {'profile': 'sokol.contract-proposal.v1', 'id': new_id, 'status': 'UNSIGNED_INTENT',
+                    'because': 'test fixture', 'base_contract_sha256': None, 'after': from_id,
+                    **{k: contract[k] for k in ('statement', 'evidence_text', 'witnesses')}}
+        data = (json.dumps(proposal, indent=2, sort_keys=True) + '\n').encode()
+        # Named as scripts/contract.py names a proposal: its id and the first 12 hex of its hash.
+        path = self.root / f'docs/contracts/proposals/{new_id}-{tool.digest(data)[:12]}.proposal.json'
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+        subprocess.run(['git', 'add', '-A'], cwd=self.root, check=True)
+        return path.relative_to(self.root).as_posix()
+
+    def unpinned_copy(self, from_id, new_id):
+        """A contract and row the owner has not pinned, next to a pinned one."""
+        contract = json.loads((self.root / f'docs/contracts/{from_id}.shadow.json').read_text())
+        contract['id'] = new_id
+        contract['statement'] = 'Fixture copy of ' + from_id + '.'
+        (self.root / f'docs/contracts/{new_id}.shadow.json').write_text(json.dumps(contract, indent=2) + '\n')
+        spec = importlib.util.spec_from_file_location('fixture_pin', self.root / 'scripts/witness-pin.py')
+        pin = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(pin)
+        doc = self.root / 'docs/INVARIANTS.md'
+        lines = doc.read_text().splitlines(keepends=True)
+        at = next(i for i, line in enumerate(lines) if line.startswith('| ' + from_id + ' |'))
+        lines.insert(at + 1, pin.contract_row(contract) + '\n')
+        doc.write_text(''.join(lines))
+        subprocess.run(['git', 'add', '-A'], cwd=self.root, check=True)
 
     def context(self):
         return tool.prepare(self.root, 'IPC-A1')
@@ -69,22 +102,23 @@ class ContractTask(unittest.TestCase):
         self.assertEqual(a['body']['snapshot'], 'sha256:' + tool.digest(tool.encode(inputs)))
 
     def test_unpinned_mesh_is_visible_but_never_promoted_to_owner_acceptance(self):
-        value, _ = tool.prepare(self.root, 'MESH-K1')
+        self.unpinned_copy('MESH-K1', 'MESH-K9')
+        value, _ = tool.prepare(self.root, 'MESH-K9')
         self.assertEqual(value['body']['binding']['correspondence'], 'UNPINNED')
         self.assertEqual(value['body']['recipe'], 'orchestrator-unit')
         self.assertEqual(value['body']['execution'], 'UNKNOWN')
 
     def test_new_restore_proposal_gets_context_without_becoming_an_adopted_contract(self):
-        proposal = next((self.root / 'docs/contracts/proposals').glob('STATE-B1-*.proposal.json'))
-        value, _ = tool.prepare(self.root, 'STATE-B1', proposal=proposal.relative_to(self.root).as_posix())
+        proposal = self.synthetic_proposal('STATE-B1', 'STATE-B9')
+        value, _ = tool.prepare(self.root, 'STATE-B9', proposal=proposal)
         self.assertEqual(value['body']['binding']['correspondence'], 'UNSIGNED_PROPOSAL')
         self.assertEqual(value['body']['binding']['proposal_acceptance'], 'NOT_ESTABLISHED')
         self.assertEqual(value['body']['recipe'], 'orchestrator-unit')
-        self.assertFalse((self.root / 'docs/contracts/STATE-B1.shadow.json').exists())
+        self.assertFalse((self.root / 'docs/contracts/STATE-B9.shadow.json').exists())
 
     def test_replay_proposal_uses_one_fixed_runner_for_both_rust_packages(self):
-        proposal = next((self.root / 'docs/contracts/proposals').glob('REPLAY-B1-*.proposal.json'))
-        value, _ = tool.prepare(self.root, 'REPLAY-B1', proposal=proposal.relative_to(self.root).as_posix())
+        proposal = self.synthetic_proposal('REPLAY-B1', 'REPLAY-B9')
+        value, _ = tool.prepare(self.root, 'REPLAY-B9', proposal=proposal)
         self.assertEqual(value['body']['binding']['correspondence'], 'UNSIGNED_PROPOSAL')
         self.assertEqual(value['body']['execution'], 'UNKNOWN')
         self.assertEqual(value['body']['recipe'], 'workspace-unit')
