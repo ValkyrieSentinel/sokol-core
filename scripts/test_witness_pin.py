@@ -173,6 +173,16 @@ class WitnessPin(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stdout)
         self.assertIn("T-3: new invariant row, not pinned yet", r.stdout)
 
+    def test_a_new_row_is_refused_on_main_where_every_pin_is_required(self):
+        p = self.dir / "docs/INVARIANTS.md"
+        p.write_text(p.read_text() + "| T-3 | New. | `a_refusal_creates_no_cooldown` |\n")
+        r = run(self.dir, "python3", "scripts/witness-pin.py", "check", "--signers", str(self.signers), "--every-pin")
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn("FAIL T-3: new invariant row, not pinned yet", r.stdout)
+        self.assertEqual(self.pin(self.key).returncode, 0)
+        r = run(self.dir, "python3", "scripts/witness-pin.py", "check", "--signers", str(self.signers), "--every-pin")
+        self.assertEqual(r.returncode, 0, r.stdout)
+
     def test_re_signing_with_another_key_is_refused(self):
         self.edit("src/gate.rs", "assert_eq!(gate(url), 0);", "let _ = gate(url);")
         intruder = self.keypair("intruder")
