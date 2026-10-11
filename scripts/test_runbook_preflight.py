@@ -76,5 +76,38 @@ class Preflight(unittest.TestCase):
             self.assert_refused_untouched(*self.run_rehearsal(netns='remote (id: 0)\\n'))
 
 
+class CurrentJournal(unittest.TestCase):
+    def test_restore_failure_requires_current_invocation_and_drains_the_producer(self):
+        source = SCRIPT.read_text()
+        if 'restore_failure_in_current_journal()' in source:
+            function = source.split('restore_failure_in_current_journal() {', 1)[1].split('\n}', 1)[0]
+            predicate = 'restore_failure_in_current_journal() {' + function + '\n}\nrestore_failure_in_current_journal'
+        else:
+            predicate = next(line.split(' && pass', 1)[0] for line in source.splitlines()
+                             if line.startswith('journalctl ') and 'Restore failed' in line)
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            payload = root / 'payload'
+            payload.write_text('filler\n' * 100000)
+            invocation = 'a' * 32
+            for mode, expected in [('large-current', 0), ('stale-only', 1), ('unreadable', 1), ('partial-current', 1), ('bad-id', 1)]:
+                (root / 'systemctl').write_text('#!/bin/sh\nprintf "%s\\n" "' + ('bad' if mode == 'bad-id' else invocation) + '"\n')
+                (root / 'systemctl').chmod(0o755)
+                journal = '#!/bin/sh\n'
+                if mode == 'unreadable':
+                    journal += 'exit 1\n'
+                elif mode == 'partial-current':
+                    journal += 'printf "Restore failed in this run\\n"\nexit 1\n'
+                elif mode == 'stale-only':
+                    journal += 'case "$*" in *"_SYSTEMD_INVOCATION_ID="*) exit 0 ;; esac\nprintf "Restore failed from a previous run\\n"\n'
+                else:
+                    journal += 'printf "Restore failed in this run\\n"\nexec cat "' + str(payload) + '"\n'
+                (root / 'journalctl').write_text(journal)
+                (root / 'journalctl').chmod(0o755)
+                result = subprocess.run(['bash', '-c', 'set -o pipefail\n' + predicate],
+                    capture_output=True, env=dict(os.environ, PATH=str(root) + os.pathsep + os.environ['PATH']), timeout=10)
+                self.assertEqual(result.returncode, expected, mode + ': ' + result.stderr.decode())
+
+
 if __name__ == '__main__':
     unittest.main()

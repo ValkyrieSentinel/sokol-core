@@ -54,6 +54,15 @@ reachable() { ip netns exec "$NS" ping -c 1 -W 1 -I "$1" "$HOST_IP" >/dev/null 2
 wait_until() { local t=$1; shift; for _ in $(seq 1 $((t * 5))); do "$@" && return 0; sleep 0.2; done; return 1; }
 up() { systemctl is-active --quiet sokol-orchestrator && [ -n "$(value sokol_build_info)" ]; }
 
+# A startup failure belongs to this service invocation; an older journal entry is not
+# evidence. Drain the producer so grep's early exit cannot turn a match into SIGPIPE failure.
+restore_failure_in_current_journal() {
+    local invocation
+    invocation=$(systemctl show sokol-orchestrator -p InvocationID --value) || return 1
+    [[ "$invocation" =~ ^[0-9a-f]{32}$ ]] || return 1
+    journalctl --no-pager -n 100 "_SYSTEMD_INVOCATION_ID=$invocation" | grep 'Restore failed' >/dev/null
+}
+
 # Ownership preflight, before any change and before the cleanup trap is armed: a refusal must
 # leave the host exactly as it was (no service stopped, no interface or namespace removed).
 # State this rehearsal left on an earlier run carries its marker and is removed, so it can be
@@ -169,7 +178,7 @@ STATE=/var/lib/sokol/audit.log.blocks.json
 echo 'not json' | sudo tee "$STATE" >/dev/null
 sudo systemctl start sokol-orchestrator
 wait_until 20 up || fail "§5.4 the service does not start with a damaged state file"
-journalctl -u sokol-orchestrator -n 100 --no-pager | grep -q 'Restore failed' && pass "§5.4 the journal says: $(journalctl -u sokol-orchestrator -n 100 --no-pager | grep -o 'Restore failed.*' | tail -1 | cut -c1-90)" || fail "§5.4 no 'Restore failed' in the journal"
+wait_until 5 restore_failure_in_current_journal && pass "§5.4 the current invocation journal reports Restore failed" || fail "§5.4 no current invocation Restore failed in the journal"
 [ "$(value sokol_state_restore_ok)" = 0 ] && pass "§5.4 sokol_state_restore_ok 0" || fail "§5.4 sokol_state_restore_ok $(value sokol_state_restore_ok)"
 ls /var/lib/sokol/ | grep -q 'blocks.json.corrupt' && pass "§5.4 the bytes are kept ($(ls /var/lib/sokol/ | grep corrupt | head -1))" || fail "§5.4 no .corrupt copy kept"
 ans=$(ctl ACCEPT_STATE_LOSS)
