@@ -189,6 +189,13 @@ class ContractTool(unittest.TestCase):
         r = self.tool('propose', 'T-1', '--statement', 'S.', '--because', '  ')
         self.assertEqual(r.returncode, 1)
 
+    def test_a_new_invariant_after_a_missing_row_is_refused_when_proposed(self):
+        r = self.tool('propose', 'T-8', '--statement', 'S.', '--witness', 'a_late_ack_retires_the_obligation',
+                      '--after', 'T-404', '--because', 'x')
+        self.assertEqual(r.returncode, 1)
+        self.assertIn('--after T-404 is not a row', r.stdout)
+        self.assertFalse(list((self.dir / 'docs/contracts/proposals').glob('*.proposal.json')))
+
     def test_a_new_invariant_is_placed_after_an_existing_row(self):
         name = self.tool('propose', 'T-9', '--statement', 'A late ACK retires the obligation.',
                          '--witness', 'a_late_ack_retires_the_obligation', '--after', 'T-1',
