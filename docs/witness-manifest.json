@@ -9,6 +9,7 @@
   "CONTROL-L1": "83962842fe5c87c27c1f73144ed55d6c7d59c20750343e264a175b195e83df39",
   "CS-P1": "20c86421cdf4044134642a59a00621fbcd7356166a8643864fb02dad24cb2687",
   "CS-P2": "5dd517e4115b6735f6e7477f4118095dccc8075d384adeb95b2bbf1a0069b031",
+  "FLOWSPEC-B1": "4bcfb9a6441b08485e2687a88e162720a37dcc60ed26ca003cb37d23ce3f7289",
   "FLOWSPEC-P1": "23412916e4d4b48929c79ebd1541c49345a29b49377f67aff8ef23ac673153ce",
   "FLOWSPEC-P2": "092a77fd366261837398647687cf247ee43845d3f66f263be8bbd108625df225",
   "IPC-A1": "6a0096b5b18b5190ee613bc7e2e3e94604665f205385b18ae074bb0b9138aafa",
@@ -113,6 +114,19 @@
    "witnesses": [
     "ipc_pacing_interval_does_not_round_below_the_configured_budget",
     "ipc_pacing_intervals_are_positive_minimal_integer_budgets"
+   ]
+  },
+  "FLOWSPEC-B1": {
+   "statement": "33cccc039362416096cbd9c93330c9049278ac9fceabfa020d8ccd7f182bbeb8",
+   "witnesses": [
+    "a_full_ipv6_owned_profile_fits_the_rib_budget",
+    "a_timed_out_call_is_killed",
+    "an_overflowing_call_is_reaped_before_return_and_a_later_call_works",
+    "an_oversized_valid_empty_rib_is_unavailable_not_observed_absence",
+    "both_command_pipes_can_fill_their_exact_budgets_without_deadlock",
+    "excessive_command_stderr_is_a_bounded_diagnostic",
+    "excessive_command_stdout_is_refused_not_an_accepted_write",
+    "pipe_byte_limits_accept_equality_and_refuse_the_next_byte"
    ]
   },
   "FLOWSPEC-P1": {
@@ -441,6 +455,9 @@
   "a_flush_records_real_queue_overflow_without_a_following_record": [
    "orchestrator/src/main.rs:647c2d250aa2f6a1f356dc0f5e9a89798908d7985293a090cccfc7a2040e5385"
   ],
+  "a_full_ipv6_owned_profile_fits_the_rib_budget": [
+   "orchestrator/src/flowspec.rs:fc7a7d3b1234f2279058e02668180075fd2510628196c6e57077062bc954b120"
+  ],
   "a_full_queue_drops_the_oldest_and_counts_it": [
    "orchestrator/src/delivery.rs:6c8570fd6e91b549a46de442429084c682d4e14b19eac9ea6d28634454c07603"
   ],
@@ -561,6 +578,9 @@
   "a_surplus_answer_does_not_settle_the_next_signal": [
    "orchestrator/src/delivery.rs:643e6766f595a373780472e6bfd89fec55d00d1329a6c0a63df730a9ade5b9ff"
   ],
+  "a_timed_out_call_is_killed": [
+   "orchestrator/src/flowspec.rs:fcb4c1d0fe03a93ee12b41f925bf0d0e235af1efa54b1b11d90575e3da00662d"
+  ],
   "a_timed_out_cleanup_worker_is_cancelled_and_joined": [
    "orchestrator/src/shutdown.rs:54dff102e072c1246b298f0887514622ed3d7fa8c1f0fb6e8ee1bc70aff8d633"
   ],
@@ -588,11 +608,17 @@
   "an_explicit_large_peer_share_can_exhaust_the_shared_peer_budget": [
    "orchestrator/src/block_table.rs:abaea139c992b7d7658c04c1aa4cdcf6eafc9c427ec482c4c9a976a19018d08f"
   ],
+  "an_overflowing_call_is_reaped_before_return_and_a_later_call_works": [
+   "orchestrator/src/flowspec.rs:2b7e39a74184dba4d05ddd0ae598007cad24a4183d6c081d5714218a900f1979"
+  ],
   "an_overlong_line_gets_one_error_and_runs_no_command": [
    "orchestrator/src/control.rs:0f80bb013e96d270133e98a8ff0b38d8c400768616f2a22384d2a0dfead81fd2"
   ],
   "an_overlong_saved_reason_is_refused_and_the_original_bytes_are_kept": [
    "orchestrator/src/state_store.rs:53b8bfd8e656a4d01c170ce0aa52fca07ee2e019db0051a09ea45b5401ee5b9b"
+  ],
+  "an_oversized_valid_empty_rib_is_unavailable_not_observed_absence": [
+   "orchestrator/src/flowspec.rs:c65902d75d59aa18cea1a0626ded195195c3dcb5e29933f142a5e141d1008e20"
   ],
   "an_unreadable_state_file_is_kept_aside_and_survives_the_next_save": [
    "orchestrator/src/state_store.rs:79490b58d4d396cccbf402aabb7ca01e87f2fa683b8fa5460419d7180593c3c3"
@@ -602,6 +628,9 @@
   ],
   "an_unverified_capacity_refusal_fences_dependent_replay_until_a_fresh_start": [
    "orchestrator/src/replay.rs:1ee635f3c72d0c00ea20f7e358527fcbc7201cc1bba4f670fd281760c8c67547"
+  ],
+  "both_command_pipes_can_fill_their_exact_budgets_without_deadlock": [
+   "orchestrator/src/flowspec.rs:8ea76382060fc017492858858b14f813dbf1c75c03adfefbe2f115763e52f19c"
   ],
   "chain_consumers_validate_the_next_segment_before_offering_it": [
    "common/src/audit_log.rs:6d36ced02f025dc8ed82dab6f79165057dd7534e07c0b96150b18eeba3a59c5d"
@@ -635,6 +664,12 @@
   ],
   "every_gate_refusal_has_one_counted_policy_reason": [
    "orchestrator/src/bin/sokol-suricata.rs:b2f9553541a54678a16193b45687ccf4d1d55433c38918ccf5bde92d59f35db9"
+  ],
+  "excessive_command_stderr_is_a_bounded_diagnostic": [
+   "orchestrator/src/flowspec.rs:1baa8f0a7fe72a37d09029871eb8ba3901863666e895975a8015af3b58988b35"
+  ],
+  "excessive_command_stdout_is_refused_not_an_accepted_write": [
+   "orchestrator/src/flowspec.rs:4b29e1afbfd471f39b34b6844ec7b414a1ffa27e88f8f71580428995a28ed550"
   ],
   "explicit_audit_gaps_fence_dependent_decisions": [
    "orchestrator/src/replay.rs:db89e772a9f5bb7ee0fd64c87a2494e529dcd7208f6c57b7dd26772b12ec5ddf"
@@ -725,6 +760,9 @@
   ],
   "peers_together_leave_the_room_kept_for_this_nodes_own_decisions": [
    "orchestrator/src/block_table.rs:6c5485ea850b7de205b17b32cc1a9abe1163b63932e2a4c5bbf20cbd38453fa6"
+  ],
+  "pipe_byte_limits_accept_equality_and_refuse_the_next_byte": [
+   "orchestrator/src/flowspec.rs:681b5d5b61268af1646e1fbe385c3784c1f4d21bff24125a45738efcf9920607"
   ],
   "producer_quiescence_keeps_shutdown_record_last": [
    "orchestrator/src/main.rs:6fc7156a6e4465af5181e53d689d5036d1253615f41d16a3ba355db21ed55fb0"
