@@ -22,6 +22,11 @@
 //!
 //! So Engage and Disengage strictly alternate, starting with Engage, and a storm that flickers
 //! faster than `hold` produces one engagement instead of a flood of them.
+//!
+//! The storm threshold is a share of live nodes, finite and in [0, 1) (`parse_storm_threshold`,
+//! checked at startup). Below 0, a cluster with no attacked node would be a storm and the latch
+//! would never see calm; at 1 or above, or NaN, no share could exceed it and storm defense would
+//! be silently off.
 
 use common::NodeTelemetry;
 use std::collections::HashMap;
@@ -60,6 +65,22 @@ pub fn classify(nodes: usize, attacked: usize, storm_threshold: f64) -> ClusterS
         ClusterStatus::LocalIncident
     } else {
         ClusterStatus::Stable
+    }
+}
+
+/// Parses `--storm-threshold`: refuses any value that is not finite and in [0, 1), so the
+/// status table above holds (no attacked node is never a storm, and a storm is reachable).
+pub fn parse_storm_threshold(text: &str) -> Result<f64, String> {
+    let value: f64 = text
+        .parse()
+        .map_err(|e| format!("not a number ({}): {:?}", e, text))?;
+    if value.is_finite() && (0.0..1.0).contains(&value) {
+        Ok(value)
+    } else {
+        Err(format!(
+            "must be a share of live nodes, finite and in [0, 1): {}",
+            value
+        ))
     }
 }
 
@@ -218,6 +239,23 @@ impl BirdEyeView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_storm_threshold_outside_zero_to_one_is_refused() {
+        for text in ["-0.1", "1.0", "1", "50", "NaN", "inf", "-inf", "", "half"] {
+            assert!(
+                parse_storm_threshold(text).is_err(),
+                "{:?} must be refused",
+                text
+            );
+        }
+        for (text, value) in [("0.0", 0.0), ("0.5", 0.5), ("0.99", 0.99)] {
+            assert_eq!(parse_storm_threshold(text), Ok(value), "{:?}", text);
+        }
+        // What the refusal protects: with a negative threshold a cluster with no attacked
+        // node classifies as a storm.
+        assert_eq!(classify(3, 0, -0.1), ClusterStatus::DistributedStorm);
+    }
 
     #[test]
     fn classification_matches_the_table() {

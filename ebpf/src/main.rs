@@ -11,7 +11,7 @@ use core::mem;
 
 use common::{
     config_flags, drop_reason, DropEvent, PacketStats, BLOCKLIST_CAPACITY, BLOCK_HIT_SLOTS,
-    DROP_REASON_SLOTS, EVENTS_RING_BYTES, MAX_EVENTS_PER_CPU_PER_SEC,
+    DROP_REASON_SLOTS, EVENTS_RING_BYTES, MAX_EVENTS_PER_CPU_PER_SEC, MAX_PAYLOAD,
 };
 
 /// The license the kernel sees (GPL-2.0-or-later, `ebpf/LICENSE`); it admits GPL-only helpers.
@@ -202,6 +202,9 @@ fn emit_drop_event_sampled(
             (*entry_ptr).ip_version = ip_version;
             (*entry_ptr)._pad = 0;
             (*entry_ptr).payload_len = 0;
+            // The ring hands out reserved space as it is, not zeroed: unwritten, this field
+            // would carry the bytes of an earlier record once the ring wraps.
+            (*entry_ptr).payload = [0; MAX_PAYLOAD];
         }
         entry.submit(0);
     } else {
