@@ -4,7 +4,8 @@ exclude_re = [
     # This verification harness is cfg(kani), absent from the unit-test binary, like tests
     # themselves. Native mutants of valid_segment_start remain in scope. Its ==/!= mutant
     # was rejected by cargo kani --harness a_zero_sequence_segment_has_the_fixed_genesis_chain
-    # (2026-10-11); the harness's non-vacuous assertions remain a review obligation.
+    # (2026-10-11). proof-task.py now checks its declared assertion against a broken genesis
+    # predicate on every scoped Kani run; adequacy beyond those controls remains review.
     "in proofs::a_zero_sequence_segment_has_the_fixed_genesis_chain$",
     "replace proofs::a_zero_sequence_segment_has_the_fixed_genesis_chain with \\(\\)$",
     # Disjoint bits: `|` and `^` give the same value.

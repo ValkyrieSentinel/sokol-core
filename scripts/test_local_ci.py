@@ -13,8 +13,10 @@ import io
 import os
 from pathlib import Path
 import platform
+import shlex
 import shutil
 import subprocess
+import sys
 import tarfile
 import tempfile
 import unittest
@@ -136,9 +138,12 @@ jobs:
         self.stub('cargo', f'if [ "$1 $2" = "kani --version" ]; then echo "Kani Rust Verifier '
                            f'${{KANI_HAVE:-0.68.0}} (cargo plugin)"; exec seq 1 200000; fi; '
                            f'echo "cargo $*" >> {self.calls}')
+        self.stub('python3', f'if [ "$1" = scripts/proof-task.py ]; then '
+                           f'echo "python3 $*" >> {self.calls}; exit 0; fi; '
+                           f'exec {shlex.quote(sys.executable)} "$@"')
         ok = self.run_step('kani', ci)
         self.assertEqual(ok.returncode, 0, ok.stdout + ok.stderr)
-        self.assertIn('cargo kani -p common', self.calls.read_text())
+        self.assertIn('python3 scripts/proof-task.py run', self.calls.read_text())
         self.calls.unlink()
         os.environ['KANI_HAVE'] = '0.67.0'
         try:

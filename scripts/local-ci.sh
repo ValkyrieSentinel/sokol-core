@@ -127,7 +127,7 @@ kani() {
         echo "Kani $want is not installed: cargo +stable install --locked kani-verifier --version $want && cargo +stable kani setup"
         exit 2
     fi
-    cargo kani -p common
+    python3 scripts/proof-task.py run
 }
 
 # CI's mutants job: the mutants of this change against origin/main (docs/MUTATION.md).
@@ -188,6 +188,7 @@ python3 scripts/test_local_ci.py
 python3 scripts/test_runbook_preflight.py
 python3 scripts/test_anchor_scripts.py
 python3 scripts/test_kani_scope.py
+python3 scripts/test_proof_task.py
 python3 scripts/test_mutants_diff.py
 python3 scripts/test_check_agents_rules.py
 python3 scripts/test_check_claims.py
