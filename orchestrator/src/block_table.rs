@@ -259,6 +259,15 @@ pub const MAX_RETRIES_PER_TICK: usize = 256;
 /// claim back to life for the length of the step. Twenty times the mesh's clock-skew bound.
 pub const FORGET_GRACE: Duration = Duration::from_secs(600);
 
+/// Whether a lease record (R26-07) is still kept at `now_ms`: like a lift record, until
+/// FORGET_GRACE past the end of its claim (`expires`, on the table's clock). The held claim is
+/// dropped at that end, but a wall-clock step back makes a resent copy live again for the
+/// length of the step (`adopt` converts the signed end with the offset in force then); the
+/// record makes that copy find the lease it already had instead of a new one.
+fn lease_kept(expires: Option<u64>, now_ms: u64) -> bool {
+    expires.is_none_or(|e| e.saturating_add(ms(FORGET_GRACE)) > now_ms)
+}
+
 /// Distinct nodes remembered per retracted id (the issuer plus a few others).
 const MAX_RETRACTORS: usize = 4;
 
@@ -542,7 +551,9 @@ pub struct BlockTable<B = KernelBlocklist> {
     quorum: Quorum,
     active_by_issuer: HashMap<u64, usize>,
     waiting: HashMap<u64, std::collections::VecDeque<ClaimId>>,
-    /// Local ends of peers' claims cut short here, remembered across restarts (R26-07).
+    /// Local ends of peers' claims cut short here, remembered across restarts (R26-07) and for
+    /// FORGET_GRACE past the claim's own end (`lease_kept`). At most MAX_KNOWN_CLAIMS
+    /// (`record_lease` says what happens at the bound).
     lease_ends: HashMap<ClaimId, (u64, Option<u64>)>,
     /// Wall clock minus this table's clock (ADR-0017); converts signed and persisted times.
     wall_offset_ms: i64,
@@ -1112,6 +1123,12 @@ impl<B: Blocklist> BlockTable<B> {
     /// Remembers where a peer claim's lease ends if the local cap cuts it short. The end only
     /// ever moves earlier: a lease shortened once (e.g. after a clock step) is not lengthened by
     /// a later restart, so records timed by it (an operator lift) outlive it.
+    ///
+    /// At MAX_KNOWN_CLAIMS records, the record of a claim no longer held whose horizon comes
+    /// first is forgotten early to make room (a held claim's lease is always recorded). That one
+    /// claim, resent after a wall-clock step back, may then get a new lease, as after
+    /// FORGET_GRACE. There is always such a record: the claim being recorded is the only held
+    /// claim without one, and at most MAX_KNOWN_CLAIMS claims are held.
     fn record_lease(&mut self, id: &ClaimId, cap: u64, expires: Option<u64>) {
         if expires.is_some_and(|e| e <= cap) {
             return;
@@ -1123,6 +1140,21 @@ impl<B: Blocklist> BlockTable<B> {
                 self.dirty = true;
             }
             None => {
+                if self.lease_ends.len() >= MAX_KNOWN_CLAIMS {
+                    let claims = &self.claims;
+                    let first = self
+                        .lease_ends
+                        .iter()
+                        .filter(|(other, _)| !claims.contains_key(*other))
+                        .min_by_key(|(_, (_, expires))| expires.unwrap_or(u64::MAX))
+                        .map(|(other, _)| other.clone());
+                    match first {
+                        Some(other) => {
+                            self.lease_ends.remove(&other);
+                        }
+                        None => return,
+                    }
+                }
                 self.lease_ends.insert(id.clone(), (cap, expires));
                 self.dirty = true;
             }
@@ -1934,7 +1966,7 @@ impl<B: Blocklist> BlockTable<B> {
         });
         let before = self.lease_ends.len();
         self.lease_ends
-            .retain(|_, (_, expires)| expires.is_none_or(|e| e > now_ms));
+            .retain(|_, (_, expires)| lease_kept(*expires, now_ms));
         if self.lease_ends.len() != before {
             self.dirty = true;
         }
@@ -2101,7 +2133,7 @@ impl<B: Blocklist> BlockTable<B> {
         let mut peer_ends: Vec<(ClaimId, u64, Option<u64>)> = self
             .lease_ends
             .iter()
-            .filter(|(_, (_, expires))| expires.is_none_or(|e| e > now_ms))
+            .filter(|(_, (_, expires))| lease_kept(*expires, now_ms))
             .map(|(id, (end, expires))| {
                 (
                     id.clone(),
@@ -2209,7 +2241,7 @@ impl<B: Blocklist> BlockTable<B> {
         }
         for (id, end, expires) in state.peer_ends {
             let (end, expires) = (self.to_local(end), expires.map(|e| self.to_local(e)));
-            if expires.is_none_or(|e| e > now_ms) && self.lease_ends.len() < MAX_KNOWN_CLAIMS {
+            if lease_kept(expires, now_ms) && self.lease_ends.len() < MAX_KNOWN_CLAIMS {
                 self.lease_ends.insert(id, (end, expires));
             }
         }
@@ -4538,6 +4570,132 @@ mod tests {
             !restarted.is_blocked(ip("203.0.113.97")),
             "a new lease after the restart"
         );
+    }
+
+    /// The same node after a restart: a new table restored from the state file at `now`.
+    fn restarted(mut t: BlockTable<FakeLists>, now: u64) -> BlockTable<FakeLists> {
+        let mut r = table(1, 64);
+        r.restore(t.take_persisted(now), |_| true, now);
+        r
+    }
+
+    /// ADR-0003, R26-07: a peer claim capped here is dropped at its own end, and a wall-clock
+    /// step back makes a resent copy live again for the length of the step. Within FORGET_GRACE
+    /// the copy finds the lease it already used, with or without a restart in between.
+    #[test]
+    fn a_used_lease_is_not_renewed_by_a_step_back_within_forget_grace_and_a_resend() {
+        for restart in [false, true] {
+            let mut t = table(1, 64);
+            let target = ip("203.0.113.125");
+            let end = T0 + 3600 * S;
+            let mut c = peer_claim(2, "203.0.113.125", T0);
+            c.expires_ms = Some(end);
+            assert_eq!(t.adopt(c.clone(), true, T0), Adoption::Enforced);
+            t.tick(T0 + ms(POLICY.max) + S);
+            assert!(!t.is_blocked(target), "restart {restart}: the lease ended");
+            t.tick(end + S);
+            assert!(
+                !t.claims.contains_key(&c.id()),
+                "the claim is dropped at its end"
+            );
+            if restart {
+                t = restarted(t, end + S);
+            }
+            t.set_clock_offset(-50_000);
+            let again = t.adopt(c, true, end + 2 * S);
+            assert!(
+                !t.is_blocked(target),
+                "restart {restart}: a second lease ({again:?})"
+            );
+            assert_eq!(again, Adoption::Held("expired"));
+        }
+    }
+
+    /// ADR-0003: an operator lift of a peer claim is kept FORGET_GRACE past the claim's end, so
+    /// a wall-clock step back within it does not bring the resent claim back. The claim ends
+    /// within the cap, so no lease record holds it: the lift alone does.
+    #[test]
+    fn a_lift_is_not_undone_by_a_step_back_within_forget_grace() {
+        for restart in [false, true] {
+            let mut t = table(1, 64);
+            let target = ip("203.0.113.126");
+            let end = T0 + 60 * S;
+            let mut c = peer_claim(2, "203.0.113.126", T0);
+            c.expires_ms = Some(end);
+            assert_eq!(t.adopt(c.clone(), true, T0), Adoption::Enforced);
+            t.lift(target, T0 + S).unwrap();
+            t.tick(end + S);
+            assert!(t.lease_ends.is_empty() && !t.claims.contains_key(&c.id()));
+            if restart {
+                t = restarted(t, end + S);
+            }
+            t.set_clock_offset(-(9 * 60 * S as i64));
+            let again = t.adopt(c, true, end + 2 * S);
+            assert!(
+                !t.is_blocked(target),
+                "restart {restart}: the lift was undone ({again:?})"
+            );
+            assert_eq!(again, Adoption::Held("retracted"));
+        }
+    }
+
+    /// ADR-0003, the documented bound: past FORGET_GRACE both records are forgotten, and a
+    /// wall-clock step back longer than that makes a resent claim count again, a used lease and
+    /// a lifted claim alike, with or without a restart.
+    #[test]
+    fn past_forget_grace_a_step_back_lets_a_resent_lease_or_lift_count_again() {
+        for restart in [false, true] {
+            let mut t = table(1, 64);
+            let end = T0 + 3600 * S;
+            let mut capped = peer_claim(2, "203.0.113.127", T0);
+            capped.expires_ms = Some(end);
+            let mut lifted = peer_claim(2, "203.0.113.128", end - 60 * S);
+            lifted.expires_ms = Some(end);
+            assert_eq!(t.adopt(capped.clone(), true, T0), Adoption::Enforced);
+            assert_eq!(
+                t.adopt(lifted.clone(), true, end - 60 * S),
+                Adoption::Enforced
+            );
+            t.lift(ip("203.0.113.128"), end - 59 * S).unwrap();
+            t.tick(end + ms(FORGET_GRACE) - S);
+            assert!(
+                t.lease_ends.contains_key(&capped.id()) && t.retractions.contains_key(&lifted.id()),
+                "both records kept within FORGET_GRACE"
+            );
+            let now = end + ms(FORGET_GRACE);
+            t.tick(now);
+            assert!(t.lease_ends.is_empty() && t.retractions.is_empty());
+            if restart {
+                t = restarted(t, now);
+            }
+            t.set_clock_offset(-(11 * 60 * S as i64));
+            assert_eq!(t.adopt(capped, true, now + S), Adoption::Enforced);
+            assert_eq!(t.adopt(lifted, true, now + S), Adoption::Enforced);
+            assert!(t.is_blocked(ip("203.0.113.127")) && t.is_blocked(ip("203.0.113.128")));
+        }
+    }
+
+    /// Lease records outlive their claims but stay within MAX_KNOWN_CLAIMS: at the bound, the
+    /// record of a claim no longer held whose horizon comes first is forgotten early; a held
+    /// claim's record is not, even when its horizon comes first.
+    #[test]
+    fn lease_records_stay_bounded_by_forgetting_the_first_ended_one() {
+        let mut t = table(1, 64);
+        let end = T0 + 3600 * S;
+        let mut held = peer_claim(2, "203.0.113.129", T0);
+        held.expires_ms = Some(end);
+        assert_eq!(t.adopt(held.clone(), true, T0), Adoption::Enforced);
+        for i in 0..MAX_KNOWN_CLAIMS as u64 - 1 {
+            t.lease_ends
+                .insert(format!("ended-{i}"), (T0, Some(end + S + i)));
+        }
+        let mut next = peer_claim(2, "203.0.113.130", T0);
+        next.expires_ms = Some(end);
+        assert_eq!(t.adopt(next.clone(), true, T0), Adoption::Enforced);
+        assert_eq!(t.lease_ends.len(), MAX_KNOWN_CLAIMS);
+        assert!(t.lease_ends.contains_key(&held.id()) && t.lease_ends.contains_key(&next.id()));
+        assert!(!t.lease_ends.contains_key("ended-0"));
+        assert!(t.lease_ends.contains_key("ended-1"));
     }
 
     fn peer_claim(issuer: u64, target: &str, issued: u64) -> Claim {
