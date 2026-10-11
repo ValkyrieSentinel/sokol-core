@@ -195,6 +195,7 @@ python3 scripts/test_witness_pin.py
 python3 scripts/test_outbox_task.py
 python3 scripts/test_contract_shadow.py
 python3 scripts/test_contract_tool.py
+python3 scripts/test_contract_task.py
 timeout 120 python3 scripts/test_crowdsec_stream.py target/release/sokol-crowdsec
 timeout 120 python3 scripts/test_suricata_recovery.py target/release/sokol-suricata
 # CI's kani job proves when something the proofs read changed (scripts/kani-scope.sh).

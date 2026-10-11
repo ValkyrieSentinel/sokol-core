@@ -39,6 +39,7 @@ mod replay;
 mod shutdown;
 mod signal;
 mod sokol;
+mod state_input;
 mod state_store;
 
 use aya::maps::{Array, LpmTrie, MapData, PerCpuArray, RingBuf};
