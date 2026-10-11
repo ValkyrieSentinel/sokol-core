@@ -6,7 +6,9 @@ tests what the row claims: a witness can be weakened under its old name and stil
 This pins, for every invariant row, its statement, its list of witnesses and the normalized
 body of each witness, in docs/witness-manifest.json signed by the owner (ssh-keygen -Y).
 
-    witness-pin.py check [--signers FILE]   # CI: exit 1 on an unsigned change
+    witness-pin.py check [--signers FILE] [--every-pin]
+        # CI: exit 1 on an unsigned change; with --every-pin (a push to main) also on anything
+        # new that is not pinned yet
     witness-pin.py sign --key PRIVATE_KEY   # owner: re-pin the current tree and sign it
 
 Comments and formatting do not change a body's hash; any other byte of the body does.
@@ -358,7 +360,7 @@ def verify(signers: pathlib.Path) -> bool:
     return verify_manifest(MANIFEST, SIGNATURE, signers)
 
 
-def check(signers: pathlib.Path) -> int:
+def check(signers: pathlib.Path, every_pin: bool = False) -> int:
     now = current()
     problems, notes = [], []
     for w, where in now["witnesses"].items():
@@ -394,6 +396,11 @@ def check(signers: pathlib.Path) -> int:
         notes.append(f"{rid}: contract is not pinned yet")
     for name in open_proposals(ROOT):
         notes.append(f"open proposal {name}: unsigned intent, not accepted")
+    if every_pin:
+        # On main nothing may stand unpinned: a merge that kept another branch's manifest would
+        # otherwise leave a row only noted, as MESH-K1 was after #7 and #8 (ADR-0023).
+        problems += [x for x in notes if x.endswith("not pinned yet")]
+        notes = [x for x in notes if not x.endswith("not pinned yet")]
     for x in notes:
         print("note", x)
     for x in problems:
@@ -427,6 +434,7 @@ if __name__ == "__main__":
     if args[:1] == ["sign"] and "--key" in args:
         sys.exit(sign(args[args.index("--key") + 1]))
     if args[:1] == ["check"]:
-        sys.exit(check(pathlib.Path(args[args.index("--signers") + 1]) if "--signers" in args else SIGNERS))
+        sys.exit(check(pathlib.Path(args[args.index("--signers") + 1]) if "--signers" in args else SIGNERS,
+                       every_pin="--every-pin" in args))
     print(__doc__)
     sys.exit(2)

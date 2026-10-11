@@ -241,6 +241,9 @@ jobs:
         # has them (the pull request that introduces this check), the tree's own are used.
         env:
           BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+          # On a push (main, tags) nothing may stand unpinned; a pull request may still add rows
+          # that the owner pins before it merges.
+          EVERY_PIN: ${{ github.event_name == 'push' && '--every-pin' || '' }}
         run: |
           cp scripts/witness-pin.py /tmp/witness-pin-tree.py
           cp .github/witness-signers /tmp/witness-signers
@@ -248,7 +251,8 @@ jobs:
             git show "$BASE:scripts/witness-pin.py" > scripts/witness-pin.py
             git show "$BASE:.github/witness-signers" > /tmp/witness-signers
           fi
-          python3 scripts/witness-pin.py check --signers /tmp/witness-signers
+          # shellcheck disable=SC2086  # empty or one flag
+          python3 scripts/witness-pin.py check --signers /tmp/witness-signers $EVERY_PIN
           cp /tmp/witness-pin-tree.py scripts/witness-pin.py
 
       - name: Cited evidence exists (tests in the compiler's list, metrics, flags, ADRs, paths)
