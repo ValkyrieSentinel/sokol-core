@@ -323,6 +323,32 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// The hook retries until its budget, not once: a node that comes up after the first
+    /// attempt failed, still within the budget, gets the report.
+    #[test]
+    fn a_node_that_comes_up_within_the_budget_still_gets_the_report() {
+        run_hook_if_child();
+        let (dir, socket) = temp_socket("late");
+        let late = socket.clone();
+        let starter = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(800));
+            node(&late, answering)
+        });
+        let (output, _) = hook(
+            "tests::a_node_that_comes_up_within_the_budget_still_gets_the_report",
+            &socket,
+        );
+        let _lines = starter.join().unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(0), "{}", stderr);
+        assert!(
+            stderr.contains(&format!("delivered {}", LINE)),
+            "{}",
+            stderr
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn a_report_the_node_rejects_is_not_called_delivered() {
         run_hook_if_child();
