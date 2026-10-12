@@ -20,6 +20,7 @@
   "IPC-T1": "088af71858cc841192a1cac08dd3a0cfe6f6fcded7772bf9ba5fbd3a13122cc3",
   "LEASE-C1": "62c7ac850ee80fee44f784de6d0430c0781468913e27c0e17b59ba0d1b160931",
   "MESH-A1": "83475cbf8f68688809123964d89096ccf2eca83eb242afd822d0132372547f03",
+  "MESH-A2": "14b7d34195160f94057a22ac5a3e4419975831c78169645f46c0184f71f7d2ab",
   "MESH-K1": "b5c64769a38d45f8829f1df5214c8898179b2641dae6f415d36cb3e35ee4e629",
   "MONITOR-L1": "762fb11af9aca18b5e95d9e71061c430745e5f50a90341f7b8356417cc13368e",
   "NODE-D1": "0765e06474e6a67f70ffa2f6ca4e0c78da7f252909be75c56a3a5c7b8740efd3",
@@ -222,6 +223,16 @@
     "an_unauthenticated_connection_cannot_buy_more_than_one_verification",
     "one_peer_cannot_hold_more_connections_than_the_bounds_assume",
     "other_peers_connections_do_not_use_up_a_nodes_slots"
+   ]
+  },
+  "MESH-A2": {
+   "statement": "592d22412e1651ada3a3af4363a52b32326a2b3fb272142f4fba2c391640cb08",
+   "witnesses": [
+    "a_bound_node_authenticates_only_from_its_address",
+    "a_handshake_relayed_by_another_peer_does_not_take_over_its_delivery",
+    "a_reload_that_moves_a_node_closes_its_connection",
+    "peers_file_addresses_are_parsed_and_checked",
+    "the_startup_warning_names_exactly_the_unbound_peers"
    ]
   },
   "MESH-K1": {
@@ -547,6 +558,9 @@
   "a_block_shortened_while_protected_stays_suspended_until_the_target_is_allowed": [
    "orchestrator/src/block_table.rs:1ad28cc9294ab1650e9e3f01e80c00e46c73e916bdadd4a4c1def16a2c2f8687"
   ],
+  "a_bound_node_authenticates_only_from_its_address": [
+   "orchestrator/src/p2p.rs:f395075e73ba46543a40b5e6503612e91833fc7daea46160356fc5b2491c9f5e"
+  ],
   "a_byte_budget_counts_whitespace_and_refuses_a_growing_stream": [
    "orchestrator/src/state_input.rs:5000399284a83d0988917490720f410ecd7089ddb559214c7f24ef2a517fe295"
   ],
@@ -606,6 +620,9 @@
   ],
   "a_gap_alone_prevents_a_successful_cli_result": [
    "orchestrator/src/replay.rs:49aff98c34d04b836fe4c4dfdf6ddb7c6f3d54fae7c5979b28c6bf5470a4ebfc"
+  ],
+  "a_handshake_relayed_by_another_peer_does_not_take_over_its_delivery": [
+   "orchestrator/src/p2p.rs:652b1f8656cdae2bb83153144d19b1771af34db87fb5eb26d988aeca58f072bb"
   ],
   "a_handshake_without_features_still_parses": [
    "orchestrator/src/p2p.rs:4e29aebd1be0f034e734c63ea7e7b03a6a5468c9a010e0d5d2c024009deb8bb4"
@@ -681,6 +698,9 @@
   ],
   "a_reload_below_held_known_claims_keeps_the_previous_envelopes": [
    "orchestrator/src/block_table.rs:ee10bbd9662da0b2e4c6e5b5f7141a8c18922b30eb2bf238f6a66a109a9352a5"
+  ],
+  "a_reload_that_moves_a_node_closes_its_connection": [
+   "orchestrator/src/p2p.rs:eb98476bf946bcadc49bcba7ab4de5e0569bd57868a629aba53f42d4c03a801f"
   ],
   "a_remaining_reason_with_the_same_end_keeps_the_block_unchanged": [
    "orchestrator/src/block_table.rs:d2cbb141deffafcd392606132acd5de97e643dc9011cc28243c32d36e33f821a"
@@ -985,6 +1005,9 @@
   "peer_witnesses_come_from_the_verified_pass": [
    "orchestrator/src/audit_witness.rs:46c387aee914796a4937b16fa28f2f53d79c347efb3732cccf689139d8a5933d"
   ],
+  "peers_file_addresses_are_parsed_and_checked": [
+   "orchestrator/src/p2p.rs:20cde1678a796ff1106d59794e61d18e2b0328717060e509796a85329b9828bd"
+  ],
   "peers_together_leave_the_room_kept_for_this_nodes_own_decisions": [
    "orchestrator/src/block_table.rs:6c5485ea850b7de205b17b32cc1a9abe1163b63932e2a4c5bbf20cbd38453fa6"
   ],
@@ -1053,6 +1076,9 @@
   ],
   "the_first_line_the_node_sees_is_the_ack_handshake": [
    "orchestrator/src/bin/sokol-fastnetmon-notify.rs:fce7d69f0d5c40398d0f0762ca36900c22f15b8a28e9f3e2d914d00b8ded49c1"
+  ],
+  "the_startup_warning_names_exactly_the_unbound_peers": [
+   "orchestrator/src/main.rs:c315c4d8158ea641bc4307b63a928fafa6d48576735b0908328435f6cfa98880"
   ],
   "the_xdp_program_drops_unparsable_headers_in_strict_mode_with_their_own_reason": [
    "common/src/lib.rs:2ddba3df85b5093d5950248434a9165b4e738a384c949ee613f7d82801e34596"
