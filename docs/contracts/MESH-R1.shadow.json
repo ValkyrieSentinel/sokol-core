@@ -1,12 +1,18 @@
 {
-  "after": "MESH-A2",
-  "base_contract_sha256": null,
-  "because": "Counterexample on 3c51594 (ROADMAP item 10, round-5 mesh candidate): after RELOAD_PEERS revoked node 2 and bound node 3 elsewhere, both still received every broadcast until their own next envelope failed (up to ~10 s); a_reload_stops_broadcasts_to_a_revoked_or_moved_node_at_once saw [2, 3, 4] reached instead of [4].",
+  "annotations": {
+    "status": "UNSIGNED_EXPLANATORY_DRAFT"
+  },
+  "decisions": [
+    {
+      "because": "Counterexample on 3c51594 (ROADMAP item 10, round-5 mesh candidate): after RELOAD_PEERS revoked node 2 and bound node 3 elsewhere, both still received every broadcast until their own next envelope failed (up to ~10 s); a_reload_stops_broadcasts_to_a_revoked_or_moved_node_at_once saw [2, 3, 4] reached instead of [4].",
+      "previous_statement_sha256": null,
+      "proposal_sha256": "4eb383e220d8c18f0ca2083a23c9320e80e1cbc04a126903a26a778acb424fc2"
+    }
+  ],
   "evidence_text": "`a_reload_stops_broadcasts_to_a_revoked_or_moved_node_at_once`, `drop_untrusted_unregisters_and_names_revoked_and_moved_nodes`",
   "id": "MESH-R1",
-  "profile": "sokol.contract-proposal.v1",
+  "profile": "sokol.contract-shadow.v1",
   "statement": "A reload that stops pinning a connected node, or binds it to an address it is not connected from, unregisters its connections at once: no broadcast of this node reaches it after the reload, and the audit record PEERS_RELOADED names those nodes (Unregistered). Their connections still close on their next envelope (MESH-A2).",
-  "status": "UNSIGNED_INTENT",
   "witnesses": [
     "a_reload_stops_broadcasts_to_a_revoked_or_moved_node_at_once",
     "drop_untrusted_unregisters_and_names_revoked_and_moved_nodes"

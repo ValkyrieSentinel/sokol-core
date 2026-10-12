@@ -1,12 +1,18 @@
 {
-  "after": "MESH-A1",
-  "base_contract_sha256": null,
-  "because": "Requirement (AGENTS.md: a parser of bytes the node does not control gets a Kani proof): SecureEnvelope::decode reads every frame of any connection before authentication but lived in orchestrator, outside the proofs. Its framing moved to common::wire; wire::proofs prove it, calibrated by proof-task.py with three faults.",
+  "annotations": {
+    "status": "UNSIGNED_EXPLANATORY_DRAFT"
+  },
+  "decisions": [
+    {
+      "because": "Requirement (AGENTS.md: a parser of bytes the node does not control gets a Kani proof): SecureEnvelope::decode reads every frame of any connection before authentication but lived in orchestrator, outside the proofs. Its framing moved to common::wire; wire::proofs prove it, calibrated by proof-task.py with three faults.",
+      "previous_statement_sha256": null,
+      "proposal_sha256": "3b35796e73c5a33d6f0aa931943e76e25a9353512fce93a25aba28407ea8e4df"
+    }
+  ],
   "evidence_text": "`a_frame_splits_into_its_header_payload_and_signature`, `frames_of_other_protocol_versions_are_named`",
   "id": "MESH-W1",
-  "profile": "sokol.contract-proposal.v1",
+  "profile": "sokol.contract-shadow.v1",
   "statement": "A frame is a v2 envelope only if it starts with SKM and a version this node speaks; decoding any frame returns, and an accepted frame's header, payload and signature account for every byte, the payload exactly as long as its header says; what the node writes splits back into the same header, payload and signature (Kani: common::wire, frames up to HEADER_LEN + 6 bytes).",
-  "status": "UNSIGNED_INTENT",
   "witnesses": [
     "a_frame_splits_into_its_header_payload_and_signature",
     "frames_of_other_protocol_versions_are_named"
