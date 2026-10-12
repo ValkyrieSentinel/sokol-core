@@ -193,6 +193,7 @@ python3 scripts/test_mutants_diff.py
 python3 scripts/test_check_agents_rules.py
 python3 scripts/test_check_claims.py
 python3 scripts/test_witness_pin.py
+python3 scripts/test_check_monitoring.py
 python3 scripts/test_outbox_task.py
 python3 scripts/test_contract_shadow.py
 python3 scripts/test_contract_tool.py

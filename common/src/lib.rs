@@ -337,19 +337,88 @@ pub mod drop_reason {
             );
         }
 
+        /// Every `drop_verdict(<len>, drop_reason::X)` call, however it is wrapped, in source
+        /// with its whitespace removed.
+        /// The call's arguments end at its matching `)`, not its first one; a call whose
+        /// second argument is not a `drop_reason::X` literal panics instead of being skipped.
+        fn dropped_reasons(flat: &str) -> BTreeSet<&str> {
+            flat.match_indices("drop_verdict(")
+                // The definition `fn drop_verdict(packet_len: u64, reason: u16)` is no call.
+                .filter(|(i, _)| !flat[..*i].ends_with("fn"))
+                .map(|(i, m)| {
+                    let args = i + m.len();
+                    let (mut depth, mut comma, mut end) = (0usize, None, None);
+                    for (j, c) in flat[args..].char_indices() {
+                        match c {
+                            '(' | '[' | '{' => depth += 1,
+                            ')' | ']' | '}' if depth == 0 => {
+                                end = Some(args + j);
+                                break;
+                            }
+                            ')' | ']' | '}' => depth -= 1,
+                            ',' if depth == 0 && comma.is_none() => comma = Some(args + j + 1),
+                            _ => {}
+                        }
+                    }
+                    let (Some(comma), Some(end)) = (comma, end) else {
+                        panic!("unparsable drop_verdict call: {}", &flat[i..]);
+                    };
+                    let reason = flat[comma..end].trim_end_matches(',');
+                    reason
+                        .strip_prefix("drop_reason::")
+                        .filter(|n| {
+                            !n.is_empty()
+                                && n.bytes().all(|b| {
+                                    b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_'
+                                })
+                        })
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "drop_verdict with a reason the scan cannot name: {}",
+                                &flat[i..=end]
+                            )
+                        })
+                })
+                .collect()
+        }
+
+        /// The scan must see a drop whatever its length argument is: a nested call there must
+        /// not hide the reason; a call cut at its first `)` hid one.
+        #[test]
+        fn the_drop_label_scan_sees_a_reason_after_a_nested_call() {
+            for call in [
+                "return Ok(drop_verdict(packet_len.min(u64::MAX), drop_reason::VFR_ANOMALY));",
+                "let v = drop_verdict(u64::from(len), drop_reason::VFR_ANOMALY);",
+            ] {
+                let flat: String = call.split_whitespace().collect();
+                let found = dropped_reasons(&flat);
+                assert!(
+                    found.contains("VFR_ANOMALY"),
+                    "a drop with VFR_ANOMALY is invisible to the scan: {call} -> {found:?}"
+                );
+            }
+        }
+
+        /// A drop whose reason is not a `drop_reason::X` literal (a variable, a helper's
+        /// parameter) cannot be checked against the labels: the scan must refuse it, not skip it.
+        #[test]
+        fn the_drop_label_scan_refuses_a_reason_it_cannot_name() {
+            let flat: String =
+                "fn drop_for(len: u64, reason: u16) -> u32 { drop_verdict(len, reason) }"
+                    .split_whitespace()
+                    .collect();
+            let refused = std::panic::catch_unwind(|| dropped_reasons(&flat).len()).is_err();
+            assert!(
+                refused,
+                "a drop_verdict call with an unnamed reason was skipped silently"
+            );
+        }
+
         #[test]
         fn a_drop_reason_has_a_metric_label_exactly_when_the_xdp_program_drops_with_it() {
             let src = include_str!("../../ebpf/src/main.rs");
-            // Every `drop_verdict(<len>, drop_reason::X)` call, however it is wrapped.
             let flat: String = src.split_whitespace().collect();
-            let dropped: BTreeSet<&str> = flat
-                .match_indices("drop_verdict(")
-                .filter_map(|(i, _)| {
-                    let call = &flat[i..flat[i..].find(')').map(|e| i + e)?];
-                    let name = call.split("drop_reason::").nth(1)?;
-                    Some(name.trim_end_matches(','))
-                })
-                .collect();
+            let dropped = dropped_reasons(&flat);
             assert!(
                 !dropped.is_empty(),
                 "no drop_verdict call found: the scan is broken"

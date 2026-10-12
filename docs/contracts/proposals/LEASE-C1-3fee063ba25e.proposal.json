@@ -1,0 +1,18 @@
+{
+  "after": null,
+  "base_contract_sha256": "4a21c7003ccd5bf908d9a7e44e3a3ad00c70a1a071d3aefc5c8f8b231b1d4741",
+  "because": "Counterexample on c51cdc9: a peer claim ending at 590 s under a 600 s cap had no lease record; after a 500 s step back and a resend it was enforced again until 605 s past its start. Every enforced peer claim now records its lease end.",
+  "evidence_text": "`a_lift_is_not_undone_by_a_step_back_within_forget_grace`, `a_used_lease_is_not_renewed_by_a_step_back_within_forget_grace_and_a_resend`, `lease_records_stay_bounded_by_forgetting_the_first_ended_one`, `past_forget_grace_a_step_back_lets_a_resent_lease_or_lift_count_again`, `restored_lease_records_keep_the_bound_and_drop_those_past_retention`, `an_uncapped_peer_claim_is_not_revived_past_the_cap_by_a_small_step_back`",
+  "id": "LEASE-C1",
+  "profile": "sokol.contract-proposal.v1",
+  "statement": "A wall-clock step back smaller than FORGET_GRACE, with or without a restart, neither renews a peer claim's used lease, including a claim whose own end lies within the cap, nor undoes an operator lift: both records live FORGET_GRACE past the claim's end; a larger step back can revive either, and that bound is the same for both.",
+  "status": "UNSIGNED_INTENT",
+  "witnesses": [
+    "a_lift_is_not_undone_by_a_step_back_within_forget_grace",
+    "a_used_lease_is_not_renewed_by_a_step_back_within_forget_grace_and_a_resend",
+    "an_uncapped_peer_claim_is_not_revived_past_the_cap_by_a_small_step_back",
+    "lease_records_stay_bounded_by_forgetting_the_first_ended_one",
+    "past_forget_grace_a_step_back_lets_a_resent_lease_or_lift_count_again",
+    "restored_lease_records_keep_the_bound_and_drop_those_past_retention"
+  ]
+}

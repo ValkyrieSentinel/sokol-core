@@ -1120,7 +1120,8 @@ impl<B: Blocklist> BlockTable<B> {
         self.settle(nets, now_ms)
     }
 
-    /// Remembers where a peer claim's lease ends if the local cap cuts it short. The end only
+    /// Remembers where every enforced peer claim's lease ends, also one whose own end lies
+    /// within the cap, so a resend after a step back cannot outlast the cap. The end only
     /// ever moves earlier: a lease shortened once (e.g. after a clock step) is not lengthened by
     /// a later restart, so records timed by it (an operator lift) outlive it.
     ///
@@ -1130,9 +1131,6 @@ impl<B: Blocklist> BlockTable<B> {
     /// FORGET_GRACE. There is always such a record: the claim being recorded is the only held
     /// claim without one, and at most MAX_KNOWN_CLAIMS claims are held.
     fn record_lease(&mut self, id: &ClaimId, cap: u64, expires: Option<u64>) {
-        if expires.is_some_and(|e| e <= cap) {
-            return;
-        }
         match self.lease_ends.get_mut(id) {
             Some((end, _)) if *end <= cap => {}
             Some((end, _)) => {
@@ -4638,6 +4636,36 @@ mod tests {
         }
     }
 
+    /// ADR-0003 ( "Заявка піра діє тут не довше --peer-max-ttl, рахуючи від моменту,
+    /// коли почала діяти"; LEASE-C1): a claim whose signed end lies just within the cap gets no
+    /// lease record, so a resend after a wall-clock step back smaller than FORGET_GRACE is
+    /// enforced again for the length of the step: its total effect here exceeds the cap.
+    #[test]
+    fn an_uncapped_peer_claim_is_not_revived_past_the_cap_by_a_small_step_back() {
+        for restart in [false, true] {
+            let mut t = table(1, 64);
+            let target = ip("203.0.113.140");
+            let end = T0 + ms(POLICY.max) - 10 * S; // 590 s, within the 600 s cap
+            let mut c = peer_claim(2, "203.0.113.140", T0);
+            c.expires_ms = Some(end);
+            assert_eq!(t.adopt(c.clone(), true, T0), Adoption::Enforced);
+            t.tick(end + S);
+            assert!(!t.is_blocked(target));
+            if restart {
+                t = restarted(t, end + S);
+            }
+            t.set_clock_offset(-500_000); // 500 s back, < FORGET_GRACE
+            let again = t.adopt(c, true, end + 2 * S);
+            let past_cap = T0 + ms(POLICY.max) + 5 * S;
+            t.tick(past_cap);
+            assert!(
+                !t.is_blocked(target),
+                "restart {restart}: enforced {} s after it began, cap is 600 s ({again:?})",
+                (past_cap - T0) / S
+            );
+        }
+    }
+
     /// ADR-0003: an operator lift of a peer claim is kept FORGET_GRACE past the claim's end, so
     /// a wall-clock step back within it does not bring the resent claim back. The claim ends
     /// within the cap, so no lease record holds it: the lift alone does.
@@ -4652,7 +4680,10 @@ mod tests {
             assert_eq!(t.adopt(c.clone(), true, T0), Adoption::Enforced);
             t.lift(target, T0 + S).unwrap();
             t.tick(end + S);
-            assert!(t.lease_ends.is_empty() && !t.claims.contains_key(&c.id()));
+            assert!(!t.claims.contains_key(&c.id()));
+            // Every enforced peer claim has a lease record; drop it so the lift alone holds
+            // the resend.
+            t.lease_ends.remove(&c.id());
             if restart {
                 t = restarted(t, end + S);
             }

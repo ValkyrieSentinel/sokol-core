@@ -85,6 +85,8 @@ pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 /// party cannot hold the slots pinned peers need.
 pub const MAX_PENDING_HANDSHAKES: usize = 16;
 pub const MAX_PENDING_PER_ADDRESS: usize = 2;
+/// Authenticated connections one node may hold here: one it dialled, one this node dialled.
+pub const MAX_CONNECTIONS_PER_NODE: usize = 2;
 /// Frames and bytes an authenticated peer may send, per second and as a burst (a full snapshot
 /// fits the burst). Past that the reader waits: the peer is slowed by TCP, nothing is dropped.
 pub const FRAMES_PER_SEC: f64 = 500.0;
@@ -1009,6 +1011,43 @@ impl PeerRegistry {
         }
     }
 
+    /// Registers an authenticated connection unless its node already holds
+    /// MAX_CONNECTIONS_PER_NODE others: the bounds of ADR-0013 (`inbound_worst_case`,
+    /// REPLAY_PER_SENDER) assume a pair of nodes holds at most two connections.
+    pub async fn admit_peer(
+        &self,
+        addr: SocketAddr,
+        link: PeerLink,
+        node_id: u64,
+        conn_id: u64,
+    ) -> bool {
+        {
+            // Checked and inserted under one write lock: two handshakes racing cannot both fit.
+            let mut peers = self.peers.write().await;
+            let held = peers
+                .iter()
+                .filter(|(a, (_, id, _))| *id == node_id && **a != addr)
+                .count();
+            if held >= MAX_CONNECTIONS_PER_NODE {
+                return false;
+            }
+            peers.insert(addr, (link, node_id, conn_id));
+        }
+        info!(
+            "[P2P] Registered authenticated peer: {} [Node ID: {}]",
+            addr, node_id
+        );
+        if let Some(tx) = self
+            .peer_up
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+        {
+            let _ = tx.send(addr);
+        }
+        true
+    }
+
     pub fn on_peer_up(&self, tx: mpsc::UnboundedSender<SocketAddr>) {
         *self.peer_up.lock().unwrap_or_else(|p| p.into_inner()) = Some(tx);
     }
@@ -1536,6 +1575,11 @@ async fn handle_reader_loop(
 
         let net_msg = match registry.open(&envelope) {
             Ok(msg) => msg,
+            Err(EnvelopeError::Replay) if authenticated_peer.is_none() => {
+                // The first frame must authenticate (ADR-0013): a copy of someone else's frame
+                // does not, and skipping it let a stranger buy a verification per copy.
+                bail!("first frame is a replay, not a handshake");
+            }
             Err(EnvelopeError::Replay) => {
                 warn!(
                     "[P2P] Replayed envelope from {} (node {}, nonce {}) ignored",
@@ -1593,7 +1637,13 @@ async fn handle_reader_loop(
                     features: features.into(),
                     ..link.clone()
                 };
-                registry.add_peer(peer_addr, link, node_id, conn_id).await;
+                if !registry.admit_peer(peer_addr, link, node_id, conn_id).await {
+                    bail!(
+                        "node {} already holds {} connections",
+                        node_id,
+                        MAX_CONNECTIONS_PER_NODE
+                    );
+                }
                 spawn_ping_loop(writer_tx.clone(), local_node_id, crypto.clone());
             }
             (None, _) => bail!("first message was not a handshake"),
@@ -3514,5 +3564,84 @@ mod tests {
             "bulk went before urgent: {:?}",
             msg
         );
+    }
+
+    fn frame_of(env: &SecureEnvelope) -> Vec<u8> {
+        let bytes = env.encode();
+        let mut frame = (bytes.len() as u32).to_be_bytes().to_vec();
+        frame.extend_from_slice(&bytes);
+        frame
+    }
+
+    async fn connections_of(registry: &PeerRegistry, node: u64) -> usize {
+        registry
+            .peers_for_test()
+            .read()
+            .await
+            .values()
+            .filter(|(_, id, _)| *id == node)
+            .count()
+    }
+
+    /// ADR-0013: the first frame has to authenticate; ARCHITECTURE 7.1: the first message
+    /// must be a handshake. A replayed frame before the handshake is skipped instead of closing
+    /// the connection, so an unauthenticated connection can make the node verify (ML-DSA, under
+    /// the shared replay mutex, unpaced) every copy it sends for HANDSHAKE_TIMEOUT.
+    #[tokio::test]
+    async fn an_unauthenticated_connection_cannot_buy_more_than_one_verification() {
+        use std::sync::atomic::Ordering;
+        let (addr, registry, peer, _rx, _stop) = listening_node().await;
+        let hello = seal(&peer, 2, &NetworkMessage::handshake(2)).unwrap();
+        let mut real = TcpStream::connect(addr).await.unwrap();
+        real.write_all(&frame_of(&hello)).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            registry.peer_count().await,
+            1,
+            "setup: node 2 authenticated"
+        );
+
+        // Whoever saw that frame on the wire sends it again and again, never authenticating.
+        let mut stranger = TcpStream::connect(addr).await.unwrap();
+        let copy = frame_of(&hello);
+        for _ in 0..50 {
+            if stranger.write_all(&copy).await.is_err() {
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+        let verified = registry.stats.rejected[3].load(Ordering::Relaxed);
+        assert_eq!(
+            verified, 1,
+            "an unauthenticated connection had {} replayed frames signature-checked; the first \
+             frame that does not authenticate must end it",
+            verified
+        );
+        drop(real);
+    }
+
+    /// ADR-0013: "a pair of nodes can hold two connections", from which the node-wide
+    /// worst case (`inbound_worst_case`) and the per-sender replay bound (REPLAY_PER_SENDER) are
+    /// derived. Nothing enforces it: one pinned peer can authenticate any number of inbound
+    /// connections (up to the 100 the listener allows, starving every other peer's inbound slot).
+    #[tokio::test]
+    async fn one_peer_cannot_hold_more_connections_than_the_bounds_assume() {
+        let (addr, registry, peer, _rx, _stop) = listening_node().await;
+        let mut open = Vec::new();
+        for _ in 0..4 {
+            let mut s = TcpStream::connect(addr).await.unwrap();
+            let hello = seal(&peer, 2, &NetworkMessage::handshake(2)).unwrap();
+            s.write_all(&frame_of(&hello)).await.unwrap();
+            open.push(s);
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        let held = connections_of(&registry, 2).await;
+        assert!(
+            held <= 2,
+            "node 2 holds {} authenticated connections; inbound_worst_case and REPLAY_PER_SENDER \
+             assume at most two per pair",
+            held
+        );
+        drop(open);
     }
 }

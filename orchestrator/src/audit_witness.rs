@@ -4,33 +4,24 @@
 //! peer's own chain, is out of that writer's reach unless it rewrites the peer's log as well.
 use std::path::Path;
 
-use common::audit_log::{check_witnesses, verify_chain, AuditReader, WitnessVerdict, CHAIN_LEN};
+#[cfg(test)]
+use common::audit_log::verify_chain;
+use common::audit_log::{check_witnesses, visit_chain, WitnessVerdict, CHAIN_LEN};
 
 /// One witness the peer's log holds for `node_id`: (peer's record seq, records, head).
 pub type Witness = (u64, u64, [u8; CHAIN_LEN]);
 
-/// The `AUDIT_WITNESS` records for `node_id` in the peer's log, after verifying its chain.
+/// The `AUDIT_WITNESS` records for `node_id` in the peer's log, read in the same pass that
+/// verifies its record chains and segment joins (REPLAY-B1, ADR-0026); nothing is returned if
+/// any later part of the scan fails.
 pub fn witnesses_for(peer_log: &Path, node_id: u64) -> Result<Vec<Witness>, String> {
-    verify_chain(peer_log).map_err(|e| format!("peer log does not verify: {}", e))?;
-    let mut files: Vec<std::path::PathBuf> = common::audit_log::rotated_segments(peer_log)
-        .map_err(|e| e.to_string())?
-        .into_iter()
-        .map(|(_, p)| p)
-        .collect();
-    files.push(peer_log.to_path_buf());
     let mut out = Vec::new();
-    for file in files {
-        let mut reader =
-            AuditReader::open(&file).map_err(|e| format!("{}: {}", file.display(), e))?;
-        while let Some(record) = reader
-            .next_record()
-            .map_err(|e| format!("{}: {}", file.display(), e))?
-        {
-            if let Some(w) = parse(&String::from_utf8_lossy(&record.payload), node_id) {
-                out.push((record.seq, w.0, w.1));
-            }
+    visit_chain(peer_log, |record| {
+        if let Some(w) = parse(&String::from_utf8_lossy(&record.payload), node_id) {
+            out.push((record.seq, w.0, w.1));
         }
-    }
+    })
+    .map_err(|e| format!("peer log does not verify: {}", e))?;
     Ok(out)
 }
 
@@ -265,5 +256,84 @@ mod tests {
         assert_eq!(print_report(&own, &peer, 1), 1);
         assert_eq!(print_report(&d.join("absent.log"), &peer, 1), 2);
         std::fs::remove_dir_all(d).unwrap();
+    }
+
+    /// REPLAY-B1 (: "audit-head comparisons consume records in the same pass that
+    /// verifies their record chains and segment joins; a failed scan returns no replay or
+    /// witness verdict"). `witnesses_for` verifies the peer's chain, then reopens every segment
+    /// and reads witnesses in a second, unjoined pass: the ADR-0026 counterexample, on the
+    /// peer side. An active segment swapped between the passes for an internally valid one that
+    /// does not join the retained segment before it supplies a witness the verified chain never
+    /// held. The swap is raced here; any forged head returned is the defect.
+    #[test]
+    fn peer_witnesses_come_from_the_verified_pass() {
+        use common::audit_log::Rotation;
+        let d = dir("segment-swap");
+        let rotation = Some(Rotation {
+            max_bytes: 1,
+            keep: 10,
+        });
+        let real_head = [0x11; CHAIN_LEN];
+        let fake_head = [0x22; CHAIN_LEN];
+        let make = |path: &Path, first: &str, head: [u8; CHAIN_LEN]| {
+            let mut log = AuditLog::open_with(path, rotation).unwrap();
+            log.append(first.as_bytes()).unwrap();
+            log.append(witness(1, (5, head)).as_bytes()).unwrap();
+            log.sync().unwrap();
+        };
+        let peer = d.join("peer.log");
+        make(&peer, "NODE_START|Node:2", real_head);
+        let forged_dir = d.join("forged");
+        std::fs::create_dir_all(&forged_dir).unwrap();
+        let forged = forged_dir.join("peer.log");
+        make(&forged, "NODE_START|Node:666", fake_head);
+        // Same start seq (1), different previous head: valid alone, not joined to peer's seg 0.
+        let real_bytes = std::fs::read(&peer).unwrap();
+        let forged_bytes = std::fs::read(&forged).unwrap();
+        assert_ne!(real_bytes, forged_bytes);
+        std::fs::write(&peer, &forged_bytes).unwrap();
+        assert!(
+            witnesses_for(&peer, 1).is_err(),
+            "the unjoined segment alone is refused"
+        );
+        std::fs::write(&peer, &real_bytes).unwrap();
+        assert_eq!(witnesses_for(&peer, 1).unwrap()[0].2, real_head);
+
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (stop2, peer2, d2) = (stop.clone(), peer.clone(), d.clone());
+        let swapper = std::thread::spawn(move || {
+            let (a, b) = (d2.join("a.tmp"), d2.join("b.tmp"));
+            let mut flip = false;
+            while !stop2.load(std::sync::atomic::Ordering::Relaxed) {
+                let (tmp, bytes) = if flip {
+                    (&a, &real_bytes)
+                } else {
+                    (&b, &forged_bytes)
+                };
+                std::fs::write(tmp, bytes).unwrap();
+                std::fs::rename(tmp, &peer2).unwrap();
+                flip = !flip;
+            }
+        });
+        let mut forged_seen = 0;
+        let mut ok = 0;
+        for _ in 0..5_000 {
+            if let Ok(ws) = witnesses_for(&peer, 1) {
+                ok += 1;
+                if ws.iter().any(|w| w.2 == fake_head) {
+                    forged_seen += 1;
+                }
+            }
+            if forged_seen > 0 {
+                break;
+            }
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        swapper.join().unwrap();
+        std::fs::remove_dir_all(d).unwrap();
+        assert_eq!(
+            forged_seen, 0,
+            "a witness from a segment that never joined the verified chain was returned ({ok} verified scans)"
+        );
     }
 }

@@ -510,27 +510,15 @@ fn regret<'a>(records: impl Iterator<Item = (u64, &'a str)>) -> Vec<(String, Reg
 /// not read is an error naming the file, never a shorter report. A final record still being
 /// written ends the reading, as it ends every reader of a live log.
 fn chain_records(path: &str) -> Result<Vec<(u64, String)>, String> {
-    verify_chain(Path::new(path)).map_err(|e| e.to_string())?;
-    let mut files: Vec<std::path::PathBuf> = rotated_segments(Path::new(path))
-        .map_err(|e| format!("{}: {}", path, e))?
-        .into_iter()
-        .map(|(_, p)| p)
-        .collect();
-    files.push(Path::new(path).to_path_buf());
+    // Read in the same pass that verifies chains and segment joins (ADR-0026).
     let mut records = Vec::new();
-    for file in &files {
-        let mut reader =
-            AuditReader::open(file).map_err(|e| format!("{}: {}", file.display(), e))?;
-        while let Some(r) = reader
-            .next_record()
-            .map_err(|e| format!("{}: {}", file.display(), e))?
-        {
-            records.push((
-                r.timestamp_ms,
-                String::from_utf8_lossy(&r.payload).into_owned(),
-            ));
-        }
-    }
+    common::audit_log::visit_chain(Path::new(path), |r| {
+        records.push((
+            r.timestamp_ms,
+            String::from_utf8_lossy(&r.payload).into_owned(),
+        ));
+    })
+    .map_err(|e| e.to_string())?;
     Ok(records)
 }
 
