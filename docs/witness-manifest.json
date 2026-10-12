@@ -10,7 +10,7 @@
   "CONTROL-L1": "83962842fe5c87c27c1f73144ed55d6c7d59c20750343e264a175b195e83df39",
   "CS-P1": "20c86421cdf4044134642a59a00621fbcd7356166a8643864fb02dad24cb2687",
   "CS-P2": "5dd517e4115b6735f6e7477f4118095dccc8075d384adeb95b2bbf1a0069b031",
-  "FASTNETMON-A1": "2d95e4129e90fec59e67f2e640688d1adfa54aae95ee90ad87d49c19c647d7ad",
+  "FASTNETMON-A1": "d7a9f0dd095b399579eb136f5aa8837278f07afe62dcda3c0a93c2eff11d94ec",
   "FLOWSPEC-B1": "4bcfb9a6441b08485e2687a88e162720a37dcc60ed26ca003cb37d23ce3f7289",
   "FLOWSPEC-P1": "23412916e4d4b48929c79ebd1541c49345a29b49377f67aff8ef23ac673153ce",
   "FLOWSPEC-P2": "092a77fd366261837398647687cf247ee43845d3f66f263be8bbd108625df225",
@@ -128,6 +128,7 @@
   "FASTNETMON-A1": {
    "statement": "62c8fc877167dfed4f734277cfa4801ff3c67b8f41b24cba1d902546cb3fd227",
    "witnesses": [
+    "a_node_that_comes_up_within_the_budget_still_gets_the_report",
     "a_node_that_never_answers_makes_the_hook_fail_within_its_budget_without_claiming_delivery",
     "a_node_that_records_the_report_makes_the_hook_report_delivery_and_exit_zero",
     "a_report_the_node_rejects_is_not_called_delivered",
@@ -506,6 +507,9 @@
   ],
   "a_mapped_and_a_plain_address_of_one_host_share_a_cooldown": [
    "orchestrator/src/bin/sokol-suricata.rs:b6d357cd10615d362959494d4a1b36dee1c1013145b2c66b7a6fa93790881cc4"
+  ],
+  "a_node_that_comes_up_within_the_budget_still_gets_the_report": [
+   "orchestrator/src/bin/sokol-fastnetmon-notify.rs:6695cfa729eaa1cbc2e37e4c22ce666ee4b92042d1591552d20ba9125c549e52"
   ],
   "a_node_that_never_answers_makes_the_hook_fail_within_its_budget_without_claiming_delivery": [
    "orchestrator/src/bin/sokol-fastnetmon-notify.rs:d2fa435fe122cb114396e8b9b90ddab8379d6ec504f57b7d496c9c21fe8dda45"
