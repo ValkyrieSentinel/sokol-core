@@ -37,6 +37,9 @@ exclude_re = [
     # with 0/{}/null/[]/[1]/[1,2]: both versions refuse the first three and the over-limit
     # sequence, and accept the empty/in-bound sequence. Keep this exclusion diagnostic-only.
     "^orchestrator/src/state_input\\.rs:\\d+:\\d+: replace entries::<impl Visitor<'de> for Bounded<T, F>>::expecting -> fmt::Result with Ok\\(Default::default\\(\\)\\)$",
+    # The FastNetMon hook's process entry only passes its arguments to notify(), whose paths
+    # the tests run as a child process (tests::hook).
+    "bin/sokol-fastnetmon-notify.rs:\\d+:\\d+: replace main with \\(\\)$",
     # Directory fsync for durability; not observable without crash injection.
     "in sync_dir",
     # An offset while the clock has not stepped: 0 and +-1 ms are indistinguishable from it.
