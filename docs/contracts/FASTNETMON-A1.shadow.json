@@ -1,0 +1,28 @@
+{
+  "annotations": {
+    "status": "UNSIGNED_EXPLANATORY_DRAFT"
+  },
+  "decisions": [
+    {
+      "because": "Counterexample (hunt round 4, 2026-10-12): sokol-fastnetmon-notify connected, wrote and logged 'sent' with no ACK handshake and no answer read, against AGENTS.md (detector input goes through delivery::Outbox in ACK mode).",
+      "previous_statement_sha256": null,
+      "proposal_sha256": "b9726936a5edd336bde3d6f64078128ba7cce8f0e8aeda2c4b6750833e0fe5a2"
+    },
+    {
+      "because": "Mutation check (CI, PR #14): the delivery deadline could become 'now - budget' (one attempt, no retry) and no witness failed. The new witness pins that the hook retries within its budget.",
+      "previous_statement_sha256": "62c8fc877167dfed4f734277cfa4801ff3c67b8f41b24cba1d902546cb3fd227",
+      "proposal_sha256": "664cb6f18da8e25eb7909367fcaf164fadf19ca68c5164b6ae68456356a864d0"
+    }
+  ],
+  "evidence_text": "`a_node_that_never_answers_makes_the_hook_fail_within_its_budget_without_claiming_delivery`, `a_node_that_records_the_report_makes_the_hook_report_delivery_and_exit_zero`, `a_report_the_node_rejects_is_not_called_delivered`, `the_first_line_the_node_sees_is_the_ack_handshake`, `a_node_that_comes_up_within_the_budget_still_gets_the_report`",
+  "id": "FASTNETMON-A1",
+  "profile": "sokol.contract-shadow.v1",
+  "statement": "The FastNetMon hook sends its report through the ACK-mode outbox within a bounded wait and reports delivery only after the node's recognized answer; no answer within the bound is a non-zero exit that says the report is lost.",
+  "witnesses": [
+    "a_node_that_comes_up_within_the_budget_still_gets_the_report",
+    "a_node_that_never_answers_makes_the_hook_fail_within_its_budget_without_claiming_delivery",
+    "a_node_that_records_the_report_makes_the_hook_report_delivery_and_exit_zero",
+    "a_report_the_node_rejects_is_not_called_delivered",
+    "the_first_line_the_node_sees_is_the_ack_handshake"
+  ]
+}

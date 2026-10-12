@@ -1,5 +1,6 @@
 {
  "contracts": {
+  "ABI-E1": "f2a8be03d5ae6544169766d38c99079a03ae6fdcf2cc723c5e1f3900fb9770c3",
   "AUDIT-A1": "46e30344f597862a3f8e8c0e4ec964aa3a1b749cb43db536c1fab43032636b3d",
   "AUDIT-R1": "d9359f45dd60250020e38761884e7e0e80b688c6bf05e2c3c59b1f66685c368f",
   "AUDIT-R2": "a2128cfe68dae5fa314e1159c902340de70d3a5c577e0b0bedd00b0a0eda05bb",
@@ -9,6 +10,7 @@
   "CONTROL-L1": "83962842fe5c87c27c1f73144ed55d6c7d59c20750343e264a175b195e83df39",
   "CS-P1": "20c86421cdf4044134642a59a00621fbcd7356166a8643864fb02dad24cb2687",
   "CS-P2": "5dd517e4115b6735f6e7477f4118095dccc8075d384adeb95b2bbf1a0069b031",
+  "FASTNETMON-A1": "d7a9f0dd095b399579eb136f5aa8837278f07afe62dcda3c0a93c2eff11d94ec",
   "FLOWSPEC-B1": "4bcfb9a6441b08485e2687a88e162720a37dcc60ed26ca003cb37d23ce3f7289",
   "FLOWSPEC-P1": "23412916e4d4b48929c79ebd1541c49345a29b49377f67aff8ef23ac673153ce",
   "FLOWSPEC-P2": "092a77fd366261837398647687cf247ee43845d3f66f263be8bbd108625df225",
@@ -33,6 +35,7 @@
   "STATE-B1": "2e14f012cd4c37689c4d6a7ec815e40fd12cc714b2cdc2a8b1518d3a1d5fda4f",
   "STATE-P1": "c77333a2be0f751dac1ec9ce6663e325d36efa51c8dc917ebe9cb81bd5af5561",
   "STATE-P2": "93fa21f3199e8249b2367c1c03cfe7dc9fb86f4ac18bc32812cfb588c4a4bc52",
+  "STORM-T1": "98e4242860e7eae61242b9da0f336711e67604265851877f1d181d810c2358b2",
   "SUR-C1": "71649ca5848e6bfeec0e1cb516058d937298924631f88b0141127498686b614a",
   "SUR-C2": "7fcaf10dafce330390b4f11b6d613a8f16500cbe135bdd57382e877471c642d0",
   "SUR-D1": "0df7ecc50aad9a0ce7a4b75881a5dab0870bb4bd5947cd5ab0a7078e65554bd8",
@@ -46,6 +49,12 @@
   "SUR-T2": "bd10db0bcde8109f8365e59820805a211ae783c95c613b0cd1d62860f6f3fbff"
  },
  "rows": {
+  "ABI-E1": {
+   "statement": "1312906f98f5bc77a82bfd3de8804dced417f1ba3e17f25a99fc8fc78bafec47",
+   "witnesses": [
+    "the_xdp_program_writes_every_field_of_a_drop_event_before_submitting_it"
+   ]
+  },
   "AUDIT-A1": {
    "statement": "526ef1b1df64b24ac7f86c6e24ee5022b773dc2c6f40ac9892b9ddf340959b15",
    "witnesses": [
@@ -114,6 +123,16 @@
    "witnesses": [
     "ipc_pacing_interval_does_not_round_below_the_configured_budget",
     "ipc_pacing_intervals_are_positive_minimal_integer_budgets"
+   ]
+  },
+  "FASTNETMON-A1": {
+   "statement": "62c8fc877167dfed4f734277cfa4801ff3c67b8f41b24cba1d902546cb3fd227",
+   "witnesses": [
+    "a_node_that_comes_up_within_the_budget_still_gets_the_report",
+    "a_node_that_never_answers_makes_the_hook_fail_within_its_budget_without_claiming_delivery",
+    "a_node_that_records_the_report_makes_the_hook_report_delivery_and_exit_zero",
+    "a_report_the_node_rejects_is_not_called_delivered",
+    "the_first_line_the_node_sees_is_the_ack_handshake"
    ]
   },
   "FLOWSPEC-B1": {
@@ -324,6 +343,13 @@
     "operator_lifts_past_the_bound_are_counted"
    ]
   },
+  "STORM-T1": {
+   "statement": "8f64bfbb34fa0dd33b84df76731c94d8ef1a581e6123d79452662c2716053e81",
+   "witnesses": [
+    "a_storm_threshold_outside_zero_to_one_is_refused",
+    "a_storm_threshold_outside_zero_to_one_is_refused_at_startup"
+   ]
+  },
   "SUR-C1": {
    "statement": "e45831ad90d9885e01696dc5e578fa69bd6a79c6d34996c4dbcb021ca6001788",
    "witnesses": [
@@ -482,6 +508,15 @@
   "a_mapped_and_a_plain_address_of_one_host_share_a_cooldown": [
    "orchestrator/src/bin/sokol-suricata.rs:b6d357cd10615d362959494d4a1b36dee1c1013145b2c66b7a6fa93790881cc4"
   ],
+  "a_node_that_comes_up_within_the_budget_still_gets_the_report": [
+   "orchestrator/src/bin/sokol-fastnetmon-notify.rs:6695cfa729eaa1cbc2e37e4c22ce666ee4b92042d1591552d20ba9125c549e52"
+  ],
+  "a_node_that_never_answers_makes_the_hook_fail_within_its_budget_without_claiming_delivery": [
+   "orchestrator/src/bin/sokol-fastnetmon-notify.rs:d2fa435fe122cb114396e8b9b90ddab8379d6ec504f57b7d496c9c21fe8dda45"
+  ],
+  "a_node_that_records_the_report_makes_the_hook_report_delivery_and_exit_zero": [
+   "orchestrator/src/bin/sokol-fastnetmon-notify.rs:2ededcba7f2450bb23fa7e73ad7c782b21db5b789bace7287d7fe5416e6955fb"
+  ],
   "a_non_canonical_statement_file_fails_the_check": [
    "orchestrator/src/audit_anchor.rs:0ca8fde409b31f9014a6f568436fb66daa4d08892859baf1deb322990ed972d8"
   ],
@@ -533,6 +568,9 @@
   "a_repeated_rib_key_cannot_hide_a_foreign_path_from_the_round": [
    "orchestrator/src/flowspec.rs:b5d3cf31d040245ff461508926800bb080b355aa46e2537287fb2a10c3c41646"
   ],
+  "a_report_the_node_rejects_is_not_called_delivered": [
+   "orchestrator/src/bin/sokol-fastnetmon-notify.rs:bdccb8cf2a571d753c0ad69a6de5f91965076c1b1cc1ba156f9610f92403cece"
+  ],
   "a_restore_keeps_every_bounded_table_within_its_runtime_bound": [
    "orchestrator/src/block_table.rs:775d036b2124ba22dc5febc7900ea5df4a9d687eb5cf521f9a618f2bdfe54c8d"
   ],
@@ -574,6 +612,12 @@
   ],
   "a_statement_is_written_once_and_never_rewritten": [
    "orchestrator/src/audit_anchor.rs:1bc1e4a25b7b85d45fbef81aec1821e457bb3bf2fca2d73d4d5c912672a9b61e"
+  ],
+  "a_storm_threshold_outside_zero_to_one_is_refused": [
+   "orchestrator/src/cluster_state.rs:7e8ac0d238f1fa8b33f454e0bd4f8fc13aa38c69cdcf00c8b46073489f5aa13b"
+  ],
+  "a_storm_threshold_outside_zero_to_one_is_refused_at_startup": [
+   "orchestrator/src/main.rs:9b84b1644187904ded6826e5f5f316b431f1714fc1f12ba4c328453373ac5f01"
   ],
   "a_surplus_answer_does_not_settle_the_next_signal": [
    "orchestrator/src/delivery.rs:643e6766f595a373780472e6bfd89fec55d00d1329a6c0a63df730a9ade5b9ff"
@@ -811,6 +855,12 @@
   ],
   "the_default_community_is_64512_and_the_node_id_and_is_refused_above_16_bits": [
    "orchestrator/src/flowspec.rs:27a794c92127ba85cb3fe77b4af64d78db753d8bb6cb967a035e5494c5c6666b"
+  ],
+  "the_first_line_the_node_sees_is_the_ack_handshake": [
+   "orchestrator/src/bin/sokol-fastnetmon-notify.rs:fce7d69f0d5c40398d0f0762ca36900c22f15b8a28e9f3e2d914d00b8ded49c1"
+  ],
+  "the_xdp_program_writes_every_field_of_a_drop_event_before_submitting_it": [
+   "common/src/lib.rs:e48b8498d4360b6d64f6a98fb4b5fb7f781f4ca2af69f1f4dcadb928cdf9f4cb"
   ],
   "unknown_reply_keeps_the_obligation_and_a_later_ack_retires_it": [
    "orchestrator/src/delivery.rs:08eaebdf5f929438bef556b1076aa80740818212bc39bde3b0b011d68598d7d9"
