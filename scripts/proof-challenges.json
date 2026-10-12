@@ -111,6 +111,46 @@
         "after": "    end.is_none_or(|e| e > now)"
       },
       "assertion": "assertion failed: kept(Some(end), now, grace)"
+    },
+    {
+      "id": "wire-accounting",
+      "file": "common/src/wire.rs",
+      "harness": "wire::proofs::every_byte_of_an_accepted_frame_is_accounted_for",
+      "replace": {
+        "before": "    let body = rest.get(28..).unwrap_or_default();",
+        "after": "    let body = rest.get(27..).unwrap_or_default();"
+      },
+      "assertion": "assertion failed: accounted"
+    },
+    {
+      "id": "wire-magic",
+      "file": "common/src/wire.rs",
+      "harness": "wire::proofs::a_frame_without_the_magic_is_refused",
+      "replace": {
+        "before": "    if magic != MAGIC {",
+        "after": "    if false {"
+      },
+      "assertion": "assertion failed: split(&bytes[..len]) == Err(WireError::Legacy)"
+    },
+    {
+      "id": "wire-roundtrip",
+      "file": "common/src/wire.rs",
+      "harness": "wire::proofs::a_written_frame_splits_back",
+      "replace": {
+        "before": "        &h.nonce.to_le_bytes(),",
+        "after": "        &h.timestamp_ms.to_le_bytes(),"
+      },
+      "assertion": "assertion failed: same"
+    },
+    {
+      "id": "replay-window",
+      "file": "common/src/replay.rs",
+      "harness": "replay::proofs::an_envelope_fresh_again_finds_its_nonce_remembered",
+      "replace": {
+        "before": "    arrived.saturating_add(REPLAY_WINDOW_MS) >= now",
+        "after": "    arrived.saturating_add(REPLAY_WINDOW_MS) > now"
+      },
+      "assertion": "assertion failed: remembered(arrived, now)"
     }
   ]
 }
