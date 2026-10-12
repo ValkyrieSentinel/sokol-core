@@ -19,7 +19,7 @@ spec = importlib.util.spec_from_file_location('proof_task_inputs', ROOT / 'scrip
 inputs_tool = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(inputs_tool)
 encode, digest, read = inputs_tool.encode, inputs_tool.digest, inputs_tool.read
-MAX_CASES = 16
+MAX_CASES = 32
 MAX_PATCH_BYTES = 4096
 MAX_CHECKS = 8192
 MAX_RESULT_BYTES = 2_097_152

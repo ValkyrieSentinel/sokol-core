@@ -136,7 +136,7 @@ pub struct MeshStats {
     pub dropped_bulk: std::sync::atomic::AtomicU64,
     /// Envelopes refused, by `EnvelopeError::LABELS`. `stale_timestamp` rising from one peer
     /// means its clock and this node's disagree by more than the envelope window.
-    pub rejected: [std::sync::atomic::AtomicU64; 5],
+    pub rejected: [std::sync::atomic::AtomicU64; EnvelopeError::LABELS.len()],
     /// Handshakes refused: a pinned node connected from an address its peers-file entry does
     /// not bind it to (ADR-0027). Its key was used from somewhere it is not.
     pub wrong_address: std::sync::atomic::AtomicU64,
@@ -617,27 +617,45 @@ impl TrustStore {
 const REPLAY_PER_SENDER: usize =
     2 * (FRAME_BURST as usize + FRAMES_PER_SEC as usize * (REPLAY_WINDOW_MS / 1000) as usize);
 
-/// One sender's remembered nonces, in arrival order.
+/// One sender's remembered nonces, in arrival order, and the floor its purged ones left
+/// (`common::replay`): an envelope stamped at or below it is refused.
 #[derive(Default)]
 struct SenderWindow {
-    order: std::collections::VecDeque<(u64, u64)>,
+    /// (arrival, nonce, timestamp) of each remembered envelope.
+    order: std::collections::VecDeque<(u64, u64, u64)>,
     seen: std::collections::HashSet<u64>,
+    floor: common::replay::Floor,
 }
 
-/// Remembers `(sender, nonce)` pairs for as long as their timestamp could still be accepted.
+/// Remembers `(sender, nonce)` pairs for as long as their timestamp could still be accepted,
+/// and refuses, per sender, every envelope stamped at or below the newest one it let go.
 ///
 /// Kept per sender and bounded per sender (N02, 2026-09-28): one peer at its full frame rate
 /// fills only its own window, never another's. Only authenticated senders reach it (the
 /// signature is checked first), so the number of windows is bounded by the trust store.
 /// Expiry pops the oldest arrivals, so a frame costs O(1) amortized, not a scan of the cache.
-/// Arrival is wall-clock time, like the acceptance check: after a backward step an entry is
-/// kept longer (the safe side), after a forward step what it guards is stale anyway.
+/// Arrival is wall-clock time, like the acceptance check. Whatever that clock does, an
+/// accepted envelope is in the cache or under its sender's floor, so it is never accepted
+/// twice in one process; a process started with `starting_at` also refuses envelopes stamped
+/// before its start (review of #26, MESH-N1; proved in `common::replay`).
 #[derive(Default)]
 pub struct ReplayGuard {
     senders: HashMap<u64, SenderWindow>,
+    /// The floor a sender's window starts with: this process's start, or none.
+    fence: common::replay::Floor,
 }
 
 impl ReplayGuard {
+    /// A guard for a process started at `started` (wall-clock ms): its cache is empty, so an
+    /// envelope stamped before the start, which the previous process may have accepted, is
+    /// refused.
+    pub fn starting_at(started: u64) -> Self {
+        Self {
+            senders: HashMap::new(),
+            fence: common::replay::fence(started),
+        }
+    }
+
     #[cfg(test)]
     fn remembered(&self) -> usize {
         self.senders.values().map(|w| w.seen.len()).sum()
@@ -647,11 +665,30 @@ impl ReplayGuard {
         &mut self,
         sender_id: u64,
         nonce: u64,
-        _timestamp_ms: u64,
+        timestamp_ms: u64,
         now: u64,
     ) -> bool {
-        let w = self.senders.entry(sender_id).or_default();
-        while let Some(&(arrived, old)) = w.order.front() {
+        self.admit(sender_id, nonce, timestamp_ms, now).is_ok()
+    }
+
+    /// Records the envelope's nonce, or says why it is refused: under its sender's floor
+    /// (`BeforeWindow`), or a nonce still remembered or a full window (`Replay`).
+    fn admit(
+        &mut self,
+        sender_id: u64,
+        nonce: u64,
+        timestamp_ms: u64,
+        now: u64,
+    ) -> Result<(), EnvelopeError> {
+        let fence = self.fence;
+        let w = self
+            .senders
+            .entry(sender_id)
+            .or_insert_with(|| SenderWindow {
+                floor: fence,
+                ..SenderWindow::default()
+            });
+        while let Some(&(arrived, old, stamped)) = w.order.front() {
             // Kept while the frame could still pass the timestamp check (`<=` skew, inclusive):
             // dropping it at exactly REPLAY_WINDOW_MS let that frame through twice (review
             // 2026-10-05 F4).
@@ -660,17 +697,21 @@ impl ReplayGuard {
             }
             w.order.pop_front();
             w.seen.remove(&old);
+            w.floor = common::replay::raise(w.floor, stamped);
+        }
+        if !common::replay::admits(timestamp_ms, w.floor) {
+            return Err(EnvelopeError::BeforeWindow);
         }
         if w.seen.contains(&nonce) {
-            return false;
+            return Err(EnvelopeError::Replay);
         }
         // Over its own budget a sender is refused (fail-closed), others are not affected.
         if w.seen.len() >= REPLAY_PER_SENDER {
-            return false;
+            return Err(EnvelopeError::Replay);
         }
         w.seen.insert(nonce);
-        w.order.push_back((now, nonce));
-        true
+        w.order.push_back((now, nonce, timestamp_ms));
+        Ok(())
     }
 }
 
@@ -801,16 +842,21 @@ pub enum EnvelopeError {
     StaleTimestamp,
     Replay,
     MalformedPayload,
+    /// Stamped at or below its sender's floor: older than an envelope of the same sender this
+    /// node already let go, or than this process's start (`common::replay`). After this node's
+    /// clock stepped back, honest envelopes can show up here too.
+    BeforeWindow,
 }
 
 impl EnvelopeError {
     /// Metric label and counter slot, in `MeshStats::rejected` order.
-    pub const LABELS: [&'static str; 5] = [
+    pub const LABELS: [&'static str; 6] = [
         "unknown_sender",
         "bad_signature",
         "stale_timestamp",
         "replay",
         "malformed_payload",
+        "before_window",
     ];
 
     fn slot(&self) -> usize {
@@ -820,6 +866,7 @@ impl EnvelopeError {
             Self::StaleTimestamp => 2,
             Self::Replay => 3,
             Self::MalformedPayload => 4,
+            Self::BeforeWindow => 5,
         }
     }
 }
@@ -905,14 +952,12 @@ fn record_and_decode(
     envelope: &SecureEnvelope,
     now: u64,
 ) -> Result<NetworkMessage, EnvelopeError> {
-    if !replay.check_and_record(
+    replay.admit(
         envelope.sender_id,
         envelope.nonce,
         envelope.timestamp_ms,
         now,
-    ) {
-        return Err(EnvelopeError::Replay);
-    }
+    )?;
 
     let payload_str =
         std::str::from_utf8(&envelope.payload).map_err(|_| EnvelopeError::MalformedPayload)?;
@@ -997,6 +1042,13 @@ impl PeerRegistry {
             stats: Arc::new(MeshStats::default()),
             frame_limit: (FRAMES_PER_SEC, FRAME_BURST),
         }
+    }
+
+    /// The replay guard of a process started at `started` (wall-clock ms): envelopes stamped
+    /// before it are refused, since the previous process's nonces are gone (MESH-N1).
+    pub fn with_startup_fence(self, started: u64) -> Self {
+        *self.replay.lock().unwrap_or_else(|p| p.into_inner()) = ReplayGuard::starting_at(started);
+        self
     }
 
     /// Another per-peer frame rate (tests: reach the pacing path with a few frames).
@@ -2181,14 +2233,13 @@ mod tests {
         );
     }
 
-    /// The bound of stateful replay rejection (MESH-N1; review of #26). A replay is refused
-    /// while its nonce is retained: until the guard sees an envelope of the same sender at a
-    /// moment more than REPLAY_WINDOW_MS after the nonce arrived (or the process restarts: the
-    /// cache is in memory). The window arithmetic (`common::replay`, proved) only says that a
-    /// nonce is retained long enough on a clock that does not step back. After a purge, a clock
-    /// that returns to the first moment accepts the original again: no clock policy prevents it.
+    /// MESH-N1 (review of #26): an accepted envelope is refused again at any moment it is
+    /// fresh, whatever this node's clock did. While its nonce is retained the cache refuses it;
+    /// once a later envelope of the same sender purged the nonce, the sender's floor does
+    /// (`before_window`). Before the floor, the purged case was accepted again after the clock
+    /// returned to the first moment.
     #[test]
-    fn a_replay_is_refused_while_its_nonce_is_retained_not_after_a_purge_and_a_step_back() {
+    fn an_accepted_envelope_is_refused_again_after_a_purge_and_a_step_back() {
         let peer = NodeCrypto::generate();
         let trust = trust_with(7, &peer);
         let at = |timestamp_ms: u64, nonce: u64| {
@@ -2208,29 +2259,51 @@ mod tests {
         };
         let original = seal(&peer, 7, &NetworkMessage::Ping).unwrap();
         let first = original.timestamp_ms;
-        for (later, retained) in [
-            (first + REPLAY_WINDOW_MS, true),
-            (first + REPLAY_WINDOW_MS + 1, false),
+        for (later, why) in [
+            (first + REPLAY_WINDOW_MS, EnvelopeError::Replay),
+            (first + REPLAY_WINDOW_MS + 1, EnvelopeError::BeforeWindow),
         ] {
             let mut guard = ReplayGuard::default();
             assert!(open(&trust, &mut guard, &original, first).is_ok());
             let advance = at(later, original.nonce.wrapping_add(1));
             assert!(open(&trust, &mut guard, &advance, later).is_ok());
-            let again = open(&trust, &mut guard, &original, first);
-            if retained {
-                assert_eq!(
-                    again.unwrap_err(),
-                    EnvelopeError::Replay,
-                    "a nonce still retained refuses the replay after the clock returns"
-                );
-            } else {
-                assert!(
-                    again.is_ok(),
-                    "the boundary moved: a purged nonce now refuses a replay after a step back; \
-                     update MESH-N1"
-                );
-            }
+            assert_eq!(
+                open(&trust, &mut guard, &original, first).unwrap_err(),
+                why,
+                "the original was accepted again after the clock returned"
+            );
+            // An honest envelope stamped after the purged one passes the floor.
+            let honest = at(first + 1, original.nonce.wrapping_add(2));
+            assert!(open(&trust, &mut guard, &honest, first + 1).is_ok());
         }
+    }
+
+    /// MESH-N1: a restarted node's cache is empty, so an envelope stamped before its start,
+    /// which the previous process may have accepted, is refused (`before_window`); one stamped
+    /// at or after the start passes.
+    #[test]
+    fn a_restarted_node_refuses_envelopes_stamped_before_its_start() {
+        let peer = NodeCrypto::generate();
+        let start = now_ms();
+        let registry = PeerRegistry::new(trust_with(7, &peer)).with_startup_fence(start);
+        let mut before = seal(&peer, 7, &NetworkMessage::Ping).unwrap();
+        before.timestamp_ms = start - 1;
+        before.signature = peer
+            .sign(&unsigned_bytes(
+                before.version,
+                before.sender_id,
+                before.timestamp_ms,
+                before.nonce,
+                &before.payload,
+            ))
+            .unwrap();
+        assert_eq!(
+            registry.open_at(&before, start).unwrap_err(),
+            EnvelopeError::BeforeWindow
+        );
+        let after = seal(&peer, 7, &NetworkMessage::Ping).unwrap();
+        assert!(after.timestamp_ms >= start);
+        assert!(registry.open_at(&after, after.timestamp_ms).is_ok());
     }
 
     #[tokio::test]
