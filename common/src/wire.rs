@@ -147,6 +147,25 @@ mod tests {
             Err(WireError::Malformed("payload longer than the frame"))
         );
     }
+
+    /// Each refusal names what a peer operator has to do.
+    #[test]
+    fn a_refusal_says_what_the_peer_speaks() {
+        let shown = |e: WireError| {
+            let mut s = String::new();
+            core::fmt::write(&mut s, format_args!("{}", e)).unwrap();
+            s
+        };
+        assert!(shown(WireError::Legacy).contains("v2..v2: upgrade the peer"));
+        assert_eq!(
+            shown(WireError::Unsupported(3)),
+            "peer sent mesh wire version 3; this node speaks v2..v2"
+        );
+        assert_eq!(
+            shown(WireError::Malformed("short header")),
+            "malformed envelope: short header"
+        );
+    }
 }
 
 #[cfg(kani)]
@@ -156,7 +175,7 @@ mod proofs {
     /// Frames up to this many bytes: the header and a few bytes past it, so every branch of
     /// `split` is reached (each field short, the payload shorter, equal or longer than the
     /// rest). Longer frames take no other path.
-    const FRAME: usize = HEADER_LEN + 6;
+    const FRAME: usize = 38; // HEADER_LEN + 6
 
     /// On any frame, `split` returns; when it accepts, the frame starts with `SKM` and a version
     /// this node speaks, and its header, payload and signature account for every byte, the

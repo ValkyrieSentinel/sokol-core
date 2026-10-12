@@ -3085,6 +3085,24 @@ mod tests {
         }
     }
 
+    /// A v1 key file on disk is a raw Dilithium3 public key and secret key, 1952 + 4000 bytes:
+    /// such a file is recognised as one by its size, not taken for a damaged v2 file.
+    #[test]
+    fn a_key_file_of_the_v1_size_on_disk_is_recognised_as_legacy() {
+        let dir = std::env::temp_dir().join(format!("sokol-v1-size-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("node.key");
+        std::fs::write(&path, vec![3u8; 5952]).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        NodeCrypto::load_or_create(&path).unwrap();
+        assert_eq!(
+            std::fs::read(dir.join("node.key.dilithium3.retired")).unwrap(),
+            vec![3u8; 5952]
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn a_legacy_key_file_is_retired_and_a_new_identity_created() {
         let dir = std::env::temp_dir().join(format!("sokol-legacy-key-{}", std::process::id()));
