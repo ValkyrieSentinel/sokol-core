@@ -1,0 +1,19 @@
+{
+  "after": null,
+  "base_contract_sha256": "f275d092374ee49162384054f08d109876c394d2efade4958d4e312d79ab4189",
+  "because": "ROADMAP item 9: the lease arithmetic moved to common::lease so that Kani proves it for every input (lease::proofs: a resent claim never outlasts its first lease, a record only moves earlier, within FORGET_GRACE a live resend finds its record; calibrated by proof-task.py with three faults). Lease and lift records now share common::lease::kept, so the bound is the same for both by construction. The unit tests stay.",
+  "evidence_text": "`a_lift_is_not_undone_by_a_step_back_within_forget_grace`, `a_used_lease_is_not_renewed_by_a_step_back_within_forget_grace_and_a_resend`, `lease_records_stay_bounded_by_forgetting_the_first_ended_one`, `past_forget_grace_a_step_back_lets_a_resent_lease_or_lift_count_again`, `restored_lease_records_keep_the_bound_and_drop_those_past_retention`, `an_uncapped_peer_claim_is_not_revived_past_the_cap_by_a_small_step_back`, `a_lease_is_capped_by_its_first_record_and_kept_for_the_grace`",
+  "id": "LEASE-C1",
+  "profile": "sokol.contract-proposal.v1",
+  "statement": "A wall-clock step back smaller than FORGET_GRACE, with or without a restart, neither renews a peer claim's used lease, including a claim whose own end lies within the cap, nor undoes an operator lift: both records live FORGET_GRACE past the claim's end; a larger step back can revive either, and that bound is the same for both.",
+  "status": "UNSIGNED_INTENT",
+  "witnesses": [
+    "a_lease_is_capped_by_its_first_record_and_kept_for_the_grace",
+    "a_lift_is_not_undone_by_a_step_back_within_forget_grace",
+    "a_used_lease_is_not_renewed_by_a_step_back_within_forget_grace_and_a_resend",
+    "an_uncapped_peer_claim_is_not_revived_past_the_cap_by_a_small_step_back",
+    "lease_records_stay_bounded_by_forgetting_the_first_ended_one",
+    "past_forget_grace_a_step_back_lets_a_resent_lease_or_lift_count_again",
+    "restored_lease_records_keep_the_bound_and_drop_those_past_retention"
+  ]
+}
