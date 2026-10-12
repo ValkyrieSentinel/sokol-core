@@ -27,8 +27,11 @@ use std::net::IpAddr;
 
 use ipnet::IpNet;
 
-use crate::block_policy::{BlockPolicy, HOME_NETWORK, LOCAL_ADDRESS};
+use crate::block_policy::BlockPolicy;
+#[cfg(test)]
+use crate::block_policy::{HOME_NETWORK, LOCAL_ADDRESS};
 use crate::block_table::{host, parse_target};
+use crate::protection::SourceRole;
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct Signal {
@@ -177,20 +180,24 @@ pub fn target(signal: &Signal, policy: &BlockPolicy) -> Result<IpNet, String> {
             .map(|()| signal.src)
             .map_err(|why| format!("prefix {} is refused ({})", signal.src, why));
     }
-    match policy.check(signal.src.addr()) {
+    match policy.check_reason(signal.src.addr()) {
         Ok(()) => Ok(signal.src),
         // The alert fired on traffic from this side (this node, or a network behind it given
         // with --home-net): the remote party is the destination.
-        Err(why @ (LOCAL_ADDRESS | HOME_NETWORK)) => {
-            let dst = signal
-                .dst
-                .ok_or_else(|| format!("source is {} and no destination was given", why))?;
-            policy
-                .check(dst.addr())
-                .map(|()| dst)
-                .map_err(|why| format!("destination {} is protected ({})", dst, why))
-        }
-        Err(why) => Err(format!("source {} is protected ({})", signal.src, why)),
+        Err(why) => match why.source_role() {
+            SourceRole::LocalSide => {
+                let dst = signal
+                    .dst
+                    .ok_or_else(|| format!("source is {} and no destination was given", why))?;
+                policy
+                    .check_reason(dst.addr())
+                    .map(|()| dst)
+                    .map_err(|why| format!("destination {} is protected ({})", dst, why))
+            }
+            SourceRole::ProtectedOther => {
+                Err(format!("source {} is protected ({})", signal.src, why))
+            }
+        },
     }
 }
 
@@ -207,6 +214,23 @@ mod tests {
         p.protect_ip("10.0.0.1".parse().unwrap(), LOCAL_ADDRESS);
         p.protect_ip("10.0.0.254".parse().unwrap(), "default gateway");
         p
+    }
+
+    #[test]
+    fn a_matching_diagnostic_cannot_redirect_a_signal_to_its_destination() {
+        use crate::protection::ProtectionReason;
+        for label in [LOCAL_ADDRESS, HOME_NETWORK] {
+            let mut policy = BlockPolicy::builtin();
+            policy.protect_ip(
+                "203.0.113.7".parse().unwrap(),
+                ProtectionReason::Diagnostic(label),
+            );
+            let signal = parse("test|203.0.113.7|198.51.100.9|x").unwrap();
+            assert!(
+                target(&signal, &policy).is_err(),
+                "diagnostic wording must not grant local-side authority"
+            );
+        }
     }
 
     #[test]

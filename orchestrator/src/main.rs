@@ -35,6 +35,7 @@ mod mesh_dispatch;
 mod mesh_sync;
 mod metrics;
 mod p2p;
+mod protection;
 mod replay;
 mod shutdown;
 mod signal;
@@ -70,6 +71,7 @@ use crate::ipc::*;
 use crate::p2p::{
     maintain_peer_connection, now_ms, NodeCrypto, P2PNetwork, PeerRegistry, TrustStore,
 };
+use crate::protection::ProtectionReason;
 use ipnet::IpNet;
 
 /// Audit trail writer. Records are queued (bounded, so a flood cannot exhaust memory) and
@@ -667,7 +669,7 @@ fn build_block_policy(args: &Args) -> anyhow::Result<BlockPolicy> {
     policy.set_min_prefix(args.min_block_prefix_v4, args.min_block_prefix_v6);
     for seed in &args.seed_peer {
         if let Ok(addr) = seed.trim().parse::<std::net::SocketAddr>() {
-            policy.protect_ip(addr.ip(), "mesh seed peer");
+            policy.protect_ip(addr.ip(), ProtectionReason::MeshSeedPeer);
         }
     }
     let cidr = |flag: &str, raw: &str| -> anyhow::Result<ipnet::IpNet> {
@@ -679,10 +681,13 @@ fn build_block_policy(args: &Args) -> anyhow::Result<BlockPolicy> {
         })
     };
     for raw in &args.never_block {
-        policy.protect(cidr("--never-block", raw)?, "operator never-block range");
+        policy.protect(
+            cidr("--never-block", raw)?,
+            ProtectionReason::OperatorNeverBlock,
+        );
     }
     for raw in &args.home_net {
-        policy.protect(cidr("--home-net", raw)?, block_policy::HOME_NETWORK);
+        policy.protect(cidr("--home-net", raw)?, ProtectionReason::HomeNetwork);
     }
     Ok(policy)
 }

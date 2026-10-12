@@ -2,24 +2,29 @@
 //! its gateway, its mesh peers or the operator's network would cut the node off.
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
+use crate::protection::ProtectionReason;
 use ipnet::IpNet;
 
 /// Reason given for this host's own interface addresses.
+#[cfg(test)]
 pub const LOCAL_ADDRESS: &str = "address of this node";
 
 /// Reason given for an address in an operator's `--home-net`: a network behind this node. Like
 /// this node's own addresses it is never blocked, and an alert from it names the remote side.
+#[cfg(test)]
 pub const HOME_NETWORK: &str = "home network (--home-net)";
 
 /// Reason given for a WireGuard peer's outer (endpoint) address: XDP sees the tunnel's UDP
 /// packets from it, so blocking it would cut the peer, and the mesh running over the tunnel, off.
+#[cfg(test)]
 pub const WIREGUARD_ENDPOINT: &str = "WireGuard peer endpoint";
 
+#[cfg(test)]
 pub const PREFIX_TOO_WIDE: &str = "prefix wider than --min-block-prefix-v4/-v6 allows";
 
 #[derive(Clone)]
 pub struct BlockPolicy {
-    protected: Vec<(IpNet, &'static str)>,
+    protected: Vec<(IpNet, ProtectionReason)>,
     /// Shortest prefix a block may have: a detector mistake must not cut off half the internet.
     min_prefix_v4: u8,
     min_prefix_v6: u8,
@@ -29,14 +34,14 @@ impl BlockPolicy {
     /// Loopback, unspecified, broadcast, multicast and IPv6 link-local (NDP with the router).
     pub fn builtin() -> Self {
         let builtin = [
-            ("127.0.0.0/8", "loopback"),
-            ("::1/128", "loopback"),
-            ("0.0.0.0/32", "unspecified address"),
-            ("::/128", "unspecified address"),
-            ("255.255.255.255/32", "broadcast"),
-            ("224.0.0.0/4", "multicast"),
-            ("ff00::/8", "multicast"),
-            ("fe80::/10", "IPv6 link-local"),
+            ("127.0.0.0/8", ProtectionReason::Loopback),
+            ("::1/128", ProtectionReason::Loopback),
+            ("0.0.0.0/32", ProtectionReason::Unspecified),
+            ("::/128", ProtectionReason::Unspecified),
+            ("255.255.255.255/32", ProtectionReason::Broadcast),
+            ("224.0.0.0/4", ProtectionReason::Multicast),
+            ("ff00::/8", ProtectionReason::Multicast),
+            ("fe80::/10", ProtectionReason::Ipv6LinkLocal),
         ];
         Self {
             protected: builtin
@@ -58,14 +63,16 @@ impl BlockPolicy {
     /// contains, or lies inside, any protected address or range.
     pub fn check_net(&self, net: IpNet) -> Result<(), &'static str> {
         if net.prefix_len() == net.max_prefix_len() {
-            return self.check(net.addr());
+            return self
+                .check_reason(net.addr())
+                .map_err(ProtectionReason::description);
         }
         let min = match net {
             IpNet::V4(_) => self.min_prefix_v4,
             IpNet::V6(_) => self.min_prefix_v6,
         };
         if net.prefix_len() < min {
-            return Err(PREFIX_TOO_WIDE);
+            return Err(ProtectionReason::PrefixTooWide.description());
         }
         // Two prefixes overlap exactly when one contains the other's network address.
         match self
@@ -73,24 +80,29 @@ impl BlockPolicy {
             .iter()
             .find(|(p, _)| net.contains(&p.network()) || p.contains(&net.network()))
         {
-            Some((_, why)) => Err(why),
+            Some((_, why)) => Err(why.description()),
             None => Ok(()),
         }
     }
 
-    pub fn protect(&mut self, net: IpNet, why: &'static str) {
-        self.protected.push((net, why));
+    pub fn protect(&mut self, net: IpNet, why: impl Into<ProtectionReason>) {
+        self.protected.push((net, why.into()));
     }
 
-    pub fn protect_ip(&mut self, ip: IpAddr, why: &'static str) {
+    pub fn protect_ip(&mut self, ip: IpAddr, why: impl Into<ProtectionReason>) {
         self.protect(IpNet::from(canonical(ip)), why);
     }
 
     /// `Err` names why the address is protected.
+    #[cfg(test)]
     pub fn check(&self, ip: IpAddr) -> Result<(), &'static str> {
+        self.check_reason(ip).map_err(ProtectionReason::description)
+    }
+
+    pub fn check_reason(&self, ip: IpAddr) -> Result<(), ProtectionReason> {
         let ip = canonical(ip);
         match self.protected.iter().find(|(net, _)| net.contains(&ip)) {
-            Some((_, why)) => Err(why),
+            Some((_, why)) => Err(*why),
             None => Ok(()),
         }
     }
@@ -99,13 +111,13 @@ impl BlockPolicy {
     pub fn with_host(&self, host: &HostView) -> Self {
         let mut policy = self.clone();
         for ip in &host.addresses {
-            policy.protect_ip(*ip, LOCAL_ADDRESS);
+            policy.protect_ip(*ip, ProtectionReason::LocalAddress);
         }
         for ip in &host.gateways {
-            policy.protect_ip(*ip, "default gateway");
+            policy.protect_ip(*ip, ProtectionReason::DefaultGateway);
         }
         for ip in &host.wireguard {
-            policy.protect_ip(*ip, WIREGUARD_ENDPOINT);
+            policy.protect_ip(*ip, ProtectionReason::WireGuardEndpoint);
         }
         policy
     }
