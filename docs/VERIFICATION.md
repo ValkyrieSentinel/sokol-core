@@ -3,8 +3,8 @@
 `common` keeps Kani harnesses beside its byte parsers, the storm latch's arithmetic
 (`common/src/storm.rs`, used by `orchestrator/src/defense.rs`) a peer claim's lease
 arithmetic (`common/src/lease.rs`, used by `orchestrator/src/block_table.rs`), the mesh
-envelope's framing (`common/src/wire.rs`) and its freshness and replay window
-(`common/src/replay.rs`), both used by `orchestrator/src/p2p.rs`, under `#[cfg(kani)]`.
+envelope's framing (`common/src/wire.rs`) and its freshness, replay window and per-sender
+floor (`common/src/replay.rs`), both used by `orchestrator/src/p2p.rs`, under `#[cfg(kani)]`.
 The executable inventory is [proof-challenges.json](../scripts/proof-challenges.json): each
 entry names a harness, its assertion and a deliberate implementation fault.
 
@@ -39,7 +39,7 @@ owner acceptance and invariant signatures remain separate.
 
 Bounds come from the harness itself. The JSON validator covers at most eight bytes from a
 ten-character alphabet; audit inputs range over their Rust types. Calibration refuses more
-than 16 challenges, ambiguous anchors, patches over 4 KiB, exports/logs over 2 MiB, or more
+than 32 challenges, ambiguous anchors, patches over 4 KiB, exports/logs over 2 MiB, or more
 than 8,192 checks per harness; execution has a total 1,800-second budget. Input-copy bounds
 are shared with `contract-task.py`. These limits do not bound compiler disk use or peak RSS;
 external tools and omitted environment inputs are not authenticated. Formal coverage of the

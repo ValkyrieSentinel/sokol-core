@@ -151,6 +151,46 @@
         "after": "    arrived.saturating_add(REPLAY_WINDOW_MS) > now"
       },
       "assertion": "assertion failed: remembered(arrived, now)"
+    },
+    {
+      "id": "replay-floor",
+      "file": "common/src/replay.rs",
+      "harness": "replay::proofs::an_accepted_envelope_is_refused_again_whatever_the_clock_did",
+      "replace": {
+        "before": "    Some(floor.map_or(purged, |f| f.max(purged)))",
+        "after": "    floor.map(|f| f.max(purged))"
+      },
+      "assertion": "assertion failed: refused"
+    },
+    {
+      "id": "replay-honest",
+      "file": "common/src/replay.rs",
+      "harness": "replay::proofs::honest_envelopes_stay_above_the_floor",
+      "replace": {
+        "before": "    floor.is_none_or(|f| timestamp_ms > f)",
+        "after": "    floor.is_none_or(|f| timestamp_ms > f.saturating_add(MAX_CLOCK_SKEW_MS))"
+      },
+      "assertion": "assertion failed: above"
+    },
+    {
+      "id": "replay-fence",
+      "file": "common/src/replay.rs",
+      "harness": "replay::proofs::a_restart_fences_off_what_came_before",
+      "replace": {
+        "before": "    started.checked_sub(1)",
+        "after": "    started.checked_sub(2)"
+      },
+      "assertion": "assertion failed: fenced"
+    },
+    {
+      "id": "replay-fence-cost",
+      "file": "common/src/replay.rs",
+      "harness": "replay::proofs::the_fence_costs_honest_senders_only_the_skew_after_the_start",
+      "replace": {
+        "before": "    started.checked_sub(1)",
+        "after": "    started.saturating_add(MAX_CLOCK_SKEW_MS).checked_sub(1)"
+      },
+      "assertion": "assertion failed: admitted"
     }
   ]
 }

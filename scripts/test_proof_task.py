@@ -110,6 +110,15 @@ class ProofTask(unittest.TestCase):
             'category': 'overflow', 'function': 'elsewhere', 'description': 'overflow', 'status': 'Failure'})
         self.assertEqual(self.evaluate(data, 1, case), 'NOT_CAUGHT')
 
+    def test_the_catalog_is_bounded(self):
+        path = self.root / tool.CATALOG
+        value = json.loads(path.read_text())
+        case = value['cases'][0]
+        value['cases'] = [dict(case, id='c%d' % i) for i in range(tool.MAX_CASES + 1)]
+        path.write_text(json.dumps(value))
+        with self.assertRaisesRegex(ValueError, 'Challenge count outside bound'):
+            tool.catalog(self.root)
+
     def test_harness_inventory_is_closed_not_a_successful_subset(self):
         for cases in (self.cases[:-1], self.cases + [self.cases[0]]):
             with self.subTest(count=len(cases)), self.assertRaises(ValueError):
