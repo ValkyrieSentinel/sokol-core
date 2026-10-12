@@ -1,12 +1,18 @@
 {
-  "after": "ABI-E1",
-  "base_contract_sha256": null,
-  "because": "Counterexample on c51cdc9: the scan cut each call at its first ')', so drop_verdict(packet_len.min(u64::MAX), drop_reason::VFR_ANOMALY) was invisible and an unlabelled drop passed; a non-literal reason was skipped silently.",
+  "annotations": {
+    "status": "UNSIGNED_EXPLANATORY_DRAFT"
+  },
+  "decisions": [
+    {
+      "because": "Counterexample on c51cdc9: the scan cut each call at its first ')', so drop_verdict(packet_len.min(u64::MAX), drop_reason::VFR_ANOMALY) was invisible and an unlabelled drop passed; a non-literal reason was skipped silently.",
+      "previous_statement_sha256": null,
+      "proposal_sha256": "d462cd7ec75f6eaf42d80ec637d677429005a1988f34b349b275ea337e8ce99b"
+    }
+  ],
   "evidence_text": "`a_drop_reason_has_a_metric_label_exactly_when_the_xdp_program_drops_with_it`, `the_drop_label_scan_refuses_a_reason_it_cannot_name`, `the_drop_label_scan_sees_a_reason_after_a_nested_call`",
   "id": "ABI-L1",
-  "profile": "sokol.contract-proposal.v1",
+  "profile": "sokol.contract-shadow.v1",
   "statement": "A drop reason has a metric label exactly when the XDP program passes it to drop_verdict; the source scan that checks this sees every drop_verdict call whatever its length argument and refuses a reason it cannot name as drop_reason::IDENT.",
-  "status": "UNSIGNED_INTENT",
   "witnesses": [
     "a_drop_reason_has_a_metric_label_exactly_when_the_xdp_program_drops_with_it",
     "the_drop_label_scan_refuses_a_reason_it_cannot_name",

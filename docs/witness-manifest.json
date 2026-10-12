@@ -1,6 +1,7 @@
 {
  "contracts": {
   "ABI-E1": "f2a8be03d5ae6544169766d38c99079a03ae6fdcf2cc723c5e1f3900fb9770c3",
+  "ABI-L1": "62f49c978eb9618b711be38ab22b2f8c47d276bc1a20a6f1bff49dcee9744330",
   "AUDIT-A1": "46e30344f597862a3f8e8c0e4ec964aa3a1b749cb43db536c1fab43032636b3d",
   "AUDIT-R1": "d9359f45dd60250020e38761884e7e0e80b688c6bf05e2c3c59b1f66685c368f",
   "AUDIT-R2": "a2128cfe68dae5fa314e1159c902340de70d3a5c577e0b0bedd00b0a0eda05bb",
@@ -17,8 +18,10 @@
   "IPC-A1": "6a0096b5b18b5190ee613bc7e2e3e94604665f205385b18ae074bb0b9138aafa",
   "IPC-R1": "b9989e447aaf0ac528045bb46ae30f905b77868400866b3732711082527f9986",
   "IPC-T1": "088af71858cc841192a1cac08dd3a0cfe6f6fcded7772bf9ba5fbd3a13122cc3",
-  "LEASE-C1": "01b04ec96ff89357d637b5c93bf66c6620fded48af08bdca51b316558a3d02e0",
+  "LEASE-C1": "62c7ac850ee80fee44f784de6d0430c0781468913e27c0e17b59ba0d1b160931",
+  "MESH-A1": "83475cbf8f68688809123964d89096ccf2eca83eb242afd822d0132372547f03",
   "MESH-K1": "b5c64769a38d45f8829f1df5214c8898179b2641dae6f415d36cb3e35ee4e629",
+  "MONITOR-L1": "762fb11af9aca18b5e95d9e71061c430745e5f50a90341f7b8356417cc13368e",
   "NODE-D1": "0765e06474e6a67f70ffa2f6ca4e0c78da7f252909be75c56a3a5c7b8740efd3",
   "NODE-R1": "4618ac4d2bb0c89369d0a8b83d84cb96e1b22f630db08c56320e0b25022bcb15",
   "NODE-R2": "3ebe18170f979f75008aa350f225e2afbb617ed4960d90b6568053bd7bc9bd71",
@@ -26,8 +29,10 @@
   "NODE-R4": "8cf92b49ba813fd0f9065d7877260af8b9767edd0eb63b977928799166b467e5",
   "NODE-R5": "9b6a8bf99e620cb06f68e6c4121c881c37d676d5be4cfa18c49626b6a389451d",
   "OPERATOR-T1": "2af779b4e665e0500e30f0d68e058ea4534558a42ee8ec5cf8dad8dc4e301d96",
+  "OPERATOR-T2": "0ed3f5826633ba95688e96c2f149b2914cdf5910974e9c25ad2e08166f898c02",
   "POLICY-T1": "83f8d78479c6bd76211fbd10a7a17e282702b357dea6e8f5916eae28cd8f0496",
-  "REPLAY-B1": "2cdd2edca0bb7095e670dac6b199e1915618333a4fd2401b9e97fd51ea3e0394",
+  "REPLAY-B1": "109a413c0fab32fb51924d7832592578cc31a8d8de186747dfae1f0b28e5bc25",
+  "REPLAY-O1": "6fefc9e54ab9149a411559620e831cee20624df1750db07255ebd5efe001dd67",
   "REPLAY-R1": "02e461a6ac12481a554c9af346378ed023100fce66f6a26224c20d8d84c68d4e",
   "REPLAY-R2": "6234809388ac9d18ef96ea855bfc54ac8fecf0527d28da8587977e2faaab0352",
   "REPLAY-R3": "3c228c7d000e878bc3643046f6b789ca25d8dd840e9dc43d1b9fe1c302986018",
@@ -57,6 +62,14 @@
    "statement": "1312906f98f5bc77a82bfd3de8804dced417f1ba3e17f25a99fc8fc78bafec47",
    "witnesses": [
     "the_xdp_program_writes_every_field_of_a_drop_event_before_submitting_it"
+   ]
+  },
+  "ABI-L1": {
+   "statement": "120894583ab49eda6bba66195f918691161b7c5f781c806ea5f68fcea7327198",
+   "witnesses": [
+    "a_drop_reason_has_a_metric_label_exactly_when_the_xdp_program_drops_with_it",
+    "the_drop_label_scan_refuses_a_reason_it_cannot_name",
+    "the_drop_label_scan_sees_a_reason_after_a_nested_call"
    ]
   },
   "AUDIT-A1": {
@@ -192,13 +205,23 @@
    ]
   },
   "LEASE-C1": {
-   "statement": "df93a76ed9ab5697ddc070d6c88e4d1e9ea11c77856b2a5ef73c200192ffff1e",
+   "statement": "9cfb620a9c62bef643e756c837675b81e834233bd19cc2ddae784d69d290ea14",
    "witnesses": [
     "a_lift_is_not_undone_by_a_step_back_within_forget_grace",
     "a_used_lease_is_not_renewed_by_a_step_back_within_forget_grace_and_a_resend",
+    "an_uncapped_peer_claim_is_not_revived_past_the_cap_by_a_small_step_back",
     "lease_records_stay_bounded_by_forgetting_the_first_ended_one",
     "past_forget_grace_a_step_back_lets_a_resent_lease_or_lift_count_again",
     "restored_lease_records_keep_the_bound_and_drop_those_past_retention"
+   ]
+  },
+  "MESH-A1": {
+   "statement": "e178c368d29c176307e2bd1920dfb9c02c21ed9a4c0bae382cbd1270a6461c4e",
+   "witnesses": [
+    "an_authenticated_connection_survives_a_replayed_frame",
+    "an_unauthenticated_connection_cannot_buy_more_than_one_verification",
+    "one_peer_cannot_hold_more_connections_than_the_bounds_assume",
+    "other_peers_connections_do_not_use_up_a_nodes_slots"
    ]
   },
   "MESH-K1": {
@@ -212,6 +235,13 @@
     "a_reload_below_held_known_claims_keeps_the_previous_envelopes",
     "an_explicit_large_peer_share_can_exhaust_the_shared_peer_budget",
     "peers_together_leave_the_room_kept_for_this_nodes_own_decisions"
+   ]
+  },
+  "MONITOR-L1": {
+   "statement": "c30c421dc42ce3c5f3b51395278941a203af21afc6ef2b6d22a80030b35d0d63",
+   "witnesses": [
+    "Monitoring.test_a_renamed_label_value_an_alert_selects_fails",
+    "Monitoring.test_a_renamed_metric_fails"
    ]
   },
   "NODE-D1": {
@@ -270,6 +300,13 @@
     "operator_tiers_are_exact_fields_and_unknown_tiers_remain_unknown"
    ]
   },
+  "OPERATOR-T2": {
+   "statement": "6374466d59c9104a9eb9bda79ae9d3071e17476d174c80e2f67b6561f2659109",
+   "witnesses": [
+    "a_detector_block_is_not_reported_as_a_trap_tier",
+    "a_kernel_drop_is_not_reported_as_a_trap_tier"
+   ]
+  },
   "POLICY-T1": {
    "statement": "f820d57a81cc3353f42d85e64c9c421b4d1acb610bc6ba213f1fefd849dda10b",
    "witnesses": [
@@ -293,9 +330,16 @@
     "foreign_build_diagnostics_cannot_grow_with_each_run",
     "late_chain_failure_discards_the_tentative_file_replay",
     "mismatch_examples_are_bounded_without_stopping_replay",
+    "peer_witnesses_come_from_the_verified_pass",
     "retained_diagnostics_preserve_counts_and_utf8_at_the_exact_budget",
     "retained_segment_inventory_refuses_limit_plus_one",
     "shortening_or_completing_a_torn_record_during_scan_is_unverified"
+   ]
+  },
+  "REPLAY-O1": {
+   "statement": "e4215f925b1f388e86159bdbd2f2c4ecf87c1f2d0b86f47099429cc7b4b07203",
+   "witnesses": [
+    "a_waiting_detection_records_a_time_not_before_the_table_moved_on"
    ]
   },
   "REPLAY-R1": {
@@ -479,6 +523,12 @@
   }
  },
  "witnesses": {
+  "Monitoring.test_a_renamed_label_value_an_alert_selects_fails": [
+   "scripts/test_check_monitoring.py:50502f160489313368bd3035aff1d3f977eb214da3e0f5b30ffc1cbb70bfda35"
+  ],
+  "Monitoring.test_a_renamed_metric_fails": [
+   "scripts/test_check_monitoring.py:1548457dfd89d9c8f4cacec3b5e7da2df6fb790043c33a597fcb7df4652817a0"
+  ],
   "ProtectionTypes.test_a_new_reason_requires_a_source_role_decision": [
    "scripts/test_protection_types.py:9abc260578c0776b35990371cd42f199b2d1d89601058b288affb795eea50376"
   ],
@@ -524,6 +574,12 @@
   "a_detection_refused_at_capacity_leaves_no_event_and_no_strike": [
    "orchestrator/src/block_table.rs:d8898bdce5f3c4c004eb7eaeb0dd89c417eacd36e304fd160f038df88b35ecd6"
   ],
+  "a_detector_block_is_not_reported_as_a_trap_tier": [
+   "orchestrator/src/main.rs:602691f241209405decc95f0d56ce08fed56ce86796b9258d869f90e6f8d6528"
+  ],
+  "a_drop_reason_has_a_metric_label_exactly_when_the_xdp_program_drops_with_it": [
+   "common/src/lib.rs:94b20feefd1410ae5557b4447dc74c789c9e157a0cf03bc7f7fd5fbdb44e81cb"
+  ],
   "a_failed_loss_notice_retains_its_count_until_recovery": [
    "orchestrator/src/main.rs:e9c701e40b514fee6dbf20fce74d11cc56e5c1f2f6ddac4c20ea760dd1fbc6af"
   ],
@@ -557,8 +613,11 @@
   "a_head_for_zero_records_of_a_pruned_log_is_not_confirmed": [
    "common/src/audit_log.rs:f0eb4c1b64df55e67c354be31f9b6d6bdac8056235eabd5e5875dff46150ebf0"
   ],
+  "a_kernel_drop_is_not_reported_as_a_trap_tier": [
+   "orchestrator/src/kernel_events.rs:5f1d6e0a237f50951f85be3cf20c6d009fa2d56e10e699dedbce84ed14b3926e"
+  ],
   "a_lift_is_not_undone_by_a_step_back_within_forget_grace": [
-   "orchestrator/src/block_table.rs:d2a501a675a7cb064596f1516db015fb64329680b109c40d98a216dbe0c394a2"
+   "orchestrator/src/block_table.rs:8830fc392740ee9f8f03acf8cef1bace4759c00de6b5f1e59a3be000265f60de"
   ],
   "a_line_sent_before_the_request_does_not_retire_it": [
    "orchestrator/src/delivery.rs:3f476f8638b77d4c2ea93c1097033d7db48bec0ef154ee5716c9b42ac3f7dd7f"
@@ -701,6 +760,9 @@
   "a_vector_cannot_choose_the_operator_tier_or_supply_header_fields": [
    "orchestrator/src/bin/sokol-operator.rs:e7fa75e0b6b525ca2cfc16af42cb682b6b4ffc939cba2892153f14b147ede712"
   ],
+  "a_waiting_detection_records_a_time_not_before_the_table_moved_on": [
+   "orchestrator/src/main.rs:b9f619f5b571e96ef834adec41cef710cc2a554025c904490d41911e87161aec"
+  ],
   "a_wanted_block_not_yet_written_still_blocks": [
    "orchestrator/src/block_table.rs:b6a306ae70461b5aaad79f7450c6935bf1fb9030dd553f4b9767e214265b0025"
   ],
@@ -712,6 +774,9 @@
   ],
   "a_zero_sequence_segment_cannot_replace_the_genesis_chain": [
    "common/src/audit_log.rs:411a24a11982eb4f4e9acc13980413cd35bf671ebf691745309d0c7304bddc79"
+  ],
+  "an_authenticated_connection_survives_a_replayed_frame": [
+   "orchestrator/src/p2p.rs:a7d71cacf47de5e2827923a7eb4ffbe3687522d5edc49ee19088a37f888a3faf"
   ],
   "an_event_still_held_needs_no_new_retraction_storage": [
    "orchestrator/src/block_table.rs:3a8245282ee23211dba2ba18b4d10ac5e18f759feaab1ba4c14a2f1f6b2b5ef2"
@@ -733,6 +798,12 @@
   ],
   "an_oversized_valid_empty_rib_is_unavailable_not_observed_absence": [
    "orchestrator/src/flowspec.rs:c65902d75d59aa18cea1a0626ded195195c3dcb5e29933f142a5e141d1008e20"
+  ],
+  "an_unauthenticated_connection_cannot_buy_more_than_one_verification": [
+   "orchestrator/src/p2p.rs:5bd3199c42084935f1c3078c7002be783650bb9aec44b7f95cd3282e91361298"
+  ],
+  "an_uncapped_peer_claim_is_not_revived_past_the_cap_by_a_small_step_back": [
+   "orchestrator/src/block_table.rs:7c4679c0af61925e18fb8a487bd469eb70ef4c5d8bfd8270c88b0a2186bb87cc"
   ],
   "an_unreadable_state_file_is_kept_aside_and_survives_the_next_save": [
    "orchestrator/src/state_store.rs:79490b58d4d396cccbf402aabb7ca01e87f2fa683b8fa5460419d7180593c3c3"
@@ -881,6 +952,9 @@
   "normal_lines_still_run_one_command_each": [
    "orchestrator/src/control.rs:a63c87233a8174b0d69b33c64c9448328a2fb18bbb048fbc947061cb1d811111"
   ],
+  "one_peer_cannot_hold_more_connections_than_the_bounds_assume": [
+   "orchestrator/src/p2p.rs:af41dc98223be036a5d46ebe52d2cb919ce1c0454e4ffa0c4d0770a762aaa456"
+  ],
   "only_local_and_home_protection_name_the_remote_destination": [
    "orchestrator/src/protection.rs:4f25e0794b53349f944b54583e7f9231cf40baf2d6f0c669d0d2b02ec857428a"
   ],
@@ -896,6 +970,9 @@
   "operator_tiers_are_exact_fields_and_unknown_tiers_remain_unknown": [
    "orchestrator/src/bin/sokol-operator.rs:2078b964d71f70d81799abc0b5586c997c44b8ab21de7db205ba41e90abb8253"
   ],
+  "other_peers_connections_do_not_use_up_a_nodes_slots": [
+   "orchestrator/src/p2p.rs:40bf7772ec5fb601c655e70c85d600a7b93e14bb27be4761c4ea96cb51ec7763"
+  ],
   "oversized_audit_records_are_counted_and_marked_before_following_data_or_flush": [
    "orchestrator/src/main.rs:5f8238ea09e54d0084116377203678b159470a25e2ce754f919cac38e557fd60"
   ],
@@ -904,6 +981,9 @@
   ],
   "past_forget_grace_a_step_back_lets_a_resent_lease_or_lift_count_again": [
    "orchestrator/src/block_table.rs:8c828baa1da2a4d0a6f49134cc617b93345316dca2d14e2983b3d60bec453312"
+  ],
+  "peer_witnesses_come_from_the_verified_pass": [
+   "orchestrator/src/audit_witness.rs:46c387aee914796a4937b16fa28f2f53d79c347efb3732cccf689139d8a5933d"
   ],
   "peers_together_leave_the_room_kept_for_this_nodes_own_decisions": [
    "orchestrator/src/block_table.rs:6c5485ea850b7de205b17b32cc1a9abe1163b63932e2a4c5bbf20cbd38453fa6"
@@ -964,6 +1044,12 @@
   ],
   "the_default_community_is_64512_and_the_node_id_and_is_refused_above_16_bits": [
    "orchestrator/src/flowspec.rs:27a794c92127ba85cb3fe77b4af64d78db753d8bb6cb967a035e5494c5c6666b"
+  ],
+  "the_drop_label_scan_refuses_a_reason_it_cannot_name": [
+   "common/src/lib.rs:cad4d58a1a7452edafb6c45d621c756ba3b9e25391826b568945aa4d70a1cb6e"
+  ],
+  "the_drop_label_scan_sees_a_reason_after_a_nested_call": [
+   "common/src/lib.rs:29906e03e7a2fee8191b1bc2046c23b5b99cd83ffbc6d43086d25fc83fc12bdf"
   ],
   "the_first_line_the_node_sees_is_the_ack_handshake": [
    "orchestrator/src/bin/sokol-fastnetmon-notify.rs:fce7d69f0d5c40398d0f0762ca36900c22f15b8a28e9f3e2d914d00b8ded49c1"
