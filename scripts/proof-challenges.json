@@ -181,6 +181,16 @@
         "after": "    started.checked_sub(2)"
       },
       "assertion": "assertion failed: fenced"
+    },
+    {
+      "id": "replay-fence-cost",
+      "file": "common/src/replay.rs",
+      "harness": "replay::proofs::the_fence_costs_honest_senders_only_the_skew_after_the_start",
+      "replace": {
+        "before": "    started.checked_sub(1)",
+        "after": "    started.saturating_add(MAX_CLOCK_SKEW_MS).checked_sub(1)"
+      },
+      "assertion": "assertion failed: admitted"
     }
   ]
 }

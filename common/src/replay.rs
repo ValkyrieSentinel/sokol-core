@@ -8,10 +8,15 @@
 //! A sender's nonce leaves the node's cache (`p2p::ReplayGuard`) REPLAY_WINDOW_MS after it
 //! arrived. Its timestamp then raises that sender's floor (`raise`), and an envelope stamped
 //! at or below the floor is refused (`admits`). So every envelope accepted in this process is
-//! either still in the cache or under the floor, whatever the clock did in between; a new
+//! either still in the cache or under the floor, whatever the clock did in between. A new
 //! process starts its floors at its start (`fence`), so an envelope stamped before the
-//! restart is refused too. While this node's clock does not step back, no honest fresh
-//! envelope is ever under a floor (`honest_envelopes_stay_above_the_floor`).
+//! restart is refused too; one the previous process accepted with a later stamp (its sender's
+//! clock ahead) is not, since the fence knows only the start.
+//!
+//! Cost to honest senders, while this node's clock does not step back: a purge never puts a
+//! fresh envelope under the floor (`honest_envelopes_stay_above_the_floor`); the fence can, for
+//! a sender whose clock is behind, but only during the first MAX_CLOCK_SKEW_MS after the start
+//! (`the_fence_costs_honest_senders_only_the_skew_after_the_start`).
 
 /// How far an envelope's timestamp may lie from this node's clock, both ways, inclusive.
 pub const MAX_CLOCK_SKEW_MS: u64 = 30_000;
@@ -138,8 +143,9 @@ mod proofs {
         assert!(refused);
     }
 
-    /// The floor costs honest senders nothing while this node's clock does not step back: an
-    /// envelope fresh at a moment no earlier than a purge is newer than the purged one.
+    /// A purge costs honest senders nothing while this node's clock does not step back: an
+    /// envelope fresh at a moment no earlier than a purge, and above the floor before it
+    /// (the fence included), is above it after. It says nothing about the fence itself.
     #[kani::proof]
     fn honest_envelopes_stay_above_the_floor() {
         let (purged, arrived, purge_at, ts, now, floor): (u64, u64, u64, u64, u64, Floor) = (
@@ -163,5 +169,21 @@ mod proofs {
         let (started, ts): (u64, u64) = (kani::any(), kani::any());
         let fenced = admits(ts, fence(started)) == (ts >= started);
         assert!(fenced);
+    }
+
+    /// The fence's cost to honest senders: from MAX_CLOCK_SKEW_MS after the start on, every
+    /// envelope fresh at this node's clock is above it. Before that, an honest sender whose
+    /// clock is behind can be refused (`before_window`), as can envelopes in flight across
+    /// the restart.
+    #[kani::proof]
+    fn the_fence_costs_honest_senders_only_the_skew_after_the_start() {
+        let (started, ts, now): (u64, u64, u64) = (kani::any(), kani::any(), kani::any());
+        // Wall-clock milliseconds are far below the top of u64.
+        let Some(settled) = started.checked_add(MAX_CLOCK_SKEW_MS) else {
+            return;
+        };
+        kani::assume(now >= settled && fresh(ts, now));
+        let admitted = admits(ts, fence(started));
+        assert!(admitted);
     }
 }

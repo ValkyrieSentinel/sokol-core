@@ -1464,7 +1464,9 @@ async fn main() -> Result<(), anyhow::Error> {
         let _ = shutdown_tx_ctrlc.send(true);
     })?;
 
-    // A replay of an envelope the previous process accepted is refused (MESH-N1).
+    // Envelopes stamped before this start are refused: the previous process may have accepted
+    // them and its nonces are gone. One it accepted with a later stamp is not (MESH-N1); an
+    // honest peer whose clock is behind can be refused for up to MAX_CLOCK_SKEW_MS.
     let peer_registry = PeerRegistry::new(trust_store).with_startup_fence(p2p::now_ms());
     let (mesh_cmd_tx, mesh_cmd_rx) = mpsc::channel::<MeshCommand>(1000);
     // This node's own detections and storm latch; never on the wire (review 2026-10-05 W3.2).
