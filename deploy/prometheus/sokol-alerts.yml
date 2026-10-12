@@ -116,6 +116,12 @@ groups:
         annotations:
           summary: "{{ $labels.instance }}: {{ $value }} mesh peers, fewer than in the last hour"
           runbook: "RUNBOOK §5.5"
+      - alert: SokolPeerWrongAddress
+        expr: increase(sokol_mesh_handshakes_wrong_address_total[10m]) > 0
+        labels: { severity: critical }
+        annotations:
+          summary: "{{ $labels.instance }}: a pinned peer's handshake came from an address its peers-file entry does not bind"
+          runbook: "RUNBOOK §5.5"
       - alert: SokolPeerClockSkew
         expr: increase(sokol_mesh_envelopes_rejected_total{reason="stale_timestamp"}[10m]) > 0
         for: 10m
