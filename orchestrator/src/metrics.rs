@@ -964,5 +964,9 @@ mod tests {
             text.contains("sokol_xdp_stats_read_failures_total 1\n"),
             "the failed read is not counted"
         );
+        // A good read after it takes the new sums and keeps the count of failures.
+        totals.read(Some([cpu].iter()));
+        totals.fill(&mut snap);
+        assert_eq!((snap.rx_packets, snap.xdp_stats_read_failures), (1_000, 1));
     }
 }
