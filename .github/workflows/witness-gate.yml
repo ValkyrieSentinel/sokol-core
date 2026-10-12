@@ -1,0 +1,119 @@
+name: Witness gate (base)
+
+# The witness gate a pull request cannot change (ADR-0023, round 6 F4). On `pull_request` CI
+# runs the pull request's own ci.yml, which could drop its gate step or forge the test log the
+# gate reads. `pull_request_target` runs this file as it is on main, so the checker, the
+# signers and the arguments of the Python witnesses all come from main.
+#
+# The pull request's tests still have to run, and its code is untrusted: on a hosted runner it
+# has sudo and could rewrite anything a later step in the same job uses. So it runs in its own
+# job that only hands over a log; the gate runs on a fresh runner that reads the pull request's
+# tree and that log as data. A forged log gains nothing: a failing witness fails `cargo test`
+# (and the job), and a witness that silently stops running needs a change to what is pinned.
+# No job has write permission, persisted credentials, secrets or a cache.
+
+on:
+  pull_request_target:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: witness-gate-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  BPF_LINKER_VERSION: v0.11.1
+  BPF_LINKER_SHA256: e058a6aecc9e65fa4c977b298a8e4b738424d7629769fd352eed409fb57e16e8
+
+jobs:
+  tests:
+    name: witness-gate tests (pull request code)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          path: base
+          persist-credentials: false
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: refs/pull/${{ github.event.pull_request.number }}/merge
+          path: pr
+          persist-credentials: false
+
+      - name: Install the pinned Rust toolchain (rust-toolchain.toml)
+        working-directory: pr
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          (cd ebpf && (rustup show active-toolchain || rustup toolchain install))
+
+      - name: Install bpf-linker
+        run: |
+          curl -sSfL -o /tmp/bpf-linker.tar.zst "https://github.com/aya-rs/bpf-linker/releases/download/${BPF_LINKER_VERSION}/bpf-linker-x86_64-unknown-linux-musl.tar.zst"
+          echo "${BPF_LINKER_SHA256}  /tmp/bpf-linker.tar.zst" | sha256sum -c -
+          tar --zstd -x -C /usr/local/bin -f /tmp/bpf-linker.tar.zst
+
+      # The commands are main's; what they compile and run is the pull request's. Its build
+      # configuration and witness files are pinned, so a change that could forge these logs is
+      # one the gate job refuses.
+      - name: Build and test
+        working-directory: pr
+        env:
+          WITNESS_PIN_CI: ${{ github.workspace }}/base/.github/workflows/ci.yml
+        run: |
+          set -o pipefail
+          mkdir -p /tmp/witness
+          (cd ebpf && cargo build --release --locked)
+          cargo build --release --locked
+          cargo test --release --locked 2>&1 | tee /tmp/witness/cargo-test.log
+          cp "$GITHUB_WORKSPACE/base/scripts/witness-pin.py" scripts/witness-pin.py
+          python3 scripts/witness-pin.py run-python | tee /tmp/witness/python.log
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: witness-logs
+          path: /tmp/witness/
+          retention-days: 7
+
+  gate:
+    name: witness-gate (base)
+    needs: tests
+    # Runs when the tests job failed too, so the required check is a failure, never a skip.
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - name: The pull request's tests passed
+        if: needs.tests.result != 'success'
+        run: |
+          echo "the pull request's tests did not pass (${{ needs.tests.result }})"
+          exit 1
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          path: base
+          persist-credentials: false
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: refs/pull/${{ github.event.pull_request.number }}/merge
+          path: pr
+          persist-credentials: false
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: witness-logs
+          path: /tmp/witness
+
+      # Nothing of the pull request runs here: its tree and the logs are read as data.
+      - name: Pinned witnesses, checked by main's checker and signers
+        working-directory: pr
+        run: |
+          cp "$GITHUB_WORKSPACE/base/scripts/witness-pin.py" scripts/witness-pin.py
+          echo "checker and signers from main $(git -C "$GITHUB_WORKSPACE/base" rev-parse HEAD)"
+          python3 scripts/witness-pin.py check \
+            --signers "$GITHUB_WORKSPACE/base/.github/witness-signers" \
+            --executed /tmp/witness/cargo-test.log --executed-python /tmp/witness/python.log
