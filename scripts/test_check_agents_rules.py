@@ -12,6 +12,9 @@ import subprocess
 import tempfile
 import unittest
 
+# Shared production type guards run through the existing agent-rule CI entry point.
+from test_protection_types import ProtectionTypes
+
 HERE = Path(__file__).resolve().parent
 CHECKED = '- An annotated rule.\n  *Checked by:* `some_test`.\n'
 
