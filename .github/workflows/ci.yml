@@ -251,8 +251,11 @@ jobs:
             git show "$BASE:scripts/witness-pin.py" > scripts/witness-pin.py
             git show "$BASE:.github/witness-signers" > /tmp/witness-signers
           fi
+          # --executed: every pinned witness also ran and passed in the Test step above (a base
+          # checker that predates the flag ignores it).
           # shellcheck disable=SC2086  # empty or one flag
-          python3 scripts/witness-pin.py check --signers /tmp/witness-signers $EVERY_PIN
+          python3 scripts/witness-pin.py check --signers /tmp/witness-signers $EVERY_PIN \
+            --executed /tmp/sokol-cargo-test.log
           cp /tmp/witness-pin-tree.py scripts/witness-pin.py
 
       - name: Cited evidence exists (tests in the compiler's list, metrics, flags, ADRs, paths)
