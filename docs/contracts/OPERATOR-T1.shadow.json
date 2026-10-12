@@ -1,12 +1,18 @@
 {
-  "after": "CONTROL-L1",
-  "base_contract_sha256": null,
-  "because": "Counterexample on b75821f: a Tier2 record with TIER=Tier1BotTarpit inside VEC increments Tier1; key-shaped vector text can supply IP, and missing/invalid node IDs become node 0/1. Restoring that production handler with the four new regressions gives four assertion failures (11 preserved tests pass).",
+  "annotations": {
+    "status": "UNSIGNED_EXPLANATORY_DRAFT"
+  },
+  "decisions": [
+    {
+      "because": "Counterexample on b75821f: a Tier2 record with TIER=Tier1BotTarpit inside VEC increments Tier1; key-shaped vector text can supply IP, and missing/invalid node IDs become node 0/1. Restoring that production handler with the four new regressions gives four assertion failures (11 preserved tests pass).",
+      "previous_statement_sha256": null,
+      "proposal_sha256": "2794a5369687ce40514e62c647721e745ee5765f791c141fb3d792ed773c3ceb"
+    }
+  ],
   "evidence_text": "`a_vector_cannot_choose_the_operator_tier_or_supply_header_fields`, `malformed_telemetry_identity_does_not_invent_node_zero_or_one`, `opaque_vectors_survive_the_socket_and_operator_data_api`, `operator_tiers_are_exact_fields_and_unknown_tiers_remain_unknown`",
   "id": "OPERATOR-T1",
-  "profile": "sokol.contract-proposal.v1",
+  "profile": "sokol.contract-shadow.v1",
   "statement": "Operator HEARTBEAT and DB_LOG require an explicit valid u32 node identity; malformed identities are ignored rather than attributed to node 0 or 1. In DB_LOG, tier counters use only exact known TIER fields and IP comes only from the header before terminal VEC; the entire VEC remainder is opaque diagnostic text. An unknown tier remains alert-visible without incrementing a known-tier counter. These are reported telemetry fields, not proof of a trap or kernel action.",
-  "status": "UNSIGNED_INTENT",
   "witnesses": [
     "a_vector_cannot_choose_the_operator_tier_or_supply_header_fields",
     "malformed_telemetry_identity_does_not_invent_node_zero_or_one",
