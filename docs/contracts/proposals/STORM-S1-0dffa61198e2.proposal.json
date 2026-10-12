@@ -1,0 +1,20 @@
+{
+  "after": null,
+  "base_contract_sha256": "9642757b4272c46e4f5ffe48fbd0567c1b0d99f72f9bfe38cba3e81610c22fdc",
+  "because": "ROADMAP item 9: the storm arithmetic moved to common::storm so that Kani proves it for every input (storm::proofs, calibrated by proof-task.py with three faults); the unit tests stay.",
+  "evidence_text": "`a_defense_reports_the_operators_base_flags`, `a_malformed_header_flood_above_the_threshold_is_an_attack_in_every_mode`, `attack_drop_reasons_above_the_threshold_count`, `drops_just_below_the_threshold_are_not_an_attack`, `drops_only_storm_mode_adds_above_the_threshold_are_not_an_attack`, `strict_parse_drops_count_when_the_operator_set_the_flag_or_storm_only_observes`, `the_xdp_program_drops_unparsable_headers_in_strict_mode_with_their_own_reason`, `storm_drops_are_left_out_and_every_other_reason_counts`",
+  "id": "STORM-S1",
+  "profile": "sokol.contract-proposal.v1",
+  "statement": "The attack signal leaves out exactly the drops storm mode itself adds (strict-parse drops while storm adds STRICT_PARSE, fragment drops while it adds DROP_IPV4_FRAGMENTS) and nothing else: a malformed-header flood is an attack in every mode, so a storm cannot keep itself going on legitimate traffic.",
+  "status": "UNSIGNED_INTENT",
+  "witnesses": [
+    "a_defense_reports_the_operators_base_flags",
+    "a_malformed_header_flood_above_the_threshold_is_an_attack_in_every_mode",
+    "attack_drop_reasons_above_the_threshold_count",
+    "drops_just_below_the_threshold_are_not_an_attack",
+    "drops_only_storm_mode_adds_above_the_threshold_are_not_an_attack",
+    "storm_drops_are_left_out_and_every_other_reason_counts",
+    "strict_parse_drops_count_when_the_operator_set_the_flag_or_storm_only_observes",
+    "the_xdp_program_drops_unparsable_headers_in_strict_mode_with_their_own_reason"
+  ]
+}

@@ -552,6 +552,7 @@ pub mod tcp_flags {
 }
 
 pub mod canonical;
+pub mod storm;
 
 #[cfg(feature = "std")]
 pub mod audit_log;

@@ -16,35 +16,20 @@ pub enum StormMode {
 }
 
 /// Flags added while engaged in strict mode.
-pub const STORM_FLAGS: u32 =
-    common::config_flags::STRICT_PARSE | common::config_flags::DROP_IPV4_FRAGMENTS;
+pub const STORM_FLAGS: u32 = common::storm::STORM_FLAGS;
 
 /// The `CONFIG` value for a state: the operator's `base` flags, plus the storm flags only while
-/// engaged in strict mode. Disengaging never clears a flag the operator set.
+/// engaged in strict mode. Disengaging never clears a flag the operator set
+/// (`common::storm::flags`, proved there).
 pub fn flags(base: u32, mode: StormMode, engaged: bool) -> u32 {
-    match (mode, engaged) {
-        (StormMode::Strict, true) => base | STORM_FLAGS,
-        _ => base,
-    }
-}
-
-/// Whether drops with `code` happen only because storm mode is engaged: fragment drops while it
-/// adds `DROP_IPV4_FRAGMENTS`, strict-parse drops while it adds `STRICT_PARSE`. A storm flag the
-/// operator set already is policy, not storm, and its drops count. `MALFORMED_HEADER` is never
-/// storm-added: those outer headers are dropped in every mode (strict parsing has its own code).
-fn storm_added(code: u16, base: u32, mode: StormMode) -> bool {
-    let added = flags(base, mode, true) & !base;
-    (code == common::drop_reason::FRAGMENT_BLOCKED
-        && added & common::config_flags::DROP_IPV4_FRAGMENTS != 0)
-        || (code == common::drop_reason::STRICT_PARSE_FAILED
-            && added & common::config_flags::STRICT_PARSE != 0)
+    common::storm::flags(base, mode == StormMode::Strict, engaged)
 }
 
 /// Whether this node's drops in a telemetry window (per-reason counters now and at the window's
 /// start, `secs` long) reach `threshold` drops per second, leaving out the reasons storm mode
 /// itself adds. Counting those would let legitimate fragmented or unparsable traffic keep the
 /// node under attack, and so the storm that causes the drops, without end (ADR-6: the cost is
-/// bounded by the storm).
+/// bounded by the storm). Which drops count is `common::storm::attack_drops`, proved there.
 pub fn under_attack(
     now: &[u64; common::DROP_REASON_SLOTS],
     window_start: &[u64; common::DROP_REASON_SLOTS],
@@ -53,13 +38,7 @@ pub fn under_attack(
     base: u32,
     mode: StormMode,
 ) -> bool {
-    let drops = now
-        .iter()
-        .zip(window_start)
-        .zip(0u16..)
-        .filter(|(_, code)| !storm_added(*code, base, mode))
-        .map(|((now, start), _)| now.saturating_sub(*start))
-        .fold(0u64, u64::saturating_add);
+    let drops = common::storm::attack_drops(now, window_start, base, mode == StormMode::Strict);
     (drops as f64 / secs.max(1.0)) as u64 >= threshold
 }
 

@@ -219,6 +219,14 @@ AFTER=$(metric 'sokol_xdp_dropped_packets_total{reason="blocklist"}')
 check "blocked IPv6 source with a truncated extension header is dropped ($MID -> $AFTER)" \
     test $((AFTER - MID)) -eq 10
 printf 'UNBAN_IP:%s\n' "$BLOCKED_V6" | nc -U -q1 "$WORK/control.sock" >/dev/null
+# Headers that do not parse are passed to the stack and still seen: they count in
+# sokol_xdp_rx_packets_total like any other passed packet (ROADMAP item 10).
+RX_BEFORE=$(metric sokol_xdp_rx_packets_total)
+send_v6 0 10   # the source is no longer blocked: a parse failure, passed
+sleep 1.2
+RX_AFTER=$(metric sokol_xdp_rx_packets_total)
+check "passed packets whose headers do not parse are counted ($RX_BEFORE -> $RX_AFTER)" \
+    test $((RX_AFTER - RX_BEFORE)) -ge 10
 
 # SYN flood on the XDP trap port: events must be rate-limited, not one per packet.
 BLOCKS_BEFORE_FLOOD=$( (grep -a -o "DYNAMIC_BLOCK_V[46]|" "$WORK/events.sntl" || true) | wc -l)

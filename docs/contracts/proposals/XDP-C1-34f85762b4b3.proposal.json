@@ -1,0 +1,13 @@
+{
+  "after": "STORM-S1",
+  "base_contract_sha256": null,
+  "because": "Counterexample on 3c51594 (ROADMAP item 10): a failed read of the STATS map published zeros, a counter reset to Prometheus; the next good read then put the whole history into one window of the rate check and of defense::under_attack, which feeds the storm latch. a_failed_stats_read_keeps_the_last_counters_and_is_counted saw (0, 0, 0) after a failed read.",
+  "evidence_text": "`a_failed_stats_read_keeps_the_last_counters_and_is_counted`",
+  "id": "XDP-C1",
+  "profile": "sokol.contract-proposal.v1",
+  "statement": "A failed read of the XDP STATS map is unknown, not zero: the XDP counters, and the rates and the storm attack signal computed from them, keep their last good values, and the failure is counted (sokol_xdp_stats_read_failures_total).",
+  "status": "UNSIGNED_INTENT",
+  "witnesses": [
+    "a_failed_stats_read_keeps_the_last_counters_and_is_counted"
+  ]
+}
