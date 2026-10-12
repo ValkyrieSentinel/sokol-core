@@ -208,6 +208,28 @@ pub(crate) fn detector_retraction_reply(out: &block_table::DetectorRetraction) -
     .into()
 }
 
+/// The audit record of a detector retraction, with how many of this node's claims it retracted.
+fn retraction_record(
+    shown: &str,
+    out: &block_table::DetectorRetraction,
+    now: u64,
+    r: &signal::Retract,
+) -> String {
+    let claims = match out {
+        block_table::DetectorRetraction::Lifted { retracted, .. } => retracted.len(),
+        _ => 0,
+    };
+    format!(
+        "DETECTOR_RETRACT|IP:{}|Result:{}|Claims:{}|At:{}|Event:{}/{}",
+        shown,
+        out.label(),
+        claims,
+        now,
+        r.source,
+        r.id
+    )
+}
+
 /// A detector takes back one of its events (ADR-0019). The block ends, or gets shorter, only as
 /// far as no other reason holds it; this node's own claims are retracted mesh-wide.
 pub(crate) async fn retract_detection(r: &signal::Retract, c: &IpcCtx) -> String {
@@ -217,19 +239,7 @@ pub(crate) async fn retract_detection(r: &signal::Retract, c: &IpcCtx) -> String
         let mut table = c.blocks.lock().await;
         let now = block_table::local_ms();
         let out = table.retract_detection(&r.source, &r.id, r.target, now);
-        let claims = match &out {
-            block_table::DetectorRetraction::Lifted { retracted, .. } => retracted.len(),
-            _ => 0,
-        };
-        c.db.append(format!(
-            "DETECTOR_RETRACT|IP:{}|Result:{}|Claims:{}|At:{}|Event:{}/{}",
-            shown,
-            out.label(),
-            claims,
-            now,
-            r.source,
-            r.id
-        ));
+        c.db.append(retraction_record(&shown, &out, now, r));
         (out, table.shares_own(), table.still_blocks(r.target, now))
     };
     let reply = retraction_reply(&out, still_blocked);
@@ -311,6 +321,26 @@ mod tests {
         ));
         let out = t.retract_detection("crowdsec", "17", net, T0 + 2 * S);
         retraction_reply(&out, t.still_blocks(net, T0 + 2 * S))
+    }
+
+    #[test]
+    fn a_retraction_record_counts_the_claims_it_retracted() {
+        let mut t = table();
+        let net = parse_target("203.0.113.9").unwrap();
+        t.detect(net, "crowdsec: x", T0 + S, Some(("crowdsec", "17")), None);
+        let out = t.retract_detection("crowdsec", "17", net, T0 + 2 * S);
+        let r = signal::Retract {
+            id: "17".into(),
+            source: "crowdsec".into(),
+            target: net,
+        };
+        assert_eq!(
+            retraction_record("203.0.113.9", &out, T0 + 2 * S, &r),
+            format!(
+                "DETECTOR_RETRACT|IP:203.0.113.9|Result:lifted|Claims:1|At:{}|Event:crowdsec/17",
+                T0 + 2 * S
+            )
+        );
     }
 
     #[test]

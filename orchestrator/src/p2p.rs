@@ -3644,4 +3644,58 @@ mod tests {
         );
         drop(open);
     }
+
+    /// The per-node cap counts that node's connections only: other peers' connections do not
+    /// use up its slots.
+    #[tokio::test]
+    async fn other_peers_connections_do_not_use_up_a_nodes_slots() {
+        let peers: Vec<NodeCrypto> = (0..3).map(|_| NodeCrypto::generate()).collect();
+        let mut trust = TrustStore::default();
+        for (i, c) in peers.iter().enumerate() {
+            trust.insert(2 + i as u64, c.public_key.clone());
+        }
+        let (addr, registry, _peer, _rx, _stop) =
+            listening_node_with(move |_| PeerRegistry::new(trust)).await;
+        let mut open = Vec::new();
+        for (i, c) in peers.iter().enumerate() {
+            let id = 2 + i as u64;
+            let mut s = TcpStream::connect(addr).await.unwrap();
+            let hello = seal(c, id, &NetworkMessage::handshake(id)).unwrap();
+            s.write_all(&frame_of(&hello)).await.unwrap();
+            open.push(s);
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        for id in 2..5 {
+            assert_eq!(
+                connections_of(&registry, id).await,
+                1,
+                "node {id} was refused its first connection"
+            );
+        }
+        drop(open);
+    }
+
+    /// After the handshake a replayed frame is ignored, not fatal: only an unauthenticated
+    /// connection is closed by one.
+    #[tokio::test]
+    async fn an_authenticated_connection_survives_a_replayed_frame() {
+        let (addr, registry, peer, _rx, _stop) = listening_node().await;
+        let hello = seal(&peer, 2, &NetworkMessage::handshake(2)).unwrap();
+        let mut s = TcpStream::connect(addr).await.unwrap();
+        s.write_all(&frame_of(&hello)).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            connections_of(&registry, 2).await,
+            1,
+            "setup: node 2 authenticated"
+        );
+        s.write_all(&frame_of(&hello)).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            connections_of(&registry, 2).await,
+            1,
+            "a replayed frame on an authenticated connection closed it"
+        );
+        drop(s);
+    }
 }
