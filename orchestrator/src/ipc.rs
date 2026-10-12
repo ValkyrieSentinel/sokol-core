@@ -212,22 +212,27 @@ pub(crate) fn detector_retraction_reply(out: &block_table::DetectorRetraction) -
 /// far as no other reason holds it; this node's own claims are retracted mesh-wide.
 pub(crate) async fn retract_detection(r: &signal::Retract, c: &IpcCtx) -> String {
     let shown = show(&r.target);
-    let now = block_table::local_ms();
+    // Time read and record submitted under the table lock.
     let (out, shares_own, still_blocked) = {
         let mut table = c.blocks.lock().await;
+        let now = block_table::local_ms();
         let out = table.retract_detection(&r.source, &r.id, r.target, now);
+        let claims = match &out {
+            block_table::DetectorRetraction::Lifted { retracted, .. } => retracted.len(),
+            _ => 0,
+        };
+        c.db.append(format!(
+            "DETECTOR_RETRACT|IP:{}|Result:{}|Claims:{}|At:{}|Event:{}/{}",
+            shown,
+            out.label(),
+            claims,
+            now,
+            r.source,
+            r.id
+        ));
         (out, table.shares_own(), table.still_blocks(r.target, now))
     };
-    let label = out.label();
     let reply = retraction_reply(&out, still_blocked);
-    let claims = match &out {
-        block_table::DetectorRetraction::Lifted { retracted, .. } => retracted.len(),
-        _ => 0,
-    };
-    c.db.append(format!(
-        "DETECTOR_RETRACT|IP:{}|Result:{}|Claims:{}|At:{}|Event:{}/{}",
-        shown, label, claims, now, r.source, r.id
-    ));
     if let block_table::DetectorRetraction::Lifted {
         retracted,
         reissued,

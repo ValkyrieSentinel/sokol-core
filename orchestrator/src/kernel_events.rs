@@ -47,9 +47,33 @@ pub fn audit_line(item: &[u8]) -> Option<String> {
     ))
 }
 
+/// The operator telemetry line for one kernel drop event (its audit line). A sampled kernel
+/// drop is not a trap hit: tier `KernelDrop`, which no trap tier counter takes (OPERATOR-T1).
+pub fn telemetry_line(node_id: u64, audit_line: &str) -> String {
+    format!(
+        "DB_LOG:NODE={}|TIER=KernelDrop|IP=0.0.0.0|VEC={}\n",
+        node_id, audit_line
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A sampled blocklist drop is a kernel drop, not a tier-1 trap hit: the operator's trap
+    /// counters (OPERATOR-T1) count exact `TIER=` fields.
+    #[test]
+    fn a_kernel_drop_is_not_reported_as_a_trap_tier() {
+        let mut e = event([0; 16], 4);
+        e.reason = common::drop_reason::SLOW_PATH_LPM_HIT;
+        let audit = audit_line(&bytes_of(&e)).unwrap();
+        let line = telemetry_line(7, &audit);
+        assert!(
+            !line.contains("TIER=Tier1BotTarpit"),
+            "a blocklist drop is counted as a tier-1 trap hit: {line}"
+        );
+        assert!(line.ends_with(&format!("|VEC={audit}\n")), "{line}");
+    }
 
     /// The bytes the kernel writes, produced from the shared struct as the XDP program does.
     fn bytes_of(event: &DropEvent) -> Vec<u8> {

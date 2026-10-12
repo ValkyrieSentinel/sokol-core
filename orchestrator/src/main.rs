@@ -953,6 +953,9 @@ async fn enforce_block_local<B: block_table::Blocklist>(
         ));
         return counted(Enforcement::Refused);
     }
+    // The decision time is read, and the decision record submitted, under the
+    // table lock, so audit order is lock order and no tick applied a later time first.
+    let mut table = blocks.lock().await;
     let now = block_table::local_ms();
     // Replay context (ADR-0016): the exact decision time and the event id go into every
     // decision record; the audit record's own timestamp is when it was written.
@@ -968,11 +971,8 @@ async fn enforce_block_local<B: block_table::Blocklist>(
     }
     // One step under the table lock (event, strike and claim together, so no state save sees
     // one without the others); the same step audit replay takes (ADR-0016).
-    let (detected, shares_own) = {
-        let mut table = blocks.lock().await;
-        let detected = table.detect(ip, reason, now, event, requested);
-        (detected, table.shares_own())
-    };
+    let detected = table.detect(ip, reason, now, event, requested);
+    let shares_own = table.shares_own();
     let added = match detected {
         block_table::Detected::Duplicate => {
             // The exact wording is an operator-facing contract (xdp-smoke greps it).
@@ -1039,6 +1039,7 @@ async fn enforce_block_local<B: block_table::Blocklist>(
             Enforcement::Pending
         }
     });
+    drop(table);
     // Mutation and audit submission share one poll. Shutdown may cancel publication or
     // the reply afterwards; a missing ACK is not evidence that the decision was refused.
     if added.new && shares_own {
@@ -1048,13 +1049,19 @@ async fn enforce_block_local<B: block_table::Blocklist>(
             .await;
     }
     if outcome == Enforcement::Enforced {
-        let telemetry_msg = format!(
-            "DROP_IMMEDIATE:{}\nDB_LOG:NODE={}|TIER=Tier1BotTarpit|IP={}|VEC={}\n",
-            shown, node_id, shown, reason
-        );
-        push_telemetry(&telemetry_msg).await;
+        push_telemetry(&enforced_telemetry(node_id, &shown, reason)).await;
     }
     outcome
+}
+
+/// What an enforced local block tells the operator: the ban (`DROP_IMMEDIATE`) and an alert.
+/// A block is not a trap hit: its tier is `LocalBlock`, which no trap tier counter takes
+/// (OPERATOR-T1: an unknown tier stays alert-visible). A trap hit reports its own tier.
+fn enforced_telemetry(node_id: u64, shown: &str, reason: &str) -> String {
+    format!(
+        "DROP_IMMEDIATE:{}\nDB_LOG:NODE={}|TIER=LocalBlock|IP={}|VEC={}\n",
+        shown, node_id, shown, reason
+    )
 }
 
 /// Build the first FlowSpec intent before its worker can run. Called after static
@@ -1332,7 +1339,8 @@ async fn main() -> Result<(), anyhow::Error> {
                                         if let Some(log_msg) = kernel_events::audit_line(&item) {
                                             db_events.append(log_msg.clone());
 
-                                            let telemetry_msg = format!("DB_LOG:NODE={}|TIER=Tier1BotTarpit|IP=0.0.0.0|VEC={}\n", node_id_ev, log_msg);
+                                            let telemetry_msg =
+                                                kernel_events::telemetry_line(node_id_ev, &log_msg);
                                             push_telemetry(&telemetry_msg).await;
                                         }
                                     }
@@ -2404,6 +2412,22 @@ async fn main() -> Result<(), anyhow::Error> {
 
 #[cfg(test)]
 mod tests {
+    /// The operator's trap tier counters (OPERATOR-T1) count exact `TIER=` fields; only a trap
+    /// hit may carry a trap tier. A Suricata or CrowdSec block is not a "TRAP TIER-1 (TARPIT)"
+    /// scanner, and the trap hit that caused a block already reported itself.
+    #[test]
+    fn a_detector_block_is_not_reported_as_a_trap_tier() {
+        let line = super::enforced_telemetry(7, "203.0.113.5", "suricata: sid:2001 ET SCAN");
+        assert!(
+            line.starts_with("DROP_IMMEDIATE:203.0.113.5\n"),
+            "the ban sync is kept: {line}"
+        );
+        assert!(
+            !line.contains("TIER=Tier1BotTarpit"),
+            "a detector's block is counted as a tier-1 trap hit: {line}"
+        );
+    }
+
     use super::*;
 
     #[test]
@@ -2717,6 +2741,66 @@ mod tests {
             counts,
             Some([2, 0, 1, 1]),
             "enforced, pending, refused, duplicate"
+        );
+        drop(db);
+        std::fs::remove_dir_all(std::path::Path::new(&path).parent().unwrap()).unwrap();
+    }
+
+    /// A detection that waits for the table lock must not record a
+    /// decision time earlier than a time the table was already advanced to while it waited
+    /// (the node's tick reads its time under the lock). Otherwise replay, which ticks at the
+    /// recorded `At:`, sees a table the node never had and reports a false MISMATCH.
+    #[tokio::test]
+    async fn a_waiting_detection_records_a_time_not_before_the_table_moved_on() {
+        let path = temp_log("at-under-lock");
+        let db = Arc::new(SentinelDb::init(&path, None).unwrap());
+        let blocks = Arc::new(tokio::sync::Mutex::new(BlockTable::with_lists(
+            AcceptLists,
+            TtlPolicy {
+                base: Duration::from_secs(60),
+                max: Duration::from_secs(600),
+            },
+            1,
+        )));
+        let registry = PeerRegistry::new(TrustStore::default());
+        let crypto = Arc::new(NodeCrypto::generate());
+        let policy = BlockPolicy::builtin();
+        let target = parse_target("198.51.100.79").unwrap();
+        // The tick holds the lock while the detection is submitted.
+        let held = blocks.clone().lock_owned().await;
+        let (b, d) = (blocks.clone(), db.clone());
+        let task = tokio::spawn(async move {
+            enforce_block_local(
+                target,
+                "ids",
+                &b,
+                &d,
+                &registry,
+                1,
+                &crypto,
+                &policy,
+                Detection::default(),
+            )
+            .await;
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let mut held = held;
+        let tick_at = block_table::local_ms();
+        held.tick(tick_at);
+        drop(held);
+        task.await.unwrap();
+        assert!(db.flush(Duration::from_secs(2)));
+        let records = read_audit(&path);
+        let at: u64 = records[0]
+            .split('|')
+            .find_map(|f| f.strip_prefix("At:"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(
+            at >= tick_at,
+            "decision recorded At:{at}, {} ms before the tick the table already applied",
+            tick_at - at
         );
         drop(db);
         std::fs::remove_dir_all(std::path::Path::new(&path).parent().unwrap()).unwrap();
