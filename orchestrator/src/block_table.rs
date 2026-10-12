@@ -3802,6 +3802,33 @@ mod tests {
         );
     }
 
+    /// Restored lease records keep the runtime bound and drop records past their retention
+    /// (LEASE-C1, STATE-P2).
+    #[test]
+    fn restored_lease_records_keep_the_bound_and_drop_those_past_retention() {
+        let mut t = table(1, 64);
+        let wall = t.to_wall(T0);
+        let state = Persisted {
+            peer_ends: (0..=MAX_KNOWN_CLAIMS)
+                .map(|i| (format!("lease-{i}"), wall + 600 * S, Some(wall + 3600 * S)))
+                .collect(),
+            ..Persisted::default()
+        };
+        t.restore(state, |_| true, T0);
+        assert_eq!(t.lease_ends.len(), MAX_KNOWN_CLAIMS);
+        let mut t = table(1, 64);
+        let ended = wall.saturating_sub(ms(FORGET_GRACE) + S);
+        let state = Persisted {
+            peer_ends: vec![("past-retention".to_string(), ended, Some(ended))],
+            ..Persisted::default()
+        };
+        t.restore(state, |_| true, T0);
+        assert!(
+            t.lease_ends.is_empty(),
+            "a record past its retention is not restored"
+        );
+    }
+
     /// Operator lifts past the bound are counted like any other retraction record (STATE-P2).
     #[test]
     fn operator_lifts_past_the_bound_are_counted() {
