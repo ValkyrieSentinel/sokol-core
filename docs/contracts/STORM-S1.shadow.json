@@ -1,12 +1,18 @@
 {
-  "after": "STORM-T1",
-  "base_contract_sha256": null,
-  "because": "Counterexample (hunt round 4, 2026-10-12): under_attack counted every drop reason, including drops storm mode itself causes, so legitimate fragmented or unparsable traffic could keep nodes under attack and the latch from ever seeing calm (ADR-0006: a cost bounded by the storm). Owner chose option A: a separate ABI reason for strict-parse drops. Witnesses added after the mutation check (PR #15).",
+  "annotations": {
+    "status": "UNSIGNED_EXPLANATORY_DRAFT"
+  },
+  "decisions": [
+    {
+      "because": "Counterexample (hunt round 4, 2026-10-12): under_attack counted every drop reason, including drops storm mode itself causes, so legitimate fragmented or unparsable traffic could keep nodes under attack and the latch from ever seeing calm (ADR-0006: a cost bounded by the storm). Owner chose option A: a separate ABI reason for strict-parse drops. Witnesses added after the mutation check (PR #15).",
+      "previous_statement_sha256": null,
+      "proposal_sha256": "d9cfcd1a0a330d65145f45d796db5f955705392ace19eada1ed4edceaf1abd75"
+    }
+  ],
   "evidence_text": "`a_defense_reports_the_operators_base_flags`, `a_malformed_header_flood_above_the_threshold_is_an_attack_in_every_mode`, `attack_drop_reasons_above_the_threshold_count`, `drops_just_below_the_threshold_are_not_an_attack`, `drops_only_storm_mode_adds_above_the_threshold_are_not_an_attack`, `strict_parse_drops_count_when_the_operator_set_the_flag_or_storm_only_observes`, `the_xdp_program_drops_unparsable_headers_in_strict_mode_with_their_own_reason`",
   "id": "STORM-S1",
-  "profile": "sokol.contract-proposal.v1",
+  "profile": "sokol.contract-shadow.v1",
   "statement": "The attack signal leaves out exactly the drops storm mode itself adds (strict-parse drops while storm adds STRICT_PARSE, fragment drops while it adds DROP_IPV4_FRAGMENTS) and nothing else: a malformed-header flood is an attack in every mode, so a storm cannot keep itself going on legitimate traffic.",
-  "status": "UNSIGNED_INTENT",
   "witnesses": [
     "a_defense_reports_the_operators_base_flags",
     "a_malformed_header_flood_above_the_threshold_is_an_attack_in_every_mode",
