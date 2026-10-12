@@ -94,6 +94,26 @@ class RetiredFiles(unittest.TestCase):
         self.with_row(ROW.replace("SUPERSEDED", "FORGOTTEN"))
         self.assert_refused("mode FORGOTTEN")
 
+    def test_a_depth_1_clone_fetches_the_archive_tag(self):
+        # CI's checkout has one commit and no tags (2026-10-12: the check died with git's 128).
+        run(self.dir, "git", "config", "uploadpack.allowAnySHA1InWant", "true")
+        clone = self.dir.parent / f"{self.dir.name}-ci"
+        run(self.dir.parent, "git", "init", "-q", str(clone))
+        run(clone, "git", "remote", "add", "origin", str(self.dir))
+        head = run(self.dir, "git", "rev-parse", "HEAD").stdout.strip()
+        run(clone, "git", "fetch", "-q", "--depth=1", "origin", head)
+        run(clone, "git", "checkout", "-q", "FETCH_HEAD")
+        self.assertNotEqual(run(clone, "git", "rev-parse", "-q", "--verify", "refs/tags/archive/2026-10-12").returncode, 0)
+        r = run(clone, "bash", "scripts/check-retired.sh")
+        shutil.rmtree(clone, ignore_errors=True)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("1 retired files: absent, digests match", r.stdout)
+
+    def test_missing_tagged_bytes_are_a_failure_not_a_crash(self):
+        run(self.dir, "git", "tag", "-d", "archive/2026-10-12")
+        run(self.dir, "git", "tag", "archive/2026-10-12", "HEAD")
+        self.assert_refused("bytes at archive/2026-10-12 are not")
+
     def test_an_empty_table_is_refused(self):
         self.with_row("")
         self.assert_refused("has no retired-files rows")

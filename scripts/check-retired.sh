@@ -32,6 +32,9 @@ done
 # Retired files, one table row each (docs/RETIRED.md, 2026-10-12 on): the exact subject is gone
 # from the tree, its bytes are at the tag with the recorded digest (I1), its loss is named (I4),
 # and its replacement exists. A table that lists nothing fails: an empty scope is not a pass.
+# CI checks out one commit: fetch the tag that holds the bytes if this clone lacks it.
+git rev-parse -q --verify "refs/tags/archive/2026-10-12^{commit}" >/dev/null ||
+    git fetch -q --depth=1 origin "refs/tags/archive/2026-10-12:refs/tags/archive/2026-10-12" 2>/dev/null || true
 rows=$(awk '/<!-- retired-files:/ {p = 1; next} p && /^\| `/ {print; next} p && !/^\|/ {p = 0}' "$LEDGER")
 [ -n "$rows" ] || { echo "FAIL $LEDGER has no retired-files rows"; fail=1; }
 while IFS='|' read -r _ path mode digest replacement loss _; do
@@ -39,7 +42,7 @@ while IFS='|' read -r _ path mode digest replacement loss _; do
     replacement=$(echo "$replacement" | sed 's/^ *//; s/ *$//'); loss=$(echo "$loss" | sed 's/^ *//; s/ *$//')
     case "$mode" in SUPERSEDED|WITHDRAWN|REFUTED|ARCHIVED) ;; *) echo "FAIL $path: mode $mode"; fail=1 ;; esac
     [ ! -e "$path" ] || { echo "FAIL $path is retired but still in the tree"; fail=1; }
-    got=$(git show "archive/2026-10-12:$path" 2>/dev/null | shasum -a 256 | cut -c1-64)
+    got=$( (git show "archive/2026-10-12:$path" 2>/dev/null || true) | shasum -a 256 | cut -c1-64)
     [ "$got" = "$digest" ] || { echo "FAIL $path: bytes at archive/2026-10-12 are not $digest"; fail=1; }
     [ -n "$loss" ] && [ "$loss" != "—" ] || { echo "FAIL $path: a retirement names what is lost"; fail=1; }
     case "$replacement" in
