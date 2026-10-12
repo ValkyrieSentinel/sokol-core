@@ -63,4 +63,7 @@ exclude_re = [
     # Not the length bound of a bare string: a unit variant would then be refused.
     "replace check_canonical -> Result<\\(\\), common::canonical::CanonicalError> with Ok\\(\\(\\)\\)$",
     "replace && with \\|\\| in check_canonical$",
+    # Whether an enforced block is pushed to the trident telemetry socket: push_telemetry
+    # writes to a socket no unit test opens. The line it sends is tested (enforced_telemetry).
+    "main.rs:\\d+:\\d+: replace == with != in enforce_block_local$",
 ]
