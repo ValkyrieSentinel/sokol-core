@@ -184,15 +184,18 @@ pub(crate) async fn execute_control<B: block_table::Blocklist>(
                         }
                     }
                     let pinned = ctx.registry.reload(trust);
+                    // Nodes no longer pinned, or bound elsewhere, get no broadcast from now on.
+                    let dropped = ctx.registry.drop_untrusted().await;
                     log_inbound_budget(pinned);
                     log::warn!(
-                        "[Control] Reloaded {}: {} pinned peers",
+                        "[Control] Reloaded {}: {} pinned peers; connections of nodes {:?} unregistered",
                         path.display(),
-                        pinned
+                        pinned,
+                        dropped
                     );
                     sntl_db.append(format!(
-                        "PEERS_RELOADED|Pinned:{}|Legacy:{:?}",
-                        pinned, legacy
+                        "PEERS_RELOADED|Pinned:{}|Legacy:{:?}|Unregistered:{:?}",
+                        pinned, legacy, dropped
                     ));
                     if legacy.is_empty() {
                         format!("OK {} pinned peers", pinned)
@@ -323,6 +326,108 @@ mod tests {
                 .await
                 .is_blocked("203.0.113.10/32".parse().unwrap()),
             "revoked peer still enforces its held claim"
+        );
+        drop(ctx);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A reload that revokes a connected node, or binds it to another address, stops this
+    /// node's broadcasts to it at once (ROADMAP item 10). Before, its link stayed registered and
+    /// got every broadcast until its own next envelope failed to authenticate (up to ~10 s).
+    #[tokio::test]
+    async fn a_reload_stops_broadcasts_to_a_revoked_or_moved_node_at_once() {
+        let dir = std::env::temp_dir().join(format!(
+            "sokol-reload-revoke-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("peers.json");
+        let crypto = Arc::new(NodeCrypto::generate());
+        let key = crypto.public_key_hex();
+        let peer = |id: u64| serde_json::json!({"node_id": id, "public_key": key});
+        let at = |id: u64, address: &str| serde_json::json!({"node_id": id, "public_key": key, "address": address});
+        std::fs::write(
+            &file,
+            serde_json::to_vec(&vec![peer(2), peer(3), peer(4)]).unwrap(),
+        )
+        .unwrap();
+        let registry = PeerRegistry::new(TrustStore::load(&file).unwrap());
+        let mut queues = Vec::new();
+        for id in [2u64, 3, 4] {
+            let (urgent, urgent_rx) = tokio::sync::mpsc::channel(4);
+            let (bulk, bulk_rx) = tokio::sync::mpsc::channel(4);
+            let link = p2p::PeerLink {
+                urgent,
+                bulk,
+                features: Arc::from(Vec::new()),
+            };
+            let addr = format!("127.0.0.{}:7946", id).parse().unwrap();
+            registry.add_peer(addr, link, id, id).await;
+            queues.push((id, urgent_rx, bulk_rx));
+        }
+        let ttl = TtlPolicy {
+            base: Duration::from_secs(60),
+            max: Duration::from_secs(600),
+        };
+        let ctx = ControlCtx {
+            state: Arc::new(StateStore::new(dir.join("state.json"))),
+            peer_limits: PeerLimits {
+                default: Envelope::unlimited(ttl.max),
+                quorum: Quorum::OFF,
+            },
+            blocks: Arc::new(tokio::sync::Mutex::new(BlockTable::with_lists(
+                AcceptLists,
+                ttl,
+                1,
+            ))),
+            policy: PolicyHandle::new(BlockPolicy::builtin()),
+            sntl_db: Arc::new(
+                SentinelDb::init(dir.join("events.sntl").to_str().unwrap(), None).unwrap(),
+            ),
+            registry,
+            peers_file: Some(file.clone()),
+            node_id: 1,
+            crypto: crypto.clone(),
+        };
+        // Node 2 revoked, node 3 bound to an address it is not connected from, node 4 kept.
+        std::fs::write(
+            &file,
+            serde_json::to_vec(&vec![at(3, "192.0.2.3"), peer(4)]).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            execute_control(control::ControlCommand::ReloadPeers, &ctx).await,
+            "OK 2 pinned peers"
+        );
+        let alert = MeshCommand::Alert {
+            level: crate::mesh_sync::AlertLevel::Info,
+            message: "after the reload".into(),
+        };
+        ctx.registry.broadcast(&alert, 1, &crypto).await.unwrap();
+        let mut reached = Vec::new();
+        for (id, urgent_rx, bulk_rx) in queues.iter_mut() {
+            if urgent_rx.try_recv().is_ok() || bulk_rx.try_recv().is_ok() {
+                reached.push(*id);
+            }
+        }
+        assert_eq!(
+            reached,
+            vec![4],
+            "only the node the reloaded peers file still trusts at its address gets broadcasts"
+        );
+        assert!(ctx.sntl_db.flush(Duration::from_secs(2)));
+        let mut reader = common::audit_log::AuditReader::open(&dir.join("events.sntl")).unwrap();
+        let mut records = Vec::new();
+        while let Some(record) = reader.next_record().unwrap() {
+            records.push(String::from_utf8(record.payload).unwrap());
+        }
+        assert!(
+            records
+                .iter()
+                .any(|r| r == "PEERS_RELOADED|Pinned:2|Legacy:[]|Unregistered:[2, 3]"),
+            "{:?}",
+            records
         );
         drop(ctx);
         std::fs::remove_dir_all(dir).unwrap();

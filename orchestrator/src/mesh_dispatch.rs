@@ -81,12 +81,12 @@ impl<B: Blocklist + Send + 'static, M: ConfigMap + 'static> MeshDispatch<B, M> {
                 let refusal = claim
                     .net()
                     .and_then(|n| self.policy.current().check_net(n).err());
-                let (now, wall) = (block_table::local_ms(), now_ms());
-                let result = self
-                    .blocks
-                    .lock()
-                    .await
-                    .adopt(claim, refusal.is_none(), now);
+                // Time is read once the table is held: a wait for it must not shorten the lease.
+                let (result, wall) = {
+                    let mut table = self.blocks.lock().await;
+                    let (now, wall) = (block_table::local_ms(), now_ms());
+                    (table.adopt(claim, refusal.is_none(), now), wall)
+                };
                 match (result, refusal) {
                     (Adoption::Enforced, _) => {
                         let left = expires.map(|e| Duration::from_millis(e.saturating_sub(wall)));
@@ -168,9 +168,9 @@ impl<B: Blocklist + Send + 'static, M: ConfigMap + 'static> MeshDispatch<B, M> {
                 claims,
                 retracted,
             } => {
-                let (now, wall) = (block_table::local_ms(), now_ms());
                 let mut adopted = 0;
                 for claim in claims {
+                    let wall = now_ms();
                     let refusal = claim
                         .net()
                         .and_then(|n| self.policy.current().check_net(n).err());
@@ -179,13 +179,11 @@ impl<B: Blocklist + Send + 'static, M: ConfigMap + 'static> MeshDispatch<B, M> {
                         claim.expires_ms.map(|e| e.saturating_sub(wall) / 1000),
                     );
                     let tag = parse_target(&shown).map(ip_tag).unwrap_or("V4");
-                    if self
-                        .blocks
-                        .lock()
-                        .await
-                        .adopt(claim, refusal.is_none(), now)
-                        == Adoption::Enforced
-                    {
+                    let adoption = {
+                        let mut table = self.blocks.lock().await;
+                        table.adopt(claim, refusal.is_none(), block_table::local_ms())
+                    };
+                    if adoption == Adoption::Enforced {
                         adopted += 1;
                         self.db.append(format!(
                             "MESH_BLOCK_{}|IP:{}|TTL:{}|Reason:sync from node {}",
@@ -196,7 +194,11 @@ impl<B: Blocklist + Send + 'static, M: ConfigMap + 'static> MeshDispatch<B, M> {
                         ));
                     }
                 }
-                let lifted = self.blocks.lock().await.retract(issuer, &retracted, now);
+                let lifted =
+                    self.blocks
+                        .lock()
+                        .await
+                        .retract(issuer, &retracted, block_table::local_ms());
                 for net in &lifted {
                     self.db
                         .append(format!("MESH_UNBLOCK|IP:{}|Issuer:{}", show(net), issuer));
@@ -495,6 +497,38 @@ mod tests {
         );
     }
 
+    /// A peer claim's lease starts when the table takes it, not when the dispatcher began to
+    /// wait for the table (ROADMAP item 10): a wait behind a busy table no longer shortens it.
+    #[tokio::test]
+    async fn a_wait_for_the_table_does_not_shorten_a_peer_claims_lease() {
+        let n = node("lease-wait", None);
+        let blocks = n.dispatch.blocks.clone();
+        let mut claim = peer_claim("198.51.100.30");
+        claim.expires_ms = None; // the local cap (600 s) is the whole lease
+        let busy = blocks.lock().await;
+        let mut dispatch = n.dispatch;
+        let adopting = tokio::spawn(async move {
+            dispatch.peer(MeshCommand::Claim { claim }).await;
+            dispatch
+        });
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let taken = block_table::local_ms();
+        drop(busy);
+        let _dispatch = adopting.await.unwrap();
+        let net = parse_target("198.51.100.30").unwrap();
+        let mut table = blocks.lock().await;
+        assert!(table.is_blocked(net), "setup: the claim is enforced");
+        let lifted = table.tick(taken + 600_000 - 500);
+        assert!(
+            lifted.is_empty() && table.is_blocked(net),
+            "the lease ended before 600 s from when the table took the claim"
+        );
+        assert!(
+            !table.tick(taken + 600_000 + 5_000).is_empty(),
+            "the cap still ends it"
+        );
+    }
+
     #[tokio::test]
     async fn a_peer_claim_on_a_protected_address_is_refused_and_audited() {
         let mut n = node("protected", Some("198.51.100.21/32"));
@@ -525,6 +559,32 @@ mod tests {
             })
             .await;
         assert!(n.in_kernel("198.51.100.22") && n.in_kernel("198.51.100.23"));
+    }
+
+    /// A snapshot audits the claims it enforced and only those: one on a protected address is
+    /// held, not recorded as a block.
+    #[tokio::test]
+    async fn a_snapshot_audits_only_the_claims_it_enforced() {
+        let mut n = node("sync-audit", Some("198.51.100.25/32"));
+        n.dispatch
+            .peer(MeshCommand::BlockSync {
+                issuer: PEER,
+                claims: vec![peer_claim("198.51.100.24"), peer_claim("198.51.100.25")],
+                retracted: vec![],
+            })
+            .await;
+        let blocks: Vec<String> = n
+            .audit()
+            .into_iter()
+            .filter(|r| r.starts_with("MESH_BLOCK_V4|"))
+            .collect();
+        assert_eq!(blocks.len(), 1, "{:?}", blocks);
+        assert!(
+            blocks[0].starts_with("MESH_BLOCK_V4|IP:198.51.100.24|")
+                && blocks[0].ends_with("|Reason:sync from node 2"),
+            "{:?}",
+            blocks
+        );
     }
 
     #[tokio::test]

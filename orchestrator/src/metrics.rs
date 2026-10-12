@@ -31,6 +31,8 @@ pub struct Snapshot {
     pub events_suppressed: u64,
     pub events_lost: u64,
     pub events_malformed: u64,
+    /// Reads of the STATS map that failed; the XDP counters keep their last good values.
+    pub xdp_stats_read_failures: u64,
     pub blocks_active_v4: usize,
     pub blocks_active_v6: usize,
     pub blocks_capacity: usize,
@@ -96,6 +98,63 @@ fn family(out: &mut String, name: &str, kind: &str, help: &str) {
 }
 
 /// Sample the worker at request time, independently of the main loop's last tick.
+/// The XDP program's counters summed over CPUs, from the last read of the STATS map that
+/// succeeded. A failed read is unknown, not zero: it keeps these sums and is counted.
+#[derive(Clone, Debug, Default)]
+pub struct XdpTotals {
+    read_failures: u64,
+    rx_packets: u64,
+    rx_bytes: u64,
+    dropped_packets: u64,
+    events_suppressed: u64,
+    events_lost: u64,
+    drops_by_reason: [u64; DROP_REASON_SLOTS],
+    observed_by_reason: [u64; DROP_REASON_SLOTS],
+}
+
+impl XdpTotals {
+    /// Sums one read of the per-CPU values; `None` is a read that failed.
+    pub fn read<'a>(&mut self, per_cpu: Option<impl IntoIterator<Item = &'a common::PacketStats>>) {
+        let Some(per_cpu) = per_cpu else {
+            self.read_failures = self.read_failures.saturating_add(1);
+            return;
+        };
+        let mut sums = XdpTotals {
+            read_failures: self.read_failures,
+            ..XdpTotals::default()
+        };
+        for cpu in per_cpu {
+            sums.rx_packets += cpu.rx_packets;
+            sums.rx_bytes += cpu.rx_bytes;
+            sums.dropped_packets += cpu.dropped_packets;
+            sums.events_suppressed += cpu.events_suppressed;
+            sums.events_lost += cpu.events_lost;
+            for (sum, n) in sums
+                .observed_by_reason
+                .iter_mut()
+                .zip(cpu.observed_by_reason)
+            {
+                *sum += n;
+            }
+            for (sum, n) in sums.drops_by_reason.iter_mut().zip(cpu.drops_by_reason) {
+                *sum += n;
+            }
+        }
+        *self = sums;
+    }
+
+    pub fn fill(&self, s: &mut Snapshot) {
+        s.rx_packets = self.rx_packets;
+        s.rx_bytes = self.rx_bytes;
+        s.dropped_packets = self.dropped_packets;
+        s.events_suppressed = self.events_suppressed;
+        s.events_lost = self.events_lost;
+        s.drops_by_reason = self.drops_by_reason;
+        s.observed_by_reason = self.observed_by_reason;
+        s.xdp_stats_read_failures = self.read_failures;
+    }
+}
+
 pub fn render_with_flowspec(s: &Snapshot, readback: &crate::flowspec::Readback) -> String {
     let view = readback.snapshot();
     let mut snapshot = s.clone();
@@ -180,6 +239,17 @@ fn render_at(s: &Snapshot, now: Instant) -> String {
         "Bytes seen by the XDP program.",
     );
     let _ = writeln!(out, "sokol_xdp_rx_bytes_total {}", s.rx_bytes);
+    family(
+        &mut out,
+        "sokol_xdp_stats_read_failures_total",
+        "counter",
+        "Reads of the XDP STATS map that failed; the XDP counters keep their last good values.",
+    );
+    let _ = writeln!(
+        out,
+        "sokol_xdp_stats_read_failures_total {}",
+        s.xdp_stats_read_failures
+    );
 
     family(
         &mut out,
@@ -843,5 +913,60 @@ mod tests {
                 name
             );
         }
+    }
+
+    /// A failed read of the STATS map is unknown, not zero (ROADMAP item 10). Zeros read as a
+    /// counter reset to Prometheus, and the next good read then looks like the whole history
+    /// arriving in one tick: to the rate check and the storm latch (`defense::under_attack`)
+    /// as much as to `rate()`. The last good sums stay and the failure is counted.
+    #[test]
+    fn a_failed_stats_read_keeps_the_last_counters_and_is_counted() {
+        let mut cpu = common::PacketStats {
+            rx_packets: 0,
+            rx_bytes: 0,
+            dropped_packets: 0,
+            drops_by_reason: [0; DROP_REASON_SLOTS],
+            events_suppressed: 0,
+            event_window_start_ns: 0,
+            events_in_window: 0,
+            events_lost: 0,
+            observed_packets: 0,
+            observed_by_reason: [0; DROP_REASON_SLOTS],
+        };
+        cpu.rx_packets = 1_000;
+        cpu.rx_bytes = 64_000;
+        cpu.dropped_packets = 40;
+        cpu.drops_by_reason[drop_reason::SLOW_PATH_LPM_HIT as usize] = 40;
+        cpu.observed_by_reason[drop_reason::SLOW_PATH_LPM_HIT as usize] = 6;
+        cpu.events_suppressed = 3;
+        cpu.events_lost = 5;
+        let mut totals = XdpTotals::default();
+        totals.read(Some([cpu, cpu].iter()));
+        totals.read(None::<std::slice::Iter<'_, common::PacketStats>>);
+        let mut snap = Snapshot::default();
+        totals.fill(&mut snap);
+        assert_eq!(
+            (snap.rx_packets, snap.rx_bytes, snap.dropped_packets),
+            (2_000, 128_000, 80),
+            "a failed read published other counters than the last good ones"
+        );
+        assert_eq!(
+            snap.drops_by_reason[drop_reason::SLOW_PATH_LPM_HIT as usize],
+            80
+        );
+        assert_eq!(
+            snap.observed_by_reason[drop_reason::SLOW_PATH_LPM_HIT as usize],
+            12
+        );
+        assert_eq!((snap.events_suppressed, snap.events_lost), (6, 10));
+        let text = render(&snap);
+        assert!(
+            text.contains("sokol_xdp_stats_read_failures_total 1\n"),
+            "the failed read is not counted"
+        );
+        // A good read after it takes the new sums and keeps the count of failures.
+        totals.read(Some([cpu].iter()));
+        totals.fill(&mut snap);
+        assert_eq!((snap.rx_packets, snap.xdp_stats_read_failures), (1_000, 1));
     }
 }

@@ -2003,6 +2003,7 @@ async fn main() -> Result<(), anyhow::Error> {
     let p2p_bind_hb = args.p2p_bind.clone();
     let control_socket_hb = args.control_socket.clone();
     let mut watermark = Watermark::default();
+    let mut xdp_totals = metrics::XdpTotals::default();
     let (registry_tick, crypto_tick) = (peer_registry.clone(), node_crypto.clone());
     let node_id_tick = args.node_id;
     let mut last_digest = std::time::Instant::now();
@@ -2182,33 +2183,16 @@ async fn main() -> Result<(), anyhow::Error> {
                 push_telemetry(&hb_msg).await;
 
 
-                let mut total_rx_packets = 0u64;
-                let mut total_rx_bytes = 0u64;
-                let mut total_dropped = 0u64;
                 let mut snapshot = metrics::Snapshot {
                     events_malformed: kernel_events::MALFORMED
                         .load(std::sync::atomic::Ordering::Relaxed),
                     ..Default::default()
                 };
-
-                if let Ok(per_cpu_stats) = stats_map.get(&0u32, 0) {
-                    for cpu_stat in per_cpu_stats.iter() {
-                        total_rx_packets += cpu_stat.0.rx_packets;
-                        total_rx_bytes += cpu_stat.0.rx_bytes;
-                        total_dropped += cpu_stat.0.dropped_packets;
-                        snapshot.events_suppressed += cpu_stat.0.events_suppressed;
-                        snapshot.events_lost += cpu_stat.0.events_lost;
-                        for (sum, n) in snapshot.observed_by_reason.iter_mut().zip(cpu_stat.0.observed_by_reason) {
-                            *sum += n;
-                        }
-                        for (sum, n) in snapshot.drops_by_reason.iter_mut().zip(cpu_stat.0.drops_by_reason) {
-                            *sum += n;
-                        }
-                    }
-                }
-                snapshot.rx_packets = total_rx_packets;
-                snapshot.rx_bytes = total_rx_bytes;
-                snapshot.dropped_packets = total_dropped;
+                let per_cpu = stats_map.get(&0u32, 0).ok();
+                xdp_totals.read(per_cpu.as_ref().map(|v| v.iter().map(|s| &s.0)));
+                xdp_totals.fill(&mut snapshot);
+                let (total_rx_packets, total_rx_bytes, total_dropped) =
+                    (snapshot.rx_packets, snapshot.rx_bytes, snapshot.dropped_packets);
                 let (v4_active, v6_active) = blocks.lock().await.active_by_family();
                 snapshot.blocks_active_v4 = v4_active;
                 snapshot.blocks_active_v6 = v6_active;

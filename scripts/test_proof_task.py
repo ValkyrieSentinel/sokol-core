@@ -20,8 +20,10 @@ class ProofTask(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name).resolve()
+        # Every source the catalog challenges, so a new proof file needs no edit here.
+        sources = sorted({c['file'] for c in json.loads((ROOT / tool.CATALOG).read_text())['cases']})
         for name in ('scripts/proof-task.py', 'scripts/contract-task.py', tool.CATALOG,
-                     'common/src/audit_log.rs', 'common/src/canonical.rs', '.github/workflows/ci.yml'):
+                     *sources, '.github/workflows/ci.yml'):
             target = self.root / name
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(ROOT / name, target)

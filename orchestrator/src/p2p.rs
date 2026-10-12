@@ -915,6 +915,17 @@ pub fn open(
     envelope: &SecureEnvelope,
     now: u64,
 ) -> Result<NetworkMessage, EnvelopeError> {
+    authenticate(trust, envelope, now)?;
+    record_and_decode(replay, envelope, now)
+}
+
+/// Sender, signature and clock window: everything before the replay cache. It reads no shared
+/// state but the trust store, so it runs without the replay lock (`PeerRegistry::open_at`).
+fn authenticate(
+    trust: &TrustStore,
+    envelope: &SecureEnvelope,
+    now: u64,
+) -> Result<(), EnvelopeError> {
     let keys = trust
         .get(envelope.sender_id)
         .ok_or(EnvelopeError::UnknownSender)?;
@@ -938,7 +949,15 @@ pub fn open(
     if envelope.timestamp_ms.abs_diff(now) > MAX_CLOCK_SKEW_MS {
         return Err(EnvelopeError::StaleTimestamp);
     }
+    Ok(())
+}
 
+/// The replay check of an authenticated envelope, then its message.
+fn record_and_decode(
+    replay: &mut ReplayGuard,
+    envelope: &SecureEnvelope,
+    now: u64,
+) -> Result<NetworkMessage, EnvelopeError> {
     if !replay.check_and_record(
         envelope.sender_id,
         envelope.nonce,
@@ -1168,6 +1187,25 @@ impl PeerRegistry {
         pinned
     }
 
+    /// Unregisters the connections of nodes the current trust store no longer pins, or binds
+    /// to another address (ADR-0027), so broadcasts stop at the reload rather than at the node's
+    /// next envelope. Their connections still close on that envelope. Returns the node ids.
+    pub async fn drop_untrusted(&self) -> Vec<u64> {
+        let trust = self.trust.read().unwrap_or_else(|p| p.into_inner()).clone();
+        let mut peers = self.peers.write().await;
+        let mut dropped: Vec<u64> = Vec::new();
+        peers.retain(|addr, (_, id, _)| {
+            let keep = trust.get(*id).is_some() && trust.address_allows(*id, addr.ip());
+            if !keep {
+                dropped.push(*id);
+            }
+            keep
+        });
+        dropped.sort_unstable();
+        dropped.dedup();
+        dropped
+    }
+
     pub fn pinned_peers(&self) -> usize {
         self.trust.read().unwrap_or_else(|p| p.into_inner()).len()
     }
@@ -1202,9 +1240,13 @@ impl PeerRegistry {
         envelope: &SecureEnvelope,
         now: u64,
     ) -> Result<NetworkMessage, EnvelopeError> {
-        let mut replay = self.replay.lock().unwrap_or_else(|p| p.into_inner());
+        // The signature check runs without the replay lock, so connections verify in parallel;
+        // only the cache lookup and insert are serialised.
         let trust = self.trust.read().unwrap_or_else(|p| p.into_inner()).clone();
-        let opened = open(&trust, &mut replay, envelope, now);
+        let opened = authenticate(&trust, envelope, now).and_then(|()| {
+            let mut replay = self.replay.lock().unwrap_or_else(|p| p.into_inner());
+            record_and_decode(&mut replay, envelope, now)
+        });
         if let Err(e) = &opened {
             if let Some(counter) = self.stats.rejected.get(e.slot()) {
                 counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2247,6 +2289,38 @@ mod tests {
             (1, 1, 1)
         );
         assert_eq!(count("bad_signature") + count("malformed_payload"), 0);
+    }
+
+    /// The ML-DSA check is the expensive step of every inbound message; under the shared replay
+    /// mutex it ran one connection at a time on one core (ROADMAP, round-5 mesh candidates).
+    /// The signature is verified without that lock: a forged envelope is refused while another
+    /// connection holds it, and the cache is still written only after a valid signature.
+    #[test]
+    fn a_signature_is_verified_without_holding_the_replay_lock() {
+        let peer = NodeCrypto::generate();
+        let registry = PeerRegistry::new(trust_with(7, &peer));
+        let forged = seal(&NodeCrypto::generate(), 7, &block_cmd("10.0.0.9")).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::scope(|s| {
+            let held = registry.replay.lock().unwrap();
+            s.spawn(|| {
+                let _ = tx.send(registry.open_at(&forged, forged.timestamp_ms));
+            });
+            let outcome = rx.recv_timeout(std::time::Duration::from_secs(10));
+            drop(held);
+            assert_eq!(
+                outcome.ok().map(|r| r.unwrap_err()),
+                Some(EnvelopeError::BadSignature),
+                "a forged envelope is refused while another connection holds the replay lock"
+            );
+        });
+        let env = seal(&peer, 7, &block_cmd("10.0.0.9")).unwrap();
+        assert!(registry.open_at(&env, env.timestamp_ms).is_ok());
+        assert_eq!(
+            registry.open_at(&env, env.timestamp_ms).unwrap_err(),
+            EnvelopeError::Replay,
+            "the replay check still runs, under the lock"
+        );
     }
 
     #[test]
@@ -3918,6 +3992,54 @@ mod tests {
             "an unbound node is accepted anywhere"
         );
         drop((wrong, right, unbound));
+    }
+
+    /// `drop_untrusted` names exactly the nodes it unregistered: revoked (2) and bound to an
+    /// address they are not connected from (3, both of its connections); a kept node (4) and an
+    /// unbound one connected from anywhere (5) stay.
+    #[tokio::test]
+    async fn drop_untrusted_unregisters_and_names_revoked_and_moved_nodes() {
+        let keys: Vec<NodeCrypto> = (0..4).map(|_| NodeCrypto::generate()).collect();
+        let mut trust = TrustStore::default();
+        for (id, key) in (2u64..).zip(&keys) {
+            trust.insert(id, key.public_key.clone());
+        }
+        let registry = PeerRegistry::new(trust);
+        let mut rxs = Vec::new();
+        for (addr, id, conn) in [
+            ("127.0.0.2:1", 2u64, 1u64),
+            ("127.0.0.3:1", 3, 2),
+            ("127.0.0.3:2", 3, 3),
+            ("192.0.2.4:1", 4, 4),
+            ("198.51.100.5:1", 5, 5),
+        ] {
+            let (tx, rx) = mpsc::channel(1);
+            rxs.push(rx);
+            registry
+                .add_peer(addr.parse().unwrap(), one_queue(tx), id, conn)
+                .await;
+        }
+        let mut next = TrustStore::default();
+        for (id, key) in (3u64..).zip(&keys[1..]) {
+            next.insert(id, key.public_key.clone());
+        }
+        next.bind_address(3, "192.0.2.3".parse().unwrap());
+        next.bind_address(4, "192.0.2.4".parse().unwrap());
+        registry.reload(next);
+        assert_eq!(registry.drop_untrusted().await, vec![2, 3]);
+        assert_eq!(
+            (
+                connections_of(&registry, 2).await,
+                connections_of(&registry, 3).await,
+                connections_of(&registry, 4).await,
+                connections_of(&registry, 5).await
+            ),
+            (0, 0, 1, 1)
+        );
+        assert!(
+            registry.drop_untrusted().await.is_empty(),
+            "nothing left to drop"
+        );
     }
 
     /// ADR-0027: a reload that binds a connected node to another address closes its connection
