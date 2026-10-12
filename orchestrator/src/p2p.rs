@@ -915,6 +915,17 @@ pub fn open(
     envelope: &SecureEnvelope,
     now: u64,
 ) -> Result<NetworkMessage, EnvelopeError> {
+    authenticate(trust, envelope, now)?;
+    record_and_decode(replay, envelope, now)
+}
+
+/// Sender, signature and clock window: everything before the replay cache. It reads no shared
+/// state but the trust store, so it runs without the replay lock (`PeerRegistry::open_at`).
+fn authenticate(
+    trust: &TrustStore,
+    envelope: &SecureEnvelope,
+    now: u64,
+) -> Result<(), EnvelopeError> {
     let keys = trust
         .get(envelope.sender_id)
         .ok_or(EnvelopeError::UnknownSender)?;
@@ -938,7 +949,15 @@ pub fn open(
     if envelope.timestamp_ms.abs_diff(now) > MAX_CLOCK_SKEW_MS {
         return Err(EnvelopeError::StaleTimestamp);
     }
+    Ok(())
+}
 
+/// The replay check of an authenticated envelope, then its message.
+fn record_and_decode(
+    replay: &mut ReplayGuard,
+    envelope: &SecureEnvelope,
+    now: u64,
+) -> Result<NetworkMessage, EnvelopeError> {
     if !replay.check_and_record(
         envelope.sender_id,
         envelope.nonce,
@@ -1202,9 +1221,13 @@ impl PeerRegistry {
         envelope: &SecureEnvelope,
         now: u64,
     ) -> Result<NetworkMessage, EnvelopeError> {
-        let mut replay = self.replay.lock().unwrap_or_else(|p| p.into_inner());
+        // The signature check runs without the replay lock, so connections verify in parallel;
+        // only the cache lookup and insert are serialised.
         let trust = self.trust.read().unwrap_or_else(|p| p.into_inner()).clone();
-        let opened = open(&trust, &mut replay, envelope, now);
+        let opened = authenticate(&trust, envelope, now).and_then(|()| {
+            let mut replay = self.replay.lock().unwrap_or_else(|p| p.into_inner());
+            record_and_decode(&mut replay, envelope, now)
+        });
         if let Err(e) = &opened {
             if let Some(counter) = self.stats.rejected.get(e.slot()) {
                 counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2247,6 +2270,38 @@ mod tests {
             (1, 1, 1)
         );
         assert_eq!(count("bad_signature") + count("malformed_payload"), 0);
+    }
+
+    /// The ML-DSA check is the expensive step of every inbound message; under the shared replay
+    /// mutex it ran one connection at a time on one core (ROADMAP, round-5 mesh candidates).
+    /// The signature is verified without that lock: a forged envelope is refused while another
+    /// connection holds it, and the cache is still written only after a valid signature.
+    #[test]
+    fn a_signature_is_verified_without_holding_the_replay_lock() {
+        let peer = NodeCrypto::generate();
+        let registry = PeerRegistry::new(trust_with(7, &peer));
+        let forged = seal(&NodeCrypto::generate(), 7, &block_cmd("10.0.0.9")).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::scope(|s| {
+            let held = registry.replay.lock().unwrap();
+            s.spawn(|| {
+                let _ = tx.send(registry.open_at(&forged, forged.timestamp_ms));
+            });
+            let outcome = rx.recv_timeout(std::time::Duration::from_secs(10));
+            drop(held);
+            assert_eq!(
+                outcome.ok().map(|r| r.unwrap_err()),
+                Some(EnvelopeError::BadSignature),
+                "a forged envelope is refused while another connection holds the replay lock"
+            );
+        });
+        let env = seal(&peer, 7, &block_cmd("10.0.0.9")).unwrap();
+        assert!(registry.open_at(&env, env.timestamp_ms).is_ok());
+        assert_eq!(
+            registry.open_at(&env, env.timestamp_ms).unwrap_err(),
+            EnvelopeError::Replay,
+            "the replay check still runs, under the lock"
+        );
     }
 
     #[test]
