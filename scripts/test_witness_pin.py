@@ -31,19 +31,21 @@ pub fn production(x: u32) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    fn unrelated() -> u32 {
+        1
+    }
+
     const LIMIT: u32 = 7;
 
     fn verdict() -> u32 {
         super::production(LIMIT)
     }
 
-    fn unrelated() -> u32 {
-        1
-    }
+    use verdict as judged;
 
     #[test]
     fn a_helper_keeps_its_verdict() {
-        assert_eq!(verdict(), 7);
+        assert_eq!(judged(), 7);
     }
 
     proptest::proptest! {
@@ -98,6 +100,20 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(expected() + self.base, 7)
 '''
 
+CARGO = '''\
+[package]
+name = "fixture"
+version = "0.1.0"
+
+[lib]
+path = "src/lib.rs"
+'''
+
+LIB = '''\
+mod gate;
+mod helpers;
+'''
+
 LOG = '''\
 running 4 tests
 test tests::a_refusal_creates_no_cooldown ... ok
@@ -122,6 +138,8 @@ class WitnessPin(unittest.TestCase):
         (self.dir / "docs/INVARIANTS.md").write_text(INVARIANTS)
         (self.dir / "src/gate.rs").write_text(RUST)
         (self.dir / "src/helpers.rs").write_text(HELPERS)
+        (self.dir / "src/lib.rs").write_text(LIB)
+        (self.dir / "Cargo.toml").write_text(CARGO)
         (self.dir / "scripts/test_recovery.py").write_text(PY)
         self.key = self.keypair("owner")
         self.signers = self.dir.parent / f"{self.dir.name}-signers"
@@ -281,6 +299,53 @@ class WitnessPin(unittest.TestCase):
         self.edit("src/helpers.rs", "with_cases(64)", "with_cases(1)")
         self.assert_refused("witness generated_cases_keep_their_count changed: its attributes or a test item")
 
+    def test_a_helper_reached_through_an_alias_is_pinned(self):
+        self.edit("src/helpers.rs", "        super::production(LIMIT)", "        7")
+        self.assert_refused("witness a_helper_keeps_its_verdict changed: its attributes or a test item")
+
+    def test_an_inner_attribute_of_the_enclosing_module_is_pinned(self):
+        self.edit("src/helpers.rs", "mod tests {\n    fn unrelated", "mod tests {\n    #![cfg(any())]\n    fn unrelated")
+        self.assert_refused("witness a_helper_keeps_its_verdict changed: its attributes or a test item")
+
+    def test_the_module_declaration_that_compiles_a_witness_is_pinned(self):
+        self.edit("src/lib.rs", "mod helpers;", "#[cfg(not(test))]\nmod helpers;")
+        self.assert_refused("witness a_helper_keeps_its_verdict changed: its attributes or a test item")
+
+    def test_a_custom_test_harness_or_runner_needs_the_owner(self):
+        p = self.dir / "Cargo.toml"
+        p.write_text(p.read_text() + '\n[[test]]\nname = "report"\nharness = false\n')
+        self.assert_refused("Cargo.toml: build configuration changed")
+        p.write_text(CARGO)
+        (self.dir / ".cargo").mkdir()
+        (self.dir / ".cargo/config.toml").write_text('[target.x86_64-unknown-linux-gnu]\nrunner = "./fake"\n')
+        run(self.dir, "git", "add", "-A")
+        self.assert_refused(".cargo/config.toml: build configuration changed")
+
+    def test_dependencies_and_profiles_are_not_build_pins(self):
+        p = self.dir / "Cargo.toml"
+        p.write_text(p.read_text() + '\n[dependencies]\nserde = "1"\n\n[profile.release]\nopt-level = 2\n')
+        r = self.check()
+        self.assertEqual(r.returncode, 0, r.stdout)
+
+    def test_a_python_witness_replaced_at_import_is_refused(self):
+        p = self.dir / "scripts/test_recovery.py"
+        p.write_text(p.read_text() + "\n\nsetattr(RecoveryTests, 'test_recovery_keeps_the_cursor', lambda self: None)\n")
+        self.assert_refused("witness RecoveryTests.test_recovery_keeps_the_cursor changed: its attributes or a test item")
+
+    def test_a_python_witness_shadowed_in_its_class_body_is_refused(self):
+        p = self.dir / "scripts/test_recovery.py"
+        p.write_text(p.read_text() + "\n    test_recovery_keeps_the_cursor = lambda self: None\n")
+        self.assert_refused("witness RecoveryTests.test_recovery_keeps_the_cursor changed: its attributes or a test item")
+
+    def test_another_python_test_body_does_not_count(self):
+        p = self.dir / "scripts/test_recovery.py"
+        self.edit("scripts/test_recovery.py", "    def test_recovery_keeps_the_cursor(self):",
+                  "    def test_unpinned(self):\n        self.assertTrue(True)\n\n    def test_recovery_keeps_the_cursor(self):")
+        self.assertEqual(self.pin(self.key).returncode, 0)
+        self.edit("scripts/test_recovery.py", "        self.assertTrue(True)", "        self.assertTrue(1)")
+        r = self.check()
+        self.assertEqual(r.returncode, 0, r.stdout)
+
     def test_unrelated_helpers_and_production_code_do_not_count(self):
         self.edit("src/helpers.rs", "    fn unrelated() -> u32 {\n        1", "    fn unrelated() -> u32 {\n        2")
         self.edit("src/helpers.rs", "pub fn production(x: u32) -> u32 {\n    x", "pub fn production(x: u32) -> u32 {\n    x + 0")
@@ -304,15 +369,16 @@ class WitnessPin(unittest.TestCase):
 
     def test_the_closure_command_names_what_is_pinned(self):
         r = run(self.dir, "python3", "scripts/witness-pin.py", "closure", "a_helper_keeps_its_verdict")
-        self.assertIn("src/helpers.rs:7 LIMIT", r.stdout)
-        self.assertIn("src/helpers.rs:9 verdict", r.stdout)
+        self.assertIn("src/helpers.rs:11 LIMIT", r.stdout)
+        self.assertIn("src/helpers.rs:13 verdict", r.stdout)
+        self.assertIn("src/helpers.rs:17 judged", r.stdout)
         self.assertNotIn("unrelated", r.stdout)
 
     def test_a_manifest_without_closures_is_noted_and_refused_on_main(self):
         import json
         manifest = self.dir / "docs/witness-manifest.json"
         pinned = json.loads(manifest.read_text())
-        del pinned["closures"]
+        del pinned["closures_v2"]
         manifest.write_text(json.dumps(pinned, indent=1, sort_keys=True) + "\n")
         (self.dir / "docs/witness-manifest.json.sig").unlink()
         subprocess.run(["ssh-keygen", "-q", "-Y", "sign", "-f", self.key, "-n", "sokol-witness", str(manifest)],
