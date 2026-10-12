@@ -295,6 +295,45 @@ mod tests {
         ));
     }
 
+    /// A storm flag the operator set is policy, so its strict-parse drops count; observe storm
+    /// mode adds no flags, so it leaves nothing out (STORM-S1).
+    #[test]
+    fn strict_parse_drops_count_when_the_operator_set_the_flag_or_storm_only_observes() {
+        let flood = window(&[(common::drop_reason::STRICT_PARSE_FAILED, 6000)]);
+        assert!(under_attack(
+            &flood,
+            &START,
+            5.0,
+            1000,
+            common::config_flags::STRICT_PARSE,
+            StormMode::Strict
+        ));
+        assert!(under_attack(
+            &flood,
+            &START,
+            5.0,
+            1000,
+            0,
+            StormMode::Observe
+        ));
+    }
+
+    /// The node passes the operator's own flags to the attack signal, not some other value.
+    #[test]
+    fn a_defense_reports_the_operators_base_flags() {
+        for base in [0, DROP_IPV4_FRAGMENTS, common::config_flags::STRICT_PARSE] {
+            let d = Defense::new(
+                Flaky {
+                    fail: false,
+                    value: None,
+                },
+                base,
+                StormMode::Strict,
+            );
+            assert_eq!(d.base(), base);
+        }
+    }
+
     struct Flaky {
         fail: bool,
         value: Option<u32>,
