@@ -6,15 +6,22 @@ tests what the row claims: a witness can be weakened under its old name and stil
 This pins, for every invariant row, its statement, its list of witnesses and the normalized
 body of each witness, in docs/witness-manifest.json signed by the owner (ssh-keygen -Y).
 
-    witness-pin.py check [--signers FILE] [--every-pin]
+    witness-pin.py check [--signers FILE] [--every-pin] [--executed CARGO_TEST_LOG]
         # CI: exit 1 on an unsigned change; with --every-pin (a push to main) also on anything
-        # new that is not pinned yet
+        # new that is not pinned yet; with --executed also when a pinned witness did not run
+        # and pass (the Rust ones in that `cargo test` log; the Python ones are run here)
     witness-pin.py sign --key PRIVATE_KEY   # owner: re-pin the current tree and sign it
+    witness-pin.py closure WITNESS          # the test items pinned with a witness
 
 Comments and formatting do not change a body's hash; any other byte of the body does.
+A witness's closure is pinned too: its attributes (#[ignore], #[cfg(..)], decorators) and every
+test-only item it reaches by name, transitively (helpers, fixtures, constants, setUp). An
+unchanged body whose helper stopped sending anything, or that no longer runs, is a change.
 A row or witness that is new and not yet pinned is reported, not refused: it guards nothing
 the owner has accepted yet. Removing or changing what is pinned is refused.
 """
+from __future__ import annotations
+
 import ast
 import hashlib
 import json
@@ -181,10 +188,29 @@ def rows() -> dict:
     return found
 
 
+RUST_RAW = re.compile(r'b?r(#*)"')
+RUST_CHAR = re.compile(r"'(\\.[^']*|[^\\'])'")
+RUST_SPECIAL = re.compile(r"""[/"'br]""")
+
+
 def rust_parts(src: str) -> list[tuple[bool, str]]:
-    """Comment-free code/literal segments; literal bytes never enter layout normalization."""
-    out, i, n = [], 0, len(src)
+    """Comment-free code/literal segments; literal bytes never enter layout normalization.
+    Code between comments is one segment; plain code is copied in runs, not per character."""
+    out, code, i, n = [], [], 0, len(src)
+
+    def flush() -> None:
+        if code:
+            out.append((False, "".join(code)))
+            code.clear()
+
     while i < n:
+        m = RUST_SPECIAL.search(src, i)
+        j = m.start() if m else n
+        if j > i:
+            code.append(src[i:j])
+            i = j
+        if i >= n:
+            break
         c = src[i]
         if src.startswith("//", i):
             i = src.find("\n", i)
@@ -198,26 +224,27 @@ def rust_parts(src: str) -> list[tuple[bool, str]]:
                     depth, i = depth - 1, i + 2
                 else:
                     i += 1
-        elif (m := re.match(r'b?r(#*)"', src[i:])) and (i == 0 or not (src[i - 1].isalnum() or src[i - 1] == "_")):
-            end = src.find('"' + m.group(1), i + m.end())
+        elif (m := RUST_RAW.match(src, i)) and (i == 0 or not (src[i - 1].isalnum() or src[i - 1] == "_")):
+            flush()
+            end = src.find('"' + m.group(1), m.end())
             end = n if end < 0 else end + 1 + len(m.group(1))
             out.append((True, src[i:end]))
             i = end
         elif c == '"':
+            flush()
             j = i + 1
             while j < n and src[j] != '"':
                 j += 2 if src[j] == "\\" else 1
             out.append((True, src[i:j + 1]))
             i = j + 1
-        elif c == "'" and (m := re.match(r"'(\\.[^']*|[^\\'])'", src[i:])):
+        elif c == "'" and (m := RUST_CHAR.match(src, i)):
+            flush()
             out.append((True, m.group(0)))
-            i += m.end()
+            i = m.end()
         else:
-            if out and not out[-1][0]:
-                out[-1] = (False, out[-1][1] + c)
-            else:
-                out.append((False, c))
+            code.append(c)
             i += 1
+    flush()
     return out
 
 
@@ -267,6 +294,269 @@ def rust_bodies(names: set[str]) -> dict[str, list[str]]:
         for name, hashes in found.items():
             bodies.setdefault(name, []).extend(hashes)
     return bodies
+
+
+CFG_TEST = re.compile(r"#\[\s*cfg\s*\(\s*test\s*\)\s*\]")
+RUST_HEAD = re.compile(
+    r"(?:pub(?:\s*\([^)]*\))?\s+)?(?:(?:async|unsafe|const|default|extern)\s+"
+    r"(?=(?:async|unsafe|const|extern|fn|impl|trait)\b))*"
+    r"(fn|const|static|struct|enum|type|trait|mod|union|impl|macro_rules\s*!)\s*")
+RUST_IMPL = re.compile(r"(?:<[^{]*?>)?\s*(?:[^{;]*?\bfor\s+)?(?:[\w]+::)*([A-Za-z_]\w*)")
+TEST_ATTR = re.compile(r"#\[\s*(?:tokio::)?test\b")
+MACRO_CALL = re.compile(r"(?:\w+::)*\w+\s*!\s*\{")
+IDENT = re.compile(r"[A-Za-z_]\w*")
+
+
+def rust_close(masked: str, at: int, open_: str, close: str) -> int:
+    depth = 0
+    for j in range(at, len(masked)):
+        if masked[j] == open_:
+            depth += 1
+        elif masked[j] == close:
+            depth -= 1
+            if depth == 0:
+                return j
+    return len(masked) - 1
+
+
+def rust_items(masked: str, lo: int, hi: int) -> list[tuple[int, int, int]]:
+    """Items of masked[lo:hi] as (start with attributes, start of the item proper, end)."""
+    items, i = [], lo
+    while i < hi:
+        while i < hi and (masked[i].isspace() or masked[i] == ";"):
+            i += 1
+        if i >= hi:
+            break
+        start = i
+        while masked.startswith("#", i) and masked[i + 1:i + 2] in ("[", "!"):
+            i = rust_close(masked, masked.find("[", i), "[", "]") + 1
+            while i < hi and masked[i].isspace():
+                i += 1
+        depth, assigned, j, end = 0, False, i, hi - 1
+        while j < hi:
+            c = masked[j]
+            if c == "{" and depth == 0 and not assigned:
+                end = rust_close(masked, j, "{", "}")
+                break
+            if c in "([{":
+                depth += 1
+            elif c in ")]}":
+                depth -= 1
+            elif c == "=" and depth == 0 and masked[j + 1:j + 2] not in ("=", ">") and masked[j - 1] not in "=!<>":
+                assigned = True
+            elif c == ";" and depth == 0:
+                end = j
+                break
+            j += 1
+        items.append((start, i, end + 1))
+        i = end + 1
+    return items
+
+
+def rust_item_name(masked: str, head: int, end: int) -> tuple[str | None, str | None]:
+    """(keyword, name) of the item at `head`: an impl is named by its self type."""
+    m = RUST_HEAD.match(masked, head, end)
+    if not m:
+        return None, None
+    keyword = m.group(1).replace(" ", "")
+    if keyword == "impl":
+        n = RUST_IMPL.match(masked, m.end(), end)
+        return keyword, n.group(1) if n else None
+    n = IDENT.match(masked, m.end(), end)
+    return keyword, n.group(0) if n else None
+
+
+def rust_test_items(masked: str, integration: bool) -> list[tuple[int, int, int, str, bool, int]]:
+    """Test-only items: those under #[cfg(test)] (a module's items, or one item, at any depth)
+    and, in an integration test file, every top-level item; items inside a macro call there
+    (proptest!) too. (start, head, end, name, is_test, context): a witness inside a macro call
+    is pinned with the call's head and inner attributes (#![proptest_config]) from `context`."""
+    spans: list[tuple[int, int, int, int]] = []
+
+    def module(lo: int, hi: int) -> None:
+        for start, head, end in rust_items(masked, lo, hi):
+            keyword, _ = rust_item_name(masked, head, end)
+            if keyword == "mod":
+                module(masked.find("{", head, end) + 1, end - 1)
+            elif keyword is None and MACRO_CALL.match(masked, head, end):
+                body = masked.find("{", head, end)
+                inner = rust_items(masked, body + 1, end - 1)
+                for s, h, e in inner:
+                    spans.append((s, h, e, start))
+            else:
+                spans.append((start, head, end, start))
+
+    if integration:
+        module(0, len(masked))
+    for m in CFG_TEST.finditer(masked):
+        for start, head, end in rust_items(masked, m.start(), len(masked))[:1]:
+            if rust_item_name(masked, head, end)[0] == "mod":
+                module(masked.find("{", head, end) + 1, end - 1)
+            else:
+                spans.append((start, head, end, start))
+    out, seen = [], set()
+    for start, head, end, context in spans:
+        if (start, end) in seen:
+            continue
+        seen.add((start, end))
+        _, name = rust_item_name(masked, head, end)
+        if name:
+            out.append((start, head, end, name, bool(TEST_ATTR.search(masked, start, head)), context))
+    return out
+
+
+REACHED: dict[str, list[str]] = {}
+
+
+def rust_closures(names: set[str]) -> dict[str, list[str]]:
+    """Per witness, one hash over its item with attributes and every test-only item it reaches
+    by name, transitively: in its own file, or in another file only through a path naming that
+    file's module (`p2p::tests::frame_of`), so a local variable called `dir` reaches nothing."""
+    files = {}
+    for path in git_files("*.rs"):
+        rel = path.relative_to(ROOT).as_posix()
+        src = strip_rust(path.read_text())
+        masked = rust_mask(src)
+        files[rel] = (src, masked, rust_test_items(masked, "/tests/" in f"/{rel}"))
+    helpers: dict[str, dict[str, list[tuple[str, int, int]]]] = {}
+    for rel, (_, _, items) in files.items():
+        for start, _, end, name, is_test, _ in items:
+            if not is_test:
+                helpers.setdefault(rel, {}).setdefault(name, []).append((rel, start, end))
+    stems: dict[str, list[str]] = {}
+    for rel in helpers:
+        stems.setdefault(pathlib.PurePosixPath(rel).stem.replace("-", "_"), []).append(rel)
+
+    def reach(rel: str, text: str) -> list[tuple[str, int, int]]:
+        hits = []
+        for ident in set(IDENT.findall(text)):
+            hits += helpers.get(rel, {}).get(ident, [])
+        for stem, ident in set(re.findall(r"\b(\w+)::(?:\w+::)*?(\w+)\b", text)):
+            for other in stems.get(stem, []):
+                if other != rel:
+                    hits += helpers[other].get(ident, [])
+        return hits
+
+    out: dict[str, list[str]] = {}
+    for rel, (src, masked, items) in files.items():
+        for start, _, end, name, is_test, context in items:
+            if name not in names or not is_test:
+                continue
+            reached, queue, seen = [], [(rel, start, end)], {(rel, start, end)}
+            while queue:
+                r, s, e = queue.pop()
+                for hit in reach(r, files[r][1][s:e]):
+                    if hit not in seen:
+                        seen.add(hit)
+                        reached.append(hit)
+                        queue.append(hit)
+            parts = [rust_layout(src[start:end])]
+            if context != start:
+                parts.append(rust_layout(src[context:masked.find("{", context) + 1]))
+                inner = masked.find("{", context) + 1
+                attrs = re.match(r"\s*((?:#!\[[^\]]*\]\s*)*)", masked[inner:start])
+                parts.append(rust_layout(src[inner:inner + len(attrs.group(1))]))
+            parts += [f"{r}:{rust_layout(files[r][0][s:e])}" for r, s, e in sorted(reached)]
+            out.setdefault(name, []).append(f"{rel}:{sha(json.dumps(parts))}")
+            REACHED.setdefault(name, []).extend(
+                f"{r}:{files[r][0].count(chr(10), 0, s) + 1} {rust_item_name(files[r][1], s, e)[1] or '?'}"
+                for r, s, e in sorted(reached))
+    return out
+
+
+def py_closures(names: set[str]) -> dict[str, list[str]]:
+    """Per witness, one hash over the method with its and its class's decorators, the class's
+    fixtures (setUp/tearDown) and every module-level or class item it reaches by name."""
+    out: dict[str, list[str]] = {}
+    for path in git_files("*.py"):
+        text = path.read_text()
+        lines = text.splitlines(keepends=True)
+        tree = ast.parse(text)
+        module: dict[str, ast.AST] = {}
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                module[node.name] = node
+            elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+                for target in (node.targets if isinstance(node, ast.Assign) else [node.target]):
+                    for n in ast.walk(target):
+                        if isinstance(n, ast.Name):
+                            module[n.id] = node
+
+        def segment(node: ast.AST) -> str:
+            first = min([node.lineno] + [d.lineno for d in getattr(node, "decorator_list", [])])
+            return py_layout(strip_py("".join(lines[first - 1:node.end_lineno])))
+
+        for cls in (n for n in tree.body if isinstance(n, ast.ClassDef)):
+            methods = {f.name: f for f in cls.body if isinstance(f, (ast.FunctionDef, ast.AsyncFunctionDef))}
+            for fn in methods.values():
+                key = f"{cls.name}.{fn.name}"
+                if key not in names:
+                    continue
+                fixtures = [methods[n] for n in ("setUp", "tearDown", "setUpClass", "tearDownClass") if n in methods]
+                reached, queue = [], [fn, *fixtures]
+                seen = {id(fn), *map(id, fixtures)}
+                while queue:
+                    node = queue.pop()
+                    for n in ast.walk(node):
+                        ident = n.id if isinstance(n, ast.Name) else n.attr if isinstance(n, ast.Attribute) else None
+                        for hit in (methods.get(ident), module.get(ident)):
+                            if hit is not None and id(hit) not in seen and hit is not cls:
+                                seen.add(id(hit))
+                                reached.append(hit)
+                                queue.append(hit)
+                parts = [segment(fn), *(segment(f) for f in fixtures)]
+                parts += [ast.dump(d) for d in cls.decorator_list]
+                parts += sorted(segment(n) for n in reached)
+                rel = path.relative_to(ROOT).as_posix()
+                REACHED.setdefault(key, []).extend(
+                    f"{rel}:{n.lineno} {getattr(n, 'name', None) or type(n).__name__}"
+                    for n in [*fixtures, *reached])
+                out.setdefault(key, []).append(f"{rel}:{sha(json.dumps(parts))}")
+    return out
+
+
+TEST_LINE = re.compile(r"^test (\S+)(?: - should panic)? \.\.\. (\w+)", re.M)
+
+
+def ci_arguments(rel: str) -> list[str]:
+    """The arguments CI passes to a Python test file (adapter tests take a binary path)."""
+    path = ROOT / ".github/workflows/ci.yml"
+    ci = path.read_text() if path.exists() else ""
+    m = re.search(rf"python3 {re.escape(rel)}((?: [^\s|&;]+)*)", ci)
+    return m.group(1).split() if m else []
+
+
+def executed(log: pathlib.Path, pinned: dict) -> list[str]:
+    """Pinned witnesses that did not run and pass: Rust ones by the `cargo test` log (every
+    definition of the name must pass), Python ones by running them here as CI runs them."""
+    results: dict[str, list[str]] = {}
+    for path, outcome in TEST_LINE.findall(log.read_text()):
+        results.setdefault(path.rsplit("::", 1)[-1], []).append(outcome)
+    problems, files = [], {}
+    for w, where in sorted(pinned.items()):
+        if RUST_TEST.fullmatch(w):
+            outcomes = results.get(w, [])
+            if outcomes.count("ok") < len(where) or any(o != "ok" for o in outcomes):
+                problems.append(f"witness {w} did not run and pass in {log} ({', '.join(outcomes) or 'absent'})")
+        elif PY_TEST.fullmatch(w):
+            for loc in where:
+                rel = loc.split(":", 1)[0]
+                args = ci_arguments(rel)
+                if args:
+                    # Its own main parses the arguments and runs the file verbosely.
+                    if rel not in files:
+                        files[rel] = subprocess.run([sys.executable, rel, *args], cwd=ROOT, capture_output=True,
+                                                    text=True, stdin=subprocess.DEVNULL, timeout=1800)
+                    r = files[rel]
+                else:
+                    module = pathlib.Path(rel)
+                    r = subprocess.run([sys.executable, "-m", "unittest", "-v", f"{module.stem}.{w}"],
+                                       cwd=ROOT / module.parent, capture_output=True, text=True,
+                                       stdin=subprocess.DEVNULL, timeout=600)
+                method = w.split(".", 1)[1]
+                if not re.search(rf"^{re.escape(method)} \(.*\) \.\.\. ok$", r.stderr, re.M):
+                    problems.append(f"witness {w} did not run and pass ({rel})")
+    return problems
 
 
 def strip_py(code: str) -> str:
@@ -343,7 +633,10 @@ def current() -> dict:
     cited = {w for r in table.values() for w in r["witnesses"]}
     bodies = {**rust_bodies({w for w in cited if RUST_TEST.fullmatch(w)}),
               **py_bodies({w for w in cited if PY_TEST.fullmatch(w)})}
+    closures = {**rust_closures({w for w in cited if RUST_TEST.fullmatch(w)}),
+                **py_closures({w for w in cited if PY_TEST.fullmatch(w)})}
     return {"rows": table, "witnesses": {w: sorted(bodies.get(w, [])) for w in sorted(cited)},
+            "closures": {w: sorted(closures.get(w, [])) for w in sorted(cited)},
             "contracts": contract_pins(ROOT)}
 
 
@@ -360,7 +653,7 @@ def verify(signers: pathlib.Path) -> bool:
     return verify_manifest(MANIFEST, SIGNATURE, signers)
 
 
-def check(signers: pathlib.Path, every_pin: bool = False) -> int:
+def check(signers: pathlib.Path, every_pin: bool = False, executed_log: pathlib.Path | None = None) -> int:
     now = current()
     problems, notes = [], []
     for w, where in now["witnesses"].items():
@@ -385,6 +678,16 @@ def check(signers: pathlib.Path, every_pin: bool = False) -> int:
     for w, where in pinned["witnesses"].items():
         if w in now["witnesses"] and now["witnesses"][w] != where:
             problems.append(f"witness {w} changed: its body is not the one the owner pinned")
+    closures = pinned.get("closures")
+    if closures is None:
+        if pinned["witnesses"]:
+            notes.append("witness closures (attributes, helpers) are not pinned yet")
+    else:
+        for w, where in closures.items():
+            if w in now["closures"] and now["closures"][w] != where and now["witnesses"].get(w) == pinned["witnesses"].get(w):
+                problems.append(f"witness {w} changed: its attributes or a test item it reaches are not the ones the owner pinned")
+    if executed_log is not None:
+        problems += executed(executed_log, pinned["witnesses"])
     for rid in sorted(set(now["rows"]) - set(pinned["rows"])):
         notes.append(f"{rid}: new invariant row, not pinned yet")
     for rid, pin in pinned.get("contracts", {}).items():
@@ -433,8 +736,14 @@ if __name__ == "__main__":
     args = sys.argv[1:]
     if args[:1] == ["sign"] and "--key" in args:
         sys.exit(sign(args[args.index("--key") + 1]))
+    if args[:1] == ["closure"] and len(args) == 2:
+        w = args[1]
+        (rust_closures if RUST_TEST.fullmatch(w) else py_closures)({w})
+        print("\n".join(REACHED.get(w, [])) or "(the witness alone)")
+        sys.exit(0)
     if args[:1] == ["check"]:
         sys.exit(check(pathlib.Path(args[args.index("--signers") + 1]) if "--signers" in args else SIGNERS,
-                       every_pin="--every-pin" in args))
+                       every_pin="--every-pin" in args,
+                       executed_log=pathlib.Path(args[args.index("--executed") + 1]) if "--executed" in args else None))
     print(__doc__)
     sys.exit(2)
