@@ -97,6 +97,11 @@ mod tests {
             config_flags::OBSERVE_ONLY
         );
         assert_eq!(flags(0, false, true), 0, "observe mode adds no flag");
+        assert_eq!(
+            flags(config_flags::STRICT_PARSE, true, true),
+            STORM_FLAGS,
+            "a storm flag the operator set stays set while engaged"
+        );
     }
 }
 
