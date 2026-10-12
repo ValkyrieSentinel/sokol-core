@@ -12,6 +12,8 @@ body of each witness, in docs/witness-manifest.json signed by the owner (ssh-key
         # and pass (the Rust ones in that `cargo test` log; the Python ones are run here)
     witness-pin.py sign --key PRIVATE_KEY   # owner: re-pin the current tree and sign it
     witness-pin.py closure WITNESS          # the test items pinned with a witness
+    witness-pin.py run-python               # run the pinned Python witnesses, print a log for
+                                            # check --executed-python (the base workflow)
 
 Comments and formatting do not change a body's hash; any other byte of the body does.
 A witness's closure is pinned too: its attributes (#[ignore], #[cfg(..)], decorators) and every
@@ -595,43 +597,72 @@ TEST_LINE = re.compile(r"^test (\S+)(?: - should panic)? \.\.\. (\w+)", re.M)
 
 
 def ci_arguments(rel: str) -> list[str]:
-    """The arguments CI passes to a Python test file (adapter tests take a binary path)."""
-    path = ROOT / ".github/workflows/ci.yml"
+    """The arguments CI passes to a Python test file (adapter tests take a binary path). The
+    base workflow points WITNESS_PIN_CI at the base's ci.yml: a pull request's own ci.yml must
+    not choose the arguments its pinned witnesses run with."""
+    import os
+    path = pathlib.Path(os.environ.get("WITNESS_PIN_CI") or ROOT / ".github/workflows/ci.yml")
     ci = path.read_text() if path.exists() else ""
     m = re.search(rf"python3 {re.escape(rel)}((?: [^\s|&;]+)*)", ci)
     return m.group(1).split() if m else []
 
 
-def executed(log: pathlib.Path, pinned: dict) -> list[str]:
+def run_python_witnesses(pinned: dict) -> dict[tuple[str, str], str]:
+    """Runs each pinned Python witness as CI runs it: (witness, file) -> unittest's output."""
+    out, files = {}, {}
+    for w, where in sorted(pinned.items()):
+        if not PY_TEST.fullmatch(w):
+            continue
+        for loc in where:
+            rel = loc.split(":", 1)[0]
+            args = ci_arguments(rel)
+            if args:
+                # Its own main parses the arguments and runs the file verbosely.
+                if rel not in files:
+                    files[rel] = subprocess.run([sys.executable, rel, *args], cwd=ROOT, capture_output=True,
+                                                text=True, stdin=subprocess.DEVNULL, timeout=1800)
+                r = files[rel]
+            else:
+                module = pathlib.Path(rel)
+                r = subprocess.run([sys.executable, "-m", "unittest", "-v", f"{module.stem}.{w}"],
+                                   cwd=ROOT / module.parent, capture_output=True, text=True,
+                                   stdin=subprocess.DEVNULL, timeout=600)
+            out[(w, rel)] = r.stderr
+    return out
+
+
+PY_SEGMENT = re.compile(r"^== witness (\S+) (\S+)$", re.M)
+
+
+def python_log(text: str) -> dict[tuple[str, str], str]:
+    """The output of `witness-pin.py run-python`, per (witness, file)."""
+    heads = list(PY_SEGMENT.finditer(text))
+    return {(h.group(1), h.group(2)): text[h.end():heads[i + 1].start() if i + 1 < len(heads) else len(text)]
+            for i, h in enumerate(heads)}
+
+
+def executed(log: pathlib.Path, pinned: dict, python: pathlib.Path | None = None) -> list[str]:
     """Pinned witnesses that did not run and pass: Rust ones by the `cargo test` log (every
-    definition of the name must pass), Python ones by running them here as CI runs them."""
+    definition of the name must pass); Python ones by the `run-python` log if given (the base
+    workflow runs them in the untrusted job), else by running them here as CI runs them."""
     results: dict[str, list[str]] = {}
     for path, outcome in TEST_LINE.findall(log.read_text()):
         results.setdefault(path.rsplit("::", 1)[-1], []).append(outcome)
-    problems, files = [], {}
+    problems = []
     for w, where in sorted(pinned.items()):
         if RUST_TEST.fullmatch(w):
             outcomes = results.get(w, [])
             if outcomes.count("ok") < len(where) or any(o != "ok" for o in outcomes):
                 problems.append(f"witness {w} did not run and pass in {log} ({', '.join(outcomes) or 'absent'})")
-        elif PY_TEST.fullmatch(w):
-            for loc in where:
-                rel = loc.split(":", 1)[0]
-                args = ci_arguments(rel)
-                if args:
-                    # Its own main parses the arguments and runs the file verbosely.
-                    if rel not in files:
-                        files[rel] = subprocess.run([sys.executable, rel, *args], cwd=ROOT, capture_output=True,
-                                                    text=True, stdin=subprocess.DEVNULL, timeout=1800)
-                    r = files[rel]
-                else:
-                    module = pathlib.Path(rel)
-                    r = subprocess.run([sys.executable, "-m", "unittest", "-v", f"{module.stem}.{w}"],
-                                       cwd=ROOT / module.parent, capture_output=True, text=True,
-                                       stdin=subprocess.DEVNULL, timeout=600)
-                method = w.split(".", 1)[1]
-                if not re.search(rf"^{re.escape(method)} \(.*\) \.\.\. ok$", r.stderr, re.M):
-                    problems.append(f"witness {w} did not run and pass ({rel})")
+    ran = python_log(python.read_text()) if python else run_python_witnesses(pinned)
+    for w, where in sorted(pinned.items()):
+        if not PY_TEST.fullmatch(w):
+            continue
+        method = w.split(".", 1)[1]
+        for loc in where:
+            rel = loc.split(":", 1)[0]
+            if not re.search(rf"^{re.escape(method)} \(.*\) \.\.\. ok$", ran.get((w, rel), ""), re.M):
+                problems.append(f"witness {w} did not run and pass ({rel})")
     return problems
 
 
@@ -757,7 +788,8 @@ def verify(signers: pathlib.Path) -> bool:
     return verify_manifest(MANIFEST, SIGNATURE, signers)
 
 
-def check(signers: pathlib.Path, every_pin: bool = False, executed_log: pathlib.Path | None = None) -> int:
+def check(signers: pathlib.Path, every_pin: bool = False, executed_log: pathlib.Path | None = None,
+          python_log_path: pathlib.Path | None = None) -> int:
     now = current()
     problems, notes = [], []
     for w, where in now["witnesses"].items():
@@ -801,7 +833,7 @@ def check(signers: pathlib.Path, every_pin: bool = False, executed_log: pathlib.
             if build.get(f) != now["build"].get(f):
                 problems.append(f"{f}: build configuration changed (how tests are built or run)")
     if executed_log is not None:
-        problems += executed(executed_log, pinned["witnesses"])
+        problems += executed(executed_log, pinned["witnesses"], python_log_path)
     for rid in sorted(set(now["rows"]) - set(pinned["rows"])):
         notes.append(f"{rid}: new invariant row, not pinned yet")
     for rid, pin in pinned.get("contracts", {}).items():
@@ -860,9 +892,17 @@ if __name__ == "__main__":
         (rust_closures if RUST_TEST.fullmatch(w) else py_closures)({w})
         print("\n".join(REACHED.get(w, [])) or "(the witness alone)")
         sys.exit(0)
+    if args[:1] == ["run-python"]:
+        # The untrusted job of the base workflow: run the pinned Python witnesses, print a log.
+        ran = run_python_witnesses(json.loads(MANIFEST.read_text())["witnesses"])
+        for (w, rel), text in ran.items():
+            print(f"== witness {w} {rel}\n{text}")
+        sys.exit(0)
     if args[:1] == ["check"]:
         sys.exit(check(pathlib.Path(args[args.index("--signers") + 1]) if "--signers" in args else SIGNERS,
                        every_pin="--every-pin" in args,
-                       executed_log=pathlib.Path(args[args.index("--executed") + 1]) if "--executed" in args else None))
+                       executed_log=pathlib.Path(args[args.index("--executed") + 1]) if "--executed" in args else None,
+                       python_log_path=pathlib.Path(args[args.index("--executed-python") + 1])
+                       if "--executed-python" in args else None))
     print(__doc__)
     sys.exit(2)

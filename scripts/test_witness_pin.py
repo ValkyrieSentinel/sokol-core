@@ -6,6 +6,7 @@ makes one change and runs the check with the owner's signers file, as CI does fr
 
     python3 scripts/test_witness_pin.py
 """
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -410,6 +411,32 @@ class WitnessPin(unittest.TestCase):
         self.assertEqual(r.returncode, 1, r.stdout)
         self.assertIn("witness generated_cases_keep_their_count did not run and pass", r.stdout)
         self.assertIn("(absent)", r.stdout)
+
+    def test_python_witness_arguments_come_from_the_base_workflow_when_given(self):
+        ci = self.dir / ".github/workflows/ci.yml"
+        ci.parent.mkdir(parents=True)
+        ci.write_text("run: python3 scripts/test_recovery.py --not-an-option\n")
+        r = self.executed(LOG)
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn("witness RecoveryTests.test_recovery_keeps_the_cursor did not run and pass", r.stdout)
+        base = self.dir.parent / f"{self.dir.name}-base-ci.yml"
+        base.write_text("run: python3 scripts/test_recovery.py\n")
+        log = self.dir.parent / f"{self.dir.name}-log"
+        r = subprocess.run(["python3", "scripts/witness-pin.py", "check", "--signers", str(self.signers),
+                            "--executed", str(log)], cwd=self.dir, capture_output=True, text=True,
+                           stdin=subprocess.DEVNULL, timeout=120, env={**os.environ, "WITNESS_PIN_CI": str(base)})
+        self.assertEqual(r.returncode, 0, r.stdout)
+
+    def test_python_witnesses_can_be_checked_from_a_run_python_log(self):
+        out = run(self.dir, "python3", "scripts/witness-pin.py", "run-python").stdout
+        self.assertIn("== witness RecoveryTests.test_recovery_keeps_the_cursor scripts/test_recovery.py", out)
+        log = self.dir.parent / f"{self.dir.name}-python"
+        (self.dir.parent / f"{self.dir.name}-log").write_text(LOG)
+        for text, code in ((out, 0), (out.replace("test_recovery_keeps_the_cursor (", "test_other ("), 1), ("", 1)):
+            log.write_text(text)
+            r = run(self.dir, "python3", "scripts/witness-pin.py", "check", "--signers", str(self.signers),
+                    "--executed", str(self.dir.parent / f"{self.dir.name}-log"), "--executed-python", str(log))
+            self.assertEqual(r.returncode, code, r.stdout)
 
     def test_a_failing_python_witness_is_refused(self):
         self.edit("scripts/test_recovery.py", "def cursor(*_):\n    return 7", "def cursor(*_):\n    return 8")
