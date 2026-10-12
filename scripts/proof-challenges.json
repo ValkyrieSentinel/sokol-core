@@ -81,6 +81,36 @@
         "after": "        STORM_FLAGS"
       },
       "assertion": "assertion failed: set & base == base && set & !base & !STORM_FLAGS == 0"
+    },
+    {
+      "id": "lease-cap",
+      "file": "common/src/lease.rs",
+      "harness": "lease::proofs::a_resent_claim_never_outlasts_its_first_lease",
+      "replace": {
+        "before": "    earlier.map_or(fresh, |end| fresh.min(end))",
+        "after": "    earlier.map_or(fresh, |_| fresh)"
+      },
+      "assertion": "assertion failed: capped <= earlier && until(end_local, capped) <= earlier"
+    },
+    {
+      "id": "lease-record",
+      "file": "common/src/lease.rs",
+      "harness": "lease::proofs::a_lease_record_only_moves_earlier",
+      "replace": {
+        "before": "    old.map_or(cap, |end| end.min(cap))",
+        "after": "    old.map_or(cap, |_| cap)"
+      },
+      "assertion": "assertion failed: end <= old && end <= new_cap"
+    },
+    {
+      "id": "lease-grace",
+      "file": "common/src/lease.rs",
+      "harness": "lease::proofs::within_grace_a_live_resend_finds_its_record",
+      "replace": {
+        "before": "    end.is_none_or(|e| e.saturating_add(grace) > now)",
+        "after": "    end.is_none_or(|e| e > now)"
+      },
+      "assertion": "assertion failed: kept(Some(end), now, grace)"
     }
   ]
 }

@@ -43,6 +43,8 @@ pub struct Snapshot {
     pub detector_retractions: [u64; crate::block_table::RETRACTION_RESULTS.len()],
     /// Block decisions by source and result, `other` last (`detections::rows`).
     pub detections: Vec<(String, [u64; crate::detections::RESULTS.len()])>,
+    /// Peer claims by issuer and result, `other` last (`detections::peer_rows`).
+    pub peer_claims: Vec<(String, [u64; crate::detections::PEER_RESULTS.len()])>,
     pub strikes_remembered: usize,
     pub strikes_evicted: u64,
     pub claims_waiting: usize,
@@ -368,6 +370,21 @@ fn render_at(s: &Snapshot, now: Instant) -> String {
                 out,
                 "sokol_detections_total{{source=\"{}\",result=\"{}\"}} {}",
                 source, result, n
+            );
+        }
+    }
+    family(
+        &mut out,
+        "sokol_mesh_claims_total",
+        "counter",
+        "Peer claims by issuer (a node id; the first 64, then other) and what this node did: enforced, held (known, not enforced), refused, known (a copy already held).",
+    );
+    for (issuer, counts) in &s.peer_claims {
+        for (result, n) in crate::detections::PEER_RESULTS.iter().zip(counts) {
+            let _ = writeln!(
+                out,
+                "sokol_mesh_claims_total{{issuer=\"{}\",result=\"{}\"}} {}",
+                issuer, result, n
             );
         }
     }
@@ -968,5 +985,22 @@ mod tests {
         totals.read(Some([cpu].iter()));
         totals.fill(&mut snap);
         assert_eq!((snap.rx_packets, snap.xdp_stats_read_failures), (1_000, 1));
+    }
+
+    #[test]
+    fn peer_claims_are_rendered_by_issuer_and_result() {
+        let snap = Snapshot {
+            peer_claims: vec![("2".into(), [5, 1, 0, 3]), ("other".into(), [0, 0, 2, 0])],
+            ..Default::default()
+        };
+        let text = render(&snap);
+        for line in [
+            "sokol_mesh_claims_total{issuer=\"2\",result=\"enforced\"} 5\n",
+            "sokol_mesh_claims_total{issuer=\"2\",result=\"held\"} 1\n",
+            "sokol_mesh_claims_total{issuer=\"2\",result=\"known\"} 3\n",
+            "sokol_mesh_claims_total{issuer=\"other\",result=\"refused\"} 2\n",
+        ] {
+            assert!(text.contains(line), "missing {line}");
+        }
     }
 }

@@ -87,6 +87,7 @@ impl<B: Blocklist + Send + 'static, M: ConfigMap + 'static> MeshDispatch<B, M> {
                     let (now, wall) = (block_table::local_ms(), now_ms());
                     (table.adopt(claim, refusal.is_none(), now), wall)
                 };
+                crate::detections::record_peer(issuer, &result);
                 match (result, refusal) {
                     (Adoption::Enforced, _) => {
                         let left = expires.map(|e| Duration::from_millis(e.saturating_sub(wall)));
@@ -183,6 +184,7 @@ impl<B: Blocklist + Send + 'static, M: ConfigMap + 'static> MeshDispatch<B, M> {
                         let mut table = self.blocks.lock().await;
                         table.adopt(claim, refusal.is_none(), block_table::local_ms())
                     };
+                    crate::detections::record_peer(issuer, &adoption);
                     if adoption == Adoption::Enforced {
                         adopted += 1;
                         self.db.append(format!(
@@ -584,6 +586,44 @@ mod tests {
                 && blocks[0].ends_with("|Reason:sync from node 2"),
             "{:?}",
             blocks
+        );
+    }
+
+    /// Every peer claim is counted under its issuer and what this node did with it, by both
+    /// ways a claim arrives (`sokol_mesh_claims_total`, `SokolPeerClaimSurge`).
+    #[tokio::test]
+    async fn peer_claims_are_counted_under_their_issuer() {
+        // The counters are process-wide: an issuer no other test uses.
+        const ISSUER: u64 = 7_177;
+        let row = || {
+            crate::detections::peer_rows()
+                .into_iter()
+                .find(|(i, _)| *i == ISSUER.to_string())
+                .map(|(_, row)| row)
+        };
+        let mut n = node("peer-count", Some("198.51.100.43/32"));
+        let claim = |target: &str| Claim {
+            issuer: ISSUER,
+            ..peer_claim(target)
+        };
+        let first = claim("198.51.100.41");
+        n.dispatch
+            .peer(MeshCommand::Claim {
+                claim: first.clone(),
+            })
+            .await;
+        n.dispatch.peer(MeshCommand::Claim { claim: first }).await;
+        n.dispatch
+            .peer(MeshCommand::BlockSync {
+                issuer: ISSUER,
+                claims: vec![claim("198.51.100.42"), claim("198.51.100.43")],
+                retracted: vec![],
+            })
+            .await;
+        assert_eq!(
+            row(),
+            Some([2, 1, 0, 1]),
+            "enforced (one by Claim, one by BlockSync), held (protected), refused, known (the resend)"
         );
     }
 
