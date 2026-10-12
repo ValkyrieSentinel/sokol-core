@@ -2306,6 +2306,62 @@ mod tests {
         assert!(registry.open_at(&after, after.timestamp_ms).is_ok());
     }
 
+    /// A Ping from node 7, stamped `timestamp_ms` with `nonce`, signed by `peer`.
+    fn ping_at(peer: &NodeCrypto, timestamp_ms: u64, nonce: u64) -> SecureEnvelope {
+        let mut env = seal(peer, 7, &NetworkMessage::Ping).unwrap();
+        env.timestamp_ms = timestamp_ms;
+        env.nonce = nonce;
+        env.signature = peer
+            .sign(&unsigned_bytes(
+                env.version,
+                env.sender_id,
+                env.timestamp_ms,
+                env.nonce,
+                &env.payload,
+            ))
+            .unwrap();
+        env
+    }
+
+    /// MESH-N1's cost at startup (review of #27): with no clock step, an honest peer whose
+    /// clock is 2 ms behind is refused right after the start (`before_window`), and from
+    /// MAX_CLOCK_SKEW_MS after the start on, any envelope fresh here passes the fence.
+    #[test]
+    fn a_peer_whose_clock_is_behind_is_fenced_off_only_just_after_the_start() {
+        let peer = NodeCrypto::generate();
+        let start = 1_000_000;
+        let registry = PeerRegistry::new(trust_with(7, &peer)).with_startup_fence(start);
+        let behind = ping_at(&peer, start - 1, 1);
+        assert!(common::replay::fresh(behind.timestamp_ms, start + 1));
+        assert_eq!(
+            registry.open_at(&behind, start + 1).unwrap_err(),
+            EnvelopeError::BeforeWindow
+        );
+        let settled = start + MAX_CLOCK_SKEW_MS;
+        let oldest_fresh = ping_at(&peer, settled - MAX_CLOCK_SKEW_MS, 2);
+        assert!(registry.open_at(&oldest_fresh, settled).is_ok());
+    }
+
+    /// The fence's reach (review of #27): it refuses only what was stamped before the start.
+    /// An envelope the previous process accepted with a later stamp (its sender's clock ahead)
+    /// is accepted again by the new one; refusing it would need replay state that outlives the
+    /// process.
+    #[test]
+    fn an_envelope_stamped_after_a_restart_passes_the_fence_even_if_seen_before() {
+        let peer = NodeCrypto::generate();
+        let trust = trust_with(7, &peer);
+        let t = 1_000_000;
+        let ahead = ping_at(&peer, t + MAX_CLOCK_SKEW_MS, 3);
+        let before = PeerRegistry::new(trust_with(7, &peer)).with_startup_fence(t);
+        assert!(before.open_at(&ahead, t).is_ok());
+        let after = PeerRegistry::new(trust).with_startup_fence(t + 1);
+        assert!(
+            after.open_at(&ahead, t + 1).is_ok(),
+            "the boundary moved: a restart now refuses envelopes the previous process saw; \
+             update MESH-N1"
+        );
+    }
+
     #[tokio::test]
     async fn replay_and_stale_envelopes_are_rejected() {
         let peer = NodeCrypto::generate();
