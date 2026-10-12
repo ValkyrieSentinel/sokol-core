@@ -138,6 +138,9 @@ pub struct MeshStats {
     /// Envelopes refused, by `EnvelopeError::LABELS`. `stale_timestamp` rising from one peer
     /// means its clock and this node's disagree by more than the envelope window.
     pub rejected: [std::sync::atomic::AtomicU64; 5],
+    /// Handshakes refused: a pinned node connected from an address its peers-file entry does
+    /// not bind it to (ADR-0027). Its key was used from somewhere it is not.
+    pub wrong_address: std::sync::atomic::AtomicU64,
 }
 
 /// Admission of connections that have not authenticated yet.
@@ -448,6 +451,10 @@ struct PeerEntry {
     /// What this peer may impose on this node (ADR-7); unset fields take the command-line defaults.
     #[serde(default)]
     envelope: Option<EnvelopeSpec>,
+    /// The only source address this node's connections are accepted from (its WireGuard tunnel
+    /// address, ADR-0027). Unset: any address, as before.
+    #[serde(default)]
+    address: Option<std::net::IpAddr>,
 }
 
 /// Per-peer overrides of the envelope defaults, from the peers file.
@@ -468,6 +475,8 @@ pub struct TrustStore {
     envelopes: HashMap<u64, EnvelopeSpec>,
     /// Peers listed with only a pre-v2 key: not trusted until their ML-DSA key is listed.
     legacy: Vec<u64>,
+    /// Source addresses peers are bound to (ADR-0027).
+    addresses: HashMap<u64, std::net::IpAddr>,
 }
 
 impl TrustStore {
@@ -534,8 +543,45 @@ impl TrustStore {
             if let Some(spec) = entry.envelope {
                 store.envelopes.insert(id, spec);
             }
+            if let Some(address) = entry.address {
+                let address = address.to_canonical();
+                if let Some((other, _)) = store.addresses.iter().find(|(_, a)| **a == address) {
+                    bail!(
+                        "peers file binds address {} to node {} and node {}",
+                        address,
+                        other,
+                        id
+                    );
+                }
+                store.addresses.insert(id, address);
+            }
         }
         Ok(store)
+    }
+
+    /// Binds a pinned node to the only source address its connections are accepted from.
+    pub fn bind_address(&mut self, node_id: u64, address: std::net::IpAddr) {
+        self.addresses.insert(node_id, address.to_canonical());
+    }
+
+    /// Whether a connection from `address` may speak as `node_id`: always for a node the peers
+    /// file binds to no address (ADR-0027).
+    pub fn address_allows(&self, node_id: u64, address: std::net::IpAddr) -> bool {
+        self.addresses
+            .get(&node_id)
+            .is_none_or(|bound| *bound == address.to_canonical())
+    }
+
+    /// Pinned nodes bound to no source address, in order.
+    pub fn unbound(&self) -> Vec<u64> {
+        let mut ids: Vec<u64> = self
+            .keys
+            .keys()
+            .filter(|id| !self.addresses.contains_key(id))
+            .copied()
+            .collect();
+        ids.sort_unstable();
+        ids
     }
 
     pub fn insert(&mut self, node_id: u64, key: VerifyingKey<MlDsa65>) {
@@ -1108,6 +1154,14 @@ impl PeerRegistry {
         Ok(())
     }
 
+    /// Whether a connection from `address` may speak as `node_id` under the current store.
+    pub fn address_allows(&self, node_id: u64, address: std::net::IpAddr) -> bool {
+        self.trust
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .address_allows(node_id, address)
+    }
+
     pub fn reload(&self, trust: TrustStore) -> usize {
         let pinned = trust.len();
         *self.trust.write().unwrap_or_else(|p| p.into_inner()) = Arc::new(trust);
@@ -1571,6 +1625,14 @@ async fn handle_reader_loop(
                     envelope.sender_id
                 );
             }
+            // A reload may have bound the node to another address since it authenticated.
+            if !registry.address_allows(peer_id, peer_addr.ip()) {
+                bail!(
+                    "node {} is no longer accepted from {} (peers file)",
+                    peer_id,
+                    peer_addr.ip()
+                );
+            }
         }
 
         let net_msg = match registry.open(&envelope) {
@@ -1631,6 +1693,20 @@ async fn handle_reader_loop(
                 }
                 if node_id == local_node_id {
                     bail!("peer presented this node's own identity");
+                }
+                // A signed handshake names neither its recipient nor its connection: another
+                // peer could relay one (ADR-0027). The tunnel address it comes from cannot be.
+                if !registry.address_allows(node_id, peer_addr.ip()) {
+                    registry.stats.wrong_address.fetch_add(1, Ordering::Relaxed);
+                    error!(
+                        "[SECURITY ALERT] Node {}'s handshake came from {}, not its peers-file address",
+                        node_id,
+                        peer_addr.ip()
+                    );
+                    bail!(
+                        "node {} connected from an address it is not bound to",
+                        node_id
+                    );
                 }
                 authenticated_peer = Some(node_id);
                 let link = PeerLink {
@@ -3697,5 +3773,224 @@ mod tests {
             "a replayed frame on an authenticated connection closed it"
         );
         drop(s);
+    }
+
+    /// A connection to `to` from a chosen loopback source address (Linux routes all of
+    /// 127.0.0.0/8 to lo).
+    async fn connect_from(source: &str, to: SocketAddr) -> TcpStream {
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind(format!("{source}:0").parse().unwrap()).unwrap();
+        socket.connect(to).await.unwrap()
+    }
+
+    /// ADR-0027: a signed handshake names neither its recipient nor its connection, so node 3
+    /// (a pinned, possibly compromised peer) could take the handshake node 2 sent *to node 3*
+    /// and replay it to node 1, which authenticated the relaying connection as node 2 and sent
+    /// node 2's broadcasts to node 3. With node 2 bound to its address, the relay is refused
+    /// and the real node 2 keeps receiving.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_handshake_relayed_by_another_peer_does_not_take_over_its_delivery() {
+        let c1 = Arc::new(NodeCrypto::generate());
+        let c2 = Arc::new(NodeCrypto::generate());
+        let c3 = NodeCrypto::generate();
+        let mut t1 = TrustStore::default();
+        t1.insert(2, c2.public_key.clone());
+        t1.insert(3, c3.public_key.clone());
+        t1.bind_address(2, "127.0.0.1".parse().unwrap());
+        t1.bind_address(3, "127.0.0.3".parse().unwrap());
+        let mut t2 = TrustStore::default();
+        t2.insert(1, c1.public_key.clone());
+        t2.insert(3, c3.public_key.clone());
+        let reg1 = PeerRegistry::new(t1);
+        let reg2 = PeerRegistry::new(t2);
+
+        let (tx1, _rx1) = mpsc::channel(64);
+        let (_stop1, stop_rx1) = watch::channel(false);
+        let l1 = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr1 = l1.local_addr().unwrap();
+        let net1 = P2PNetwork::new(addr1, 1, c1.clone(), tx1, 16, stop_rx1, reg1.clone());
+        tokio::spawn(async move { net1.serve(l1).await });
+
+        // The real node 2 dials node 1 (from 127.0.0.1, its bound address) and authenticates.
+        let (tx2, mut rx2) = mpsc::channel(64);
+        tokio::spawn(connect_to_peer(
+            addr1,
+            2,
+            c2.clone(),
+            reg2.clone(),
+            tx2.clone(),
+        ));
+        for _ in 0..50 {
+            if reg1.peer_count().await == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            reg1.peer_count().await,
+            1,
+            "setup: node 2 connected to node 1"
+        );
+
+        // Node 2 also dials node 3 (a seed) and sends it its handshake.
+        let l3 = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr3 = l3.local_addr().unwrap();
+        tokio::spawn(connect_to_peer(addr3, 2, c2.clone(), reg2.clone(), tx2));
+        let (mut from2, _) = l3.accept().await.unwrap();
+        let mut len = [0u8; 4];
+        from2.read_exact(&mut len).await.unwrap();
+        let mut hs = vec![0u8; u32::from_be_bytes(len) as usize];
+        from2.read_exact(&mut hs).await.unwrap();
+
+        // Node 3 relays that handshake to node 1 from its own address.
+        let mut relay = connect_from("127.0.0.3", addr1).await;
+        relay.write_all(&len).await.unwrap();
+        relay.write_all(&hs).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            reg1.stats
+                .wrong_address
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the relayed handshake was not refused for its address"
+        );
+
+        reg1.broadcast(&alert("203.0.113.7"), 1, &c1).await.unwrap();
+        let got = timeout(Duration::from_secs(2), rx2.recv()).await;
+        assert!(
+            matches!(got, Ok(Some(MeshCommand::Alert { .. }))),
+            "node 2 did not get node 1's broadcast: node 3's connection, authenticated by node 2's \
+             relayed handshake, took it (node 1 holds {} connections as node 2)",
+            connections_of(&reg1, 2).await
+        );
+        drop(relay);
+    }
+
+    /// ADR-0027: a node bound to an address authenticates only from it; any other source is
+    /// refused and counted. A node bound to no address is accepted from anywhere, as before.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_bound_node_authenticates_only_from_its_address() {
+        let peer = NodeCrypto::generate();
+        let other = NodeCrypto::generate();
+        let mut trust = trust_with(2, &peer);
+        trust.insert(3, other.public_key.clone());
+        trust.bind_address(2, "127.0.0.2".parse().unwrap());
+        let (addr, registry, _p, _rx, _stop) =
+            listening_node_with(move |_| PeerRegistry::new(trust)).await;
+        let hello = |c: &NodeCrypto, id: u64| {
+            frame_of(&seal(c, id, &NetworkMessage::handshake(id)).unwrap())
+        };
+
+        let mut wrong = connect_from("127.0.0.5", addr).await;
+        wrong.write_all(&hello(&peer, 2)).await.unwrap();
+        let mut right = connect_from("127.0.0.2", addr).await;
+        right.write_all(&hello(&peer, 2)).await.unwrap();
+        let mut unbound = connect_from("127.0.0.5", addr).await;
+        unbound.write_all(&hello(&other, 3)).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        assert_eq!(
+            registry
+                .stats
+                .wrong_address
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            connections_of(&registry, 2).await,
+            1,
+            "node 2 from its own address"
+        );
+        let peers = registry.peers_for_test();
+        let from: Vec<_> = peers
+            .read()
+            .await
+            .iter()
+            .filter(|(_, (_, id, _))| *id == 2)
+            .map(|(a, _)| a.ip())
+            .collect();
+        assert_eq!(from, vec!["127.0.0.2".parse::<std::net::IpAddr>().unwrap()]);
+        assert_eq!(
+            connections_of(&registry, 3).await,
+            1,
+            "an unbound node is accepted anywhere"
+        );
+        drop((wrong, right, unbound));
+    }
+
+    /// ADR-0027: a reload that binds a connected node to another address closes its connection
+    /// on the node's next envelope.
+    #[tokio::test]
+    async fn a_reload_that_moves_a_node_closes_its_connection() {
+        let (addr, registry, peer, _rx, _stop) = listening_node().await;
+        let mut s = TcpStream::connect(addr).await.unwrap();
+        s.write_all(&frame_of(
+            &seal(&peer, 2, &NetworkMessage::handshake(2)).unwrap(),
+        ))
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            connections_of(&registry, 2).await,
+            1,
+            "setup: node 2 authenticated"
+        );
+
+        let mut moved = trust_with(2, &peer);
+        moved.bind_address(2, "192.0.2.2".parse().unwrap());
+        registry.reload(moved);
+        s.write_all(&frame_of(&seal(&peer, 2, &NetworkMessage::Ping).unwrap()))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            connections_of(&registry, 2).await,
+            0,
+            "node 2 kept speaking from an address the peers file no longer binds it to"
+        );
+    }
+
+    /// ADR-0027: `address` is read from the peers file (an IPv4-mapped IPv6 form is the IPv4
+    /// address), one address cannot be bound to two nodes, and unbound nodes are listed.
+    #[test]
+    fn peers_file_addresses_are_parsed_and_checked() {
+        let a = NodeCrypto::generate();
+        let b = NodeCrypto::generate();
+        let (ka, kb) = (a.public_key_hex(), b.public_key_hex());
+        let path = peers_file(
+            "address",
+            &format!(
+                r#"[{{"node_id": 2, "public_key": "{ka}", "address": "::ffff:10.99.0.2"}},
+                    {{"node_id": 3, "public_key": "{kb}"}}]"#
+            ),
+        );
+        let store = TrustStore::load(&path).unwrap();
+        assert!(store.address_allows(2, "10.99.0.2".parse().unwrap()));
+        assert!(!store.address_allows(2, "10.99.0.3".parse().unwrap()));
+        assert!(store.address_allows(3, "203.0.113.1".parse().unwrap()));
+        assert_eq!(store.unbound(), vec![3]);
+
+        let path = peers_file(
+            "address-twice",
+            &format!(
+                r#"[{{"node_id": 2, "public_key": "{ka}", "address": "10.99.0.2"}},
+                    {{"node_id": 3, "public_key": "{kb}", "address": "10.99.0.2"}}]"#
+            ),
+        );
+        let err = TrustStore::load(&path)
+            .err()
+            .expect("one address for two nodes");
+        assert!(
+            format!("{err:#}").contains("binds address 10.99.0.2"),
+            "{err:#}"
+        );
+
+        let path = peers_file(
+            "address-garbage",
+            &format!(r#"[{{"node_id": 2, "public_key": "{ka}", "address": "10.99.0"}}]"#),
+        );
+        assert!(TrustStore::load(&path).is_err());
     }
 }

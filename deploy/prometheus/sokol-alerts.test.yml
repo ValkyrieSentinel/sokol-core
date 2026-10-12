@@ -89,7 +89,11 @@ tests:
       - { series: 'sokol_mesh_broadcasts_dropped_total{job="sokol",instance="n1",class="urgent"}', values: '0 0 250x10' }
       - { series: 'sokol_claims_waiting{job="sokol",instance="n1"}', values: '13616x40' }
       - { series: 'sokol_cluster_storm_engaged{job="sokol",instance="n1"}', values: '0 1x5' }
+      - { series: 'sokol_mesh_handshakes_wrong_address_total{job="sokol",instance="n1"}', values: '0 0 1x10' }
     alert_rule_test:
+      - eval_time: 5m
+        alertname: SokolPeerWrongAddress
+        exp_alerts: [ { exp_labels: { severity: critical, job: sokol, instance: n1 }, exp_annotations: { summary: "n1: a pinned peer's handshake came from an address its peers-file entry does not bind", runbook: "RUNBOOK §5.5" } } ]
       - eval_time: 5m
         alertname: SokolAuditRecordsLost
         exp_alerts: [ { exp_labels: { severity: warning, job: sokol, instance: n1 }, exp_annotations: { summary: "n1: audit records lost (disk, rights or queue overflow)", runbook: "RUNBOOK §5.3" } } ]
