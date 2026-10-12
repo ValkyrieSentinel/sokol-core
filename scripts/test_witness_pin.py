@@ -19,6 +19,46 @@ INVARIANTS = '''\
 |---|---|---|
 | T-1 | A refusal creates no cooldown. | `a_refusal_creates_no_cooldown` |
 | T-2 | Recovery keeps the cursor. | `RecoveryTests.test_recovery_keeps_the_cursor` |
+| H-1 | A helper keeps its verdict. | `a_helper_keeps_its_verdict` |
+| H-2 | Generated cases keep their count. | `generated_cases_keep_their_count` |
+| H-3 | A restart keeps the start. | `RecoveryTests.test_restart_keeps_the_start` |
+'''
+
+HELPERS = '''\
+pub fn production(x: u32) -> u32 {
+    x
+}
+
+#[cfg(test)]
+mod tests {
+    const LIMIT: u32 = 7;
+
+    fn verdict() -> u32 {
+        super::production(LIMIT)
+    }
+
+    fn unrelated() -> u32 {
+        1
+    }
+
+    #[test]
+    fn a_helper_keeps_its_verdict() {
+        assert_eq!(verdict(), 7);
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(64))]
+        #[test]
+        fn an_unpinned_generated_case(x in 0u32..9) {
+            assert!(x < 9);
+        }
+
+        #[test]
+        fn generated_cases_keep_their_count(x in 0u32..9) {
+            assert!(x < 9);
+        }
+    }
+}
 '''
 
 RUST = '''\
@@ -36,10 +76,34 @@ mod tests {
 PY = '''\
 import unittest
 
+START = 7
+
+
+def cursor(*_):
+    return 7
+
+
+def expected():
+    return START
+
 
 class RecoveryTests(unittest.TestCase):
+    def setUp(self):
+        self.base = 0
+
     def test_recovery_keeps_the_cursor(self):
         self.assertEqual(cursor(), 7)
+
+    def test_restart_keeps_the_start(self):
+        self.assertEqual(expected() + self.base, 7)
+'''
+
+LOG = '''\
+running 4 tests
+test tests::a_refusal_creates_no_cooldown ... ok
+test helpers::tests::a_helper_keeps_its_verdict ... ok
+test helpers::tests::generated_cases_keep_their_count ... ok
+test other::tests::an_unpinned_test ... ignored
 '''
 
 
@@ -57,6 +121,7 @@ class WitnessPin(unittest.TestCase):
         shutil.copy(HERE / "witness-pin.py", self.dir / "scripts/witness-pin.py")
         (self.dir / "docs/INVARIANTS.md").write_text(INVARIANTS)
         (self.dir / "src/gate.rs").write_text(RUST)
+        (self.dir / "src/helpers.rs").write_text(HELPERS)
         (self.dir / "scripts/test_recovery.py").write_text(PY)
         self.key = self.keypair("owner")
         self.signers = self.dir.parent / f"{self.dir.name}-signers"
@@ -96,7 +161,7 @@ class WitnessPin(unittest.TestCase):
     def test_a_pinned_tree_passes(self):
         r = self.check()
         self.assertEqual(r.returncode, 0, r.stdout)
-        self.assertIn("2 invariant rows and 2 witnesses", r.stdout)
+        self.assertIn("5 invariant rows and 5 witnesses", r.stdout)
 
     def test_comments_and_line_breaks_do_not_count(self):
         self.edit("src/gate.rs", "        // The URL", "        // A reworded note.\n        // The URL")
@@ -196,6 +261,95 @@ class WitnessPin(unittest.TestCase):
         self.assertEqual(self.check().returncode, 1)
         self.assertEqual(self.pin(self.key).returncode, 0)
         self.assertEqual(self.check().returncode, 0)
+
+
+    # A witness is its closure: attributes, and the test items it reaches (ADR-0023 amendment).
+
+    def test_an_ignored_rust_witness_is_refused(self):
+        self.edit("src/helpers.rs", "    #[test]\n    fn a_helper_keeps_its_verdict", "    #[test]\n    #[ignore]\n    fn a_helper_keeps_its_verdict")
+        self.assert_refused("witness a_helper_keeps_its_verdict changed: its attributes or a test item")
+
+    def test_a_weakened_rust_helper_is_refused(self):
+        self.edit("src/helpers.rs", "        super::production(LIMIT)", "        7")
+        self.assert_refused("witness a_helper_keeps_its_verdict changed: its attributes or a test item")
+
+    def test_a_changed_test_constant_is_refused(self):
+        self.edit("src/helpers.rs", "const LIMIT: u32 = 7;", "const LIMIT: u32 = 8;")
+        self.assert_refused("witness a_helper_keeps_its_verdict changed: its attributes or a test item")
+
+    def test_proptest_case_count_is_pinned(self):
+        self.edit("src/helpers.rs", "with_cases(64)", "with_cases(1)")
+        self.assert_refused("witness generated_cases_keep_their_count changed: its attributes or a test item")
+
+    def test_unrelated_helpers_and_production_code_do_not_count(self):
+        self.edit("src/helpers.rs", "    fn unrelated() -> u32 {\n        1", "    fn unrelated() -> u32 {\n        2")
+        self.edit("src/helpers.rs", "pub fn production(x: u32) -> u32 {\n    x", "pub fn production(x: u32) -> u32 {\n    x + 0")
+        r = self.check()
+        self.assertEqual(r.returncode, 0, r.stdout)
+
+    def test_a_skipped_python_witness_is_refused(self):
+        self.edit("scripts/test_recovery.py", "    def test_restart_keeps_the_start", "    @unittest.skip(\"later\")\n    def test_restart_keeps_the_start")
+        self.assert_refused("witness RecoveryTests.test_restart_keeps_the_start changed: its attributes or a test item")
+
+    def test_a_skipped_python_class_is_refused(self):
+        self.edit("scripts/test_recovery.py", "class RecoveryTests(", "@unittest.skip(\"later\")\nclass RecoveryTests(")
+        self.assert_refused("witness RecoveryTests.test_restart_keeps_the_start changed: its attributes or a test item")
+
+    def test_a_python_fixture_or_module_helper_change_is_refused(self):
+        self.edit("scripts/test_recovery.py", "self.base = 0", "self.base = 1")
+        self.assert_refused("witness RecoveryTests.test_restart_keeps_the_start changed: its attributes or a test item")
+        self.edit("scripts/test_recovery.py", "self.base = 1", "self.base = 0")
+        self.edit("scripts/test_recovery.py", "START = 7", "START = 6")
+        self.assert_refused("witness RecoveryTests.test_restart_keeps_the_start changed: its attributes or a test item")
+
+    def test_the_closure_command_names_what_is_pinned(self):
+        r = run(self.dir, "python3", "scripts/witness-pin.py", "closure", "a_helper_keeps_its_verdict")
+        self.assertIn("src/helpers.rs:7 LIMIT", r.stdout)
+        self.assertIn("src/helpers.rs:9 verdict", r.stdout)
+        self.assertNotIn("unrelated", r.stdout)
+
+    def test_a_manifest_without_closures_is_noted_and_refused_on_main(self):
+        import json
+        manifest = self.dir / "docs/witness-manifest.json"
+        pinned = json.loads(manifest.read_text())
+        del pinned["closures"]
+        manifest.write_text(json.dumps(pinned, indent=1, sort_keys=True) + "\n")
+        (self.dir / "docs/witness-manifest.json.sig").unlink()
+        subprocess.run(["ssh-keygen", "-q", "-Y", "sign", "-f", self.key, "-n", "sokol-witness", str(manifest)],
+                       stdin=subprocess.DEVNULL, check=True)
+        r = self.check()
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertIn("witness closures (attributes, helpers) are not pinned yet", r.stdout)
+        r = run(self.dir, "python3", "scripts/witness-pin.py", "check", "--signers", str(self.signers), "--every-pin")
+        self.assertEqual(r.returncode, 1, r.stdout)
+
+    # A pinned witness must also run and pass: an attribute outside any hash, or a test runner
+    # that skips it, would otherwise leave a signed row with no evidence behind it.
+
+    def executed(self, log):
+        (self.dir.parent / f"{self.dir.name}-log").write_text(log)
+        return run(self.dir, "python3", "scripts/witness-pin.py", "check", "--signers", str(self.signers),
+                   "--executed", str(self.dir.parent / f"{self.dir.name}-log"))
+
+    def test_every_pinned_witness_ran_and_passed(self):
+        r = self.executed(LOG)
+        self.assertEqual(r.returncode, 0, r.stdout)
+
+    def test_an_ignored_or_absent_rust_witness_is_refused(self):
+        r = self.executed(LOG.replace("a_helper_keeps_its_verdict ... ok", "a_helper_keeps_its_verdict ... ignored"))
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn("witness a_helper_keeps_its_verdict did not run and pass", r.stdout)
+        self.assertIn("(ignored)", r.stdout)
+        r = self.executed(LOG.replace("test helpers::tests::generated_cases_keep_their_count ... ok\n", ""))
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn("witness generated_cases_keep_their_count did not run and pass", r.stdout)
+        self.assertIn("(absent)", r.stdout)
+
+    def test_a_failing_python_witness_is_refused(self):
+        self.edit("scripts/test_recovery.py", "def cursor(*_):\n    return 7", "def cursor(*_):\n    return 8")
+        r = self.executed(LOG)
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn("witness RecoveryTests.test_recovery_keeps_the_cursor did not run and pass", r.stdout)
 
 
 if __name__ == "__main__":
