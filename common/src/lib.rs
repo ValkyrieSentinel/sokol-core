@@ -256,6 +256,10 @@ pub mod drop_reason {
     pub const MANUAL_BLOCK: u16 = 8;
     pub const FRAGMENT_BLOCKED: u16 = 9;
     pub const INVALID_TCP_FLAGS: u16 = 10;
+    /// Headers that do not parse, dropped only because `config_flags::STRICT_PARSE` is set (a
+    /// storm, ADR-6). Apart from `MALFORMED_HEADER`, which is dropped in every mode, so that the
+    /// attack signal can leave out the drops storm mode itself adds and keep counting the rest.
+    pub const STRICT_PARSE_FAILED: u16 = 11;
 
     /// Label for metrics; `None` for codes that are never recorded as drops. A label is a
     /// claim that the counter can move: only codes the XDP program passes to `drop_verdict`
@@ -267,6 +271,7 @@ pub mod drop_reason {
             MALFORMED_HEADER => Some("malformed_header"),
             FRAGMENT_BLOCKED => Some("fragment_blocked"),
             INVALID_TCP_FLAGS => Some("invalid_tcp_flags"),
+            STRICT_PARSE_FAILED => Some("strict_parse"),
             _ => None,
         }
     }
@@ -276,7 +281,7 @@ pub mod drop_reason {
         extern crate std;
         use std::{collections::BTreeSet, string::String, vec::Vec};
 
-        const CODES: [(&str, u16); 10] = [
+        const CODES: [(&str, u16); 11] = [
             ("STATIC_BLOCK", super::STATIC_BLOCK),
             ("FAST_PATH_HIT", super::FAST_PATH_HIT),
             ("SLOW_PATH_LPM_HIT", super::SLOW_PATH_LPM_HIT),
@@ -287,7 +292,50 @@ pub mod drop_reason {
             ("MANUAL_BLOCK", super::MANUAL_BLOCK),
             ("FRAGMENT_BLOCKED", super::FRAGMENT_BLOCKED),
             ("INVALID_TCP_FLAGS", super::INVALID_TCP_FLAGS),
+            ("STRICT_PARSE_FAILED", super::STRICT_PARSE_FAILED),
         ];
+
+        #[test]
+        fn every_drop_reason_code_is_distinct_and_has_its_own_counter_slot() {
+            let codes: BTreeSet<u16> = CODES.iter().map(|(_, c)| *c).collect();
+            assert_eq!(codes.len(), CODES.len(), "two reasons share a code");
+            for (n, c) in CODES {
+                assert!(
+                    (c as usize) < crate::DROP_REASON_SLOTS,
+                    "{n} = {c} is masked into another reason's slot"
+                );
+            }
+        }
+
+        #[test]
+        fn the_xdp_program_drops_unparsable_headers_in_strict_mode_with_their_own_reason() {
+            // Only the drop that exists because STRICT_PARSE is set uses STRICT_PARSE_FAILED;
+            // the outer headers dropped in every mode keep MALFORMED_HEADER (ADR-6, ADR-0015).
+            let src = include_str!("../../ebpf/src/main.rs");
+            let flat: String = src.split_whitespace().collect();
+            let guard = "Err(_)ifconfig_enabled(config_flags::STRICT_PARSE)=>{";
+            let start = flat
+                .find(guard)
+                .map(|i| i + guard.len())
+                .expect("the strict-parse arm is not found: the scan is broken");
+            let end = flat[start..]
+                .find('}')
+                .expect("the strict-parse arm has no end");
+            let arm = &flat[start..start + end];
+            assert!(
+                arm.contains("drop_verdict(packet_len,drop_reason::STRICT_PARSE_FAILED)"),
+                "the strict-parse drop does not use STRICT_PARSE_FAILED: {arm}"
+            );
+            assert_eq!(
+                flat.matches("drop_reason::STRICT_PARSE_FAILED").count(),
+                1,
+                "STRICT_PARSE_FAILED is used outside the strict-parse arm"
+            );
+            assert!(
+                flat.contains("drop_verdict(packet_len,drop_reason::MALFORMED_HEADER)"),
+                "the always-on malformed-header drops are gone"
+            );
+        }
 
         #[test]
         fn a_drop_reason_has_a_metric_label_exactly_when_the_xdp_program_drops_with_it() {

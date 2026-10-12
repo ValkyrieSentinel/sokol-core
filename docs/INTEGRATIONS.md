@@ -80,7 +80,9 @@ would cut the tunnel and the mesh with it.
 ### Cluster telemetry
 
 Every 5 s each node sends its peers a signed load report (packets and drops per second, active
-blocks, and whether drops exceed `--attack-drops-per-sec`, default 1000). A node may only report
+blocks, and whether drops exceed `--attack-drops-per-sec`, default 1000; drops that only this
+node's storm strict mode adds, `strict_parse` and `fragment_blocked` without the operator's
+`--drop-ipv4-fragments`, are left out so a storm cannot keep itself going). A node may only report
 about itself. Nodes silent for 15 s drop out of the view. The cluster status is:
 
 | nodes under attack                          | `sokol_cluster_status` |
@@ -95,7 +97,7 @@ without a storm, so a flickering storm is one event. Reports travel only between
 connected peers, so connect the nodes as a full mesh (`--seed-peer` to every other node).
 
 While the latch is engaged, `--storm-mode strict` (the default) tightens XDP on this node: packets
-whose headers do not parse are dropped instead of passed to the stack (`malformed_header`), and
+whose headers do not parse are dropped instead of passed to the stack (`strict_parse`), and
 IPv4 fragments are dropped. When the latch disengages, exactly the flags the operator configured
 (e.g. `--drop-ipv4-fragments`) are restored. Both transitions are audited (`DEFENSE_MODE|Strict`,
 `DEFENSE_MODE|Normal`) and shown as `sokol_defense_strict`. `--storm-mode observe` only logs the
@@ -633,7 +635,7 @@ instances.
 
 `--metrics-bind 127.0.0.1:9469` serves Prometheus metrics at `/metrics`:
 `sokol_xdp_rx_packets_total`, `sokol_xdp_rx_bytes_total`,
-`sokol_xdp_dropped_packets_total{reason=...}` (`blocklist` for every blocked source, `malformed_header`, `invalid_tcp_flags`, `fragment_blocked`), `sokol_xdp_events_suppressed_total`,
+`sokol_xdp_dropped_packets_total{reason=...}` (`blocklist` for every blocked source, `malformed_header` for outer headers dropped in every mode, `strict_parse` for headers dropped only in storm strict mode, `invalid_tcp_flags`, `fragment_blocked`), `sokol_xdp_events_suppressed_total`,
 `sokol_blocks_active`, `sokol_p2p_active_peers`, `sokol_audit_queue_overflow_total`,
 `sokol_flowspec_announced`, `sokol_flowspec_enabled`, `sokol_flowspec_readback_ok`,
 `sokol_flowspec_readback_age_seconds`, `sokol_flowspec_discard_rules`, `sokol_flowspec_round_converged`, `sokol_cluster_status`, `sokol_cluster_nodes`,

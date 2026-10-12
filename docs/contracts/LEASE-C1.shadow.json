@@ -1,0 +1,23 @@
+{
+  "annotations": {
+    "status": "UNSIGNED_EXPLANATORY_DRAFT"
+  },
+  "decisions": [
+    {
+      "because": "Counterexample (hunt round 4, 2026-10-12): after tick dropped a used lease at the claim's end, a 50 s wall step back and a resend gave the claim a second lease (R26-07: the bound is total per claim); a lift was undone by an 11 min step back without a restart, while ADR-0003 disclaimed that only between restarts. Owner chose option A. Witnesses added after the mutation check (PR #15).",
+      "previous_statement_sha256": null,
+      "proposal_sha256": "6ac8a033b4f92f4a2a35decd88134879b15310dca30a606453846d3b82476bf5"
+    }
+  ],
+  "evidence_text": "`a_lift_is_not_undone_by_a_step_back_within_forget_grace`, `a_used_lease_is_not_renewed_by_a_step_back_within_forget_grace_and_a_resend`, `lease_records_stay_bounded_by_forgetting_the_first_ended_one`, `past_forget_grace_a_step_back_lets_a_resent_lease_or_lift_count_again`, `restored_lease_records_keep_the_bound_and_drop_those_past_retention`",
+  "id": "LEASE-C1",
+  "profile": "sokol.contract-shadow.v1",
+  "statement": "A wall-clock step back smaller than FORGET_GRACE, with or without a restart, neither renews a peer claim's used lease nor undoes an operator lift: both records live FORGET_GRACE past the claim's end; a larger step back can revive either, and that bound is the same for both.",
+  "witnesses": [
+    "a_lift_is_not_undone_by_a_step_back_within_forget_grace",
+    "a_used_lease_is_not_renewed_by_a_step_back_within_forget_grace_and_a_resend",
+    "lease_records_stay_bounded_by_forgetting_the_first_ended_one",
+    "past_forget_grace_a_step_back_lets_a_resent_lease_or_lift_count_again",
+    "restored_lease_records_keep_the_bound_and_drop_those_past_retention"
+  ]
+}

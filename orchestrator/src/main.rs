@@ -1991,6 +1991,7 @@ async fn main() -> Result<(), anyhow::Error> {
     let mut telemetry_window_start = std::time::Instant::now();
     let mut window_rx = 0u64;
     let mut window_dropped = 0u64;
+    let mut window_drops_by_reason = [0u64; common::DROP_REASON_SLOTS];
     let (flowspec_tx, flowspec_rx) = flowspec_channel(&*blocks.lock().await);
     let flowspec_gobgp = match (args.flowspec_gobgp.clone(), args.enforce) {
         (Some(_), Enforce::Observe) => {
@@ -2267,8 +2268,17 @@ async fn main() -> Result<(), anyhow::Error> {
                         drops_per_sec,
                         // An observing node drops nothing and claims no attack: peers' storm latch
                         // (strict parsing, fragment drops) must not engage on its account (ADR-0018).
+                        // Drops storm mode itself adds do not count: they would keep the storm
+                        // going on legitimate fragmented or unparsable traffic (ADR-6).
                         under_attack: args.enforce == Enforce::Drop
-                            && (drops_per_sec >= args.attack_drops_per_sec || reported_attacks > 0),
+                            && (defense::under_attack(
+                                &snapshot.drops_by_reason,
+                                &window_drops_by_reason,
+                                secs,
+                                args.attack_drops_per_sec,
+                                defense.base(),
+                                defense.mode(),
+                            ) || reported_attacks > 0),
                         blocks_active: (v4_active + v6_active) as u64,
                     };
                     if let Some(record) = report.telemetry_record() {
@@ -2280,6 +2290,7 @@ async fn main() -> Result<(), anyhow::Error> {
                     telemetry_window_start = std::time::Instant::now();
                     window_rx = total_rx_packets;
                     window_dropped = total_dropped;
+                    window_drops_by_reason = snapshot.drops_by_reason;
                 }
                 snapshot.external_attacks = reported_attacks;
                 let cluster = *cluster_summary.read().unwrap_or_else(|p| p.into_inner());
