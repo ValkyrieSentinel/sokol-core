@@ -2206,6 +2206,7 @@ async fn main() -> Result<(), anyhow::Error> {
                         table.event_memory();
                     snapshot.detector_retractions = table.detector_retractions();
                     snapshot.detections = detections::rows();
+                    snapshot.peer_claims = detections::peer_rows();
                     (snapshot.strikes_remembered, snapshot.strikes_evicted) =
                         table.strike_memory();
                     snapshot.claims_waiting = table.waiting_claims(block_table::local_ms());

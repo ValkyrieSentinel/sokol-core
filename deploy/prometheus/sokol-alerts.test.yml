@@ -140,3 +140,21 @@ tests:
           - { exp_labels: { severity: warning, instance: n1, source: cold-rise }, exp_annotations: { summary: "n1: cold-rise asked for 1.5k blocks within 5 min, over ten times its usual pace or with no history", runbook: "RUNBOOK §5.1: check the detector before its blocks spread" } }
           - { exp_labels: { severity: warning, instance: n1, source: cold-jump }, exp_annotations: { summary: "n1: cold-jump asked for 1.5k blocks within 5 min, over ten times its usual pace or with no history", runbook: "RUNBOOK §5.1: check the detector before its blocks spread" } }
       - { eval_time: 60m, alertname: SokolDetectorSurge, exp_alerts: [] }
+
+  # A peer claim surge, as the detector surge above: node 2 a quiet hour then 300 claims a
+  # minute (enforced and held both count); node 3 a steady high pace; node 4's known copies do
+  # not count; node 5 has no series before its first claim.
+  - interval: 1m
+    input_series:
+      - { series: 'sokol_mesh_claims_total{job="sokol",instance="n1",issuer="2",result="enforced"}', values: '0x65 200+200x9' }
+      - { series: 'sokol_mesh_claims_total{job="sokol",instance="n1",issuer="2",result="held"}', values: '0x65 100+100x9' }
+      - { series: 'sokol_mesh_claims_total{job="sokol",instance="n1",issuer="3",result="enforced"}', values: '0+100x75' }
+      - { series: 'sokol_mesh_claims_total{job="sokol",instance="n1",issuer="4",result="known"}', values: '0x65 1000+1000x9' }
+      - { series: 'sokol_mesh_claims_total{job="sokol",instance="n1",issuer="5",result="enforced"}', values: '_x65 300+300x9' }
+    alert_rule_test:
+      - eval_time: 70m
+        alertname: SokolPeerClaimSurge
+        exp_alerts:
+          - { exp_labels: { severity: warning, instance: n1, issuer: "2" }, exp_annotations: { summary: "n1: node 2 sent 1.5k claims within 5 min, over ten times its usual pace or with no history", runbook: "RUNBOOK §5.1: check the peer's detector; its envelope bounds what this node enforces" } }
+          - { exp_labels: { severity: warning, instance: n1, issuer: "5" }, exp_annotations: { summary: "n1: node 5 sent 1.5k claims within 5 min, over ten times its usual pace or with no history", runbook: "RUNBOOK §5.1: check the peer's detector; its envelope bounds what this node enforces" } }
+      - { eval_time: 60m, alertname: SokolPeerClaimSurge, exp_alerts: [] }

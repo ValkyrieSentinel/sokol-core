@@ -265,7 +265,7 @@ pub const FORGET_GRACE: Duration = Duration::from_secs(600);
 /// length of the step (`adopt` converts the signed end with the offset in force then); the
 /// record makes that copy find the lease it already had instead of a new one.
 fn lease_kept(expires: Option<u64>, now_ms: u64) -> bool {
-    expires.is_none_or(|e| e.saturating_add(ms(FORGET_GRACE)) > now_ms)
+    common::lease::kept(expires, now_ms, ms(FORGET_GRACE))
 }
 
 /// Distinct nodes remembered per retracted id (the issuer plus a few others).
@@ -1132,10 +1132,12 @@ impl<B: Blocklist> BlockTable<B> {
     /// claim without one, and at most MAX_KNOWN_CLAIMS claims are held.
     fn record_lease(&mut self, id: &ClaimId, cap: u64, expires: Option<u64>) {
         match self.lease_ends.get_mut(id) {
-            Some((end, _)) if *end <= cap => {}
             Some((end, _)) => {
-                *end = cap;
-                self.dirty = true;
+                let moved = common::lease::recorded_end(Some(*end), cap);
+                if moved != *end {
+                    *end = moved;
+                    self.dirty = true;
+                }
             }
             None => {
                 if self.lease_ends.len() >= MAX_KNOWN_CLAIMS {
@@ -1610,15 +1612,15 @@ impl<B: Blocklist> BlockTable<B> {
         if self.known_of(claim.issuer) >= envelope.max_known {
             return Adoption::Refused(PEER_SHARE_FULL);
         }
-        let cap = now_ms.saturating_add(ms(self.policy.max.min(envelope.max_ttl)));
         // A claim already given a lease here (before a restart) keeps that lease's end: the
         // local cap bounds a claim's total effect, not each lifetime of this process (R26-07).
-        let cap = match self.lease_ends.get(&id) {
-            Some((end, _)) => cap.min(*end),
-            None => cap,
-        };
+        let cap = common::lease::cap(
+            now_ms,
+            ms(self.policy.max.min(envelope.max_ttl)),
+            self.lease_ends.get(&id).map(|(end, _)| *end),
+        );
         let end_local = self.end_of(&claim);
-        let until_ms = Some(end_local.map_or(cap, |e| e.min(cap)));
+        let until_ms = Some(common::lease::until(end_local, cap));
         // Only a claim that could count takes a slot or waits for one: not one whose lease ran
         // out (before a restart), one the local policy refuses, or one already retracted (a
         // lifted claim resent by its issuer must not use up the issuer's quota).
@@ -1920,10 +1922,11 @@ impl<B: Blocklist> BlockTable<B> {
                 };
                 // Enforcement starts now, so the local end is counted from now, but never past
                 // a lease this claim already had (before a restart, R26-07).
-                let cap =
-                    now_ms.saturating_add(ms(self.policy.max.min(self.envelope(issuer).max_ttl)));
-                let earlier = self.lease_ends.get(&id).map(|(end, _)| *end);
-                let cap = earlier.map_or(cap, |end| cap.min(end));
+                let cap = common::lease::cap(
+                    now_ms,
+                    ms(self.policy.max.min(self.envelope(issuer).max_ttl)),
+                    self.lease_ends.get(&id).map(|(end, _)| *end),
+                );
                 if cap <= now_ms {
                     continue;
                 }
@@ -1938,7 +1941,7 @@ impl<B: Blocklist> BlockTable<B> {
                 if let Some(h) = self.claims.get_mut(&id) {
                     if !h.in_quota && h.live(now_ms) {
                         h.in_quota = true;
-                        h.until_ms = Some(h.end_local.map_or(cap, |e| e.min(cap)));
+                        h.until_ms = Some(common::lease::until(h.end_local, cap));
                         h.ended = false;
                         *self.active_by_issuer.entry(issuer).or_insert(0) += 1;
                         touched.push(h.net);
@@ -1952,9 +1955,8 @@ impl<B: Blocklist> BlockTable<B> {
         // A forgotten record must not leave its target's kernel entry stale.
         let claims = &self.claims;
         self.retractions.retain(|id, r| {
-            let keep = r
-                .forget_ms
-                .is_none_or(|f| f.saturating_add(ms(FORGET_GRACE)) > now_ms);
+            // The same bound as a lease record (`lease_kept`): LEASE-C1.
+            let keep = lease_kept(r.forget_ms, now_ms);
             if !keep {
                 if let Some(h) = claims.get(id) {
                     touched.push(h.net);
@@ -4634,6 +4636,29 @@ mod tests {
             );
             assert_eq!(again, Adoption::Held("expired"));
         }
+    }
+
+    /// A lease record's end moves earlier with a shorter cap, and the change is saved (the
+    /// table is dirty); a later, longer cap leaves it where it is (`common::lease`).
+    #[test]
+    fn a_lease_record_moves_only_earlier_and_is_saved_when_it_does() {
+        let mut t = table(1, 64);
+        let id: ClaimId = "lease-record".into();
+        t.record_lease(&id, T0 + 600 * S, None);
+        t.dirty = false;
+        t.record_lease(&id, T0 + 400 * S, None);
+        assert_eq!(
+            t.lease_ends.get(&id).map(|(end, _)| *end),
+            Some(T0 + 400 * S)
+        );
+        assert!(t.dirty, "a record moved earlier is saved");
+        t.dirty = false;
+        t.record_lease(&id, T0 + 500 * S, None);
+        assert_eq!(
+            t.lease_ends.get(&id).map(|(end, _)| *end),
+            Some(T0 + 400 * S)
+        );
+        assert!(!t.dirty, "an unchanged record is not rewritten");
     }
 
     /// ADR-0003 ( "Заявка піра діє тут не довше --peer-max-ttl, рахуючи від моменту,
