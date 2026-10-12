@@ -30,6 +30,16 @@ pub static DETECTIONS: Mutex<Detections> = Mutex::new(Detections {
     other: [0; RESULTS.len()],
 });
 
+/// The label for a source an adapter named on the IPC socket: this node's own sources (`trap`,
+/// `telemetry`) are not names an adapter can take, so such a decision counts as `other`.
+pub fn adapter_label(name: &str) -> &str {
+    if name == TRAP || name == TELEMETRY {
+        OTHER
+    } else {
+        name
+    }
+}
+
 /// A name usable as a label value as it is (what `signal::parse` admits for a source).
 fn plain(source: &str) -> bool {
     !source.is_empty()
@@ -119,5 +129,13 @@ mod tests {
             3,
             "64 bytes, dots and underscores are names"
         );
+    }
+
+    #[test]
+    fn only_this_nodes_own_source_names_are_relabelled() {
+        assert_eq!(adapter_label(TRAP), OTHER);
+        assert_eq!(adapter_label(TELEMETRY), OTHER);
+        assert_eq!(adapter_label("suricata"), "suricata");
+        assert_eq!(adapter_label("trap2"), "trap2");
     }
 }

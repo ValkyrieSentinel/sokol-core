@@ -1,8 +1,8 @@
 //! The detector/trap IPC socket: one line in, one acknowledgement out (ACK mode, F09). Moved verbatim out of `main.rs` by the 2026-10-05 review (W3.3); behaviour unchanged.
 use super::*;
 
-pub(crate) struct IpcCtx {
-    pub(crate) blocks: SharedBlockTable,
+pub(crate) struct IpcCtx<B: block_table::Blocklist = block_table::KernelBlocklist> {
+    pub(crate) blocks: SharedBlockTable<B>,
     pub(crate) db: Arc<SentinelDb>,
     pub(crate) registry: PeerRegistry,
     pub(crate) node_id: u64,
@@ -14,7 +14,10 @@ pub(crate) struct IpcCtx {
 /// One IPC command; returns the reply a client in ACK mode gets (F09): `OK applied`,
 /// `OK refused <why>` (final, do not retry), `OK pending` (recorded, kernel write retried by the
 /// node), `OK recorded`, or `ERR <why>` (malformed, do not retry).
-pub(crate) async fn handle_ipc_line(content: &str, c: &IpcCtx) -> String {
+pub(crate) async fn handle_ipc_line<B: block_table::Blocklist>(
+    content: &str,
+    c: &IpcCtx<B>,
+) -> String {
     // One policy snapshot per line: the decision and its answer read the same never-block set,
     // so a refusal the policy does not explain is the table's, not a policy change in between.
     let policy = c.policy.current();
@@ -128,7 +131,7 @@ pub(crate) async fn handle_ipc_line(content: &str, c: &IpcCtx) -> String {
                             &c.crypto,
                             &policy,
                             Detection {
-                                source: &sig.source,
+                                source: detections::adapter_label(&sig.source),
                                 event,
                                 requested: verb.ttl,
                             },
@@ -232,7 +235,10 @@ fn retraction_record(
 
 /// A detector takes back one of its events (ADR-0019). The block ends, or gets shorter, only as
 /// far as no other reason holds it; this node's own claims are retracted mesh-wide.
-pub(crate) async fn retract_detection(r: &signal::Retract, c: &IpcCtx) -> String {
+pub(crate) async fn retract_detection<B: block_table::Blocklist>(
+    r: &signal::Retract,
+    c: &IpcCtx<B>,
+) -> String {
     let shown = show(&r.target);
     // Time read and record submitted under the table lock.
     let (out, shares_own, still_blocked) = {
@@ -406,5 +412,49 @@ mod tests {
             format!("OK refused {}", block_table::TOO_MANY_CLAIMS),
             "names the table's own refusal"
         );
+    }
+
+    /// `trap` and `telemetry` are this node's own sources in `sokol_detections_total`
+    /// (ROADMAP item 10): an adapter that names itself so on the IPC socket must not have its
+    /// decisions counted as trap hits or telemetry. It is still enforced, and its audit record
+    /// keeps the name it gave; only the counter label is `other`.
+    #[tokio::test]
+    async fn an_adapter_cannot_be_counted_under_a_source_of_this_node() {
+        let dir = std::env::temp_dir().join(format!(
+            "sokol-ipc-label-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let c = IpcCtx {
+            blocks: Arc::new(tokio::sync::Mutex::new(table())),
+            db: Arc::new(SentinelDb::init(dir.join("audit.log").to_str().unwrap(), None).unwrap()),
+            registry: PeerRegistry::new(TrustStore::default()),
+            node_id: 1,
+            crypto: Arc::new(NodeCrypto::generate()),
+            policy: PolicyHandle::new(BlockPolicy::builtin()),
+            reports: Arc::new(std::sync::Mutex::new(attack_reports::AttackReports::new(
+                Duration::from_secs(60),
+            ))),
+        };
+        let count = |label: &str| {
+            detections::rows()
+                .into_iter()
+                .find(|(s, _)| s == label)
+                .map_or(0, |(_, row)| row[0])
+        };
+        // The trap path runs only in a live node, so no other test moves the `trap` row.
+        let before = count(detections::TRAP);
+        assert_eq!(
+            handle_ipc_line("SIGNAL:trap|198.51.100.61|-|spoofed", &c).await,
+            "OK applied"
+        );
+        assert_eq!(
+            count(detections::TRAP),
+            before,
+            "an IPC line was counted as a trap hit of this node"
+        );
+        drop(c);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

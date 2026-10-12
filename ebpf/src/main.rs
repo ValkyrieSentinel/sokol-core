@@ -224,7 +224,11 @@ pub fn sentinel_vfr_filter(ctx: XdpContext) -> u32 {
             let packet_len = (ctx.data_end() - ctx.data()) as u64;
             drop_verdict(packet_len, drop_reason::STRICT_PARSE_FAILED)
         }
-        Err(_) => xdp_action::XDP_PASS,
+        // Passed, so seen: rx_packets counts it like every other passed packet.
+        Err(_) => {
+            record_rx((ctx.data_end() - ctx.data()) as u64);
+            xdp_action::XDP_PASS
+        }
     }
 }
 

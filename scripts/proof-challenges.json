@@ -51,6 +51,36 @@
         "after": "    pub fn validate_strict_json_object(_input: &str) -> Result<(), CanonicalError> {\n        Ok(())\n    }"
       },
       "assertion": "assertion failed: trimmed.starts_with('{') && trimmed.ends_with('}')"
+    },
+    {
+      "id": "storm-counted",
+      "file": "common/src/storm.rs",
+      "harness": "storm::proofs::storm_added_drops_never_move_the_attack_signal",
+      "replace": {
+        "before": "    if storm_added(code, base, strict) {",
+        "after": "    if false {"
+      },
+      "assertion": "assertion failed: counted(code, now, start, base, strict) == 0"
+    },
+    {
+      "id": "storm-malformed",
+      "file": "common/src/storm.rs",
+      "harness": "storm::proofs::every_other_drop_reason_counts_in_every_mode",
+      "replace": {
+        "before": "|| (code == drop_reason::STRICT_PARSE_FAILED && added & config_flags::STRICT_PARSE != 0)",
+        "after": "|| ((code == drop_reason::STRICT_PARSE_FAILED || code == drop_reason::MALFORMED_HEADER) && added & config_flags::STRICT_PARSE != 0)"
+      },
+      "assertion": "assertion failed: counted(code, now, start, base, strict) == now.saturating_sub(start)"
+    },
+    {
+      "id": "storm-flags",
+      "file": "common/src/storm.rs",
+      "harness": "storm::proofs::a_storm_adds_only_its_flags_and_keeps_the_operators",
+      "replace": {
+        "before": "        base | STORM_FLAGS",
+        "after": "        STORM_FLAGS"
+      },
+      "assertion": "assertion failed: set & base == base && set & !base & !STORM_FLAGS == 0"
     }
   ]
 }
