@@ -1,0 +1,13 @@
+{
+  "after": "MESH-A2",
+  "base_contract_sha256": null,
+  "because": "Measurement R5 on 3c51594 (ROADMAP item 10): PeerRegistry::open_at held the shared replay mutex across the ML-DSA-65 verification, so all inbound verification ran one connection at a time on one core; a_signature_is_verified_without_holding_the_replay_lock times out on that code (no answer in 10 s while another thread holds the lock). Signature and clock window are now checked before the lock; only the replay lookup and insert run under it, still only after a valid signature.",
+  "evidence_text": "`a_signature_is_verified_without_holding_the_replay_lock`",
+  "id": "MESH-V1",
+  "profile": "sokol.contract-proposal.v1",
+  "statement": "An inbound envelope's sender, ML-DSA signature and clock window are checked without the shared replay lock, so connections verify in parallel: a forged envelope is refused while another connection holds the lock. Only the replay lookup and insert run under it, and only after the signature verified, so unknown senders cannot fill the cache.",
+  "status": "UNSIGNED_INTENT",
+  "witnesses": [
+    "a_signature_is_verified_without_holding_the_replay_lock"
+  ]
+}
