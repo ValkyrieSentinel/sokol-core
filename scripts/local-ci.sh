@@ -18,7 +18,7 @@
 # archives whose checksum is verified on every run, into a directory first on PATH; what is
 # already installed elsewhere is never trusted for its version text. Policy checks that CI runs
 # only on x86_64 (fmt, retired, claims, monitoring, cargo-deny) run here on either architecture;
-# promtool needs docker and is skipped, with a notice, without it.
+# promtool needs a docker daemon and is skipped, with a notice, without one.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 QUICK=0
@@ -81,6 +81,8 @@ tools() {
     local bpf_v gobgp_v archive
     bpf_v=$(pin BPF_LINKER_VERSION)
     gobgp_v=$(pin GOBGP_VERSION)
+    # bpf-linker ships only as .tar.zst: without zstd tar fails after the download, unclearly.
+    command -v zstd >/dev/null || { echo "FAIL zstd is needed to unpack bpf-linker (apt-get install zstd)"; return 1; }
     rm -rf "$TOOLS"
     mkdir -p "$TOOLS"
     archive=$(checked_archive \
@@ -106,11 +108,12 @@ tools() {
 monitoring() {
     step "monitoring"
     scripts/check-monitoring.sh
-    if command -v docker >/dev/null; then
+    # The client alone is not docker: a host may have it without a running daemon.
+    if command -v docker >/dev/null && docker info >/dev/null 2>&1; then
         docker run --rm -v "$PWD/deploy/prometheus:/w" -w /w --entrypoint promtool \
             "$(pin prometheus_image)" test rules sokol-alerts.test.yml
     else
-        echo "promtool skipped: no docker (CI runs it)"
+        echo "promtool skipped: no docker daemon (CI runs it)"
     fi
 }
 
