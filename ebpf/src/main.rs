@@ -217,13 +217,12 @@ fn emit_drop_event_sampled(
 pub fn sentinel_vfr_filter(ctx: XdpContext) -> u32 {
     match try_sentinel_vfr_filter(&ctx) {
         Ok(ret) => ret,
-        // Headers that do not parse: passed to the stack normally, dropped in strict mode.
+        // Headers that do not parse: passed to the stack normally, dropped in strict mode. Own
+        // reason, not MALFORMED_HEADER: these drops exist only while a storm sets STRICT_PARSE,
+        // and the attack signal must be able to leave them out (ADR-6).
         Err(_) if config_enabled(config_flags::STRICT_PARSE) => {
-            let verdict = drop_verdict(
-                (ctx.data_end() - ctx.data()) as u64,
-                drop_reason::MALFORMED_HEADER,
-            );
-            verdict
+            let packet_len = (ctx.data_end() - ctx.data()) as u64;
+            drop_verdict(packet_len, drop_reason::STRICT_PARSE_FAILED)
         }
         Err(_) => xdp_action::XDP_PASS,
     }

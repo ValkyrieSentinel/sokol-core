@@ -1266,16 +1266,21 @@ for _ in range(int(sys.argv[2])):
     s.send(eth + ip6)
 PY
     }
+    # Strict-parse drops have their own reason (ADR-0015): MALFORMED_HEADER is for outer headers
+    # dropped in every mode, and it keeps counting towards the attack signal (ADR-6).
+    strict_parse() { metric 'sokol_xdp_dropped_packets_total{reason="strict_parse"}'; }
     malformed() { metric 'sokol_xdp_dropped_packets_total{reason="malformed_header"}'; }
     check "storm: node 1 switched XDP to strict mode" grep -aq "DEFENSE_MODE|Strict" "$WORK/events.sntl"
     check "storm: strict mode is reported" wait_metric sokol_defense_strict 1
-    BEFORE=$(malformed); send_truncated_v6 10; sleep 1.2
-    check "storm: unparsable headers from an unblocked source are dropped in strict mode ($BEFORE -> $(malformed))" \
-        test $(( $(malformed) - BEFORE )) -eq 10
+    BEFORE=$(strict_parse); MALFORMED_BEFORE=$(malformed); send_truncated_v6 10; sleep 1.2
+    check "storm: unparsable headers from an unblocked source are dropped in strict mode ($BEFORE -> $(strict_parse))" \
+        test $(( $(strict_parse) - BEFORE )) -eq 10
+    check "storm: strict-parse drops are not counted as malformed_header" \
+        test "$(malformed)" -eq "$MALFORMED_BEFORE"
     for _ in $(seq 1 75); do grep -aq "DEFENSE_MODE|Normal" "$WORK/events.sntl" && break; sleep 1; done
     check "storm over: node 1 returns to normal mode" grep -aq "DEFENSE_MODE|Normal" "$WORK/events.sntl"
-    BEFORE=$(malformed); send_truncated_v6 10; sleep 1.2
-    check "normal mode: unparsable headers pass to the stack again" test "$(malformed)" -eq "$BEFORE"
+    BEFORE=$(strict_parse); send_truncated_v6 10; sleep 1.2
+    check "normal mode: unparsable headers pass to the stack again" test "$(strict_parse)" -eq "$BEFORE"
     # ADR-0021: each node keeps the other's fsynced audit head in its own log.
     check "audit witnesses: node 1 recorded node 2's heads" \
         bash -c "test \"\$(curl -s http://127.0.0.1:9469/metrics | awk '\$1==\"sokol_audit_witnesses_recorded_total\"{print \$2}')\" -gt 0"

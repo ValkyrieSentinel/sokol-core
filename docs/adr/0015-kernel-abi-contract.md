@@ -72,3 +72,15 @@ XDP-програма пише `DropEvent` у ring buffer і `PacketStats` у per
   останнє поле закінчується рівно на розмірі. Поле, додане чи прибране будь-де, змінює число
   в assert.
 - Коди `drop_reason` не змінились. Мітки метрик мають лише ті коди, з якими XDP відкидає.
+
+## Зміна 2026-10-12: код `drop_reason::STRICT_PARSE_FAILED` (11, мітка `strict_parse`)
+
+- Нерозбірливий заголовок, відкинутий лише тому, що шторм увімкнув `STRICT_PARSE`, раніше
+  рахувався як `MALFORMED_HEADER`, разом із зовнішніми заголовками, які відкидаються в
+  будь-якому режимі. Сигнал атаки не міг відрізнити ціну шторму від флуду сміттям (ADR-0006).
+- Розкладка не змінилась: код 11 менший за `DROP_REASON_SLOTS` (16) і має власний слот у
+  `drops_by_reason`/`observed_by_reason`. Перевіряють
+  `every_drop_reason_code_is_distinct_and_has_its_own_counter_slot` і
+  `the_xdp_program_drops_unparsable_headers_in_strict_mode_with_their_own_reason`.
+- Метрика `sokol_xdp_dropped_packets_total{reason="malformed_header"}` більше не росте від
+  суворого розбору; ці відкидання тепер `reason="strict_parse"`. Релізу ще немає.
