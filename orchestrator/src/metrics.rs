@@ -55,6 +55,7 @@ pub struct Snapshot {
     pub blocks_pending_oldest_secs: f64,
     pub mesh_handshakes_refused: u64,
     pub mesh_handshake_timeouts: u64,
+    pub mesh_wrong_address: u64,
     pub mesh_frames_delayed: u64,
     pub mesh_sync_requests_throttled: u64,
     pub audit_witnesses_recorded: u64,
@@ -404,7 +405,12 @@ fn render_at(s: &Snapshot, now: Instant) -> String {
         family(&mut out, name, "gauge", help);
         let _ = writeln!(out, "{} {:.6}", name, value);
     }
-    let counters: [(&str, &str, u64); 8] = [
+    let counters: [(&str, &str, u64); 9] = [
+        (
+            "sokol_mesh_handshakes_wrong_address_total",
+            "Handshakes refused: a pinned node connected from an address its peers-file entry does not bind it to.",
+            s.mesh_wrong_address,
+        ),
         (
             "sokol_mesh_handshakes_refused_total",
             "Connections refused: too many not yet authenticated (in total or from one address).",

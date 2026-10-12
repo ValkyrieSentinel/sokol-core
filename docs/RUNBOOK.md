@@ -64,10 +64,14 @@ sudo -u sokol /usr/local/bin/sokol-orchestrator --key-file /var/lib/sokol/node.k
 
 ```json
 [
-  { "node_id": 2, "public_key": "mldsa65:<hex вузла 2>" },
-  { "node_id": 3, "public_key": "mldsa65:<hex вузла 3>" }
+  { "node_id": 2, "public_key": "mldsa65:<hex вузла 2>", "address": "10.99.0.2" },
+  { "node_id": 3, "public_key": "mldsa65:<hex вузла 3>", "address": "10.99.0.3" }
 ]
 ```
+
+`"address"` — тунельна адреса вузла в WireGuard (`AllowedIPs` його `[Peer]`). Рукостискання
+вузла з іншої адреси відкидається (ADR-0027). Без неї інший пір може переслати рукостискання
+вузла й перехопити доставку йому; при старті журнал називає такі вузли.
 
 ## 3. Перший старт і перевірка
 
@@ -115,6 +119,7 @@ I/O-помилка не доводить пошкодження. `OK` не пі�
 | `sokol_mesh_handshake_timeouts_total` | швидко росте | хтось відкриває з'єднання й мовчить |
 | `sokol_tick_seconds_max` | > 0,5 | обслуговування таблиці сповільнюється |
 | `sokol_xdp_events_lost_total` | росте | orchestrator не встигає читати події ядра: кільце повне, події (не блоки) губляться |
+| `sokol_mesh_handshakes_wrong_address_total` | > 0 | рукостискання закріпленого піра прийшло не з його `"address"`: помилка конфігурації або ключ піра використано деінде (ADR-0027). Алерт `SokolPeerWrongAddress`, див. §5.5 |
 | `sokol_xdp_events_malformed_total` | > 0 | XDP-програма й orchestrator розходяться в розкладці подій (ADR-0015): бінарник зібрано неправильно |
 | `sokol_detections_total{source,result}` | одне джерело різко зросло | детектор (чи пастка) раптом вимагає багато блоків: хибне правило, отруєний фід. Алерт `SokolDetectorSurge`, див. §5.1 |
 | `sokol_block_outcomes_total{effect="none"}` | частка велика | блоки нічого не відкидають: `sudo sokol-monitor --outcomes /var/lib/sokol/audit.log` покаже, які детектори й правила (ADR-0014) |
@@ -123,7 +128,7 @@ I/O-помилка не доводить пошкодження. `OK` не пі�
 Будь-яка з перших п'яти причин переводить вузол у `MODE=DEGRADED`. Захист при цьому працює.
 
 **Готові алерти й дашборд:**
-- `deploy/prometheus/sokol-alerts.yml` — 17 правил за цією таблицею, з тестами
+- `deploy/prometheus/sokol-alerts.yml` — 18 правил за цією таблицею, з тестами
   `promtool test rules sokol-alerts.test.yml`;
 - `deploy/prometheus/prometheus.yml` — приклад збору. Метрики без автентифікації, тож
   `--metrics-bind` лише на приватну адресу (WireGuard, мережа керування);
@@ -212,6 +217,7 @@ ctl ACCEPT_STATE_LOSS             # "OK state loss accepted"; вузол вих�
 | `has only a legacy Dilithium3 key` | у `peers.json` старий ключ v1 | новий `mldsa65:` ключ піра (README, оновлення v1→v2) |
 | `pre-versioned mesh protocol` / `no common mesh protocol version` | пір іншої версії | оновити пір |
 | `no handshake within 5s` | з'єднання мовчить | мережа, файрвол (TCP 7946) |
+| `connected from an address it is not bound to` | рукостискання вузла прийшло не з його `"address"` | звірити `"address"` з `AllowedIPs`; якщо збігається — ключ вузла використано деінде: §6 «Компрометація» |
 
 Меш сходиться сам: дайджести кожні 15 с, знімок — не частіше разу на 5 с на піра.
 
