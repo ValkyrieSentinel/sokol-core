@@ -4638,6 +4638,29 @@ mod tests {
         }
     }
 
+    /// A lease record's end moves earlier with a shorter cap, and the change is saved (the
+    /// table is dirty); a later, longer cap leaves it where it is (`common::lease`).
+    #[test]
+    fn a_lease_record_moves_only_earlier_and_is_saved_when_it_does() {
+        let mut t = table(1, 64);
+        let id: ClaimId = "lease-record".into();
+        t.record_lease(&id, T0 + 600 * S, None);
+        t.dirty = false;
+        t.record_lease(&id, T0 + 400 * S, None);
+        assert_eq!(
+            t.lease_ends.get(&id).map(|(end, _)| *end),
+            Some(T0 + 400 * S)
+        );
+        assert!(t.dirty, "a record moved earlier is saved");
+        t.dirty = false;
+        t.record_lease(&id, T0 + 500 * S, None);
+        assert_eq!(
+            t.lease_ends.get(&id).map(|(end, _)| *end),
+            Some(T0 + 400 * S)
+        );
+        assert!(!t.dirty, "an unchanged record is not rewritten");
+    }
+
     /// ADR-0003 ( "Заявка піра діє тут не довше --peer-max-ttl, рахуючи від моменту,
     /// коли почала діяти"; LEASE-C1): a claim whose signed end lies just within the cap gets no
     /// lease record, so a resend after a wall-clock step back smaller than FORGET_GRACE is

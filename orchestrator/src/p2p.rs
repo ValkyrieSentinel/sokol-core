@@ -39,20 +39,23 @@ use common::canonical::CanonicalParser;
 /// FIPS 204 context string of every envelope signature: a signature made for anything else
 /// with the same key never verifies as a mesh envelope.
 const SIGNATURE_CONTEXT: &[u8] = b"sokol-mesh-envelope";
-/// Every frame starts with these bytes and the wire version.
-const WIRE_MAGIC: &[u8; 3] = b"SKM";
+/// Every frame starts with these bytes and the wire version (`common::wire`, proved there).
+const WIRE_MAGIC: &[u8; 3] = common::wire::MAGIC;
 /// Wire versions this node speaks. Handshakes are always sent as v2 envelopes (the stable
 /// bootstrap format). Only v2 exists, so every frame is sealed as v2; a v3 must make the writer
 /// use the version negotiated for its connection (see [`negotiate`]).
-pub const WIRE_VERSION_MIN: u8 = 2;
-pub const WIRE_VERSION_MAX: u8 = 2;
+pub const WIRE_VERSION_MIN: u8 = common::wire::VERSION_MIN;
+pub const WIRE_VERSION_MAX: u8 = common::wire::VERSION_MAX;
 /// Public keys in the peers file and `--print-public-key` carry their algorithm.
 pub const KEY_PREFIX: &str = "mldsa65:";
 /// Node key file: this magic, then the 32-byte ML-DSA seed (FIPS 204 KeyGen_internal input).
 const KEY_FILE_MAGIC: &[u8; 4] = b"SKK2";
 /// A pre-v2 key file: raw Dilithium3 public key (1952 bytes) and secret key (4000 bytes).
 const LEGACY_KEY_FILE_LEN: usize = 1952 + 4000;
-pub const MAX_CLOCK_SKEW_MS: u64 = 30_000;
+pub const MAX_CLOCK_SKEW_MS: u64 = common::replay::MAX_CLOCK_SKEW_MS;
+/// How long a nonce is remembered after it arrived (`common::replay`, proved there to fit
+/// MAX_CLOCK_SKEW_MS).
+const REPLAY_WINDOW_MS: u64 = common::replay::REPLAY_WINDOW_MS;
 /// Measured cost of verifying a small envelope (ADR-0013, `measure_resource_costs`, aarch64).
 pub const VERIFY_SMALL_MICROS: f64 = 25.0;
 
@@ -71,10 +74,6 @@ pub fn inbound_worst_case(peers: usize) -> (f64, f64, f64) {
     )
 }
 
-/// How long a nonce is remembered after it arrived: a timestamp accepted then is at most
-/// MAX_CLOCK_SKEW_MS ahead, so it is stale this long after arrival. Both bounds are inclusive:
-/// at exactly this age the frame is still acceptable, so its nonce is still remembered.
-const REPLAY_WINDOW_MS: u64 = 2 * MAX_CLOCK_SKEW_MS;
 pub const MAX_FRAME_BYTES: usize = 128 * 1024;
 
 // ---- Resource limits of the mesh transport (see ARCHITECTURE, ADR-0013) ----
@@ -656,7 +655,7 @@ impl ReplayGuard {
             // Kept while the frame could still pass the timestamp check (`<=` skew, inclusive):
             // dropping it at exactly REPLAY_WINDOW_MS let that frame through twice (review
             // 2026-10-05 F4).
-            if arrived.saturating_add(REPLAY_WINDOW_MS) >= now {
+            if common::replay::remembered(arrived, now) {
                 break;
             }
             w.order.pop_front();
@@ -687,36 +686,10 @@ pub struct SecureEnvelope {
 }
 
 /// Bytes before the payload: magic, version, sender, timestamp, nonce, payload length.
-const ENVELOPE_HEADER_LEN: usize = 3 + 1 + 8 + 8 + 8 + 4;
+const ENVELOPE_HEADER_LEN: usize = common::wire::HEADER_LEN;
 
-/// Why a frame is not a v2 envelope.
-#[derive(Debug, PartialEq, Eq)]
-pub enum WireError {
-    /// Does not start with `SKM`: the pre-versioned protocol (v1, Dilithium3 over bincode).
-    Legacy,
-    /// `SKM` with a version this node does not speak.
-    Unsupported(u8),
-    Malformed(&'static str),
-}
-
-impl std::fmt::Display for WireError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Legacy => write!(
-                f,
-                "peer speaks the pre-versioned mesh protocol (v1: Dilithium3 over bincode); \
-                 this node speaks v{}..v{}: upgrade the peer",
-                WIRE_VERSION_MIN, WIRE_VERSION_MAX
-            ),
-            Self::Unsupported(v) => write!(
-                f,
-                "peer sent mesh wire version {}; this node speaks v{}..v{}",
-                v, WIRE_VERSION_MIN, WIRE_VERSION_MAX
-            ),
-            Self::Malformed(why) => write!(f, "malformed envelope: {}", why),
-        }
-    }
-}
+/// Why a frame is not a v2 envelope (`common::wire`).
+pub use common::wire::WireError;
 
 impl SecureEnvelope {
     /// Wire format v2, all integers little-endian:
@@ -741,39 +714,12 @@ impl SecureEnvelope {
     }
 
     pub fn decode(frame: &[u8]) -> Result<Self, WireError> {
-        let Some((magic, rest)) = frame.split_first_chunk::<3>() else {
-            return Err(WireError::Legacy);
-        };
-        if magic != WIRE_MAGIC {
-            return Err(WireError::Legacy);
-        }
-        let Some((&version, rest)) = rest.split_first() else {
-            return Err(WireError::Malformed("no version"));
-        };
-        if !(WIRE_VERSION_MIN..=WIRE_VERSION_MAX).contains(&version) {
-            return Err(WireError::Unsupported(version));
-        }
-        let field =
-            |rest: &[u8], at: usize| -> Option<[u8; 8]> { rest.get(at..at + 8)?.try_into().ok() };
-        let (Some(sender), Some(timestamp), Some(nonce)) =
-            (field(rest, 0), field(rest, 8), field(rest, 16))
-        else {
-            return Err(WireError::Malformed("short header"));
-        };
-        let payload_len = rest
-            .get(24..28)
-            .and_then(|b| <[u8; 4]>::try_from(b).ok())
-            .map(u32::from_le_bytes)
-            .ok_or(WireError::Malformed("short header"))? as usize;
-        let body = rest.get(28..).unwrap_or_default();
-        let (payload, signature) = body
-            .split_at_checked(payload_len)
-            .ok_or(WireError::Malformed("payload longer than the frame"))?;
+        let (h, payload, signature) = common::wire::split(frame)?;
         Ok(Self {
-            version,
-            sender_id: u64::from_le_bytes(sender),
-            timestamp_ms: u64::from_le_bytes(timestamp),
-            nonce: u64::from_le_bytes(nonce),
+            version: h.version,
+            sender_id: h.sender_id,
+            timestamp_ms: h.timestamp_ms,
+            nonce: h.nonce,
             payload: payload.to_vec(),
             signature: signature.to_vec(),
         })
@@ -789,12 +735,13 @@ fn unsigned_bytes(
     payload: &[u8],
 ) -> Vec<u8> {
     let mut msg = Vec::with_capacity(ENVELOPE_HEADER_LEN + payload.len() + 3309);
-    msg.extend_from_slice(WIRE_MAGIC);
-    msg.push(version);
-    msg.extend_from_slice(&sender_id.to_le_bytes());
-    msg.extend_from_slice(&timestamp_ms.to_le_bytes());
-    msg.extend_from_slice(&nonce.to_le_bytes());
-    msg.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    let h = common::wire::Header {
+        version,
+        sender_id,
+        timestamp_ms,
+        nonce,
+    };
+    msg.extend_from_slice(&common::wire::header(&h, payload.len() as u32));
     msg.extend_from_slice(payload);
     msg
 }
@@ -946,7 +893,7 @@ fn authenticate(
         return Err(EnvelopeError::BadSignature);
     }
 
-    if envelope.timestamp_ms.abs_diff(now) > MAX_CLOCK_SKEW_MS {
+    if !common::replay::fresh(envelope.timestamp_ms, now) {
         return Err(EnvelopeError::StaleTimestamp);
     }
     Ok(())
