@@ -1,12 +1,18 @@
 {
-  "after": "MESH-K1",
-  "base_contract_sha256": null,
-  "because": "Counterexamples on c51cdc9: a never-authenticated connection had 50 replayed handshakes signature-checked (replay was skipped, not refused, before authentication); one pinned peer authenticated 4 connections (up to the listener's 100), outside ADR-0013's two-per-pair bound. The two other witnesses kill the mutants that widened the refusal.",
+  "annotations": {
+    "status": "UNSIGNED_EXPLANATORY_DRAFT"
+  },
+  "decisions": [
+    {
+      "because": "Counterexamples on c51cdc9: a never-authenticated connection had 50 replayed handshakes signature-checked (replay was skipped, not refused, before authentication); one pinned peer authenticated 4 connections (up to the listener's 100), outside ADR-0013's two-per-pair bound. The two other witnesses kill the mutants that widened the refusal.",
+      "previous_statement_sha256": null,
+      "proposal_sha256": "9663af1e60516ac3ac91e0d7fe7fc9fc010fc8aba91a33e262160e8e3cac446b"
+    }
+  ],
   "evidence_text": "`an_authenticated_connection_survives_a_replayed_frame`, `an_unauthenticated_connection_cannot_buy_more_than_one_verification`, `one_peer_cannot_hold_more_connections_than_the_bounds_assume`, `other_peers_connections_do_not_use_up_a_nodes_slots`",
   "id": "MESH-A1",
-  "profile": "sokol.contract-proposal.v1",
+  "profile": "sokol.contract-shadow.v1",
   "statement": "A connection whose first frame does not authenticate is closed, a replayed copy of a valid frame included, so an unauthenticated connection costs at most one signature verification; after the handshake a replayed frame is ignored. A pinned peer holds at most two authenticated connections, the bound from which inbound_worst_case and REPLAY_PER_SENDER are derived; a third is refused, and other peers' connections do not count against it.",
-  "status": "UNSIGNED_INTENT",
   "witnesses": [
     "an_authenticated_connection_survives_a_replayed_frame",
     "an_unauthenticated_connection_cannot_buy_more_than_one_verification",

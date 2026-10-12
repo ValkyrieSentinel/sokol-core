@@ -1,0 +1,19 @@
+{
+  "annotations": {
+    "status": "UNSIGNED_EXPLANATORY_DRAFT"
+  },
+  "decisions": [
+    {
+      "because": "Counterexample on c51cdc9: a detection read its time before awaiting the table lock; a tick that won the lock forgot a strike the decision's At: still counted, and the node recorded an At: 56 ms before the tick it had applied, so replay reported a false MISMATCH (exit 1). Operator ban/unban/flush and detector retraction were moved to the same order; only the detection path has a witness.",
+      "previous_statement_sha256": null,
+      "proposal_sha256": "0fd0632a848c0a52e9a1465bb1135bed66611c26d5877fcac13c71c34d0d7d52"
+    }
+  ],
+  "evidence_text": "`a_waiting_detection_records_a_time_not_before_the_table_moved_on`",
+  "id": "REPLAY-O1",
+  "profile": "sokol.contract-shadow.v1",
+  "statement": "A local detection that waits for the table lock records a decision time no earlier than any time the table was advanced to while it waited, and submits its decision record before releasing the lock, so replay at the recorded time sees the table the node had.",
+  "witnesses": [
+    "a_waiting_detection_records_a_time_not_before_the_table_moved_on"
+  ]
+}
