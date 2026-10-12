@@ -25,6 +25,8 @@
   "NODE-R3": "745bb8369c5b678cc8cfd1e12a53cf61b32c027792f0d9f66b915eb0913f646a",
   "NODE-R4": "8cf92b49ba813fd0f9065d7877260af8b9767edd0eb63b977928799166b467e5",
   "NODE-R5": "9b6a8bf99e620cb06f68e6c4121c881c37d676d5be4cfa18c49626b6a389451d",
+  "OPERATOR-T1": "2af779b4e665e0500e30f0d68e058ea4534558a42ee8ec5cf8dad8dc4e301d96",
+  "POLICY-T1": "83f8d78479c6bd76211fbd10a7a17e282702b357dea6e8f5916eae28cd8f0496",
   "REPLAY-B1": "2cdd2edca0bb7095e670dac6b199e1915618333a4fd2401b9e97fd51ea3e0394",
   "REPLAY-R1": "02e461a6ac12481a554c9af346378ed023100fce66f6a26224c20d8d84c68d4e",
   "REPLAY-R2": "6234809388ac9d18ef96ea855bfc54ac8fecf0527d28da8587977e2faaab0352",
@@ -259,6 +261,26 @@
     "a_retraction_while_the_target_is_protected_takes_its_claim_back_mesh_wide"
    ]
   },
+  "OPERATOR-T1": {
+   "statement": "3468b5c80719f77cde51819524f10b39e33128be051d5ac61fae271ca6d9ff4b",
+   "witnesses": [
+    "a_vector_cannot_choose_the_operator_tier_or_supply_header_fields",
+    "malformed_telemetry_identity_does_not_invent_node_zero_or_one",
+    "opaque_vectors_survive_the_socket_and_operator_data_api",
+    "operator_tiers_are_exact_fields_and_unknown_tiers_remain_unknown"
+   ]
+  },
+  "POLICY-T1": {
+   "statement": "f820d57a81cc3353f42d85e64c9c421b4d1acb610bc6ba213f1fefd849dda10b",
+   "witnesses": [
+    "ProtectionTypes.test_a_new_reason_requires_a_source_role_decision",
+    "ProtectionTypes.test_production_diagnostic_strings_cannot_construct_protection",
+    "a_matching_diagnostic_cannot_redirect_a_signal_to_its_destination",
+    "legacy_fixture_labels_keep_their_typed_protection_identity",
+    "matching_diagnostic_text_does_not_grant_local_source_authority",
+    "only_local_and_home_protection_name_the_remote_destination"
+   ]
+  },
   "REPLAY-B1": {
    "statement": "095b625bf251303d0008c4f31ff378325a8a4c3ab621a506d2c594f5126c82a0",
    "witnesses": [
@@ -457,6 +479,12 @@
   }
  },
  "witnesses": {
+  "ProtectionTypes.test_a_new_reason_requires_a_source_role_decision": [
+   "scripts/test_protection_types.py:9abc260578c0776b35990371cd42f199b2d1d89601058b288affb795eea50376"
+  ],
+  "ProtectionTypes.test_production_diagnostic_strings_cannot_construct_protection": [
+   "scripts/test_protection_types.py:182e91bb48538b8d95c75bf7c9836d07a644e453d7df8997df0e0968ca8029dd"
+  ],
   "RecoveryTests.test_cooldown_diagnostics_aggregate_across_batches_without_losing_counts": [
    "scripts/test_suricata_recovery.py:9901e28f9d7fa253f827045c1b71b164453154cd1aac8290db91c038b4c3a777"
   ],
@@ -540,6 +568,9 @@
   ],
   "a_mapped_and_a_plain_address_of_one_host_share_a_cooldown": [
    "orchestrator/src/bin/sokol-suricata.rs:b6d357cd10615d362959494d4a1b36dee1c1013145b2c66b7a6fa93790881cc4"
+  ],
+  "a_matching_diagnostic_cannot_redirect_a_signal_to_its_destination": [
+   "orchestrator/src/signal.rs:33dedf6d2745adede44dcf995468153429ee53d52c5274a2714434b92072f81a"
   ],
   "a_node_that_comes_up_within_the_budget_still_gets_the_report": [
    "orchestrator/src/bin/sokol-fastnetmon-notify.rs:6695cfa729eaa1cbc2e37e4c22ce666ee4b92042d1591552d20ba9125c549e52"
@@ -666,6 +697,9 @@
   ],
   "a_used_lease_is_not_renewed_by_a_step_back_within_forget_grace_and_a_resend": [
    "orchestrator/src/block_table.rs:3d189f541beb8ddbfa252ab9df634c659a7bc64f69b2bfc99549a85f880e32a0"
+  ],
+  "a_vector_cannot_choose_the_operator_tier_or_supply_header_fields": [
+   "orchestrator/src/bin/sokol-operator.rs:e7fa75e0b6b525ca2cfc16af42cb682b6b4ffc939cba2892153f14b147ede712"
   ],
   "a_wanted_block_not_yet_written_still_blocks": [
    "orchestrator/src/block_table.rs:b6a306ae70461b5aaad79f7450c6935bf1fb9030dd553f4b9767e214265b0025"
@@ -820,6 +854,9 @@
   "lease_records_stay_bounded_by_forgetting_the_first_ended_one": [
    "orchestrator/src/block_table.rs:07afc4daf12821b991bfac2cbf24a5b506850277d0f4292d9e32bbe6a81c41de"
   ],
+  "legacy_fixture_labels_keep_their_typed_protection_identity": [
+   "orchestrator/src/protection.rs:7e147d2e93999e010822fd505690e392547ae13172032d4613b33a7ed82ad2c0"
+  ],
   "local_decision_is_audited_before_cancellable_mesh_publication": [
    "orchestrator/src/main.rs:60f15be671476e5113c9e4a5e8a37fa351650216add7874bdacdc029415f0126"
   ],
@@ -828,6 +865,12 @@
   ],
   "lost_answer_keeps_expiry_and_later_retry_sends_its_retraction": [
    "orchestrator/src/delivery.rs:0a5d4949613481d8183ef76d002b8e2b57001accfa5390eb73566e4d86a98848"
+  ],
+  "malformed_telemetry_identity_does_not_invent_node_zero_or_one": [
+   "orchestrator/src/bin/sokol-operator.rs:2bfd0736111ff3d6c8d6a0b26ed990af0cc41e4d90d37b696903ddc0066f59c3"
+  ],
+  "matching_diagnostic_text_does_not_grant_local_source_authority": [
+   "orchestrator/src/protection.rs:7189b33d6625f1f219f072df14f9b61638b29f3e6db9894ca792c03f742ae1dd"
   ],
   "maximal_writer_records_roundtrip_with_escaped_reasons_and_all_tables": [
    "orchestrator/src/state_input.rs:6a004172c934fe3c45f5050708af44fce1b7b800d618c4d18872f1dfe55be3a0"
@@ -838,11 +881,20 @@
   "normal_lines_still_run_one_command_each": [
    "orchestrator/src/control.rs:a63c87233a8174b0d69b33c64c9448328a2fb18bbb048fbc947061cb1d811111"
   ],
+  "only_local_and_home_protection_name_the_remote_destination": [
+   "orchestrator/src/protection.rs:4f25e0794b53349f944b54583e7f9231cf40baf2d6f0c669d0d2b02ec857428a"
+  ],
   "only_the_canonical_line_is_a_statement": [
    "orchestrator/src/audit_anchor.rs:4666938b8edb555bc0d8a6a16cb83be5d765366264298881a0a3621c68aa70bc"
   ],
+  "opaque_vectors_survive_the_socket_and_operator_data_api": [
+   "orchestrator/src/bin/sokol-operator.rs:1e1bb50ce7566e94ef18a4d3934af16c87ed4dced849ad74c4470ee07c653300"
+  ],
   "operator_lifts_past_the_bound_are_counted": [
    "orchestrator/src/block_table.rs:8655b9032d02c23bc26a9fc6c8a0afb9610d8ddafa1a70967902946f534af01a"
+  ],
+  "operator_tiers_are_exact_fields_and_unknown_tiers_remain_unknown": [
+   "orchestrator/src/bin/sokol-operator.rs:2078b964d71f70d81799abc0b5586c997c44b8ab21de7db205ba41e90abb8253"
   ],
   "oversized_audit_records_are_counted_and_marked_before_following_data_or_flush": [
    "orchestrator/src/main.rs:5f8238ea09e54d0084116377203678b159470a25e2ce754f919cac38e557fd60"
