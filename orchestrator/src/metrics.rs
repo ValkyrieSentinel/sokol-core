@@ -68,7 +68,7 @@ pub struct Snapshot {
     pub audit_anchor_failures: u64,
     pub mesh_dropped_urgent: u64,
     /// Envelopes refused, in `p2p::EnvelopeError::LABELS` order.
-    pub mesh_rejected: [u64; 5],
+    pub mesh_rejected: [u64; crate::p2p::EnvelopeError::LABELS.len()],
     pub clock_steps: u64,
     pub clock_last_step_ms: i64,
     pub mesh_dropped_bulk: u64,
@@ -871,7 +871,7 @@ mod tests {
             dropped_packets: 3,
             events_suppressed: 7,
             events_lost: 6,
-            mesh_rejected: [0, 0, 3, 0, 0],
+            mesh_rejected: [0, 0, 3, 0, 0, 4],
             clock_steps: 2,
             clock_last_step_ms: -3_600_000,
             claims_waiting: 5,
@@ -905,6 +905,7 @@ mod tests {
         assert!(
             text.contains("sokol_mesh_envelopes_rejected_total{reason=\"stale_timestamp\"} 3\n")
         );
+        assert!(text.contains("sokol_mesh_envelopes_rejected_total{reason=\"before_window\"} 4\n"));
         assert!(text.contains("sokol_clock_steps_total 2\n"));
         assert!(text.contains("sokol_clock_last_step_seconds -3600.000\n"));
         assert!(text.contains("sokol_claims_waiting 5\n"));
