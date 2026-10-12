@@ -30,6 +30,7 @@ import pathlib
 import re
 import subprocess
 import sys
+import unicodedata
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 INVARIANTS = ROOT / "docs/INVARIANTS.md"
@@ -137,6 +138,20 @@ def generated_invariants(text: str, root: pathlib.Path) -> str:
     if DECLARATION in text:
         if marker_ids or text.count(DECLARATION) != 1:
             raise ValueError('A generated document has one declaration and no per-row markers')
+        hidden = [(m.start(), m.end()) for m in re.finditer(r"<!--.*?(?:-->|\Z)", text, re.S)]
+        offset, fenced = 0, False
+        for line in text.splitlines(keepends=True):
+            stripped = line.strip()
+            if stripped.startswith(("```", "~~~")):
+                fenced = not fenced
+            elif ROW.match(line) and (fenced or any(a <= offset < b for a, b in hidden)):
+                raise ValueError('A row is hidden in a comment or code block: ' + ROW.match(line).group(1))
+            elif stripped.startswith("|") and not ROW.match(line) and not (fenced or any(a <= offset < b for a, b in hidden)):
+                cell = unicodedata.normalize("NFKC", stripped.strip("|").split("|")[0]).strip()
+                cell = re.sub(r"[\u2010-\u2015\u2212]", "-", cell)
+                if CONTRACT_ID.fullmatch(cell):
+                    raise ValueError('A table line names ' + cell + ' but is not a row (| ID | ...)')
+            offset += len(line)
         row_ids = [m.group(1) for m in map(ROW.match, text.splitlines()) if m]
         for rid in row_ids:
             if rid not in contracts:
@@ -300,7 +315,7 @@ CFG_TEST = re.compile(r"#\[\s*cfg\s*\(\s*test\s*\)\s*\]")
 RUST_HEAD = re.compile(
     r"(?:pub(?:\s*\([^)]*\))?\s+)?(?:(?:async|unsafe|const|default|extern)\s+"
     r"(?=(?:async|unsafe|const|extern|fn|impl|trait)\b))*"
-    r"(fn|const|static|struct|enum|type|trait|mod|union|impl|macro_rules\s*!)\s*")
+    r"(fn|const|static|struct|enum|type|trait|mod|union|impl|macro_rules\s*!|use)\s*")
 RUST_IMPL = re.compile(r"(?:<[^{]*?>)?\s*(?:[^{;]*?\bfor\s+)?(?:[\w]+::)*([A-Za-z_]\w*)")
 TEST_ATTR = re.compile(r"#\[\s*(?:tokio::)?test\b")
 MACRO_CALL = re.compile(r"(?:\w+::)*\w+\s*!\s*\{")
@@ -359,50 +374,101 @@ def rust_item_name(masked: str, head: int, end: int) -> tuple[str | None, str | 
     if not m:
         return None, None
     keyword = m.group(1).replace(" ", "")
-    if keyword == "impl":
+    if keyword == "use":
+        # `use helper as h;` must reach `helper` from a witness that calls `h`: a use item is
+        # named by the name it binds (the alias, or the last segment).
+        bound = [n for n in re.findall(r"([A-Za-z_]\w*)\s*[,;}]", masked[m.end():end])
+                 if n not in ("self", "super", "crate")]
+        return keyword, ",".join(bound) or None
         n = RUST_IMPL.match(masked, m.end(), end)
         return keyword, n.group(1) if n else None
     n = IDENT.match(masked, m.end(), end)
     return keyword, n.group(0) if n else None
 
 
-def rust_test_items(masked: str, integration: bool) -> list[tuple[int, int, int, str, bool, int]]:
+def rust_inner_attributes(masked: str, body: int, hi: int) -> int:
+    """End of the inner attributes (#![...]) at the start of a block whose `{` is at `body`."""
+    i = body + 1
+    while True:
+        j = i
+        while j < hi and masked[j].isspace():
+            j += 1
+        if not masked.startswith("#!", j):
+            return i
+        i = rust_close(masked, masked.find("[", j), "[", "]") + 1
+
+
+def rust_test_items(masked: str, integration: bool) -> list[tuple[int, int, int, str, bool, tuple]]:
     """Test-only items: those under #[cfg(test)] (a module's items, or one item, at any depth)
     and, in an integration test file, every top-level item; items inside a macro call there
-    (proptest!) too. (start, head, end, name, is_test, context): a witness inside a macro call
-    is pinned with the call's head and inner attributes (#![proptest_config]) from `context`."""
-    spans: list[tuple[int, int, int, int]] = []
+    (proptest!) too. (start, head, end, name, is_test, contexts): `contexts` are the spans of
+    every enclosing module's or macro call's head and inner attributes (#![cfg(..)],
+    #![proptest_config]), pinned with the item: they decide whether and how it runs."""
+    spans: list[tuple[int, int, int, tuple]] = []
 
-    def module(lo: int, hi: int) -> None:
+    def block(lo: int, hi: int, contexts: tuple) -> None:
         for start, head, end in rust_items(masked, lo, hi):
             keyword, _ = rust_item_name(masked, head, end)
-            if keyword == "mod":
-                module(masked.find("{", head, end) + 1, end - 1)
+            if keyword == "mod" and masked[end - 1] == "}":
+                body = masked.find("{", head, end)
+                inner = rust_inner_attributes(masked, body, end)
+                block(inner, end - 1, contexts + ((start, inner),))
             elif keyword is None and MACRO_CALL.match(masked, head, end):
                 body = masked.find("{", head, end)
-                inner = rust_items(masked, body + 1, end - 1)
-                for s, h, e in inner:
-                    spans.append((s, h, e, start))
+                inner = rust_inner_attributes(masked, body, end)
+                block(inner, end - 1, contexts + ((start, inner),))
             else:
-                spans.append((start, head, end, start))
+                spans.append((start, head, end, contexts))
 
     if integration:
-        module(0, len(masked))
+        block(0, len(masked), ())
     for m in CFG_TEST.finditer(masked):
         for start, head, end in rust_items(masked, m.start(), len(masked))[:1]:
-            if rust_item_name(masked, head, end)[0] == "mod":
-                module(masked.find("{", head, end) + 1, end - 1)
+            if rust_item_name(masked, head, end)[0] == "mod" and masked[end - 1] == "}":
+                body = masked.find("{", head, end)
+                inner = rust_inner_attributes(masked, body, end)
+                block(inner, end - 1, ((start, inner),))
             else:
-                spans.append((start, head, end, start))
+                spans.append((start, head, end, ()))
     out, seen = [], set()
-    for start, head, end, context in spans:
+    for start, head, end, contexts in spans:
         if (start, end) in seen:
             continue
         seen.add((start, end))
         _, name = rust_item_name(masked, head, end)
-        if name:
-            out.append((start, head, end, name, bool(TEST_ATTR.search(masked, start, head)), context))
+        for one in (name or "").split(","):
+            if one:
+                out.append((start, head, end, one, bool(TEST_ATTR.search(masked, start, head)), contexts))
     return out
+
+
+def rust_declarations(files: dict) -> dict[str, list[str]]:
+    """For each file, the `mod name;` items (with attributes) that include it in a crate: a
+    `#[cfg_attr(test, path = ..)]` or `#[cfg(not(test))]` there would drop its tests."""
+    found: dict[str, list[str]] = {}
+    for rel, (src, masked, _) in files.items():
+        here = pathlib.PurePosixPath(rel)
+        for start, head, end in rust_items(masked, 0, len(masked)):
+            keyword, name = rust_item_name(masked, head, end)
+            if keyword != "mod" or masked[end - 1] != ";" or not name:
+                continue
+            attrs = src[start:head]
+            m = re.search(r'path\s*=\s*"([^"]+)"', attrs)
+            if m:
+                target = here.parent / m.group(1)
+            elif here.name in ("main.rs", "lib.rs", "mod.rs"):
+                target = here.parent / f"{name}.rs"
+            else:
+                target = here.parent / here.stem / f"{name}.rs"
+            target = pathlib.PurePosixPath(*[p for p in target.parts if p != "."])
+            parts: list[str] = []
+            for part in target.parts:
+                if part == ".." and parts:
+                    parts.pop()
+                else:
+                    parts.append(part)
+            found.setdefault("/".join(parts), []).append(f"{rel}:{rust_layout(src[start:end])}")
+    return found
 
 
 REACHED: dict[str, list[str]] = {}
@@ -418,6 +484,7 @@ def rust_closures(names: set[str]) -> dict[str, list[str]]:
         src = strip_rust(path.read_text())
         masked = rust_mask(src)
         files[rel] = (src, masked, rust_test_items(masked, "/tests/" in f"/{rel}"))
+    declarations = rust_declarations(files)
     helpers: dict[str, dict[str, list[tuple[str, int, int]]]] = {}
     for rel, (_, _, items) in files.items():
         for start, _, end, name, is_test, _ in items:
@@ -439,7 +506,7 @@ def rust_closures(names: set[str]) -> dict[str, list[str]]:
 
     out: dict[str, list[str]] = {}
     for rel, (src, masked, items) in files.items():
-        for start, _, end, name, is_test, context in items:
+        for start, _, end, name, is_test, contexts in items:
             if name not in names or not is_test:
                 continue
             reached, queue, seen = [], [(rel, start, end)], {(rel, start, end)}
@@ -451,11 +518,8 @@ def rust_closures(names: set[str]) -> dict[str, list[str]]:
                         reached.append(hit)
                         queue.append(hit)
             parts = [rust_layout(src[start:end])]
-            if context != start:
-                parts.append(rust_layout(src[context:masked.find("{", context) + 1]))
-                inner = masked.find("{", context) + 1
-                attrs = re.match(r"\s*((?:#!\[[^\]]*\]\s*)*)", masked[inner:start])
-                parts.append(rust_layout(src[inner:inner + len(attrs.group(1))]))
+            parts += [rust_layout(src[a:b]) for a, b in contexts]
+            parts += declarations.get(rel, [])
             parts += [f"{r}:{rust_layout(files[r][0][s:e])}" for r, s, e in sorted(reached)]
             out.setdefault(name, []).append(f"{rel}:{sha(json.dumps(parts))}")
             REACHED.setdefault(name, []).extend(
@@ -482,6 +546,17 @@ def py_closures(names: set[str]) -> dict[str, list[str]]:
                         if isinstance(n, ast.Name):
                             module[n.id] = node
 
+        def import_time(closure: set[int]) -> str:
+            """The module as it runs on import: every statement, with the bodies of functions
+            outside the closure left out. A module-level `setattr(Class, 'test_x', ...)`, a
+            class-body assignment shadowing a witness or a `__main__` block are all in it."""
+            drop: set[int] = set()
+            for n in ast.walk(tree):
+                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and id(n) not in closure:
+                    drop.update(range(n.body[0].lineno, n.end_lineno + 1))
+            kept = "".join(line for i, line in enumerate(lines, 1) if i not in drop)
+            return py_layout(strip_py(kept))
+
         def segment(node: ast.AST) -> str:
             first = min([node.lineno] + [d.lineno for d in getattr(node, "decorator_list", [])])
             return py_layout(strip_py("".join(lines[first - 1:node.end_lineno])))
@@ -507,6 +582,7 @@ def py_closures(names: set[str]) -> dict[str, list[str]]:
                 parts = [segment(fn), *(segment(f) for f in fixtures)]
                 parts += [ast.dump(d) for d in cls.decorator_list]
                 parts += sorted(segment(n) for n in reached)
+                parts.append(import_time({id(fn), *map(id, fixtures), *map(id, reached)}))
                 rel = path.relative_to(ROOT).as_posix()
                 REACHED.setdefault(key, []).extend(
                     f"{rel}:{n.lineno} {getattr(n, 'name', None) or type(n).__name__}"
@@ -628,6 +704,33 @@ def py_layout(code: str) -> str:
     return json.dumps(tokens, ensure_ascii=True, separators=(",", ":"))
 
 
+CARGO_SECTION = re.compile(r"^\[\[?([^\]]+)\]\]?\s*$")
+TARGET_SECTIONS = ("lib", "bin", "test", "bench", "example", "workspace")
+
+
+def build_pins() -> dict[str, str]:
+    """What decides whether and how tests are built and run, outside the test code: Cargo
+    target sections, [workspace], [patch.*] and `auto*` keys, whole .cargo/config files (a
+    `runner` there could print any test output) and build scripts (they could rewrite sources
+    before the crate compiles)."""
+    pins = {}
+    for path in git_files("*Cargo.toml"):
+        kept, section = [], ""
+        for line in path.read_text().splitlines():
+            m = CARGO_SECTION.match(line.strip())
+            if m:
+                section = m.group(1).strip()
+            keep = section.split(".")[0] in TARGET_SECTIONS or section.startswith("patch") \
+                or (section == "package" and line.strip().startswith("auto"))
+            if keep and line.strip() and not line.strip().startswith("#"):
+                kept.append(" ".join(line.split()))
+        pins[path.relative_to(ROOT).as_posix()] = sha("\n".join(kept))
+    for pattern in (".cargo/config", ".cargo/config.toml", "*/.cargo/config", "*/.cargo/config.toml", "build.rs", "*/build.rs"):
+        for path in git_files(pattern):
+            pins[path.relative_to(ROOT).as_posix()] = sha(path.read_text())
+    return pins
+
+
 def current() -> dict:
     table = rows()
     cited = {w for r in table.values() for w in r["witnesses"]}
@@ -636,7 +739,8 @@ def current() -> dict:
     closures = {**rust_closures({w for w in cited if RUST_TEST.fullmatch(w)}),
                 **py_closures({w for w in cited if PY_TEST.fullmatch(w)})}
     return {"rows": table, "witnesses": {w: sorted(bodies.get(w, [])) for w in sorted(cited)},
-            "closures": {w: sorted(closures.get(w, [])) for w in sorted(cited)},
+            "closures_v2": {w: sorted(closures.get(w, [])) for w in sorted(cited)},
+            "build": build_pins(),
             "contracts": contract_pins(ROOT)}
 
 
@@ -678,14 +782,24 @@ def check(signers: pathlib.Path, every_pin: bool = False, executed_log: pathlib.
     for w, where in pinned["witnesses"].items():
         if w in now["witnesses"] and now["witnesses"][w] != where:
             problems.append(f"witness {w} changed: its body is not the one the owner pinned")
-    closures = pinned.get("closures")
+    # `closures` is the first closure rule (2026-10-12, #21), kept frozen for checkers of that
+    # version; `closures_v2` adds aliases, enclosing modules, module declarations.
+    closures = pinned.get("closures_v2")
     if closures is None:
         if pinned["witnesses"]:
             notes.append("witness closures (attributes, helpers) are not pinned yet")
     else:
         for w, where in closures.items():
-            if w in now["closures"] and now["closures"][w] != where and now["witnesses"].get(w) == pinned["witnesses"].get(w):
+            if w in now["closures_v2"] and now["closures_v2"][w] != where and now["witnesses"].get(w) == pinned["witnesses"].get(w):
                 problems.append(f"witness {w} changed: its attributes or a test item it reaches are not the ones the owner pinned")
+    build = pinned.get("build")
+    if build is None:
+        if pinned["witnesses"]:
+            notes.append("build configuration (Cargo targets, .cargo/config, build.rs) is not pinned yet")
+    elif build != now["build"]:
+        for f in sorted(set(build) | set(now["build"])):
+            if build.get(f) != now["build"].get(f):
+                problems.append(f"{f}: build configuration changed (how tests are built or run)")
     if executed_log is not None:
         problems += executed(executed_log, pinned["witnesses"])
     for rid in sorted(set(now["rows"]) - set(pinned["rows"])):
@@ -721,6 +835,11 @@ def sign(key: str) -> int:
     if missing:
         print("FAIL refusing to pin witnesses that do not exist:", ", ".join(missing))
         return 1
+    if MANIFEST.exists():
+        # Checkers of the first closure rule still read `closures`; it stays as it was pinned.
+        legacy = json.loads(MANIFEST.read_text()).get("closures")
+        if legacy is not None:
+            now["closures"] = legacy
     MANIFEST.write_text(json.dumps(now, indent=1, sort_keys=True) + "\n")
     # ssh-keygen asks before overwriting a signature and, without a terminal, keeps the old
     # one and still exits 0: a re-pin would leave the previous signature in place.
