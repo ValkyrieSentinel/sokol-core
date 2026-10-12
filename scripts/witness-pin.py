@@ -101,6 +101,40 @@ DECLARATION = ('<!-- Every invariant row is generated from docs/contracts/<ID>.s
                'change a contract with scripts/contract.py, never this table by hand. -->')
 
 
+RETIREMENT_MODES = ('SUPERSEDED', 'WITHDRAWN', 'REFUTED', 'ARCHIVED')
+
+
+def check_retirement(contract: dict) -> None:
+    """A retired contract is the tombstone of its row (ADR-0024, retiring a row). Predicates:
+    R1 the mode is one of RETIREMENT_MODES; R2 the loss is a non-empty list of non-empty texts
+    (an empty loss reads as an unmeasured one, never as none); R3 SUPERSEDED names a
+    replacement and only SUPERSEDED does; R4 REFUTED names its counterexample tests and only
+    REFUTED does. R5 and R6 (no row; the replacement is an active row) need the table and are
+    checked by generated_invariants."""
+    status, retired = contract.get('status'), contract.get('retirement')
+    if status is None and retired is None:
+        return
+    if status != 'retired' or not isinstance(retired, dict):
+        raise ValueError(contract['id'] + ': a retirement needs status "retired" and a retirement record')
+    if set(retired) != {'mode', 'loss', 'replacement', 'counterexamples'}:
+        raise ValueError(contract['id'] + ': a retirement has exactly mode, loss, replacement, counterexamples')
+    mode, loss = retired['mode'], retired['loss']
+    if mode not in RETIREMENT_MODES:
+        raise ValueError(contract['id'] + ': retirement mode must be one of ' + ', '.join(RETIREMENT_MODES))
+    if not isinstance(loss, list) or not loss or not all(isinstance(x, str) and x.strip() for x in loss):
+        raise ValueError(contract['id'] + ': a retirement names what is lost (a non-empty loss)')
+    if (mode == 'SUPERSEDED') != isinstance(retired['replacement'], str):
+        raise ValueError(contract['id'] + ': SUPERSEDED, and only SUPERSEDED, names a replacement')
+    examples = retired['counterexamples']
+    if not isinstance(examples, list) or (mode == 'REFUTED') != bool(examples) or not all(
+            isinstance(w, str) and (RUST_TEST.fullmatch(w) or PY_TEST.fullmatch(w)) for w in examples):
+        raise ValueError(contract['id'] + ': REFUTED, and only REFUTED, names its counterexample tests')
+
+
+def retired(contract: dict) -> bool:
+    return contract.get('status') == 'retired'
+
+
 def load_contracts(root: pathlib.Path) -> dict:
     """Bounded local contract sources by ID; proposals live in a subdirectory and are not sources."""
     directory = root / 'docs/contracts'
@@ -127,6 +161,7 @@ def load_contracts(root: pathlib.Path) -> dict:
         if not names or names != contract['witnesses']:
             raise ValueError('Contract witness list differs from its evidence text')
         contract_row(contract)
+        check_retirement(contract)
         contracts[rid] = contract
     return contracts
 
@@ -159,6 +194,13 @@ def generated_invariants(text: str, root: pathlib.Path) -> str:
             if rid not in contracts:
                 raise ValueError(rid + ' has no contract source; every row is generated')
         for rid, contract in contracts.items():
+            if retired(contract):
+                if rid in row_ids:
+                    raise ValueError('Retired ' + rid + ' still has a row')
+                new = contract['retirement']['replacement']
+                if new is not None and (new not in contracts or retired(contracts[new]) or new not in row_ids):
+                    raise ValueError('Retired ' + rid + ' is superseded by ' + new + ', which is not an active row')
+                continue
             if row_ids.count(rid) != 1:
                 raise ValueError('Contract ' + rid + ' needs exactly one row')
             if contract_row(contract) not in text.splitlines():
@@ -178,6 +220,10 @@ def contract_pins(root: pathlib.Path) -> dict:
     pins = {}
     for rid, c in load_contracts(root).items():
         accepted = {k: c.get(k) for k in ('statement', 'evidence_text', 'witnesses', 'decisions')}
+        if retired(c):
+            # Only a retired contract carries these keys, so the pins of active ones keep the
+            # bytes earlier checkers compute.
+            accepted.update(status=c['status'], retirement=c['retirement'])
         pins[rid] = sha(json.dumps(accepted, sort_keys=True, ensure_ascii=False, separators=(',', ':')))
     return pins
 
@@ -765,6 +811,9 @@ def build_pins() -> dict[str, str]:
 def current() -> dict:
     table = rows()
     cited = {w for r in table.values() for w in r["witnesses"]}
+    # A REFUTED row's counterexamples are the evidence its tombstone rests on: pinned too.
+    cited |= {w for c in load_contracts(ROOT).values() if retired(c)
+              for w in c['retirement']['counterexamples']}
     bodies = {**rust_bodies({w for w in cited if RUST_TEST.fullmatch(w)}),
               **py_bodies({w for w in cited if PY_TEST.fullmatch(w)})}
     closures = {**rust_closures({w for w in cited if RUST_TEST.fullmatch(w)}),

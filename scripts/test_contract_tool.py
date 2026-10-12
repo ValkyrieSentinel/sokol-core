@@ -139,6 +139,101 @@ class ContractTool(unittest.TestCase):
         p.write_text(p.read_text() + '| T\u20112 | Lookalike with a non-breaking hyphen. | `a_refusal_creates_no_cooldown` |\n')
         self.assert_refused('A table line names T-2 but is not a row')
 
+    # Retiring a row: the contract stays as the tombstone (ADR-0024, retiring a row).
+
+    def retire(self, rid, *args, key=True):
+        r = self.tool('propose', rid, *args)
+        self.assertEqual(r.returncode, 0, r.stdout)
+        name = r.stdout.strip()
+        return self.tool('accept', name, *(['--key', self.key] if key else []))
+
+    def test_a_superseded_row_leaves_the_table_and_keeps_its_tombstone(self):
+        r = self.retire('T-2', '--retire', 'SUPERSEDED', '--replacement', 'T-1',
+                        '--loss', 'the obligation of an unknown reply is no longer stated on its own',
+                        '--because', 'T-1 now covers it')
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertNotIn('| T-2 |', self.invariants())
+        c = self.read_contract('T-2')
+        self.assertEqual((c['status'], c['retirement']['mode'], c['retirement']['replacement']),
+                         ('retired', 'SUPERSEDED', 'T-1'))
+        self.assertEqual(c['decisions'][-1]['because'], 'T-1 now covers it')
+        r = self.check()
+        self.assertEqual(r.returncode, 0, r.stdout)
+        listed = self.tool('list', '--retired').stdout
+        self.assertIn('T-2 SUPERSEDED by T-1 | lost: the obligation', listed)
+
+    def test_a_retirement_without_the_owner_signature_is_refused(self):
+        self.retire('T-2', '--retire', 'WITHDRAWN', '--loss', 'x', '--because', 'y', key=False)
+        self.assert_refused('T-2: pinned invariant row was removed')
+
+    def test_a_retirement_names_what_is_lost(self):
+        r = self.tool('propose', 'T-2', '--retire', 'ARCHIVED', '--because', 'old')
+        self.assertEqual(r.returncode, 1)
+        self.assertIn('non-empty loss', r.stdout)
+        c = self.read_contract('T-2')
+        c.update(status='retired', retirement={'mode': 'ARCHIVED', 'loss': [' '], 'replacement': None,
+                                               'counterexamples': []})
+        self.write_contract(c)
+        self.assert_refused('T-2: a retirement names what is lost')
+
+    def test_superseded_needs_an_active_replacement(self):
+        r = self.tool('propose', 'T-2', '--retire', 'SUPERSEDED', '--loss', 'x', '--because', 'y')
+        self.assertEqual(r.returncode, 1)
+        r = self.tool('propose', 'T-2', '--retire', 'SUPERSEDED', '--replacement', 'T-404', '--loss', 'x',
+                      '--because', 'y')
+        self.assertEqual(r.returncode, 1)
+        self.assertIn('--replacement T-404 is not an active row', r.stdout)
+        self.assertEqual(self.retire('T-2', '--retire', 'SUPERSEDED', '--replacement', 'T-1', '--loss', 'x',
+                                     '--because', 'y').returncode, 0)
+        r = self.tool('propose', 'T-1', '--retire', 'WITHDRAWN', '--loss', 'x', '--because', 'y')
+        self.assertEqual(r.returncode, 1)
+        self.assertIn('T-1 replaces a retired row', r.stdout)
+
+    def test_refuted_needs_existing_counterexamples_and_pins_them(self):
+        r = self.tool('propose', 'T-2', '--retire', 'REFUTED', '--loss', 'x', '--because', 'y')
+        self.assertEqual(r.returncode, 1)
+        self.assertIn('REFUTED, and only REFUTED, names its counterexample tests', r.stdout)
+        r = self.tool('propose', 'T-2', '--retire', 'REFUTED', '--counterexample', 'a_test_that_is_not_there',
+                      '--loss', 'x', '--because', 'y')
+        self.assertEqual(r.returncode, 1)
+        self.assertEqual(self.retire('T-2', '--retire', 'REFUTED', '--counterexample',
+                                     'a_late_ack_retires_the_obligation', '--loss', 'x',
+                                     '--because', 'a late ACK shows the claim was wrong').returncode, 0)
+        self.assertEqual(self.check().returncode, 0)
+        src = self.dir / 'src/gate.rs'
+        src.write_text(src.read_text().replace('assert!(retired());', 'let _ = retired();'))
+        self.assert_refused('witness a_late_ack_retires_the_obligation changed')
+
+    def test_a_retired_row_cannot_come_back_by_hand(self):
+        self.retire('T-2', '--retire', 'WITHDRAWN', '--loss', 'x', '--because', 'y')
+        p = self.dir / 'docs/INVARIANTS.md'
+        p.write_text(p.read_text() + '| T-2 | x | `an_unknown_reply_keeps_the_obligation` |\n')
+        self.assert_refused('Retired T-2 still has a row')
+        r = self.tool('propose', 'T-2', '--statement', 'Back.', '--because', 'z')
+        self.assertEqual(r.returncode, 1)
+        self.assertIn('T-2 is retired; a new row needs a new ID', r.stdout)
+
+    def test_a_hand_written_tombstone_is_checked_like_a_proposed_one(self):
+        good = {'mode': 'SUPERSEDED', 'loss': ['x'], 'replacement': 'T-1', 'counterexamples': []}
+        for bad, needle in (({'mode': 'FORGOTTEN'}, 'retirement mode must be one of'),
+                            ({'replacement': 'T-404'}, 'superseded by T-404, which is not an active row'),
+                            ({'replacement': 'T-2'}, 'superseded by T-2, which is not an active row'),
+                            ({'extra': 1}, 'exactly mode, loss, replacement, counterexamples')):
+            with self.subTest(bad):
+                c = self.read_contract('T-2')
+                c.update(status='retired', retirement={**good, **bad})
+                self.write_contract(c)
+                p = self.dir / 'docs/INVARIANTS.md'
+                p.write_text(''.join(l for l in p.read_text().splitlines(keepends=True) if not l.startswith('| T-2 |')))
+                self.assert_refused(needle)
+
+    def test_an_unsigned_change_to_a_tombstone_is_refused(self):
+        self.retire('T-2', '--retire', 'WITHDRAWN', '--loss', 'the real loss', '--because', 'y')
+        c = self.read_contract('T-2')
+        c['retirement']['loss'] = ['nothing much']
+        self.write_contract(c)
+        self.assert_refused('T-2: contract statement, witnesses or decision history changed')
+
     def test_a_row_without_a_contract_is_refused(self):
         p = self.dir / 'docs/INVARIANTS.md'
         p.write_text(p.read_text() + '| T-3 | Hand written. | `a_refusal_creates_no_cooldown` |\n')

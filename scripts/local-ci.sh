@@ -197,6 +197,7 @@ python3 scripts/test_check_agents_rules.py
 python3 scripts/test_check_claims.py
 python3 scripts/test_witness_pin.py
 python3 scripts/test_gate_provenance.py
+python3 scripts/test_check_retired.py
 python3 scripts/test_check_monitoring.py
 python3 scripts/test_outbox_task.py
 python3 scripts/test_contract_shadow.py

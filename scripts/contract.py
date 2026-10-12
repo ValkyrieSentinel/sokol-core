@@ -6,13 +6,18 @@
     contract.py propose <ID> --because TEXT [--statement S] [--witness NAME]... [--after ID]
         Record an unsigned intent in docs/contracts/proposals/. Nothing it says is accepted.
         --after places a new invariant's row after an existing one.
+    contract.py propose <ID> --retire MODE --loss TEXT... --because TEXT [--replacement ID]
+                       [--counterexample NAME]...
+        Record an intent to retire a row (SUPERSEDED, WITHDRAWN, REFUTED, ARCHIVED). Accepted,
+        the row leaves the table and its contract stays as the tombstone: statement, history,
+        mode, what is lost, the replacement (SUPERSEDED) or the counterexample tests (REFUTED).
     contract.py accept <PROPOSAL-FILE> [--key OWNER_KEY]
         Apply an intent to its contract if the contract is still the one the intent was made
         against, append the decision to the contract's history, regenerate, and with --key
         re-pin through scripts/witness-pin.py sign. Without the owner's signature the gate
         refuses the change, so accepting is the owner's act, not the proposer's.
-    contract.py list
-        Open proposals.
+    contract.py list [--retired]
+        Open proposals; with --retired, the tombstones of retired rows.
 
 A proposal names the reason (a counterexample, a measurement, a requirement). The gate reads
 the contract, never the proposal; an open proposal is reported as a note.
@@ -81,9 +86,50 @@ def witnesses_exist(names: list[str]) -> list[str]:
     return [n for n in names if not (rust.get(n) or py.get(n))]
 
 
+def propose_retirement(rid: str, because: str, mode: str, loss: list[str], replacement: str | None,
+                       counterexamples: list[str]) -> int:
+    path = contract_path(rid)
+    contracts = gate.load_contracts(ROOT)
+    current = contracts.get(rid)
+    if current is None or gate.retired(current):
+        print('FAIL ' + rid + ' is not an active row')
+        return 1
+    if any(gate.retired(c) and c['retirement']['replacement'] == rid for c in contracts.values()):
+        print('FAIL ' + rid + ' replaces a retired row; retire that tombstone\'s claim first')
+        return 1
+    if not because.strip():
+        print('FAIL a proposal names its reason (--because)')
+        return 1
+    missing = witnesses_exist(counterexamples)
+    if missing:
+        print('FAIL counterexamples must be existing tests: ' + ', '.join(missing))
+        return 1
+    if replacement is not None and (replacement not in contracts or gate.retired(contracts[replacement])):
+        print('FAIL --replacement ' + replacement + ' is not an active row')
+        return 1
+    record = {'mode': mode, 'loss': [x.strip() for x in loss], 'replacement': replacement,
+              'counterexamples': sorted(set(counterexamples))}
+    gate.check_retirement({'id': rid, 'status': 'retired', 'retirement': record})
+    body = {
+        'profile': PROPOSAL_PROFILE, 'id': rid, 'status': 'UNSIGNED_INTENT', 'because': because.strip(),
+        'base_contract_sha256': sha(path.read_bytes()), 'retire': record,
+        'statement': current['statement'], 'evidence_text': current['evidence_text'],
+        'witnesses': current['witnesses'], 'after': None,
+    }
+    PROPOSALS.mkdir(parents=True, exist_ok=True)
+    data = dump(body).encode()
+    out = PROPOSALS / f'{rid}-{sha(data)[:12]}.proposal.json'
+    out.write_bytes(data)
+    print(out.relative_to(ROOT))
+    return 0
+
+
 def propose(rid: str, because: str, statement: str | None, witnesses: list[str], after: str | None) -> int:
     path = contract_path(rid)
     current = json.loads(path.read_text()) if path.exists() else None
+    if current is not None and gate.retired(current):
+        print('FAIL ' + rid + ' is retired; a new row needs a new ID')
+        return 1
     if current is None and not (statement and witnesses and after):
         print('FAIL a new invariant needs --statement, at least one --witness and --after')
         return 1
@@ -147,6 +193,9 @@ def accept(file: str, key: str | None) -> int:
     })
     contract.update({k: p[k] for k in ('statement', 'evidence_text', 'witnesses')})
     text = INVARIANTS.read_text()
+    if p.get('retire'):
+        contract.update(status='retired', retirement=p['retire'])
+        text = ''.join(line for line in text.splitlines(keepends=True) if not line.startswith('| ' + p['id'] + ' |'))
     if p['after']:
         lines = text.splitlines(keepends=True)
         at = [i for i, line in enumerate(lines) if line.startswith('| ' + p['after'] + ' |')]
@@ -169,13 +218,18 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest='command', required=True)
     sub.add_parser('regenerate')
-    sub.add_parser('list')
+    pl = sub.add_parser('list')
+    pl.add_argument('--retired', action='store_true')
     pp = sub.add_parser('propose')
     pp.add_argument('id')
     pp.add_argument('--because', required=True)
     pp.add_argument('--statement')
     pp.add_argument('--witness', action='append', default=[])
     pp.add_argument('--after')
+    pp.add_argument('--retire', choices=gate.RETIREMENT_MODES)
+    pp.add_argument('--loss', action='append', default=[])
+    pp.add_argument('--replacement')
+    pp.add_argument('--counterexample', action='append', default=[])
     pa = sub.add_parser('accept')
     pa.add_argument('proposal')
     pa.add_argument('--key')
@@ -184,10 +238,25 @@ def main() -> int:
         if a.command == 'regenerate':
             return regenerate()
         if a.command == 'list':
+            if a.retired:
+                for rid, c in gate.load_contracts(ROOT).items():
+                    if gate.retired(c):
+                        r = c['retirement']
+                        print(f"{rid} {r['mode']}" + (f" by {r['replacement']}" if r['replacement'] else '')
+                              + ' | lost: ' + '; '.join(r['loss']))
+                return 0
             for name in gate.open_proposals(ROOT):
                 print(name)
             return 0
+        if a.command == 'propose' and a.retire:
+            if a.statement is not None or a.witness or a.after:
+                print('FAIL a retirement changes no statement, witness or position')
+                return 1
+            return propose_retirement(a.id, a.because, a.retire, a.loss, a.replacement, a.counterexample)
         if a.command == 'propose':
+            if a.loss or a.replacement or a.counterexample:
+                print('FAIL --loss, --replacement and --counterexample belong to --retire')
+                return 1
             return propose(a.id, a.because, a.statement, a.witness, a.after)
         return accept(a.proposal, a.key)
     except (ValueError, KeyError, OSError, json.JSONDecodeError) as error:

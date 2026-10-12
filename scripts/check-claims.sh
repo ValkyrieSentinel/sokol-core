@@ -11,7 +11,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 DOCS=(README.md ARCHITECTURE.md ROADMAP.md AGENTS.md docs/*.md docs/adr/*.md docs/measurements/*/README.md)
-EXTERNAL_FLAGS='--locked --bin --bins --in-diff --shard --list --release --quick --proposal --signers --every-pin --executed --executed-python'  # cargo, mutants and the local CI/contract tools
+EXTERNAL_FLAGS='--locked --bin --bins --in-diff --shard --list --release --quick --proposal --signers --every-pin --executed --executed-python --retire --loss --because --replacement --counterexample --retired'  # cargo, mutants and the local CI/contract tools
 fail=0; n_tests=0; n_metrics=0; n_flags=0; n_adrs=0; n_paths=0
 bad() { echo "FAIL $*"; fail=1; }
 # shellcheck disable=SC2207  # paths in this tree have no spaces
