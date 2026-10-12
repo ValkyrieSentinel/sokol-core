@@ -1464,7 +1464,8 @@ async fn main() -> Result<(), anyhow::Error> {
         let _ = shutdown_tx_ctrlc.send(true);
     })?;
 
-    let peer_registry = PeerRegistry::new(trust_store);
+    // A replay of an envelope the previous process accepted is refused (MESH-N1).
+    let peer_registry = PeerRegistry::new(trust_store).with_startup_fence(p2p::now_ms());
     let (mesh_cmd_tx, mesh_cmd_rx) = mpsc::channel::<MeshCommand>(1000);
     // This node's own detections and storm latch; never on the wire (review 2026-10-05 W3.2).
     let (local_cmd_tx, local_cmd_rx) = mpsc::channel::<mesh_sync::LocalCommand>(1000);

@@ -1,14 +1,17 @@
-//! The mesh's freshness check and replay window (ADR-0010, review 2026-10-05 F4): when an
-//! envelope's timestamp is acceptable and how long after its arrival its nonce must be kept.
-//! It lives here, apart from the node, so that Kani can prove the two bounds fit
+//! The mesh's freshness check and replay window (ADR-0010, review 2026-10-05 F4, review of
+//! #26): when an envelope's timestamp is acceptable, how long after its arrival its nonce is
+//! kept, and the floor below which a sender's envelopes are refused once their nonces are
+//! gone. It lives here, apart from the node, so that Kani can prove it
 //! (`cargo kani -p common`, docs/VERIFICATION.md); `orchestrator/src/p2p.rs` calls it.
 //! Times are wall-clock milliseconds.
 //!
-//! This is arithmetic only. Refusing a replay also needs the nonce to be still in the node's
-//! cache (`p2p::ReplayGuard`): it is dropped once an envelope of the same sender arrives more
-//! than REPLAY_WINDOW_MS after it, and on restart. A clock that steps back past the window
-//! after such a purge accepts the original again
-//! (`a_replay_is_refused_while_its_nonce_is_retained_not_after_a_purge_and_a_step_back`).
+//! A sender's nonce leaves the node's cache (`p2p::ReplayGuard`) REPLAY_WINDOW_MS after it
+//! arrived. Its timestamp then raises that sender's floor (`raise`), and an envelope stamped
+//! at or below the floor is refused (`admits`). So every envelope accepted in this process is
+//! either still in the cache or under the floor, whatever the clock did in between; a new
+//! process starts its floors at its start (`fence`), so an envelope stamped before the
+//! restart is refused too. While this node's clock does not step back, no honest fresh
+//! envelope is ever under a floor (`honest_envelopes_stay_above_the_floor`).
 
 /// How far an envelope's timestamp may lie from this node's clock, both ways, inclusive.
 pub const MAX_CLOCK_SKEW_MS: u64 = 30_000;
@@ -26,6 +29,26 @@ pub fn fresh(timestamp_ms: u64, now: u64) -> bool {
 /// Whether a nonce that arrived at `arrived` must still be remembered at `now`.
 pub fn remembered(arrived: u64, now: u64) -> bool {
     arrived.saturating_add(REPLAY_WINDOW_MS) >= now
+}
+
+/// The timestamps a sender's window refuses outright: those at or below it. `None` refuses
+/// nothing.
+pub type Floor = Option<u64>;
+
+/// The floor of a window in a process started at `started`: an envelope stamped before the
+/// start may have been accepted by the previous process, whose cache is gone.
+pub fn fence(started: u64) -> Floor {
+    started.checked_sub(1)
+}
+
+/// The floor after a nonce stamped `purged` leaves the cache.
+pub fn raise(floor: Floor, purged: u64) -> Floor {
+    Some(floor.map_or(purged, |f| f.max(purged)))
+}
+
+/// Whether an envelope stamped `timestamp_ms` is above the floor.
+pub fn admits(timestamp_ms: u64, floor: Floor) -> bool {
+    floor.is_none_or(|f| timestamp_ms > f)
 }
 
 #[cfg(test)]
@@ -50,6 +73,24 @@ mod tests {
         );
         assert!(remembered(u64::MAX - 1, u64::MAX), "saturates");
     }
+
+    /// The floor on concrete values: a purged timestamp and everything below it is refused,
+    /// later ones pass; a process started at `t` refuses envelopes stamped before `t`.
+    #[test]
+    fn the_floor_refuses_purged_timestamps_and_those_before_the_start() {
+        assert!(
+            admits(0, None) && admits(5, fence(0)),
+            "no fence refuses nothing"
+        );
+        assert!(!admits(99, fence(100)) && admits(100, fence(100)));
+        let floor = raise(fence(100), 500);
+        assert!(!admits(500, floor) && !admits(120, floor) && admits(501, floor));
+        assert_eq!(raise(floor, 300), floor, "the floor never moves down");
+        assert!(
+            !admits(u64::MAX, raise(None, u64::MAX)),
+            "saturates at the top"
+        );
+    }
 }
 
 #[cfg(kani)]
@@ -66,5 +107,61 @@ mod proofs {
         let (timestamp, arrived, now): (u64, u64, u64) = (kani::any(), kani::any(), kani::any());
         kani::assume(fresh(timestamp, arrived) && fresh(timestamp, now));
         assert!(remembered(arrived, now));
+    }
+
+    /// The policy for one accepted envelope, any start and any clock: after its window was
+    /// touched (purging it when due), the envelope is refused at any moment it is fresh. Every
+    /// accepted envelope is in the cache or under the floor, and the floor only rises, so this
+    /// holds after any number of touches (a later purge raises the floor further).
+    #[kani::proof]
+    fn an_accepted_envelope_is_refused_again_whatever_the_clock_did() {
+        let (started, ts, arrived, touched, again): (u64, u64, u64, u64, u64) = (
+            kani::any(),
+            kani::any(),
+            kani::any(),
+            kani::any(),
+            kani::any(),
+        );
+        let mut floor = fence(started);
+        // Accepted at `arrived`.
+        kani::assume(fresh(ts, arrived) && admits(ts, floor));
+        let mut retained = true;
+        // The sender's window is next touched at `touched` (any clock: earlier or later than
+        // `arrived`), which purges the entry when its window is over.
+        if !remembered(arrived, touched) {
+            floor = raise(floor, ts);
+            retained = false;
+        }
+        // The same envelope again, at any moment it is fresh: refused by the cache or the floor.
+        kani::assume(fresh(ts, again));
+        let refused = retained || !admits(ts, floor);
+        assert!(refused);
+    }
+
+    /// The floor costs honest senders nothing while this node's clock does not step back: an
+    /// envelope fresh at a moment no earlier than a purge is newer than the purged one.
+    #[kani::proof]
+    fn honest_envelopes_stay_above_the_floor() {
+        let (purged, arrived, purge_at, ts, now, floor): (u64, u64, u64, u64, u64, Floor) = (
+            kani::any(),
+            kani::any(),
+            kani::any(),
+            kani::any(),
+            kani::any(),
+            kani::any(),
+        );
+        kani::assume(fresh(purged, arrived) && !remembered(arrived, purge_at));
+        kani::assume(purge_at <= now && fresh(ts, now) && admits(ts, floor));
+        let above = admits(ts, raise(floor, purged));
+        assert!(above);
+    }
+
+    /// A restarted process refuses every envelope stamped before its start, and nothing
+    /// stamped at or after it.
+    #[kani::proof]
+    fn a_restart_fences_off_what_came_before() {
+        let (started, ts): (u64, u64) = (kani::any(), kani::any());
+        let fenced = admits(ts, fence(started)) == (ts >= started);
+        assert!(fenced);
     }
 }
