@@ -1054,6 +1054,18 @@ async fn enforce_block_local<B: block_table::Blocklist>(
     outcome
 }
 
+/// The startup warning naming pinned peers the peers file binds to no address (ADR-0027).
+fn unbound_peers_warning(trust: &TrustStore) -> Option<String> {
+    let unbound = trust.unbound();
+    (!unbound.is_empty()).then(|| {
+        format!(
+            "[P2P] Peers {:?} have no \"address\" in the peers file: a handshake relayed by another \
+             peer can authenticate as them (ADR-0027). Bind each to its WireGuard tunnel address.",
+            unbound
+        )
+    })
+}
+
 /// What an enforced local block tells the operator: the ban (`DROP_IMMEDIATE`) and an alert.
 /// A block is not a trap hit: its tier is `LocalBlock`, which no trap tier counter takes
 /// (OPERATOR-T1: an unknown tier stays alert-visible). A trap hit reports its own tier.
@@ -1115,6 +1127,9 @@ async fn main() -> Result<(), anyhow::Error> {
         }
     };
     log_inbound_budget(trust_store.len());
+    if let Some(warning) = unbound_peers_warning(&trust_store) {
+        log::warn!("{}", warning);
+    }
 
     // The static part (built-in ranges, seeds, --never-block) plus the host's own addresses and
     // gateways, which are re-read while the node runs (the protected set follows the host).
@@ -2234,6 +2249,7 @@ async fn main() -> Result<(), anyhow::Error> {
                     let stats = &peer_registry.stats;
                     snapshot.mesh_handshakes_refused = stats.handshakes_refused.load(Ordering::Relaxed);
                     snapshot.mesh_handshake_timeouts = stats.handshake_timeouts.load(Ordering::Relaxed);
+                    snapshot.mesh_wrong_address = stats.wrong_address.load(Ordering::Relaxed);
                     snapshot.mesh_frames_delayed = stats.frames_delayed.load(Ordering::Relaxed);
                     snapshot.mesh_sync_requests_throttled =
                         sync_throttled.load(Ordering::Relaxed);
@@ -2415,6 +2431,20 @@ mod tests {
     /// The operator's trap tier counters (OPERATOR-T1) count exact `TIER=` fields; only a trap
     /// hit may carry a trap tier. A Suricata or CrowdSec block is not a "TRAP TIER-1 (TARPIT)"
     /// scanner, and the trap hit that caused a block already reported itself.
+    #[test]
+    fn the_startup_warning_names_exactly_the_unbound_peers() {
+        let key = |_: u64| NodeCrypto::generate().public_key.clone();
+        let mut trust = TrustStore::default();
+        assert_eq!(super::unbound_peers_warning(&trust), None);
+        trust.insert(2, key(2));
+        trust.insert(3, key(3));
+        trust.bind_address(2, "10.99.0.2".parse().unwrap());
+        let warning = super::unbound_peers_warning(&trust).expect("node 3 is unbound");
+        assert!(warning.contains("Peers [3] have no"), "{warning}");
+        trust.bind_address(3, "10.99.0.3".parse().unwrap());
+        assert_eq!(super::unbound_peers_warning(&trust), None);
+    }
+
     #[test]
     fn a_detector_block_is_not_reported_as_a_trap_tier() {
         let line = super::enforced_telemetry(7, "203.0.113.5", "suricata: sid:2001 ET SCAN");
