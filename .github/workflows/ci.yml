@@ -236,23 +236,26 @@ jobs:
 
       - name: Pinned witnesses unchanged without the owner's signature (ADR-0023)
         if: matrix.policy_checks && matrix.part == 'test'
-        # The checker and the signers come from the base branch: a pull request that weakened
-        # a witness could otherwise also weaken the check or add its own key. Until the base
-        # has them (the pull request that introduces this check), the tree's own are used.
+        # The checker and the signers come from the base commit: a pull request that weakened
+        # a witness could otherwise also weaken the check or add its own key. The checkout is
+        # one commit deep, so the base is fetched here; if it cannot be, the step fails rather
+        # than fall back to the pull request's own checker (2026-10-12: it had, since #1).
         env:
           BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
           # On a push (main, tags) nothing may stand unpinned; a pull request may still add rows
           # that the owner pins before it merges.
           EVERY_PIN: ${{ github.event_name == 'push' && '--every-pin' || '' }}
         run: |
-          cp scripts/witness-pin.py /tmp/witness-pin-tree.py
-          cp .github/witness-signers /tmp/witness-signers
-          if git cat-file -e "$BASE:scripts/witness-pin.py" 2>/dev/null; then
-            git show "$BASE:scripts/witness-pin.py" > scripts/witness-pin.py
-            git show "$BASE:.github/witness-signers" > /tmp/witness-signers
+          if [ -z "$BASE" ] || [ "$BASE" = 0000000000000000000000000000000000000000 ]; then
+            git fetch --no-tags --depth=2 origin "$(git rev-parse HEAD)"
+            BASE=$(git rev-parse HEAD^1)
           fi
-          # --executed: every pinned witness also ran and passed in the Test step above (a base
-          # checker that predates the flag ignores it).
+          git fetch --no-tags --depth=1 origin "$BASE"
+          cp scripts/witness-pin.py /tmp/witness-pin-tree.py
+          git show "$BASE:scripts/witness-pin.py" > scripts/witness-pin.py
+          git show "$BASE:.github/witness-signers" > /tmp/witness-signers
+          echo "checker and signers from base $BASE"
+          # --executed: every pinned witness also ran and passed in the Test step above.
           # shellcheck disable=SC2086  # empty or one flag
           python3 scripts/witness-pin.py check --signers /tmp/witness-signers $EVERY_PIN \
             --executed /tmp/sokol-cargo-test.log
@@ -297,6 +300,7 @@ jobs:
           python3 scripts/test_check_agents_rules.py
           python3 scripts/test_check_claims.py
           python3 scripts/test_witness_pin.py
+          python3 scripts/test_gate_provenance.py
           python3 scripts/test_check_monitoring.py
           python3 scripts/test_outbox_task.py
           python3 scripts/test_contract_shadow.py

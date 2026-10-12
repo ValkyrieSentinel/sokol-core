@@ -112,6 +112,33 @@ class ContractTool(unittest.TestCase):
         self.assertEqual(self.tool('regenerate').returncode, 0)
         self.assertEqual(self.check().returncode, 0)
 
+    def test_a_row_moved_into_a_comment_is_refused(self):
+        p = self.dir / 'docs/INVARIANTS.md'
+        text = p.read_text()
+        real = next(line for line in text.splitlines() if line.startswith('| T-2 |'))
+        p.write_text(text.replace(real + '\n', '') + '\n<!--\n' + real + '\n-->\n')
+        self.assert_refused('A row is hidden in a comment or code block: T-2')
+
+    def test_a_row_moved_into_a_code_block_is_refused(self):
+        p = self.dir / 'docs/INVARIANTS.md'
+        text = p.read_text()
+        real = next(line for line in text.splitlines() if line.startswith('| T-2 |'))
+        p.write_text(text.replace(real + '\n', '') + '\n```\n' + real + '\n```\n')
+        self.assert_refused('A row is hidden in a comment or code block: T-2')
+
+    def test_a_weaker_lookalike_in_front_of_a_hidden_row_is_refused(self):
+        p = self.dir / 'docs/INVARIANTS.md'
+        text = p.read_text()
+        real = next(line for line in text.splitlines() if line.startswith('| T-2 |'))
+        p.write_text(text.replace(real, '|T-2| Usually keeps the obligation. | `an_unknown_reply_keeps_the_obligation` |')
+                     + '\n<!--\n' + real + '\n-->\n')
+        self.assert_refused('A table line names T-2 but is not a row')
+
+    def test_a_table_line_that_names_a_row_but_is_not_one_is_refused(self):
+        p = self.dir / 'docs/INVARIANTS.md'
+        p.write_text(p.read_text() + '| T\u20112 | Lookalike with a non-breaking hyphen. | `a_refusal_creates_no_cooldown` |\n')
+        self.assert_refused('A table line names T-2 but is not a row')
+
     def test_a_row_without_a_contract_is_refused(self):
         p = self.dir / 'docs/INVARIANTS.md'
         p.write_text(p.read_text() + '| T-3 | Hand written. | `a_refusal_creates_no_cooldown` |\n')
