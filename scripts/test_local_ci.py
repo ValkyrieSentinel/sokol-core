@@ -156,7 +156,8 @@ jobs:
 
     def test_monitoring_runs_ci_pinned_promtool_and_propagates_its_failure(self):
         ci = self.fixture()
-        self.stub('docker', f'echo "docker $*" >> {self.calls}; exit ${{DOCKER_STATUS:-0}}')
+        self.stub('docker', f'[ "$1" = info ] && exit 0; '
+                            f'echo "docker $*" >> {self.calls}; exit ${{DOCKER_STATUS:-0}}')
         ok = self.run_step('monitoring', ci)
         self.assertEqual(ok.returncode, 0, ok.stdout + ok.stderr)
         call = [l for l in self.calls.read_text().splitlines() if l.startswith('docker ')][-1]
@@ -169,6 +170,38 @@ jobs:
         finally:
             del os.environ['DOCKER_STATUS']
         self.assertNotEqual(failed.returncode, 0, 'a failing promtool fails the step')
+
+    def test_monitoring_without_a_docker_daemon_skips_promtool_with_a_notice(self):
+        # A host with the docker client but no daemon (a fresh cloud container) is a host
+        # without docker, not a failed promtool.
+        ci = self.fixture()
+        self.stub('docker', f'echo "docker $*" >> {self.calls}; '
+                            'echo "failed to connect to the docker API" >&2; exit 1')
+        result = self.run_step('monitoring', ci)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('promtool skipped', result.stdout)
+        runs = [l for l in self.calls.read_text().splitlines() if l.startswith('docker run')]
+        self.assertEqual(runs, [], 'no promtool run without a daemon')
+
+    def test_tools_without_zstd_fail_before_downloading_and_name_it(self):
+        # Every command of the host except zstd, so the archive cannot be unpacked.
+        hidden = self.tmp / 'no-zstd'
+        hidden.mkdir()
+        for d in os.environ['PATH'].split(os.pathsep):
+            if not os.path.isdir(d):
+                continue
+            for name in os.listdir(d):
+                link = hidden / name
+                if name.startswith('zstd') or name in ('unzstd', 'zstdcat') or link.exists():
+                    continue
+                link.symlink_to(os.path.join(d, name))
+        ci = self.fixture()
+        env = dict(os.environ, PATH=os.pathsep.join([str(self.stubs), str(hidden)]),
+                   LOCAL_CI_YML=str(ci), LOCAL_CI_CACHE=str(self.tmp / 'cache'))
+        result = subprocess.run([str(SCRIPT), '--step', 'tools'], capture_output=True, text=True, env=env)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('zstd', result.stdout + result.stderr)
+        self.assertFalse(self.calls.exists(), 'nothing is downloaded that cannot be unpacked')
 
 
 if __name__ == '__main__':

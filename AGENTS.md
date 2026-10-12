@@ -31,11 +31,14 @@ cargo test --locked --bins -p orchestrator   # unit tests; no eBPF object or bpf
 cargo test --locked -p common
 cargo clippy --locked --all-targets -- -D warnings   # needs the eBPF object (below)
 cargo fmt --all -- --check
-scripts/check-claims.sh && scripts/check-retired.sh
+scripts/check-claims.sh && scripts/check-retired.sh   # check-claims builds all binaries: eBPF object
 ```
 
-The full `cargo test`, clippy over all targets and the XDP smoke need the eBPF object first:
-`cd ebpf && cargo build --release --locked` (bpf-linker, see README).
+The full `cargo test`, clippy over all targets, `scripts/check-claims.sh` and the XDP smoke need
+the eBPF object first: `cd ebpf && cargo build --release --locked` (bpf-linker, see README).
+Run the tests as a non-root user, as CI does: under root
+`an_unreadable_state_file_is_kept_aside_and_survives_the_next_save` fails, since root reads a
+mode-000 file. A cloud container often runs as root; there that one failure is the host's.
 
 **Run CI before pushing:** `scripts/local-ci.sh` runs the CI job on this host in the same order,
 with the pins and checksums read from `ci.yml` (bpf-linker, GoBGP, cargo-deny), including the
