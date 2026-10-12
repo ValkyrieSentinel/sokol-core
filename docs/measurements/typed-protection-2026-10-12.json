@@ -1,0 +1,72 @@
+{
+  "profile": "sokol.typed-protection-observation.v1",
+  "trust": "UNSIGNED_LOCAL_TEST_OBSERVATION",
+  "acceptance": "NOT_ESTABLISHED",
+  "base": "b75821fe8bc45c524c9765f607d47f7f7197366b",
+  "known_inputs": {
+    "orchestrator/src/protection.rs": "sha256:aaf5a46d72261e56a4435e3d576eeb4c137c612708f38d16495d3d15ccbceda3",
+    "orchestrator/src/block_policy.rs": "sha256:e159975ca5627fac481e9493fbd67093829e597494d6d3c143fe02d18f728d51",
+    "orchestrator/src/signal.rs": "sha256:65d7aeda0a0ccf2ba4a783e29579f8d1476aa8d8bf6bf0e023c458af92f2fac9",
+    "orchestrator/src/main.rs": "sha256:5d7646b8b3f32e19f7ce8aa525e77c0ff7122eb7488ff582ffb9645348c5d9ed",
+    "scripts/test_protection_types.py": "sha256:3b623a214daed5c081dfff8c4253b2b6627a15f7dc88dd7cb6bf2e91189e9f8a",
+    "scripts/test_check_agents_rules.py": "sha256:2e948b295e8d22380c95c493fef477cb0a6a152f39790def25e2a5b02993575e"
+  },
+  "type_controls": {
+    "context": "Actual protection.rs compiled with rustc in default production configuration, without cfg(test).",
+    "missing_role": "E0004 naming FutureProtection with primary span in source_role; description already supplied",
+    "positive_controls": [
+      "baseline compiles",
+      "explicit ProtectedOther compiles",
+      "explicit LocalSide compiles",
+      "typed LocalAddress construction compiles"
+    ],
+    "string_ingress": "From<&str> E0277; legacy fixture conversion excluded in this configuration",
+    "limits": "Module-level exhaustiveness/admission, not semantic correctness of a future role or a whole-program proof."
+  },
+  "native_controls": {
+    "production_roles": 12,
+    "tests": [
+      "only_local_and_home_protection_name_the_remote_destination",
+      "matching_diagnostic_text_does_not_grant_local_source_authority",
+      "legacy_fixture_labels_keep_their_typed_protection_identity",
+      "a_matching_diagnostic_cannot_redirect_a_signal_to_its_destination"
+    ],
+    "text_based_mutation": "Replace source_role call in signal::target with diagnostic-label matching",
+    "assertion_failures": 1,
+    "output_sha256": "sha256:d56d5ed086e1bd8fb45b26b90f47d70b973537067709f8f2194f6374dd76f1a0"
+  },
+  "changed_line_mutants": {
+    "generated": 15,
+    "caught": 11,
+    "unviable": 4,
+    "missed": 0,
+    "outcomes_sha256": "sha256:aa01f61a88a550b4f1c6932af19e5c33b03511231e044b739a95ec0abbf54d21"
+  },
+  "local_ci": {
+    "command": "scripts/local-ci.sh",
+    "environment": "Lima Ubuntu 24.04 aarch64",
+    "result": "PASS",
+    "output_sha256": "sha256:c46b2c85057e68c780a0ea3fc3aeba648668f29785f825ed761e8cb3d096877e",
+    "coverage": [
+      "build and tests",
+      "Clippy",
+      "Python regressions with imported ProtectionTypes",
+      "changed-line mutants",
+      "veth XDP smoke",
+      "cluster demo",
+      "runbook upgrade/rollback/support bundle"
+    ],
+    "not_run": [
+      "promtool: Docker unavailable; hosted CI covers it",
+      "cargo-deny: hosted x86_64 CI only",
+      "Kani: proof inputs unchanged; CI YAML remains unchanged"
+    ]
+  },
+  "owner_pins": {
+    "rows": 49,
+    "witnesses": 157,
+    "status": "MATCH",
+    "new_boundary": "POLICY-T1 unsigned intent"
+  },
+  "scope": "Behavior-preserving typed policy with current labels retained; local controls are not independent review, owner acceptance or native-NIC qualification."
+}
