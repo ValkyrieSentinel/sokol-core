@@ -2181,6 +2181,58 @@ mod tests {
         );
     }
 
+    /// The bound of stateful replay rejection (MESH-N1; review of #26). A replay is refused
+    /// while its nonce is retained: until the guard sees an envelope of the same sender at a
+    /// moment more than REPLAY_WINDOW_MS after the nonce arrived (or the process restarts: the
+    /// cache is in memory). The window arithmetic (`common::replay`, proved) only says that a
+    /// nonce is retained long enough on a clock that does not step back. After a purge, a clock
+    /// that returns to the first moment accepts the original again: no clock policy prevents it.
+    #[test]
+    fn a_replay_is_refused_while_its_nonce_is_retained_not_after_a_purge_and_a_step_back() {
+        let peer = NodeCrypto::generate();
+        let trust = trust_with(7, &peer);
+        let at = |timestamp_ms: u64, nonce: u64| {
+            let mut env = seal(&peer, 7, &NetworkMessage::Ping).unwrap();
+            env.timestamp_ms = timestamp_ms;
+            env.nonce = nonce;
+            env.signature = peer
+                .sign(&unsigned_bytes(
+                    env.version,
+                    env.sender_id,
+                    env.timestamp_ms,
+                    env.nonce,
+                    &env.payload,
+                ))
+                .unwrap();
+            env
+        };
+        let original = seal(&peer, 7, &NetworkMessage::Ping).unwrap();
+        let first = original.timestamp_ms;
+        for (later, retained) in [
+            (first + REPLAY_WINDOW_MS, true),
+            (first + REPLAY_WINDOW_MS + 1, false),
+        ] {
+            let mut guard = ReplayGuard::default();
+            assert!(open(&trust, &mut guard, &original, first).is_ok());
+            let advance = at(later, original.nonce.wrapping_add(1));
+            assert!(open(&trust, &mut guard, &advance, later).is_ok());
+            let again = open(&trust, &mut guard, &original, first);
+            if retained {
+                assert_eq!(
+                    again.unwrap_err(),
+                    EnvelopeError::Replay,
+                    "a nonce still retained refuses the replay after the clock returns"
+                );
+            } else {
+                assert!(
+                    again.is_ok(),
+                    "the boundary moved: a purged nonce now refuses a replay after a step back; \
+                     update MESH-N1"
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     async fn replay_and_stale_envelopes_are_rejected() {
         let peer = NodeCrypto::generate();

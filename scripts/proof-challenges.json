@@ -145,7 +145,7 @@
     {
       "id": "replay-window",
       "file": "common/src/replay.rs",
-      "harness": "replay::proofs::an_envelope_fresh_again_finds_its_nonce_remembered",
+      "harness": "replay::proofs::the_replay_window_covers_the_clock_skew_both_ways",
       "replace": {
         "before": "    arrived.saturating_add(REPLAY_WINDOW_MS) >= now",
         "after": "    arrived.saturating_add(REPLAY_WINDOW_MS) > now"

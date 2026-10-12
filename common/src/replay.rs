@@ -1,8 +1,14 @@
-//! The mesh's freshness and replay window (ADR-0010, review 2026-10-05 F4): when an envelope's
-//! timestamp is acceptable and how long its nonce must be remembered so that it cannot be
-//! accepted twice. It lives here, apart from the node, so that Kani can prove the two bounds
-//! fit (`cargo kani -p common`, docs/VERIFICATION.md); `orchestrator/src/p2p.rs` calls it.
+//! The mesh's freshness check and replay window (ADR-0010, review 2026-10-05 F4): when an
+//! envelope's timestamp is acceptable and how long after its arrival its nonce must be kept.
+//! It lives here, apart from the node, so that Kani can prove the two bounds fit
+//! (`cargo kani -p common`, docs/VERIFICATION.md); `orchestrator/src/p2p.rs` calls it.
 //! Times are wall-clock milliseconds.
+//!
+//! This is arithmetic only. Refusing a replay also needs the nonce to be still in the node's
+//! cache (`p2p::ReplayGuard`): it is dropped once an envelope of the same sender arrives more
+//! than REPLAY_WINDOW_MS after it, and on restart. A clock that steps back past the window
+//! after such a purge accepts the original again
+//! (`a_replay_is_refused_while_its_nonce_is_retained_not_after_a_purge_and_a_step_back`).
 
 /// How far an envelope's timestamp may lie from this node's clock, both ways, inclusive.
 pub const MAX_CLOCK_SKEW_MS: u64 = 30_000;
@@ -50,11 +56,13 @@ mod tests {
 mod proofs {
     use super::*;
 
-    /// An envelope accepted once (fresh at its arrival) that is fresh again at any later or
-    /// earlier moment finds its nonce still remembered then, so it is refused as a replay:
-    /// REPLAY_WINDOW_MS is long enough for MAX_CLOCK_SKEW_MS, both bounds inclusive.
+    /// The window fits the skew: for any timestamp and any two moments at which it is fresh
+    /// (its arrival and a later or earlier one), the window started at the arrival still covers
+    /// the other moment, both bounds inclusive. That is what the cache needs to keep a nonce
+    /// long enough; it says nothing about what the cache did in between (a purge by a later
+    /// arrival, a restart), which this predicate does not model.
     #[kani::proof]
-    fn an_envelope_fresh_again_finds_its_nonce_remembered() {
+    fn the_replay_window_covers_the_clock_skew_both_ways() {
         let (timestamp, arrived, now): (u64, u64, u64) = (kani::any(), kani::any(), kani::any());
         kani::assume(fresh(timestamp, arrived) && fresh(timestamp, now));
         assert!(remembered(arrived, now));
