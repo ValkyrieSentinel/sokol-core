@@ -40,12 +40,10 @@ pub(crate) async fn execute_control<B: block_table::Blocklist>(
             if let Err(why) = policy.check_net(ip) {
                 return format!("ERR {} is protected ({})", shown, why);
             }
+            // Time and record under the table lock (audit order = lock order).
+            let mut table = blocks.lock().await;
             let at = block_table::local_ms();
-            let added = match blocks
-                .lock()
-                .await
-                .add_local(ip, ClaimKind::Operator, "operator", at)
-            {
+            let added = match table.add_local(ip, ClaimKind::Operator, "operator", at) {
                 Ok(added) => added,
                 Err(why) => return format!("ERR {} not banned: {}", shown, why),
             };
@@ -55,6 +53,7 @@ pub(crate) async fn execute_control<B: block_table::Blocklist>(
                 shown,
                 at
             ));
+            drop(table);
             match added.applied {
                 Ok(()) => {
                     log::warn!("[Control] Operator ban for {}", shown);
@@ -68,15 +67,12 @@ pub(crate) async fn execute_control<B: block_table::Blocklist>(
         }
         ControlCommand::Unban(ip) => {
             let shown = show(&ip);
-            let at = block_table::local_ms();
             let (result, still_blocked) = {
                 let mut table = blocks.lock().await;
+                let at = block_table::local_ms();
                 let result = table.lift(ip, at);
-                (result, table.is_blocked(ip))
-            };
-            match result {
-                Ok(lifted) => {
-                    log::warn!("[Control] Operator unban for {}", shown);
+                // Submitted before the lock is released (audit order = lock order).
+                if let Ok(lifted) = &result {
                     sntl_db.append(format!(
                         "OPERATOR_UNBAN_{}|IP:{}|Claims:{}|At:{}",
                         ip_tag(ip),
@@ -84,6 +80,12 @@ pub(crate) async fn execute_control<B: block_table::Blocklist>(
                         lifted.claims,
                         at
                     ));
+                }
+                (result, table.is_blocked(ip))
+            };
+            match result {
+                Ok(lifted) => {
+                    log::warn!("[Control] Operator unban for {}", shown);
                     broadcast_retraction(ctx, lifted.retracted).await;
                     if still_blocked {
                         format!(
@@ -102,32 +104,40 @@ pub(crate) async fn execute_control<B: block_table::Blocklist>(
             }
         }
         ControlCommand::FlushDynamic => {
-            let at = block_table::local_ms();
-            let (released, lifted) = blocks.lock().await.flush_detector(at);
+            let (released, lifted) = {
+                let mut table = blocks.lock().await;
+                let at = block_table::local_ms();
+                let (released, lifted) = table.flush_detector(at);
+                sntl_db.append(format!(
+                    "OPERATOR_FLUSH|Released:{}|At:{}",
+                    released.len(),
+                    at
+                ));
+                (released, lifted)
+            };
             log::warn!(
                 "[Control] Operator flushed {} dynamic blocks",
                 released.len()
             );
-            sntl_db.append(format!(
-                "OPERATOR_FLUSH|Released:{}|At:{}",
-                released.len(),
-                at
-            ));
             broadcast_retraction(ctx, lifted.retracted).await;
             format!("OK released {} dynamic blocks", released.len())
         }
         ControlCommand::FlushAll => {
-            let at = block_table::local_ms();
-            let (released, lifted) = blocks.lock().await.flush_all(at);
+            let (released, lifted) = {
+                let mut table = blocks.lock().await;
+                let at = block_table::local_ms();
+                let (released, lifted) = table.flush_all(at);
+                sntl_db.append(format!(
+                    "OPERATOR_FLUSH_ALL|Released:{}|At:{}",
+                    released.len(),
+                    at
+                ));
+                (released, lifted)
+            };
             log::warn!(
                 "[Control] Operator flushed {} blocks (operator and dynamic)",
                 released.len()
             );
-            sntl_db.append(format!(
-                "OPERATOR_FLUSH_ALL|Released:{}|At:{}",
-                released.len(),
-                at
-            ));
             broadcast_retraction(ctx, lifted.retracted).await;
             format!("OK released {} blocks", released.len())
         }
