@@ -634,11 +634,23 @@
   "a_failed_restore_keeps_the_node_degraded_until_the_loss_is_accepted": [
    "orchestrator/src/state_store.rs:00b601edaaa799cf1765f9ad38a3ad5a011f7a3bf069f26a82d714772c328506"
   ],
+  "a_failed_stats_read_keeps_the_last_counters_and_is_counted": [
+   "orchestrator/src/metrics.rs:f2c21c144aaa7b777f66ff0a76e8e1fddf0a615e6b7628ac93560692b57014ce"
+  ],
   "a_file_over_the_writer_byte_budget_is_refused_without_reading_or_replacing_it": [
    "orchestrator/src/state_store.rs:b6c2d68987ea3f7f6a8639e23c2370b5ec0e54f894e5b90d385432e4bf713297"
   ],
   "a_flush_records_real_queue_overflow_without_a_following_record": [
    "orchestrator/src/main.rs:2d9f1b92f93dfed5eecfb8a9cd1ceed455779627b81d06e9b1ff1158dcdb4d32"
+  ],
+  "a_frame_at_the_edge_of_the_skew_window_is_not_accepted_twice": [
+   "orchestrator/src/p2p.rs:07bbee39bc600f8490526ad766c7c7f7876ff8ef8212e3e24c7aad6a1bd5ae08"
+  ],
+  "a_frame_fresh_at_the_edge_of_the_window_is_still_remembered": [
+   "common/src/replay.rs:dbf56bc2931e8ddc7b15ee4bafa06c2dfbf72438da78bbee0eb563e5bd2996b4"
+  ],
+  "a_frame_splits_into_its_header_payload_and_signature": [
+   "common/src/wire.rs:3a398cd3b2a5324f53b335af8ca49d6efc8cfdfc0e5a125250623ae7fc607b55"
   ],
   "a_full_ipv6_owned_profile_fits_the_rib_budget": [
    "orchestrator/src/flowspec.rs:c59804c7b2d9988727f8720fa8336a27d114f2f83e3612a8416d2114a8c3b085"
@@ -666,6 +678,9 @@
   ],
   "a_kernel_drop_is_not_reported_as_a_trap_tier": [
    "orchestrator/src/kernel_events.rs:b08f11871b662281f9e5ff4c0d110fbecb2c9cfb828a994c3db5ec952322446b"
+  ],
+  "a_lease_is_capped_by_its_first_record_and_kept_for_the_grace": [
+   "common/src/lease.rs:275cda8758802feca8e25d8805083f841b0a6792426bf1c06fc4fb7715e65826"
   ],
   "a_lift_is_not_undone_by_a_step_back_within_forget_grace": [
    "orchestrator/src/block_table.rs:2dd2d49c924ec3d28f2c6b80348dd378907809fa476a8b45f16dc39dc52b2240"
@@ -703,6 +718,9 @@
   "a_peer_beyond_its_known_claims_share_is_refused_alone": [
    "orchestrator/src/block_table.rs:1eb3ce84d2412efe02ecb4e77a82b9b28033be6dc18eef35fac2038aace99370"
   ],
+  "a_peer_whose_clock_is_behind_is_fenced_off_only_just_after_the_start": [
+   "orchestrator/src/p2p.rs:8b14108498ebf575601297823f53de9ca8a34b4eec6179ab8f2981586cbc3bf2"
+  ],
   "a_peers_audit_head_is_witnessed_once_per_interval": [
    "orchestrator/src/mesh_dispatch.rs:feeaadd32daf4628d5a89028c94f3b45cbf127b9b96b0e06ad859dac4ca6cf3a"
   ],
@@ -733,6 +751,9 @@
   "a_reload_below_held_known_claims_keeps_the_previous_envelopes": [
    "orchestrator/src/block_table.rs:4ba31ad54c4bac1954d6651d20f13251792e25bb7ffaef03945f7b66d93d6df5"
   ],
+  "a_reload_stops_broadcasts_to_a_revoked_or_moved_node_at_once": [
+   "orchestrator/src/control_exec.rs:d77e8a2b5e7f0060af18ee03f2ab90336821c782fdf7204d5fcad9874cd10c8c"
+  ],
   "a_reload_that_moves_a_node_closes_its_connection": [
    "orchestrator/src/p2p.rs:d373d80a7fc8257f92a8385f4643e30738bf6d6ec096fa58ae33ec924563c24d"
   ],
@@ -747,6 +768,9 @@
   ],
   "a_report_the_node_rejects_is_not_called_delivered": [
    "orchestrator/src/bin/sokol-fastnetmon-notify.rs:26ecadae7624e7e2de0b32a5b291297afb1f457ff1eac85ed2844e23791d1fe6"
+  ],
+  "a_restarted_node_refuses_envelopes_stamped_before_its_start": [
+   "orchestrator/src/p2p.rs:b7107dde4a0822386840ea6b8477aee1a0a70fc5c9d1667e67566c85338a747f"
   ],
   "a_restore_keeps_every_bounded_table_within_its_runtime_bound": [
    "orchestrator/src/block_table.rs:1e480bf6933a3901da03c2a7bebff0c1868c3d0df38d837df3bb1e46ae9ba770"
@@ -781,6 +805,9 @@
   "a_shortening_capacity_refusal_keeps_both_event_supports": [
    "orchestrator/src/block_table.rs:710603c26091c8d1501edbcbd43e8d49096999d49d238dda96b6fbac9bde0ce4"
   ],
+  "a_signature_is_verified_without_holding_the_replay_lock": [
+   "orchestrator/src/p2p.rs:1db58b384eee671ed5e07d72f5be3a122f129c14283a92a6ae08479520a8d7a2"
+  ],
   "a_statement_file_named_for_another_statement_fails_the_check": [
    "orchestrator/src/audit_anchor.rs:9b5c64a37a223f687c1bf044212355df77830ed09a3417625637ac7d45c5050c"
   ],
@@ -814,6 +841,9 @@
   "a_vector_cannot_choose_the_operator_tier_or_supply_header_fields": [
    "orchestrator/src/bin/sokol-operator.rs:6c12e8f431234ec2fb0d06f14fe5d95b9671abda18131ef3c3cd7ea3760cfba3"
   ],
+  "a_wait_for_the_table_does_not_shorten_a_peer_claims_lease": [
+   "orchestrator/src/mesh_dispatch.rs:aba5fe9419dd411a6d2908176f3d9028f96319ffac7c0fcac31a5e4b4837ddf4"
+  ],
   "a_waiting_detection_records_a_time_not_before_the_table_moved_on": [
    "orchestrator/src/main.rs:3f6ef44175febf8a92e0c431f91bb31b3a907d33e7fa176aed11d2894615f191"
   ],
@@ -829,8 +859,17 @@
   "a_zero_sequence_segment_cannot_replace_the_genesis_chain": [
    "common/src/audit_log.rs:9347cb4c715cb4907303e250487b6dd046f2342bc24a80646ae9236f7a809066"
   ],
+  "an_accepted_envelope_is_refused_again_after_a_purge_and_a_step_back": [
+   "orchestrator/src/p2p.rs:a1c6710ceee2e44886523dfc204717c77052dc25f13a80d31e92fa0ae49172f2"
+  ],
+  "an_adapter_cannot_be_counted_under_a_source_of_this_node": [
+   "orchestrator/src/ipc.rs:02f778d27a764c7203f01ca94366ac318e5bc189ef85076855aa02a4edcbd183"
+  ],
   "an_authenticated_connection_survives_a_replayed_frame": [
    "orchestrator/src/p2p.rs:73330ee21fb1fbe267fddfb32d34295b61ee4073da3ac1b480ba8e1d6894799e"
+  ],
+  "an_envelope_stamped_after_a_restart_passes_the_fence_even_if_seen_before": [
+   "orchestrator/src/p2p.rs:9c116149199ec0c5556e68805653f1afe75d4ecaa37df3b5f8c0d61867d6720a"
   ],
   "an_event_still_held_needs_no_new_retraction_storage": [
    "orchestrator/src/block_table.rs:8f36ce1c4ee49ac60542145a04afde3d681cdb9373074755106c2a6b416ea188"
@@ -904,11 +943,17 @@
   "disconnected_final_sync_records_real_queue_overflow": [
    "orchestrator/src/main.rs:04e01e8b9bf089cb6bd6d88fe18a6d47139274b2f6fc06dc4c763436326a91c8"
   ],
+  "drop_untrusted_unregisters_and_names_revoked_and_moved_nodes": [
+   "orchestrator/src/p2p.rs:33e4f037b4366dbdd4d0f52d3ab5759374b2b254fd99b0179bd6289ab37371ed"
+  ],
   "drops_just_below_the_threshold_are_not_an_attack": [
    "orchestrator/src/defense.rs:fb94f34ff39dca20d7bd250e796f663f6265bb6bff0a8fe75bd9fb9a7d647a20"
   ],
   "drops_only_storm_mode_adds_above_the_threshold_are_not_an_attack": [
    "orchestrator/src/defense.rs:ceb4688538ddae60567b07b9247d80d4620db36a87c17d98026fc5802870c263"
+  ],
+  "each_issuer_counts_apart_and_the_label_set_is_bounded": [
+   "orchestrator/src/detections.rs:33868a8ff31cef15b4e44f5c3f609bd31603a8f3403b92f0fbd50fdcbcc52302"
   ],
   "every_gate_refusal_has_one_counted_policy_reason": [
    "orchestrator/src/bin/sokol-suricata.rs:51bcb30d721811e2f236284c04cb24177b24e13dd8ddb3e22dc4dc7ab5cf19c3"
@@ -936,6 +981,9 @@
   ],
   "forwarding_expiry_is_counted_loss_not_an_ack_and_spends_flush_budget": [
    "orchestrator/src/delivery.rs:7a17004f1f7222765542923c3a773a256b04064176b86377ac903f3a67b85dc6"
+  ],
+  "frames_of_other_protocol_versions_are_named": [
+   "orchestrator/src/p2p.rs:7b200032b78569abaee1a5ac380aaf077d428149e390896b6a89b425ccc95bef"
   ],
   "free_text_reason_is_not_a_field_namespace": [
    "orchestrator/src/replay.rs:b303542406cf7c58cbc139e017e38b1848948225d4ec8203c766d5529170f9c6"
@@ -1015,6 +1063,9 @@
   "only_the_canonical_line_is_a_statement": [
    "orchestrator/src/audit_anchor.rs:4315be5d8898b3cc908c29627c0112e35aaf23bd09584e3a3dd4201953966dda"
   ],
+  "only_this_nodes_own_source_names_are_relabelled": [
+   "orchestrator/src/detections.rs:faa4dd88d5a249deb364834606b839026ca86397811be2d311066c1e0f77286b"
+  ],
   "opaque_vectors_survive_the_socket_and_operator_data_api": [
    "orchestrator/src/bin/sokol-operator.rs:df3762f12095a6ecb95d503cc829e48969663e27184858e66fac3ee8a0cf1fe3"
   ],
@@ -1035,6 +1086,12 @@
   ],
   "past_forget_grace_a_step_back_lets_a_resent_lease_or_lift_count_again": [
    "orchestrator/src/block_table.rs:b833fee51d5d49d85a8b4feecbeb5f8b02d32f70f3acf67f609fc2509c8a47ab"
+  ],
+  "peer_claims_are_counted_under_their_issuer": [
+   "orchestrator/src/mesh_dispatch.rs:02dd3665635b04341325749425be3f1571bd6241ce4179e0264863da0948d1d1"
+  ],
+  "peer_claims_are_rendered_by_issuer_and_result": [
+   "orchestrator/src/metrics.rs:4ad68e7659928bd9962efa9be38de25167cc090a3cf3f72aaaeb0c2028aed82d"
   ],
   "peer_witnesses_come_from_the_verified_pass": [
    "orchestrator/src/audit_witness.rs:f75acef5bdd0311ee735f229d1bb306bf991a2bc3a206dd45e7b6680d069a555"
@@ -1096,6 +1153,9 @@
   "statements_confirm_the_log_and_expose_a_recomputed_rewrite": [
    "orchestrator/src/audit_anchor.rs:70866e367a14dbada653f4fd2de78fb048a2f209b766d81b5d2a171e19ad27f1"
   ],
+  "storm_drops_are_left_out_and_every_other_reason_counts": [
+   "common/src/storm.rs:8b4e3a8f4ad52525a10bc2f607e4784fa138737619035e19bb3d7dc11f9abf61"
+  ],
   "strict_parse_drops_count_when_the_operator_set_the_flag_or_storm_only_observes": [
    "orchestrator/src/defense.rs:61afa3089cd3ab2594aa14046379c49d2fee4a0a62771d0ce6230e7be315b030"
   ],
@@ -1110,6 +1170,9 @@
   ],
   "the_first_line_the_node_sees_is_the_ack_handshake": [
    "orchestrator/src/bin/sokol-fastnetmon-notify.rs:96cf26ab9933be434f74469c57e21e44c2be37cd58c30379b8f9f78ec1f45acb"
+  ],
+  "the_floor_refuses_purged_timestamps_and_those_before_the_start": [
+   "common/src/replay.rs:d6943fc09beb9c8a82a35cd33f2b36b7e782f1df6e5534bca57a06d9f863b98b"
   ],
   "the_startup_warning_names_exactly_the_unbound_peers": [
    "orchestrator/src/main.rs:22275c4fec538e30442c874ffd30470e121590aaa3178461109cd81de9b2eec8"
@@ -1144,12 +1207,19 @@
   "FLOWSPEC-P1": "23412916e4d4b48929c79ebd1541c49345a29b49377f67aff8ef23ac673153ce",
   "FLOWSPEC-P2": "092a77fd366261837398647687cf247ee43845d3f66f263be8bbd108625df225",
   "IPC-A1": "6a0096b5b18b5190ee613bc7e2e3e94604665f205385b18ae074bb0b9138aafa",
+  "IPC-L1": "56700a9f7476254a5c5112a725cd321d80592a56e38c82eca2c3d4547b521577",
   "IPC-R1": "b9989e447aaf0ac528045bb46ae30f905b77868400866b3732711082527f9986",
   "IPC-T1": "088af71858cc841192a1cac08dd3a0cfe6f6fcded7772bf9ba5fbd3a13122cc3",
-  "LEASE-C1": "62c7ac850ee80fee44f784de6d0430c0781468913e27c0e17b59ba0d1b160931",
+  "LEASE-C1": "d0ecabec0b99fb218c6bbc733fe834a076381493b93b4ca02a37bde868cf3119",
+  "LEASE-W1": "07105336ae7c8b08da79feb6b84897608cab06978ac9517f03e80f18b4451a30",
   "MESH-A1": "83475cbf8f68688809123964d89096ccf2eca83eb242afd822d0132372547f03",
   "MESH-A2": "14b7d34195160f94057a22ac5a3e4419975831c78169645f46c0184f71f7d2ab",
+  "MESH-C1": "25af225be034979edf4a33ac301263b53dd5019f8fffce2a6a8789fb77223a0c",
   "MESH-K1": "b5c64769a38d45f8829f1df5214c8898179b2641dae6f415d36cb3e35ee4e629",
+  "MESH-N1": "7cf87f33c97ff017501c42be8568024acd1973d07c7b9133d98bcb1edb89355e",
+  "MESH-R1": "8a23a2f3720c9b96ac29bd1ee776d2badff9b8b6e6c894b1ed2f604a1f837e5e",
+  "MESH-V1": "0a25e02498896aa457d83b29f6bb032461006726d5e563362972f52b920d25be",
+  "MESH-W1": "70bfce13af175b5b166edca4341696f86f06f8907ce2a8cd2d471aa09e189b3b",
   "MONITOR-L1": "762fb11af9aca18b5e95d9e71061c430745e5f50a90341f7b8356417cc13368e",
   "NODE-D1": "0765e06474e6a67f70ffa2f6ca4e0c78da7f252909be75c56a3a5c7b8740efd3",
   "NODE-R1": "4618ac4d2bb0c89369d0a8b83d84cb96e1b22f630db08c56320e0b25022bcb15",
@@ -1172,7 +1242,7 @@
   "STATE-B1": "2e14f012cd4c37689c4d6a7ec815e40fd12cc714b2cdc2a8b1518d3a1d5fda4f",
   "STATE-P1": "c77333a2be0f751dac1ec9ce6663e325d36efa51c8dc917ebe9cb81bd5af5561",
   "STATE-P2": "93fa21f3199e8249b2367c1c03cfe7dc9fb86f4ac18bc32812cfb588c4a4bc52",
-  "STORM-S1": "d45fb47a478f53b547620d55215c67f5df2306a282d77dbdb09fdbc65dfb84b0",
+  "STORM-S1": "8cfa43120290b691f73c473a645587821355a1e74df9a8f2e73964cf6669cac1",
   "STORM-T1": "98e4242860e7eae61242b9da0f336711e67604265851877f1d181d810c2358b2",
   "SUR-C1": "71649ca5848e6bfeec0e1cb516058d937298924631f88b0141127498686b614a",
   "SUR-C2": "7fcaf10dafce330390b4f11b6d613a8f16500cbe135bdd57382e877471c642d0",
@@ -1184,7 +1254,8 @@
   "SUR-Q1": "2bc447f61d219b83a7199f3a67cf4e87c4dd0c290714f971d7a4e4e60176a62b",
   "SUR-R1": "f5edfc06e0f4f32425b18a4b2a92880f86fe1b1e9b17a487816d87364769b6e8",
   "SUR-T1": "aa51941a60d06f354217c9fef3e85cfe1d6340a997faa08016dd44d1283e07ea",
-  "SUR-T2": "bd10db0bcde8109f8365e59820805a211ae783c95c613b0cd1d62860f6f3fbff"
+  "SUR-T2": "bd10db0bcde8109f8365e59820805a211ae783c95c613b0cd1d62860f6f3fbff",
+  "XDP-C1": "6a0fdba9024ac533c6eea93e0d2fc4b10e779748ddce53c50f80403bdf08938b"
  },
  "rows": {
   "ABI-E1": {
@@ -1316,6 +1387,13 @@
     "unknown_reply_keeps_the_obligation_and_a_later_ack_retires_it"
    ]
   },
+  "IPC-L1": {
+   "statement": "5bb9a01775868b71bffffc135bb07b9694cac90d199e400add02b8e99f251b45",
+   "witnesses": [
+    "an_adapter_cannot_be_counted_under_a_source_of_this_node",
+    "only_this_nodes_own_source_names_are_relabelled"
+   ]
+  },
   "IPC-R1": {
    "statement": "7d16704800297f6e2d79383db3843e71721b3826d19fc4449b63acac5d6013e0",
    "witnesses": [
@@ -1336,12 +1414,19 @@
   "LEASE-C1": {
    "statement": "9cfb620a9c62bef643e756c837675b81e834233bd19cc2ddae784d69d290ea14",
    "witnesses": [
+    "a_lease_is_capped_by_its_first_record_and_kept_for_the_grace",
     "a_lift_is_not_undone_by_a_step_back_within_forget_grace",
     "a_used_lease_is_not_renewed_by_a_step_back_within_forget_grace_and_a_resend",
     "an_uncapped_peer_claim_is_not_revived_past_the_cap_by_a_small_step_back",
     "lease_records_stay_bounded_by_forgetting_the_first_ended_one",
     "past_forget_grace_a_step_back_lets_a_resent_lease_or_lift_count_again",
     "restored_lease_records_keep_the_bound_and_drop_those_past_retention"
+   ]
+  },
+  "LEASE-W1": {
+   "statement": "44d106a6e3e5d53e7f871cceaa4d60ec5622cd6745b0f3f6a8b1be45d751bb0a",
+   "witnesses": [
+    "a_wait_for_the_table_does_not_shorten_a_peer_claims_lease"
    ]
   },
   "MESH-A1": {
@@ -1363,6 +1448,14 @@
     "the_startup_warning_names_exactly_the_unbound_peers"
    ]
   },
+  "MESH-C1": {
+   "statement": "da5ec13027b8a76393d6e589fce630b96149a646e67b58241cbac009ab82c786",
+   "witnesses": [
+    "each_issuer_counts_apart_and_the_label_set_is_bounded",
+    "peer_claims_are_counted_under_their_issuer",
+    "peer_claims_are_rendered_by_issuer_and_result"
+   ]
+  },
   "MESH-K1": {
    "statement": "32f95310c1f2e76c1b172501d10bbdaacc8c6820e0cc9c58e0c574e0f50f04fc",
    "witnesses": [
@@ -1374,6 +1467,38 @@
     "a_reload_below_held_known_claims_keeps_the_previous_envelopes",
     "an_explicit_large_peer_share_can_exhaust_the_shared_peer_budget",
     "peers_together_leave_the_room_kept_for_this_nodes_own_decisions"
+   ]
+  },
+  "MESH-N1": {
+   "statement": "7be5c146477c2207f0f8c4f6f3024d2d199fd2a8aa763c28dbd6ad6cb55a5b67",
+   "witnesses": [
+    "a_frame_at_the_edge_of_the_skew_window_is_not_accepted_twice",
+    "a_frame_fresh_at_the_edge_of_the_window_is_still_remembered",
+    "a_peer_whose_clock_is_behind_is_fenced_off_only_just_after_the_start",
+    "a_restarted_node_refuses_envelopes_stamped_before_its_start",
+    "an_accepted_envelope_is_refused_again_after_a_purge_and_a_step_back",
+    "an_envelope_stamped_after_a_restart_passes_the_fence_even_if_seen_before",
+    "the_floor_refuses_purged_timestamps_and_those_before_the_start"
+   ]
+  },
+  "MESH-R1": {
+   "statement": "0a61b57b5f032c72e5ba7a8c41bf5ba519bac6524564664fbc149a2c675a8874",
+   "witnesses": [
+    "a_reload_stops_broadcasts_to_a_revoked_or_moved_node_at_once",
+    "drop_untrusted_unregisters_and_names_revoked_and_moved_nodes"
+   ]
+  },
+  "MESH-V1": {
+   "statement": "8147ac5d30704d3e5b5b97796ada0ed9e5a4f74e51024406607425d287a247f2",
+   "witnesses": [
+    "a_signature_is_verified_without_holding_the_replay_lock"
+   ]
+  },
+  "MESH-W1": {
+   "statement": "9e9b3f62b975ab3f4c08f68fe010fc4ce4af7721f7a420097c64c29d8d883417",
+   "witnesses": [
+    "a_frame_splits_into_its_header_payload_and_signature",
+    "frames_of_other_protocol_versions_are_named"
    ]
   },
   "MONITOR-L1": {
@@ -1568,6 +1693,7 @@
     "attack_drop_reasons_above_the_threshold_count",
     "drops_just_below_the_threshold_are_not_an_attack",
     "drops_only_storm_mode_adds_above_the_threshold_are_not_an_attack",
+    "storm_drops_are_left_out_and_every_other_reason_counts",
     "strict_parse_drops_count_when_the_operator_set_the_flag_or_storm_only_observes",
     "the_xdp_program_drops_unparsable_headers_in_strict_mode_with_their_own_reason"
    ]
@@ -1659,6 +1785,12 @@
     "cli_forwarding_age_accepts_zero_and_normal_intervals_but_rejects_bad_numbers",
     "cli_rejects_unrepresentable_forwarding_age_before_startup"
    ]
+  },
+  "XDP-C1": {
+   "statement": "386bf26a6b3ca62bb8664fa44fd0fcb7b91ed0df4bd80c52b971d7582d89b8bf",
+   "witnesses": [
+    "a_failed_stats_read_keeps_the_last_counters_and_is_counted"
+   ]
   }
  },
  "witnesses": {
@@ -1728,11 +1860,23 @@
   "a_failed_restore_keeps_the_node_degraded_until_the_loss_is_accepted": [
    "orchestrator/src/state_store.rs:a8a7d22f2638ec79af51d6a380125272442dd984d118548f1b22191b39a5e0d3"
   ],
+  "a_failed_stats_read_keeps_the_last_counters_and_is_counted": [
+   "orchestrator/src/metrics.rs:303d5c30baf73c0c61540e0a169fbf3395872f775b3a4e6352dd182e14eb75e9"
+  ],
   "a_file_over_the_writer_byte_budget_is_refused_without_reading_or_replacing_it": [
    "orchestrator/src/state_store.rs:f730d7d9593b5a07f7d349345ca355f3608a3f16adf7573f239fb6d44075d989"
   ],
   "a_flush_records_real_queue_overflow_without_a_following_record": [
    "orchestrator/src/main.rs:647c2d250aa2f6a1f356dc0f5e9a89798908d7985293a090cccfc7a2040e5385"
+  ],
+  "a_frame_at_the_edge_of_the_skew_window_is_not_accepted_twice": [
+   "orchestrator/src/p2p.rs:957759ce316549ce28902a35ea5202ed30bb49e5bc40c68e4bfaf363046900c7"
+  ],
+  "a_frame_fresh_at_the_edge_of_the_window_is_still_remembered": [
+   "common/src/replay.rs:f45bb8292d354673a7d2f855fcb696e742fc9de31b00dd1d75c488c213bf549a"
+  ],
+  "a_frame_splits_into_its_header_payload_and_signature": [
+   "common/src/wire.rs:a9c114c4551625baeb0be768d316f90258d3ef922b341aa0680e76e43596dc49"
   ],
   "a_full_ipv6_owned_profile_fits_the_rib_budget": [
    "orchestrator/src/flowspec.rs:fc7a7d3b1234f2279058e02668180075fd2510628196c6e57077062bc954b120"
@@ -1760,6 +1904,9 @@
   ],
   "a_kernel_drop_is_not_reported_as_a_trap_tier": [
    "orchestrator/src/kernel_events.rs:5f1d6e0a237f50951f85be3cf20c6d009fa2d56e10e699dedbce84ed14b3926e"
+  ],
+  "a_lease_is_capped_by_its_first_record_and_kept_for_the_grace": [
+   "common/src/lease.rs:87cafd300899623b45e451264fd09c606bec5d2670c531409c8830fb1f650aee"
   ],
   "a_lift_is_not_undone_by_a_step_back_within_forget_grace": [
    "orchestrator/src/block_table.rs:8830fc392740ee9f8f03acf8cef1bace4759c00de6b5f1e59a3be000265f60de"
@@ -1797,6 +1944,9 @@
   "a_peer_beyond_its_known_claims_share_is_refused_alone": [
    "orchestrator/src/block_table.rs:1f5e371c2dc361bbe7ef8d682ba6c58377ed12451ca7e7d5cb123ad67716e64f"
   ],
+  "a_peer_whose_clock_is_behind_is_fenced_off_only_just_after_the_start": [
+   "orchestrator/src/p2p.rs:2ee275010e6b7164693f0d0eece05fa5033637e23490d075b615cd756decc69f"
+  ],
   "a_peers_audit_head_is_witnessed_once_per_interval": [
    "orchestrator/src/mesh_dispatch.rs:07715d75cbe271d25f56fa81a48021df6e80ad9cf85aca77c9315dfa880cd5ff"
   ],
@@ -1827,6 +1977,9 @@
   "a_reload_below_held_known_claims_keeps_the_previous_envelopes": [
    "orchestrator/src/block_table.rs:ee10bbd9662da0b2e4c6e5b5f7141a8c18922b30eb2bf238f6a66a109a9352a5"
   ],
+  "a_reload_stops_broadcasts_to_a_revoked_or_moved_node_at_once": [
+   "orchestrator/src/control_exec.rs:f0e4981f3a030be397676ae3fb7324f6a795098905b49103632d06c8e4b08a40"
+  ],
   "a_reload_that_moves_a_node_closes_its_connection": [
    "orchestrator/src/p2p.rs:eb98476bf946bcadc49bcba7ab4de5e0569bd57868a629aba53f42d4c03a801f"
   ],
@@ -1841,6 +1994,9 @@
   ],
   "a_report_the_node_rejects_is_not_called_delivered": [
    "orchestrator/src/bin/sokol-fastnetmon-notify.rs:bdccb8cf2a571d753c0ad69a6de5f91965076c1b1cc1ba156f9610f92403cece"
+  ],
+  "a_restarted_node_refuses_envelopes_stamped_before_its_start": [
+   "orchestrator/src/p2p.rs:8f92cd625997c6be3be764ec74ff0757b05c77e96fb240058296550e28e477db"
   ],
   "a_restore_keeps_every_bounded_table_within_its_runtime_bound": [
    "orchestrator/src/block_table.rs:775d036b2124ba22dc5febc7900ea5df4a9d687eb5cf521f9a618f2bdfe54c8d"
@@ -1875,6 +2031,9 @@
   "a_shortening_capacity_refusal_keeps_both_event_supports": [
    "orchestrator/src/block_table.rs:5c95f1954bd8cf22b4d899bde6a76e0cf89974b83ac51666c71fed8629307a31"
   ],
+  "a_signature_is_verified_without_holding_the_replay_lock": [
+   "orchestrator/src/p2p.rs:46cf67c963ed6389ba78391c87b0c06c796609855ae802ddeeb39904bbbcc189"
+  ],
   "a_statement_file_named_for_another_statement_fails_the_check": [
    "orchestrator/src/audit_anchor.rs:a11d174dcfe74139aa8bafa99c98937ac11aa135b0c9f03a687176ab3afb11f1"
   ],
@@ -1908,6 +2067,9 @@
   "a_vector_cannot_choose_the_operator_tier_or_supply_header_fields": [
    "orchestrator/src/bin/sokol-operator.rs:e7fa75e0b6b525ca2cfc16af42cb682b6b4ffc939cba2892153f14b147ede712"
   ],
+  "a_wait_for_the_table_does_not_shorten_a_peer_claims_lease": [
+   "orchestrator/src/mesh_dispatch.rs:15b9af4ea91132790ea723c500b0951e74fd551a96ffa0a17d3faa3d316ab605"
+  ],
   "a_waiting_detection_records_a_time_not_before_the_table_moved_on": [
    "orchestrator/src/main.rs:b9f619f5b571e96ef834adec41cef710cc2a554025c904490d41911e87161aec"
   ],
@@ -1923,8 +2085,17 @@
   "a_zero_sequence_segment_cannot_replace_the_genesis_chain": [
    "common/src/audit_log.rs:411a24a11982eb4f4e9acc13980413cd35bf671ebf691745309d0c7304bddc79"
   ],
+  "an_accepted_envelope_is_refused_again_after_a_purge_and_a_step_back": [
+   "orchestrator/src/p2p.rs:70153b7331c98de0571e82bddd8d6add7f6daab0f5c8edca0cc9a06a972bb93c"
+  ],
+  "an_adapter_cannot_be_counted_under_a_source_of_this_node": [
+   "orchestrator/src/ipc.rs:c08b86a87d3ea76ca40de569c85506fecfc640c669a59a23356a433a32592fdc"
+  ],
   "an_authenticated_connection_survives_a_replayed_frame": [
    "orchestrator/src/p2p.rs:a7d71cacf47de5e2827923a7eb4ffbe3687522d5edc49ee19088a37f888a3faf"
+  ],
+  "an_envelope_stamped_after_a_restart_passes_the_fence_even_if_seen_before": [
+   "orchestrator/src/p2p.rs:4f4568a8a45b2417c3e8b9fdfce42983cf7185d58ed2fca701b4355f4e939ad2"
   ],
   "an_event_still_held_needs_no_new_retraction_storage": [
    "orchestrator/src/block_table.rs:3a8245282ee23211dba2ba18b4d10ac5e18f759feaab1ba4c14a2f1f6b2b5ef2"
@@ -1998,11 +2169,17 @@
   "disconnected_final_sync_records_real_queue_overflow": [
    "orchestrator/src/main.rs:bb44d5f4384b276f3760ce7c34328d3f49148a4d888562896b7f04f17665486a"
   ],
+  "drop_untrusted_unregisters_and_names_revoked_and_moved_nodes": [
+   "orchestrator/src/p2p.rs:cdef66ff76b205e2be6c6fc6aa5cec1ab60eea5e903e3f30c19023f3df4d9f58"
+  ],
   "drops_just_below_the_threshold_are_not_an_attack": [
    "orchestrator/src/defense.rs:3f52acf3f5ee3bd421964fbedb0a4f0f360a1765547710c1acd7a18468633790"
   ],
   "drops_only_storm_mode_adds_above_the_threshold_are_not_an_attack": [
    "orchestrator/src/defense.rs:2ca17a8e37bac8342606f462091a18e09c8f42df32c4bfc98bd88ff81d273e2d"
+  ],
+  "each_issuer_counts_apart_and_the_label_set_is_bounded": [
+   "orchestrator/src/detections.rs:0bd093a6cfc3ceaf9a067e42a9d89f3d6242d8115080f7144f609447fc91f3d6"
   ],
   "every_gate_refusal_has_one_counted_policy_reason": [
    "orchestrator/src/bin/sokol-suricata.rs:b2f9553541a54678a16193b45687ccf4d1d55433c38918ccf5bde92d59f35db9"
@@ -2030,6 +2207,9 @@
   ],
   "forwarding_expiry_is_counted_loss_not_an_ack_and_spends_flush_budget": [
    "orchestrator/src/delivery.rs:192ed909a39a213c69474c84277eacb0c3cfd379f2e81a59f5e4f471be453066"
+  ],
+  "frames_of_other_protocol_versions_are_named": [
+   "orchestrator/src/p2p.rs:e4d397cab7b01ebb5f90d6a361346a0210d576c89c0e74a735fcd5d90722048f"
   ],
   "free_text_reason_is_not_a_field_namespace": [
    "orchestrator/src/replay.rs:451470a3cb953b554b1a0174098b8f7082002d808c33714ef6f96f1ae7b4fe23"
@@ -2109,6 +2289,9 @@
   "only_the_canonical_line_is_a_statement": [
    "orchestrator/src/audit_anchor.rs:4666938b8edb555bc0d8a6a16cb83be5d765366264298881a0a3621c68aa70bc"
   ],
+  "only_this_nodes_own_source_names_are_relabelled": [
+   "orchestrator/src/detections.rs:6d0c8d4cd040f568f01842042655bb9b206b06cfa4ae9e2176b1202390eafba0"
+  ],
   "opaque_vectors_survive_the_socket_and_operator_data_api": [
    "orchestrator/src/bin/sokol-operator.rs:1e1bb50ce7566e94ef18a4d3934af16c87ed4dced849ad74c4470ee07c653300"
   ],
@@ -2129,6 +2312,12 @@
   ],
   "past_forget_grace_a_step_back_lets_a_resent_lease_or_lift_count_again": [
    "orchestrator/src/block_table.rs:8c828baa1da2a4d0a6f49134cc617b93345316dca2d14e2983b3d60bec453312"
+  ],
+  "peer_claims_are_counted_under_their_issuer": [
+   "orchestrator/src/mesh_dispatch.rs:c7fe6a26005cd0052013b72dd022592db49610cd0d9243f1159f60b4f561b253"
+  ],
+  "peer_claims_are_rendered_by_issuer_and_result": [
+   "orchestrator/src/metrics.rs:66e77badb2408c0a536a125a46bc9ba0e30f23305a5bdba35da51f00e4a3ccda"
   ],
   "peer_witnesses_come_from_the_verified_pass": [
    "orchestrator/src/audit_witness.rs:46c387aee914796a4937b16fa28f2f53d79c347efb3732cccf689139d8a5933d"
@@ -2190,6 +2379,9 @@
   "statements_confirm_the_log_and_expose_a_recomputed_rewrite": [
    "orchestrator/src/audit_anchor.rs:e0ddaf11cdfacddd7d3a3a8130597982ec297d9d6b8c100e85fd2ba5170ac4d6"
   ],
+  "storm_drops_are_left_out_and_every_other_reason_counts": [
+   "common/src/storm.rs:199b8ffa5ec17f26f0177cc55b5300741bc2d3341d217c4fc8405b6a12af0524"
+  ],
   "strict_parse_drops_count_when_the_operator_set_the_flag_or_storm_only_observes": [
    "orchestrator/src/defense.rs:68275aa8739537a5cbcf77e148766fc98b306e28dfd2a7691e0991396329ff77"
   ],
@@ -2204,6 +2396,9 @@
   ],
   "the_first_line_the_node_sees_is_the_ack_handshake": [
    "orchestrator/src/bin/sokol-fastnetmon-notify.rs:fce7d69f0d5c40398d0f0762ca36900c22f15b8a28e9f3e2d914d00b8ded49c1"
+  ],
+  "the_floor_refuses_purged_timestamps_and_those_before_the_start": [
+   "common/src/replay.rs:d3eab773d5130e6bf295b13043ecbc4601956c93b30e180eef6bab27e4417bd1"
   ],
   "the_startup_warning_names_exactly_the_unbound_peers": [
    "orchestrator/src/main.rs:c315c4d8158ea641bc4307b63a928fafa6d48576735b0908328435f6cfa98880"
