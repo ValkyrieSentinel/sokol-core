@@ -8,10 +8,11 @@ exclude_re = [
     # predicate on every scoped Kani run; adequacy beyond those controls remains review.
     "in proofs::a_zero_sequence_segment_has_the_fixed_genesis_chain$",
     "replace proofs::a_zero_sequence_segment_has_the_fixed_genesis_chain with \\(\\)$",
-    # The storm proofs and their specification are cfg(kani), absent from the unit-test
-    # binary. scripts/proof-task.py calibrates each harness with a fault of its own
-    # (storm-counted, storm-malformed, storm-flags in scripts/proof-challenges.json).
-    "storm\\.rs:\\d+:\\d+: .*proofs::",
+    # The proofs of the arithmetic and framing moved out of the node (storm, lease, wire,
+    # replay) and their specifications are cfg(kani), absent from the unit-test binary.
+    # scripts/proof-task.py calibrates each harness with a fault of its own
+    # (scripts/proof-challenges.json) and refuses a harness without one.
+    "common/src/(storm|lease|wire|replay)\\.rs:\\d+:\\d+: .*proofs::",
     # STORM_FLAGS is two disjoint bits: `|` and `^` give the same constant.
     "storm\\.rs:\\d+:\\d+: replace \\| with \\^$",
     # Disjoint bits: `|` and `^` give the same value.

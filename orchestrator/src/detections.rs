@@ -86,6 +86,80 @@ pub fn rows() -> Vec<(String, [u64; RESULTS.len()])> {
     DETECTIONS.lock().map(|d| d.rows()).unwrap_or_default()
 }
 
+/// Peer claims by what this node did with them, in counter order (`sokol_mesh_claims_total`):
+/// enforced here, held (known, not enforced: protected, quota, envelope, quorum, map full),
+/// refused (not taken in), known (a copy already held).
+pub const PEER_RESULTS: [&str; 4] = ["enforced", "held", "refused", "known"];
+/// Distinct issuer labels besides `other`: issuers are pinned peers, so this bound is reached
+/// only by a mesh larger than any measured (30 nodes); later issuers count as `other`.
+pub const MAX_ISSUERS: usize = 64;
+
+/// The mesh counterpart of `Detections`: a peer whose detector misfires, or a compromised peer
+/// within its envelope (ADR-7), makes this node block what it claims; counted per issuer, a
+/// surge shows within minutes (`SokolPeerClaimSurge`) instead of when the map fills.
+#[derive(Default)]
+pub struct PeerClaims {
+    issuers: Vec<(u64, [u64; PEER_RESULTS.len()])>,
+    other: [u64; PEER_RESULTS.len()],
+}
+
+pub static PEER_CLAIMS: Mutex<PeerClaims> = Mutex::new(PeerClaims {
+    issuers: Vec::new(),
+    other: [0; PEER_RESULTS.len()],
+});
+
+impl PeerClaims {
+    /// Counts one claim of `issuer`; `result` is an index into `PEER_RESULTS`.
+    pub fn record(&mut self, issuer: u64, result: usize) {
+        let row = match self.issuers.iter().position(|(i, _)| *i == issuer) {
+            Some(i) => self.issuers.get_mut(i).map(|(_, row)| row),
+            None if self.issuers.len() < MAX_ISSUERS => {
+                self.issuers.push((issuer, [0; PEER_RESULTS.len()]));
+                self.issuers.last_mut().map(|(_, row)| row)
+            }
+            None => None,
+        };
+        let row = row.unwrap_or(&mut self.other);
+        if let Some(n) = row.get_mut(result) {
+            *n += 1;
+        }
+    }
+
+    /// (issuer label, counts) for every issuer, `other` last.
+    pub fn rows(&self) -> Vec<(String, [u64; PEER_RESULTS.len()])> {
+        let mut rows: Vec<_> = self
+            .issuers
+            .iter()
+            .map(|(issuer, row)| (issuer.to_string(), *row))
+            .collect();
+        rows.push((OTHER.to_string(), self.other));
+        rows
+    }
+}
+
+/// The `PEER_RESULTS` index of an adoption.
+pub fn peer_result(adoption: &crate::block_table::Adoption) -> usize {
+    use crate::block_table::Adoption;
+    match adoption {
+        Adoption::Enforced => 0,
+        Adoption::Held(_) => 1,
+        Adoption::Refused(_) => 2,
+        Adoption::Known => 3,
+    }
+}
+
+/// Counts one peer claim in `PEER_CLAIMS`.
+pub fn record_peer(issuer: u64, adoption: &crate::block_table::Adoption) {
+    if let Ok(mut c) = PEER_CLAIMS.lock() {
+        c.record(issuer, peer_result(adoption));
+    }
+}
+
+/// A copy of `PEER_CLAIMS` for the metrics snapshot.
+pub fn peer_rows() -> Vec<(String, [u64; PEER_RESULTS.len()])> {
+    PEER_CLAIMS.lock().map(|c| c.rows()).unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -137,5 +211,35 @@ mod tests {
         assert_eq!(adapter_label(TELEMETRY), OTHER);
         assert_eq!(adapter_label("suricata"), "suricata");
         assert_eq!(adapter_label("trap2"), "trap2");
+    }
+
+    #[test]
+    fn each_issuer_counts_apart_and_the_label_set_is_bounded() {
+        use crate::block_table::Adoption;
+        let mut c = PeerClaims::default();
+        c.record(2, peer_result(&Adoption::Enforced));
+        c.record(2, peer_result(&Adoption::Held("quota")));
+        c.record(3, peer_result(&Adoption::Refused("x")));
+        c.record(3, peer_result(&Adoption::Known));
+        for i in 0..MAX_ISSUERS as u64 + 3 {
+            c.record(1_000 + i, 0);
+        }
+        let rows = c.rows();
+        assert_eq!(
+            rows.len(),
+            MAX_ISSUERS + 1,
+            "{} labels and other",
+            MAX_ISSUERS
+        );
+        assert_eq!(rows[0], ("2".to_string(), [1, 1, 0, 0]));
+        assert_eq!(rows[1], ("3".to_string(), [0, 0, 1, 1]));
+        // 2 known + 62 new issuers got labels; the 5 after them count as other.
+        assert_eq!(rows.last().unwrap(), &(OTHER.to_string(), [5, 0, 0, 0]));
+        c.record(2, 0);
+        assert_eq!(
+            c.rows()[0].1,
+            [2, 1, 0, 0],
+            "a known issuer keeps its label"
+        );
     }
 }

@@ -552,7 +552,10 @@ pub mod tcp_flags {
 }
 
 pub mod canonical;
+pub mod lease;
+pub mod replay;
 pub mod storm;
+pub mod wire;
 
 #[cfg(feature = "std")]
 pub mod audit_log;

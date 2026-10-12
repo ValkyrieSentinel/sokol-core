@@ -1,7 +1,10 @@
 # Bounded proofs and executable challenges
 
-`common` keeps Kani harnesses beside its byte parsers and the storm latch's arithmetic
-(`common/src/storm.rs`, used by `orchestrator/src/defense.rs`) under `#[cfg(kani)]`.
+`common` keeps Kani harnesses beside its byte parsers, the storm latch's arithmetic
+(`common/src/storm.rs`, used by `orchestrator/src/defense.rs`) a peer claim's lease
+arithmetic (`common/src/lease.rs`, used by `orchestrator/src/block_table.rs`), the mesh
+envelope's framing (`common/src/wire.rs`) and its freshness and replay window
+(`common/src/replay.rs`), both used by `orchestrator/src/p2p.rs`, under `#[cfg(kani)]`.
 The executable inventory is [proof-challenges.json](../scripts/proof-challenges.json): each
 entry names a harness, its assertion and a deliberate implementation fault.
 
@@ -40,7 +43,7 @@ than 16 challenges, ambiguous anchors, patches over 4 KiB, exports/logs over 2 M
 than 8,192 checks per harness; execution has a total 1,800-second budget. Input-copy bounds
 are shared with `contract-task.py`. These limits do not bound compiler disk use or peak RSS;
 external tools and omitted environment inputs are not authenticated. Formal coverage of the
-orchestrator (beyond the storm arithmetic it calls in `common`), XDP logic and native-NIC
+orchestrator (beyond the storm, lease, framing and replay-window code it calls in `common`), XDP logic and native-NIC
 production behavior remains outside these proofs.
 
 `python3 scripts/test_proof_task.py` checks the report/refusal boundary with controlled JSON.
