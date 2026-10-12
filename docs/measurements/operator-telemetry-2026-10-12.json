@@ -1,0 +1,73 @@
+{
+  "profile": "sokol.operator-telemetry-observation.v1",
+  "trust": "UNSIGNED_LOCAL_TEST_OBSERVATION",
+  "acceptance": "NOT_ESTABLISHED",
+  "base": "b75821fe8bc45c524c9765f607d47f7f7197366b",
+  "source": {
+    "path": "orchestrator/src/bin/sokol-operator.rs",
+    "sha256": "sha256:4df51b013173b001175a3ac1ce968bc17ac52bcca656ef5b9ddfb476e30c9639"
+  },
+  "counterexample": {
+    "wire": "DB_LOG:NODE=7|TIER=Tier2PayloadCapture|VEC=client TIER=Tier1BotTarpit|IP=203.0.113.9\n",
+    "old_tier1": 1,
+    "expected_tier1": 0,
+    "expected_tier2": 1,
+    "expected_ip": "Unknown",
+    "expected_vector": "client TIER=Tier1BotTarpit|IP=203.0.113.9"
+  },
+  "witnesses": [
+    "a_vector_cannot_choose_the_operator_tier_or_supply_header_fields",
+    "operator_tiers_are_exact_fields_and_unknown_tiers_remain_unknown",
+    "malformed_telemetry_identity_does_not_invent_node_zero_or_one",
+    "opaque_vectors_survive_the_socket_and_operator_data_api"
+  ],
+  "old_behavior_mutation": {
+    "replacement": "Restore only the base process_trident_telemetry body; retain current tests",
+    "passed": 11,
+    "assertion_failures": 4,
+    "output_sha256": "sha256:cd78eec814d43151b7c5bbb76455a608dc12d9fc9bba20288d100792dfaaac4f"
+  },
+  "fixed_operator_tests": {
+    "passed": 15,
+    "failed": 0,
+    "socket_api_scope": "UnixStream::pair -> read_telemetry -> authenticated Router /api/data"
+  },
+  "changed_line_mutants": {
+    "generated": 13,
+    "caught": 13,
+    "missed": 0,
+    "outcomes_sha256": "sha256:ac176f3df6c0869d15844c63af8cd5afe32ef8d96962915d44e9553782201841"
+  },
+  "local_ci": {
+    "command": "scripts/local-ci.sh",
+    "environment": "Lima Ubuntu 24.04 aarch64",
+    "result": "PASS",
+    "output_sha256": "sha256:868b1ed0270c931bd26ea7e33c5db9b2bcce77520accdd4763ee3e673125b65e",
+    "checks": [
+      "format",
+      "retirement verification",
+      "eBPF build",
+      "workspace build/tests",
+      "cited evidence",
+      "Clippy",
+      "Python regressions",
+      "changed-line mutants",
+      "XDP veth/netns smoke",
+      "three-node demo",
+      "runbook upgrade/rollback/support bundle"
+    ],
+    "not_run": [
+      "promtool: Docker unavailable; covered by hosted CI",
+      "cargo-deny: hosted x86_64 CI only",
+      "Kani: no proof inputs changed"
+    ]
+  },
+  "owner_pins": {
+    "rows": 49,
+    "witnesses": 157,
+    "status": "MATCH",
+    "new_boundary": "OPERATOR-T1-2794a5369687.proposal.json",
+    "new_boundary_status": "UNSIGNED_INTENT"
+  },
+  "scope": "Reported header fields only, not authenticity of a trap classification or proof of kernel action. Local controlled tests; no independent review, owner adoption or physical NIC qualification."
+}

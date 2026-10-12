@@ -368,10 +368,10 @@ async fn process_trident_telemetry(state: &AppState, uid: u32, raw_msg: &str) {
 
     for line in raw_msg.lines() {
         if let Some(data) = line.strip_prefix("HEARTBEAT:") {
-            let id = extract_value(data, "ID=")
-                .unwrap_or("0".into())
-                .parse::<u32>()
-                .unwrap_or(0);
+            let Some(id) = extract_value(data, "ID=").and_then(|id| id.parse::<u32>().ok()) else {
+                log::warn!("Ignoring heartbeat without a valid node ID");
+                continue;
+            };
             if !nodes.iter().any(|n| n.id == id) {
                 nodes.push(ClientNode {
                     id,
@@ -406,19 +406,24 @@ async fn process_trident_telemetry(state: &AppState, uid: u32, raw_msg: &str) {
                 }
             }
         } else if let Some(data) = line.strip_prefix("DB_LOG:") {
-            let node_id = extract_value(data, "NODE=")
-                .unwrap_or("1".into())
-                .parse::<u32>()
-                .unwrap_or(1);
-
-            if data.contains("TIER=Tier1BotTarpit") {
-                metrics.traps.tier1_bot_tarpit += 1;
-            } else if data.contains("TIER=Tier1_5SlowDrip") {
-                metrics.traps.tier1_5_slow_drip += 1;
-            } else if data.contains("TIER=Tier2PayloadCapture") {
-                metrics.traps.tier2_payload_capture += 1;
-            } else if data.contains("TIER=Tier3InteractiveJail") {
-                metrics.traps.tier3_interactive_jail += 1;
+            // VEC is the final, opaque field: client diagnostics may contain pipes and
+            // key-shaped text. They must not supply telemetry header fields or choose a tier.
+            let (header, vector) = data.split_once("|VEC=").unwrap_or_else(|| {
+                data.strip_prefix("VEC=")
+                    .map_or((data, "Unknown Anomaly"), |vector| ("", vector))
+            });
+            let Some(node_id) =
+                extract_value(header, "NODE=").and_then(|id| id.parse::<u32>().ok())
+            else {
+                log::warn!("Ignoring telemetry log without a valid node ID");
+                continue;
+            };
+            match extract_value(header, "TIER=").as_deref() {
+                Some("Tier1BotTarpit") => metrics.traps.tier1_bot_tarpit += 1,
+                Some("Tier1_5SlowDrip") => metrics.traps.tier1_5_slow_drip += 1,
+                Some("Tier2PayloadCapture") => metrics.traps.tier2_payload_capture += 1,
+                Some("Tier3InteractiveJail") => metrics.traps.tier3_interactive_jail += 1,
+                _ => {}
             }
 
             let new_id = alerts.len() as u64 + 1;
@@ -428,9 +433,8 @@ async fn process_trident_telemetry(state: &AppState, uid: u32, raw_msg: &str) {
                     id: new_id,
                     timestamp: Utc::now().format("%H:%M:%S").to_string(),
                     node_id,
-                    source_ip: extract_value(data, "IP=").unwrap_or_else(|| "Unknown".into()),
-                    attack_vector: extract_value(data, "VEC=")
-                        .unwrap_or_else(|| "Unknown Anomaly".into()),
+                    source_ip: extract_value(header, "IP=").unwrap_or_else(|| "Unknown".into()),
+                    attack_vector: vector.to_string(),
                     mitigation: "TRIDENT_TRAP_ENGAGED".into(),
                 },
             );
@@ -1365,6 +1369,134 @@ mod tests {
         let view = observed_nodes(&st.nodes.read().await);
         assert_eq!(view[0].health_status, "STALE");
         assert!(!view[0].xdp_loaded);
+    }
+
+    #[tokio::test]
+    async fn a_vector_cannot_choose_the_operator_tier_or_supply_header_fields() {
+        let st = state();
+        process_trident_telemetry(&st, me(),
+            "DB_LOG:NODE=7|TIER=Tier2PayloadCapture|VEC=client TIER=Tier1BotTarpit|IP=203.0.113.9\n").await;
+        let metrics = st.metrics.read().await;
+        assert_eq!(
+            metrics.traps.tier1_bot_tarpit, 0,
+            "client text must not choose Tier1"
+        );
+        assert_eq!(metrics.traps.tier2_payload_capture, 1);
+        drop(metrics);
+        let alerts = st.alerts.read().await;
+        assert_eq!(alerts[0].node_id, 7);
+        assert_eq!(
+            alerts[0].source_ip, "Unknown",
+            "IP inside VEC is opaque text"
+        );
+        assert_eq!(
+            alerts[0].attack_vector,
+            "client TIER=Tier1BotTarpit|IP=203.0.113.9"
+        );
+    }
+
+    #[tokio::test]
+    async fn operator_tiers_are_exact_fields_and_unknown_tiers_remain_unknown() {
+        let st = state();
+        for tier in [
+            "Tier1BotTarpit",
+            "Tier1_5SlowDrip",
+            "Tier2PayloadCapture",
+            "Tier3InteractiveJail",
+        ] {
+            process_trident_telemetry(
+                &st,
+                me(),
+                &format!("DB_LOG:NODE=7|TIER={tier}|IP=203.0.113.7|VEC=normal\n"),
+            )
+            .await;
+        }
+        for data in [
+            "TIER=Tier1BotTarpitSuffix|VEC=unknown",
+            "TIER=unknown|VEC=TIER=Tier1BotTarpit",
+            "VEC=TIER=Tier1BotTarpit",
+        ] {
+            process_trident_telemetry(&st, me(), &format!("DB_LOG:NODE=7|{data}\n")).await;
+        }
+        let metrics = st.metrics.read().await;
+        assert_eq!(
+            (
+                metrics.traps.tier1_bot_tarpit,
+                metrics.traps.tier1_5_slow_drip,
+                metrics.traps.tier2_payload_capture,
+                metrics.traps.tier3_interactive_jail
+            ),
+            (1, 1, 1, 1)
+        );
+        let alerts = st.alerts.read().await;
+        assert_eq!(alerts.len(), 7, "unknown tier still has a visible alert");
+        assert_eq!(alerts.last().unwrap().source_ip, "203.0.113.7");
+    }
+
+    #[tokio::test]
+    async fn malformed_telemetry_identity_does_not_invent_node_zero_or_one() {
+        let st = state();
+        for message in [
+            "HEARTBEAT:NAME=missing",
+            "HEARTBEAT:ID=wrong",
+            "HEARTBEAT:ID=4294967296",
+            "DB_LOG:TIER=Tier1BotTarpit|VEC=no owner",
+            "DB_LOG:NODE=wrong|TIER=Tier1BotTarpit|VEC=no owner",
+            "DB_LOG:VEC=client|NODE=7|TIER=Tier1BotTarpit",
+        ] {
+            process_trident_telemetry(&st, me(), message).await;
+        }
+        assert!(
+            st.nodes.read().await.is_empty(),
+            "missing identity is not node zero"
+        );
+        assert!(
+            st.alerts.read().await.is_empty(),
+            "missing identity is not node one"
+        );
+        assert_eq!(st.metrics.read().await.traps.tier1_bot_tarpit, 0);
+        process_trident_telemetry(
+            &st,
+            me(),
+            "HEARTBEAT:ID=0|NAME=real-zero\nDB_LOG:NODE=0|TIER=Tier1BotTarpit|VEC=real\n",
+        )
+        .await;
+        assert_eq!(
+            st.nodes.read().await[0].id,
+            0,
+            "an explicit zero is a real identity"
+        );
+        assert_eq!(st.alerts.read().await[0].node_id, 0);
+    }
+
+    #[tokio::test]
+    async fn opaque_vectors_survive_the_socket_and_operator_data_api() {
+        let st = state();
+        let (mut writer, reader) = UnixStream::pair().unwrap();
+        let consumer = tokio::spawn({
+            let st = st.clone();
+            async move { read_telemetry(&st, me(), reader).await }
+        });
+        writer.write_all(b"DB_LOG:NODE=7|TIER=Tier3InteractiveJail|IP=203.0.113.7|VEC=payload|TIER=Tier1BotTarpit|NODE=99\n").await.unwrap();
+        drop(writer);
+        consumer.await.unwrap();
+        let (status, _, body) = call(
+            build_router(st),
+            get("/api/data")
+                .header(header::AUTHORIZATION, format!("Bearer {}", TOKEN))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["metrics"]["traps"]["tier1_bot_tarpit"], 0);
+        assert_eq!(body["metrics"]["traps"]["tier3_interactive_jail"], 1);
+        assert_eq!(body["alerts"][0]["node_id"], 7);
+        assert_eq!(body["alerts"][0]["source_ip"], "203.0.113.7");
+        assert_eq!(
+            body["alerts"][0]["attack_vector"],
+            "payload|TIER=Tier1BotTarpit|NODE=99"
+        );
     }
 
     /// F11: telemetry is framed by lines, so a heartbeat split across writes is not lost.
