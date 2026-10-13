@@ -30,5 +30,6 @@ libc = "0.2"
 ureq = { version = "2", default-features = false }
 
 [dev-dependencies]
+tokio = { version = "1.0", features = ["test-util"] }
 proptest = { version = "1", default-features = false, features = ["std"] }
 tower = { version = "0.5", features = ["util"] }
