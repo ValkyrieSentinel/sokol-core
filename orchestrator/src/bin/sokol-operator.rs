@@ -631,7 +631,10 @@ fn parse_bans(reply: &str) -> Result<(usize, HashSet<String>), String> {
     for field in fields {
         let target =
             parse_block_target(field).ok_or_else(|| "invalid LIST_BANS target".to_string())?;
-        if bans.len() >= MAX_LISTED_BANS || !bans.insert(target) {
+        if bans.len() >= MAX_LISTED_BANS {
+            return Err(format!("LIST_BANS lists more than {MAX_LISTED_BANS} targets"));
+        }
+        if !bans.insert(target) {
             return Err("duplicate LIST_BANS target".into());
         }
     }
@@ -1693,6 +1696,25 @@ mod tests {
         assert_eq!(total, MAX_LISTED_BANS + 1);
         assert_eq!(listed.len(), MAX_LISTED_BANS);
         assert!(parse_bans(&(reply + " 203.0.113.9")).is_err());
+    }
+
+    /// Review of #31: a reply over the listing cap and a reply with a repeated target are
+    /// different faults; the operator reading the error must not look for a duplicate that
+    /// is not there.
+    #[test]
+    fn an_over_long_list_and_a_duplicate_are_told_apart() {
+        let targets: Vec<_> = (0..=MAX_LISTED_BANS)
+            .map(|i| format!("10.{}.{}.1", i / 256, i % 256))
+            .collect();
+        let long = format!("{} {}", MAX_LISTED_BANS + 1, targets.join(" "));
+        assert_eq!(
+            parse_bans(&long).unwrap_err(),
+            format!("LIST_BANS lists more than {MAX_LISTED_BANS} targets")
+        );
+        assert_eq!(
+            parse_bans("2 203.0.113.9 203.0.113.9").unwrap_err(),
+            "duplicate LIST_BANS target"
+        );
     }
 
     #[tokio::test]

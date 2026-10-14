@@ -404,6 +404,32 @@ def registry_layout(path):
                 raise ValueError('Private or unsupported Cargo registry refused')
 
 
+LOCK_PACKAGE = re.compile(r'\[\[package\]\]\nname = "([^"]+)"\nversion = "([^"]+)"\n'
+                          r'source = "registry\+https://github\.com/rust-lang/crates\.io-index"')
+
+
+def registry_within_lock(path, lock):
+    """The registry's crates and unpacked sources are only crates.io packages of the received
+    Cargo.lock.
+
+    Review of #33: a developer's whole Cargo registry made the recorded identity change
+    whenever any other project was built, often exceeded the input budget, and exposed other
+    projects' sources to candidate code. A dedicated CARGO_HOME filled by `cargo fetch
+    --locked` for this lockfile holds exactly these packages. Its index cache is public
+    metadata of every name the resolver looked at (more than the lockfile names) and holds no
+    source, so it is not restricted here."""
+    packages = {f'{m[1]}-{m[2]}' for m in LOCK_PACKAGE.finditer(lock)}
+    for kind, suffix in (('cache', '.crate'), ('src', '')):
+        base = path / kind
+        if not base.is_dir():
+            continue
+        for registry in base.iterdir():
+            for item in registry.iterdir():
+                if not (item.name.endswith(suffix) and item.name[:len(item.name) - len(suffix)] in packages):
+                    raise ValueError('Registry holds ' + item.name + ', which the received Cargo.lock does not '
+                                     'name; use a dedicated CARGO_HOME filled by cargo fetch --locked')
+
+
 def sandbox(source, toolchain, registry, worker_path, unit=None, defect=None):
     # Every argument is recipient-owned; nothing from the manifest becomes argv.
     argv = ['/usr/bin/bwrap', '--unshare-all', '--die-with-parent', '--new-session',
@@ -494,7 +520,6 @@ def replay(pack, output, binary, signers, actor, key, toolchain, registry, respo
     toolchain = Path(toolchain).resolve(strict=True)
     registry = Path(registry).resolve(strict=True)
     registry_layout(registry)
-    external = public_registry(registry)
     tools = toolchain_identity(toolchain)
     method = {name: digest(read(ROOT / name)) for name in
               ('scripts/counterexample_worker.py', 'scripts/counterexample-task.py',
@@ -507,6 +532,8 @@ def replay(pack, output, binary, signers, actor, key, toolchain, registry, respo
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(blob(Path(pack), entry['sha256']))
             path.chmod(0o755 if entry['executable'] else 0o644)
+        registry_within_lock(registry, (source / 'Cargo.lock').read_text())
+        external = public_registry(registry)
         defect = Path(directory).resolve() / 'defect'
         shutil.copytree(source, defect)
         mutant_path = defect / worker.CASE_FILE

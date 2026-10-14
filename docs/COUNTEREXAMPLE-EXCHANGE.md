@@ -98,6 +98,13 @@ private keys. An actual model selects its own actor/key and independently pinned
 verifier/signers, then invokes `counterexample-task.py replay` with a **new**
 output directory. `--respond-to` names an existing observation it is answering.
 
+The registry is a dedicated Cargo home filled for the received lockfile only
+(`CARGO_HOME=/absolute/exchange-cargo cargo fetch --locked` in the received source,
+then `--registry /absolute/exchange-cargo/registry`). `replay` refuses a registry that
+holds any crate the received `Cargo.lock` does not name: a developer's whole registry
+would make the recorded digest change with every other project built, often exceed the
+input budget, and expose other projects' sources to the candidate code.
+
 ```sh
 python3 scripts/counterexample-task.py inspect /absolute/received-pack \
   --warrant /absolute/warrant-rs --warrant-sha256 RECIPIENT_SELECTED_SHA256 \
