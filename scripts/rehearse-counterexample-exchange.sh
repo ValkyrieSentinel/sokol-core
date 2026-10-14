@@ -8,7 +8,13 @@ mkdir -p "$output"
 output=$(cd "$output" && pwd)
 verifier_hash=$(sha256sum "$binary" | cut -d' ' -f1)
 toolchain=$(dirname "$(dirname "$(rustup which rustc)")")
-registry=${CARGO_HOME:-$HOME/.cargo}/registry
+# A dedicated Cargo home with exactly this lockfile's crates (replay refuses any other):
+# its digest is then a function of the inputs, and no other project's sources are exposed.
+registry=${SOKOL_EXCHANGE_REGISTRY:-}
+if [ -z "$registry" ]; then
+    CARGO_HOME="$output/cargo-home" cargo fetch --locked --quiet
+    registry="$output/cargo-home/registry"
+fi
 "$binary" keygen --out "$output/demo-author.key" >"$output/author-public-key.txt"
 "$binary" keygen --out "$output/demo-recipient.key" >"$output/recipient-public-key.txt"
 common=(--warrant "$binary" --warrant-sha256 "$verifier_hash")
