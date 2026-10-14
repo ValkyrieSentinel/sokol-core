@@ -324,6 +324,7 @@ jobs:
         run: |
           test -x "$SOKOL_WARRANT_BIN"
           python3 scripts/test_counterexample_task.py
+          python3 scripts/test_counterexample_hostile_pack.py
 
       - name: CrowdSec stream recovery regression
         if: matrix.part == 'test'
