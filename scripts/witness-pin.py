@@ -598,6 +598,22 @@ def py_closures(names: set[str]) -> dict[str, list[str]]:
                         if isinstance(n, ast.Name):
                             module[n.id] = node
 
+        # `from helper_module import x` / `import helper_module` of a module beside this file:
+        # its import-time code runs before any witness, and what the witness takes from it is
+        # part of what the witness checks (2026-10-14).
+        local_modules: dict[str, pathlib.Path] = {}
+        imported: dict[str, tuple[str, str]] = {}
+        for node in tree.body:
+            if isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
+                if (path.parent / f"{node.module}.py").exists():
+                    local_modules[node.module] = path.parent / f"{node.module}.py"
+                    for alias in node.names:
+                        imported[alias.asname or alias.name] = (node.module, alias.name)
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    if (path.parent / f"{alias.name}.py").exists():
+                        local_modules[alias.asname or alias.name] = path.parent / f"{alias.name}.py"
+
         def import_time(closure: set[int]) -> str:
             """The module as it runs on import: every statement, with the bodies of functions
             outside the closure left out. A module-level `setattr(Class, 'test_x', ...)`, a
@@ -635,12 +651,43 @@ def py_closures(names: set[str]) -> dict[str, list[str]]:
                 parts += [ast.dump(d) for d in cls.decorator_list]
                 parts += sorted(segment(n) for n in reached)
                 parts.append(import_time({id(fn), *map(id, fixtures), *map(id, reached)}))
+                used: dict[str, set[str]] = {}
+                for x in (fn, *fixtures, *reached):
+                    for n in ast.walk(x):
+                        if isinstance(n, ast.Name) and n.id in imported:
+                            used.setdefault(imported[n.id][0], set()).add(imported[n.id][1])
+                        elif isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name) and n.value.id in local_modules:
+                            used.setdefault(n.value.id, set()).add(n.attr)
                 rel = path.relative_to(ROOT).as_posix()
+                for alias in sorted(set(local_modules) | set(used)):
+                    module_path = local_modules[alias] if alias in local_modules else path.parent / f"{alias}.py"
+                    parts.append(py_module_part(module_path, used.get(alias, set())))
+                    REACHED.setdefault(key, []).append(
+                        f"{module_path.relative_to(ROOT).as_posix()} import-time code"
+                        + "".join(f", {n}" for n in sorted(used.get(alias, set()))))
                 REACHED.setdefault(key, []).extend(
                     f"{rel}:{n.lineno} {getattr(n, 'name', None) or type(n).__name__}"
                     for n in [*fixtures, *reached])
                 out.setdefault(key, []).append(f"{rel}:{sha(json.dumps(parts))}")
     return out
+
+
+def py_module_part(path: pathlib.Path, names: set[str]) -> str:
+    """A local module a witness's file imports: its import-time code (function bodies left out)
+    and the full source of the items the witness takes from it. Items those reach inside that
+    module are not followed; their bodies run only through the named items, whose source is
+    pinned, and execution evidence covers the rest."""
+    text = path.read_text()
+    lines = text.splitlines(keepends=True)
+    tree = ast.parse(text)
+    keep = {node.name: node for node in tree.body if getattr(node, "name", None) in names}
+    drop: set[int] = set()
+    for n in ast.walk(tree):
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n not in keep.values():
+            drop.update(range(n.body[0].lineno, n.end_lineno + 1))
+    skeleton = "".join(line for i, line in enumerate(lines, 1) if i not in drop)
+    rel = path.relative_to(ROOT).as_posix()
+    return f"{rel}:{py_layout(strip_py(skeleton))}"
 
 
 TEST_LINE = re.compile(r"^test (\S+)(?: - should panic)? \.\.\. (\w+)", re.M)
@@ -789,6 +836,12 @@ CARGO_SECTION = re.compile(r"^\[\[?([^\]]+)\]\]?\s*$")
 TARGET_SECTIONS = ("lib", "bin", "test", "bench", "example", "workspace")
 
 
+# Current pin fields. A change of rule gets a new field; the earlier fields stay in the manifest
+# as pinned, so the base branch's checker (which computes them) still accepts the change.
+CLOSURES = "closures_v4"
+BUILD = "build_v2"
+
+
 def build_pins() -> dict[str, str]:
     """What decides whether and how tests are built and run, outside the test code: Cargo
     target sections, [workspace], [patch.*] and `auto*` keys, whole .cargo/config files (a
@@ -806,7 +859,8 @@ def build_pins() -> dict[str, str]:
             if keep and line.strip() and not line.strip().startswith("#"):
                 kept.append(" ".join(line.split()))
         pins[path.relative_to(ROOT).as_posix()] = sha("\n".join(kept))
-    for pattern in (".cargo/config", ".cargo/config.toml", "*/.cargo/config", "*/.cargo/config.toml", "build.rs", "*/build.rs"):
+    for pattern in (".cargo/config", ".cargo/config.toml", "*/.cargo/config", "*/.cargo/config.toml", "build.rs", "*/build.rs",
+                    "rust-toolchain", "rust-toolchain.toml", "*/rust-toolchain", "*/rust-toolchain.toml"):
         for path in git_files(pattern):
             pins[path.relative_to(ROOT).as_posix()] = sha(path.read_text())
     return pins
@@ -823,8 +877,8 @@ def current() -> dict:
     closures = {**rust_closures({w for w in cited if RUST_TEST.fullmatch(w)}),
                 **py_closures({w for w in cited if PY_TEST.fullmatch(w)})}
     return {"rows": table, "witnesses": {w: sorted(bodies.get(w, [])) for w in sorted(cited)},
-            "closures_v3": {w: sorted(closures.get(w, [])) for w in sorted(cited)},
-            "build": build_pins(),
+            CLOSURES: {w: sorted(closures.get(w, [])) for w in sorted(cited)},
+            BUILD: build_pins(),
             "contracts": contract_pins(ROOT)}
 
 
@@ -867,23 +921,24 @@ def check(signers: pathlib.Path, every_pin: bool = False, executed_log: pathlib.
     for w, where in pinned["witnesses"].items():
         if w in now["witnesses"] and now["witnesses"][w] != where:
             problems.append(f"witness {w} changed: its body is not the one the owner pinned")
-    # `closures` (#21) and `closures_v2` (#22) are earlier closure rules, kept frozen for
-    # checkers of those versions; `closures_v3` names an impl by its self type again.
-    closures = pinned.get("closures_v3")
+    # closures (#21), closures_v2 (#22), closures_v3 (#40) and build (#22) are earlier rules,
+    # kept frozen for checkers of those versions; closures_v4 follows Python imports of local
+    # modules, build_v2 adds the Rust toolchain file.
+    closures = pinned.get(CLOSURES)
     if closures is None:
         if pinned["witnesses"]:
             notes.append("witness closures (attributes, helpers) are not pinned yet")
     else:
         for w, where in closures.items():
-            if w in now["closures_v3"] and now["closures_v3"][w] != where and now["witnesses"].get(w) == pinned["witnesses"].get(w):
+            if w in now[CLOSURES] and now[CLOSURES][w] != where and now["witnesses"].get(w) == pinned["witnesses"].get(w):
                 problems.append(f"witness {w} changed: its attributes or a test item it reaches are not the ones the owner pinned")
-    build = pinned.get("build")
+    build = pinned.get(BUILD)
     if build is None:
         if pinned["witnesses"]:
-            notes.append("build configuration (Cargo targets, .cargo/config, build.rs) is not pinned yet")
-    elif build != now["build"]:
-        for f in sorted(set(build) | set(now["build"])):
-            if build.get(f) != now["build"].get(f):
+            notes.append("build configuration (Cargo targets, .cargo/config, build.rs, toolchain) is not pinned yet")
+    elif build != now[BUILD]:
+        for f in sorted(set(build) | set(now[BUILD])):
+            if build.get(f) != now[BUILD].get(f):
                 problems.append(f"{f}: build configuration changed (how tests are built or run)")
     if executed_log is not None:
         problems += executed(executed_log, pinned["witnesses"], python_log_path)
@@ -921,11 +976,9 @@ def sign(key: str) -> int:
         print("FAIL refusing to pin witnesses that do not exist:", ", ".join(missing))
         return 1
     if MANIFEST.exists():
-        # Checkers of earlier closure rules still read their own field; each stays as pinned.
-        pinned_before = json.loads(MANIFEST.read_text())
-        for legacy in ("closures", "closures_v2"):
-            if legacy in pinned_before:
-                now[legacy] = pinned_before[legacy]
+        # Checkers of earlier rules still read their own fields; each stays as pinned.
+        for field, value in json.loads(MANIFEST.read_text()).items():
+            now.setdefault(field, value)
     MANIFEST.write_text(json.dumps(now, indent=1, sort_keys=True) + "\n")
     # ssh-keygen asks before overwriting a signature and, without a terminal, keeps the old
     # one and still exits 0: a re-pin would leave the previous signature in place.

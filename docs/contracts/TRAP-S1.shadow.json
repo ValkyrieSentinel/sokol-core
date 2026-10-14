@@ -1,0 +1,19 @@
+{
+  "annotations": {
+    "status": "UNSIGNED_EXPLANATORY_DRAFT"
+  },
+  "decisions": [
+    {
+      "because": "Round 7 candidate on 27d0ea0: a client trickling a byte per read (each read waits up to 8 s), or one that never reads a tarpit's writes, held one of the 256 trap slots indefinitely, and the ban came only when the session ended.",
+      "previous_statement_sha256": null,
+      "proposal_sha256": "1ba5fa5664b9d7c73b32050613fdf0f3a906f788c39d89bc201619729c31ba7e"
+    }
+  ],
+  "evidence_text": "`a_trickling_client_cannot_hold_a_trap_slot_past_the_session_deadline`",
+  "id": "TRAP-S1",
+  "profile": "sokol.contract-shadow.v1",
+  "statement": "A trap session holds its connection slot at most MAX_SESSION (300 s), however the client paces its reads or writes; a session the deadline ends still blocks its source, with that reason.",
+  "witnesses": [
+    "a_trickling_client_cannot_hold_a_trap_slot_past_the_session_deadline"
+  ]
+}

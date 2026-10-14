@@ -91,6 +91,8 @@ mod tests {
 PY = '''\
 import unittest
 
+from recovery_helper import offset
+
 START = 7
 
 
@@ -110,7 +112,16 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(cursor(), 7)
 
     def test_restart_keeps_the_start(self):
-        self.assertEqual(expected() + self.base, 7)
+        self.assertEqual(expected() + self.base + offset(), 7)
+'''
+
+HELPER = '''\
+def offset():
+    return 0
+
+
+def unrelated():
+    return 1
 '''
 
 CARGO = '''\
@@ -154,6 +165,8 @@ class WitnessPin(unittest.TestCase):
         (self.dir / "src/lib.rs").write_text(LIB)
         (self.dir / "Cargo.toml").write_text(CARGO)
         (self.dir / "scripts/test_recovery.py").write_text(PY)
+        (self.dir / "scripts/recovery_helper.py").write_text(HELPER)
+        (self.dir / "rust-toolchain.toml").write_text('[toolchain]\nchannel = "nightly-2026-09-24"\n')
         self.key = self.keypair("owner")
         self.signers = self.dir.parent / f"{self.dir.name}-signers"
         self.signers.write_text(f'owner namespaces="sokol-witness" {Path(self.key + ".pub").read_text()}')
@@ -365,6 +378,38 @@ class WitnessPin(unittest.TestCase):
         self.edit("src/helpers.rs", "        fn seven(&self) -> u32 {\n            7", "        fn seven(&self) -> u32 {\n            8")
         self.assert_refused("witness a_helper_keeps_its_verdict changed: its attributes or a test item")
 
+    def test_the_rust_toolchain_is_a_build_pin(self):
+        self.edit("rust-toolchain.toml", "nightly-2026-09-24", "nightly-2026-10-01")
+        self.assert_refused("rust-toolchain.toml: build configuration changed")
+
+    def test_a_helper_imported_from_a_local_module_is_pinned(self):
+        self.edit("scripts/recovery_helper.py", "def offset():\n    return 0", "def offset():\n    return 7 - 7")
+        self.assert_refused("witness RecoveryTests.test_restart_keeps_the_start changed: its attributes or a test item")
+
+    def test_import_time_code_of_an_imported_local_module_is_pinned(self):
+        p = self.dir / "scripts/recovery_helper.py"
+        p.write_text(p.read_text() + "\nimport test_recovery\n")
+        self.assert_refused("witness RecoveryTests.test_restart_keeps_the_start changed: its attributes or a test item")
+
+    def test_an_unused_function_of_an_imported_module_does_not_count(self):
+        self.edit("scripts/recovery_helper.py", "def unrelated():\n    return 1", "def unrelated():\n    return 2")
+        self.assertEqual(self.check().returncode, 0)
+
+    def test_a_re_sign_keeps_the_fields_of_earlier_rules(self):
+        # A base-branch checker computes the field of its own rule; dropping it at a re-sign
+        # would make that checker refuse the next change.
+        import json
+        manifest = self.dir / "docs/witness-manifest.json"
+        pinned = json.loads(manifest.read_text())
+        pinned["closures_v0"] = {"frozen": ["kept"]}
+        manifest.write_text(json.dumps(pinned, indent=1, sort_keys=True) + "\n")
+        self.assertEqual(self.pin(self.key).returncode, 0)
+        self.assertEqual(json.loads(manifest.read_text())["closures_v0"], {"frozen": ["kept"]})
+
+    def test_the_closure_command_names_imported_module_items(self):
+        r = run(self.dir, "python3", "scripts/witness-pin.py", "closure", "RecoveryTests.test_restart_keeps_the_start")
+        self.assertIn("scripts/recovery_helper.py import-time code, offset", r.stdout)
+
     def test_unrelated_helpers_and_production_code_do_not_count(self):
         self.edit("src/helpers.rs", "    fn unrelated() -> u32 {\n        1", "    fn unrelated() -> u32 {\n        2")
         self.edit("src/helpers.rs", "pub fn production(x: u32) -> u32 {\n    x", "pub fn production(x: u32) -> u32 {\n    x + 0")
@@ -397,7 +442,8 @@ class WitnessPin(unittest.TestCase):
         import json
         manifest = self.dir / "docs/witness-manifest.json"
         pinned = json.loads(manifest.read_text())
-        del pinned["closures_v3"]
+        for field in [f for f in pinned if f.startswith("closures")]:
+            del pinned[field]
         manifest.write_text(json.dumps(pinned, indent=1, sort_keys=True) + "\n")
         (self.dir / "docs/witness-manifest.json.sig").unlink()
         subprocess.run(["ssh-keygen", "-q", "-Y", "sign", "-f", self.key, "-n", "sokol-witness", str(manifest)],
