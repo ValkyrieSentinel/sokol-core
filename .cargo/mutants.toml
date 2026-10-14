@@ -73,4 +73,10 @@ exclude_re = [
     # Whether an enforced block is pushed to the trident telemetry socket: push_telemetry
     # writes to a socket no unit test opens. The line it sends is tested (enforced_telemetry).
     "main.rs:\\d+:\\d+: replace == with != in enforce_block_local$",
+    # The monitor TUI's refresh reads the fixed system audit path (DB_FILE), out of a unit
+    # test's reach; what it does with each record is display_fields, which is tested.
+    "bin/monitor.rs:\\d+:\\d+: replace read_new_events -> io::Result<\\(\\)> with Ok\\(\\(\\)\\)$",
+    # The trap's accept loop binds its listening ports; what it does per connection is
+    # serve_trap_connection, which is tested.
+    "bin/trident_trap.rs:\\d+:\\d+: replace UltimateTridentOrchestrator::run -> Result<\\(\\), Box<dyn std::error::Error>> with Ok\\(\\(\\)\\)$",
 ]

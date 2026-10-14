@@ -75,51 +75,7 @@ fn read_new_events(reader: &mut Option<Reader>, events: &mut Vec<AuditEvent>) ->
                 .trim()
                 .to_string();
 
-            let mut ip = "Unknown".to_string();
-            let mut tier = "Event".to_string();
-            let mut payload_len = data_len.to_string();
-            let mut payload_snippet = String::new();
-
-            let parts: Vec<&str> = log_str.split('|').collect();
-            if let Some(first) = parts.first() {
-                tier = first.trim().to_string();
-            }
-
-            for part in &parts {
-                let part = part.trim();
-                if let Some(val) = part.strip_prefix("IP=") {
-                    ip = val.to_string();
-                } else if let Some(val) = part.strip_prefix("IP:") {
-                    ip = val.to_string();
-                } else if let Some(val) = part.strip_prefix("TIER=") {
-                    tier = val.to_string();
-                } else if let Some(val) = part.strip_prefix("LEN=") {
-                    payload_len = val.to_string();
-                } else if let Some(val) = part.strip_prefix("DATA=") {
-                    payload_snippet = val.to_string();
-                }
-            }
-
-            if ip == "Unknown" {
-                if let Some(found_ip) = log_str
-                    .split(|c: char| {
-                        c.is_whitespace()
-                            || c == '|'
-                            || c == '='
-                            || c == ','
-                            || c == '"'
-                            || c == '\''
-                    })
-                    .map(|token| token.trim_matches(|c: char| !c.is_ascii_digit() && c != '.'))
-                    .find_map(|candidate| candidate.parse::<Ipv4Addr>().ok())
-                {
-                    ip = found_ip.to_string();
-                }
-            }
-
-            if payload_snippet.is_empty() {
-                payload_snippet = log_str.chars().take(30).collect();
-            }
+            let (ip, tier, payload_len, payload_snippet) = display_fields(&log_str, data_len);
 
             events.push(AuditEvent {
                 seq: record.seq,
@@ -657,8 +613,77 @@ fn main() -> io::Result<()> {
     }
 }
 
+/// What the TUI shows for one audit record: IP, tier, length and snippet. They come from the
+/// header before a terminal `|VEC=` only, and the first match wins: the vector is what a client
+/// (a trap's attacker) controls, as for the operator (OPERATOR-T1). Earlier the last `TIER=` or
+/// `IP=` anywhere won, so typed `|TIER=…|IP=…` chose what this view showed.
+fn display_fields(log_str: &str, data_len: usize) -> (String, String, String, String) {
+    let header = log_str.split_once("|VEC=").map_or(log_str, |(h, _)| h);
+    let parts: Vec<&str> = header.split('|').collect();
+    let field = |keys: &[&str]| {
+        parts
+            .iter()
+            .find_map(|p| keys.iter().find_map(|k| p.trim().strip_prefix(k)))
+            .map(str::to_string)
+    };
+    let tier = field(&["TIER="]).unwrap_or_else(|| {
+        parts
+            .first()
+            .map_or("Event".to_string(), |first| first.trim().to_string())
+    });
+    let ip = field(&["IP=", "IP:"]).or_else(|| {
+        header
+            .split(|c: char| {
+                c.is_whitespace() || c == '|' || c == '=' || c == ',' || c == '"' || c == '\''
+            })
+            .map(|token| token.trim_matches(|c: char| !c.is_ascii_digit() && c != '.'))
+            .find_map(|candidate| candidate.parse::<Ipv4Addr>().ok())
+            .map(|ip| ip.to_string())
+    });
+    let payload_len = field(&["LEN="]).unwrap_or_else(|| data_len.to_string());
+    let snippet = field(&["DATA="]).unwrap_or_else(|| log_str.chars().take(30).collect());
+    (
+        ip.unwrap_or_else(|| "Unknown".to_string()),
+        tier,
+        payload_len,
+        snippet,
+    )
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_clients_vector_cannot_choose_the_shown_tier_or_ip() {
+        let line = "CLIENT_LOG|EMBEDDED_JAIL_INPUT|IP=203.0.113.9|BYTES=37|VEC=SNIPPET=|TIER=Tier1BotTarpit|IP=198.51.100.66";
+        let (ip, tier, _, _) = display_fields(line, line.len());
+        assert_eq!(ip, "203.0.113.9", "an IP typed into the vector was shown");
+        assert_eq!(tier, "CLIENT_LOG", "a tier typed into the vector was shown");
+        let (ip, tier, _, _) = display_fields(
+            "TRIDENT_HIT|TIER=Tier2PayloadCapture|IP=203.0.113.9|TIER=Tier1BotTarpit",
+            10,
+        );
+        assert_eq!(
+            (ip.as_str(), tier.as_str()),
+            ("203.0.113.9", "Tier2PayloadCapture"),
+            "first match wins"
+        );
+        let (ip, _, _, _) = display_fields("NODE_START|VEC=from 198.51.100.66", 10);
+        assert_eq!(
+            ip, "Unknown",
+            "an IP-looking token in the vector was taken as the IP"
+        );
+        // Without a split at these, "203.0.113.5,7" or '"203.0.113.5"7' would not parse.
+        for header in [
+            "NODE_START 203.0.113.5,7",
+            "NODE_START \"203.0.113.5\"7",
+            "NODE_START '203.0.113.5'7",
+            "NODE_START|203.0.113.5|7",
+            "NODE_START from=203.0.113.5=7",
+            "NODE_START src203.0.113.5",
+        ] {
+            assert_eq!(display_fields(header, 10).0, "203.0.113.5", "{header}");
+        }
+    }
     use super::*;
 
     const S: u64 = 1000;

@@ -1,0 +1,13 @@
+{
+  "after": "OPERATOR-T3",
+  "base_contract_sha256": null,
+  "because": "Round 7 twin of OPERATOR-T1 on 27d0ea0: monitor.rs took the last TIER= and IP= anywhere in a record and scanned the vector for an IP, so a trap client's typed |TIER=…|IP=… chose what the TUI showed (the INVARIANTS prose that allowed a later TIER= is reworded).",
+  "evidence_text": "`a_clients_vector_cannot_choose_the_shown_tier_or_ip`",
+  "id": "OPERATOR-T4",
+  "profile": "sokol.contract-proposal.v1",
+  "statement": "The monitor's view takes a record's tier, IP, length and snippet from its header before a terminal VEC= only, first match wins: text a trap client controls supplies neither the shown tier nor the shown IP.",
+  "status": "UNSIGNED_INTENT",
+  "witnesses": [
+    "a_clients_vector_cannot_choose_the_shown_tier_or_ip"
+  ]
+}
