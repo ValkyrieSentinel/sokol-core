@@ -1,1 +1,2 @@
 owner namespaces="sokol-witness" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGxNv3viXbiRL+yNURBRalK6d0UAROpnFadOWqPQWdoD s0fractal sokol witness owner
+agent namespaces="sokol-witness" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPHalTqgdUN+O0jlMvpg6ZIfbTaCr20JHUyWqTS7H22G sokol-witness-agent
