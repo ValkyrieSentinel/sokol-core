@@ -16,6 +16,7 @@ BEFORE = 'Err(error) if attempted_write => ControlOutcome::Unknown(error),'
 AFTER = 'Err(error) if attempted_write => ControlOutcome::NotSent(error),'
 FOCUS = 'a_command_applied_without_a_reply_has_an_unknown_outcome'
 ASSERTION = 'lost reply cannot prove rejection:'
+FRAME = 'SOKOL_WORKER_REPORT_V1 '
 WITNESSES = (
     FOCUS, 'a_list_reply_reports_its_total_and_refuses_malformed_targets',
     'a_live_heartbeat_cannot_make_failed_ban_readback_fresh',
@@ -72,6 +73,8 @@ def command(argv, cwd='/source'):
                 if len(output) > OUTPUT_BYTES:
                     raise ValueError('OUTPUT_BUDGET')
         code = p.wait(timeout=max(.01, deadline - time.monotonic()))
+        if code < 0:
+            raise ValueError('NATIVE_SIGNAL_REFUSAL')
         return code, output.decode('utf-8', 'replace')
     finally:
         try:
@@ -148,10 +151,17 @@ def main():
         defect = phase('defect', True)
         restored = phase('restored')
         report = {'profile': 'sokol.counterexample-execution.v1', 'phases': [repair, defect, restored]}
+        success = all(p['build']['status'] == 'BUILT' and p['build']['returncode'] == 0
+                      and len(p['witnesses']) == (1 if p['phase'] == 'defect' else len(WITNESSES))
+                      and all(r['status'] == ('ASSERTION_RED' if p['phase'] == 'defect' else 'PASS')
+                              for r in p['witnesses']) for p in report['phases'])
+        code = 0 if success else 1
     except (ValueError, OSError, subprocess.TimeoutExpired) as error:
         report = {'profile': 'sokol.counterexample-execution.v1', 'refusal': str(error), 'phases': []}
-    print(json.dumps(report, sort_keys=True, separators=(',', ':')))
+        code = 3
+    print(FRAME + json.dumps(report, sort_keys=True, separators=(',', ':')))
+    return code
 
 
 if __name__ == '__main__':
-    main()
+    raise SystemExit(main())

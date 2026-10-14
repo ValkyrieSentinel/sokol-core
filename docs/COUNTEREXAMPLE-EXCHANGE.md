@@ -117,6 +117,9 @@ refused operation does not pretend to have a test verdict. The JSON view exposes
 method/toolchain/registry hashes, budgets, transcript addresses and any recorded
 disagreement; at most four observations are projected, with an explicit total
 and partial flag. Neither agreement nor disagreement resolves a settlement.
+Native check reasons use the worker's actual exit status and exact captured output
+blob. A structured resource refusal is recorded as prose plus evidence with no
+`cmd@v1` pass/fail claim. Missing/ambiguous output or a contradictory exit is refused.
 
 The runner records the complete selected toolchain and public registry digest,
 the four local method files, Warrant binary and kernel. System compiler/libraries

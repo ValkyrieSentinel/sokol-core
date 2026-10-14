@@ -77,6 +77,13 @@ print('ISOLATION_CONTROLS_PASSED')
             print('FAIL: output control')
             return 1
         print('PASS: excess output refused and named worker cgroup stopped')
+        code, raw = tool.isolated_run(source, toolchain, registry,
+                                     tool.ROOT / 'scripts/counterexample_worker.py')
+        execution = tool.worker_report(raw, code)
+        if code != 3 or tool.evaluate(execution) != 'REFUSED':
+            print('FAIL: structured native refusal was interpreted as a verdict')
+            return 1
+        print('PASS: actual worker refusal/exit/output agrees; no pass/fail verdict')
     return 0
 
 

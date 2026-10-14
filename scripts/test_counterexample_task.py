@@ -66,6 +66,19 @@ class Interpretation(unittest.TestCase):
         value['phases'].reverse()
         self.assertEqual(tool.evaluate(value), 'REFUSED')
 
+    def test_native_exit_frame_and_refusal_are_distinct(self):
+        run = execution()
+        raw = (W.FRAME + tool.encode(run).decode() + '\n').encode()
+        self.assertEqual(tool.worker_report(raw, 0), run)
+        for code in (1, 3, 9):
+            with self.assertRaisesRegex(ValueError, 'exit status'):
+                tool.worker_report(raw, code)
+        with self.assertRaisesRegex(ValueError, 'ambiguous'):
+            tool.worker_report(raw + raw, 0)
+        refusal = {'profile': 'sokol.counterexample-execution.v1', 'refusal': 'TIME_BUDGET', 'phases': []}
+        raw = (W.FRAME + tool.encode(refusal).decode() + '\nservice exited 3\n').encode()
+        self.assertEqual(tool.worker_report(raw, 3), refusal)
+
     def test_executed_snapshot_must_equal_the_declared_phase(self):
         descriptor = {'repair_snapshot': 'a' * 64, 'defect_snapshot': 'b' * 64}
         value = execution()
@@ -258,8 +271,14 @@ class PublicWarrant(unittest.TestCase):
         run = execution()
         for phase in run['phases']:
             phase['snapshot'] = self.desc['defect_snapshot'] if phase['phase'] == 'defect' else self.desc['repair_snapshot']
+        code = 0
+        if status == 'REFUSED':
+            run = {'profile': 'sokol.counterexample-execution.v1', 'refusal': 'TIME_BUDGET', 'phases': []}
+            code = 3
+        raw = (W.FRAME + tool.encode(run).decode() + '\n').encode()
         report = {'profile': 'sokol.counterexample-observation.v1', 'subject': subject or self.manifest['subject'],
-                  'status': status, 'execution': run}
+                  'status': status, 'execution': run, 'native_transcript': tool.put(self.pack, raw),
+                  'native_returncode': code}
         report_hash = tool.put(self.pack, tool.encode(report))
         wid = tool.file_record(self.pack, self.binary, self.manifest['subject'], 'demo-recipient', self.key,
                               [report_hash], self.manifest['proposal'], report)
@@ -283,6 +302,13 @@ class PublicWarrant(unittest.TestCase):
         self.observation(subject='0' * 64)
         with self.assertRaisesRegex(ValueError, 'not bound'):
             tool.view(self.pack, self.binary, ROOT / '.github/witness-signers')
+
+    def test_resource_refusal_has_no_cmd_verdict(self):
+        wid = self.observation('REFUSED')
+        env = tool.document(tool.read(self.pack / '.warrants/records' / (wid + '.json')))
+        self.assertTrue(all(r['kind'] == 'prose' for r in env['body']['because']))
+        value = tool.view(self.pack, self.binary, ROOT / '.github/witness-signers')
+        self.assertEqual(value['observations'][0]['claimed_status'], 'REFUSED')
 
 
 if __name__ == '__main__':

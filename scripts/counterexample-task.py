@@ -310,9 +310,12 @@ def file_record(pack, binary, subject, actor, key, evidence, prior=None, executi
     if respond_to:
         args += ['--prior', hash_name(respond_to)]
     if execution:
-        args += ['--check', put(pack, read(ROOT / 'scripts/counterexample_worker.py')),
+        if execution['status'] in ('REFUSED', 'SOURCE_MISMATCH'):
+            args += ['--reason', 'Native check UNVERIFIED: ' + execution['status'] + '; no test verdict claimed.']
+        else:
+            args += ['--check', put(pack, read(ROOT / 'scripts/counterexample_worker.py')),
                  '--runtime', 'cmd@v1', '--verdict', 'pass' if execution['status'] == 'REPRODUCED' else 'fail',
-                 '--transcript', put(pack, encode(execution))]
+                 '--transcript', execution['native_transcript']]
     else:
         args += ['--reason', 'Proposal to reproduce a scoped counterfactual; no execution or acceptance claimed.']
     code, out = warrant(binary, pack, args)
@@ -463,6 +466,19 @@ def evaluate(execution, descriptor=None):
     return 'REPRODUCED'
 
 
+def worker_report(raw, code):
+    frames = [line[len(worker.FRAME):] for line in raw.decode('utf-8').splitlines()
+              if line.startswith(worker.FRAME)]
+    if len(frames) != 1:
+        raise ValueError('ISOLATION_OR_RESOURCE_REFUSAL: missing or ambiguous worker frame')
+    execution = document(frames[0])
+    status = evaluate(execution)
+    expected_code = 0 if status == 'REPRODUCED' else 3 if status == 'REFUSED' else 1
+    if code != expected_code:
+        raise ValueError('Worker exit status contradicts its measured execution')
+    return execution
+
+
 def replay(pack, output, binary, signers, actor, key, toolchain, registry, respond_to=None):
     if platform.system() != 'Linux' or os.geteuid() == 0:
         raise ValueError('Linux non-root isolated worker required')
@@ -499,9 +515,7 @@ def replay(pack, output, binary, signers, actor, key, toolchain, registry, respo
         runner = Path(directory).resolve() / 'worker.py'
         runner.write_bytes(read(ROOT / 'scripts/counterexample_worker.py'))
         code, raw = isolated_run(source, toolchain, registry, runner, defect)
-        if code:
-            raise ValueError('ISOLATION_OR_RESOURCE_REFUSAL: ' + raw[-2048:].decode('utf-8', 'replace'))
-        execution = document(raw)
+        execution = worker_report(raw, code)
         status = evaluate(execution, desc)
         if public_registry(registry) != external or toolchain_identity(toolchain) != tools:
             raise ValueError('External inputs moved during replay')
@@ -514,6 +528,7 @@ def replay(pack, output, binary, signers, actor, key, toolchain, registry, respo
             raise ValueError('Pack moved during replay')
         report = {'profile': 'sokol.counterexample-observation.v1', 'subject': manifest['subject'],
                   'status': status, 'execution': execution, 'method': method,
+                  'native_transcript': digest(raw), 'native_returncode': code,
                   'recipient_verifier_sha256': digest(read(binary)), 'toolchain': tools,
                   'registry': external, 'system': {'machine': platform.machine(), 'kernel': platform.release()},
                   'budget': {'seconds': TOTAL_SECONDS, 'memory_bytes': MEMORY_BYTES,
@@ -522,6 +537,7 @@ def replay(pack, output, binary, signers, actor, key, toolchain, registry, respo
                   'independence': 'FRESH_PROCESS_NOT_INDEPENDENT_MODEL_REVIEW'}
         staged = Path(directory).resolve() / 'pack'
         shutil.copytree(pack, staged)
+        put(staged, raw)
         report_hash = put(staged, encode(report))
         observation = file_record(staged, binary, manifest['subject'], actor, key,
                                   [report_hash], manifest['proposal'], report, respond_to)
@@ -538,22 +554,33 @@ def view(pack, binary, signers):
     manifest, desc, body, records, verification = inspect(pack, binary, signers)
     observations = []
     for wid, env in records:
-        for reason in env['body']['because']:
-            if reason.get('runtime') == 'cmd@v1' and reason.get('transcript'):
-                report = document(blob(Path(pack), reason['transcript']))
-                if (report.get('profile') != 'sokol.counterexample-observation.v1'
-                        or report.get('subject') != manifest['subject']
-                        or reason['transcript'] not in env['body']['evidence']):
+        for address in sorted(set(env['body']['evidence'])):
+            try:
+                report = document(blob(pack, address))
+            except (ValueError, UnicodeError):
+                continue
+            if isinstance(report, dict) and report.get('profile') == 'sokol.counterexample-observation.v1':
+                if report.get('subject') != manifest['subject']:
                     raise ValueError('Observation transcript is not bound to this subject/evidence')
                 if report['status'] != evaluate(report['execution'], desc):
                     raise ValueError('Recorded status contradicts transcript')
+                raw = blob(pack, report['native_transcript'])
+                if worker_report(raw, report['native_returncode']) != report['execution']:
+                    raise ValueError('Observation differs from native transcript')
+                if report['status'] not in ('REFUSED', 'SOURCE_MISMATCH'):
+                    matching = [r for r in env['body']['because'] if r.get('runtime') == 'cmd@v1'
+                                and r.get('check') == desc['worker_sha256']
+                                and r.get('transcript') == report['native_transcript']
+                                and r.get('verdict') == ('pass' if report['native_returncode'] == 0 else 'fail')]
+                    if len(matching) != 1:
+                        raise ValueError('Native check reason/exit/transcript differs')
                 observations.append({'warrant': wid, 'actor': env['body']['actor']['id'],
                                      'claimed_status': report['status'], 'execution': 'RECORDED_NOT_REPLAYED',
                                      'method': report.get('method', {'status': 'NOT_RECORDED'}),
                                      'budget': report.get('budget', {'status': 'NOT_RECORDED'}),
                                      'toolchain': report.get('toolchain', {'status': 'NOT_RECORDED'}),
                                      'registry': report.get('registry', {'status': 'NOT_RECORDED'}),
-                                     'transcript': reason['transcript']})
+                                     'transcript': report['native_transcript'], 'observation': address})
     return {'profile': 'sokol.counterexample-view.v1', 'subject': manifest['subject'],
             'proposal': manifest['proposal'], 'claim': 'An applied command with a lost reply is reported UNKNOWN, not NOT_SENT.',
             'contract_statement': body['statement'], 'case': CASE,
