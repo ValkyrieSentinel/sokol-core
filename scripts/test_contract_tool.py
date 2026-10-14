@@ -327,6 +327,20 @@ class ContractTool(unittest.TestCase):
         r = self.every_pin()
         self.assertEqual(r.returncode, 0, r.stdout)
 
+    def test_run_python_runs_the_agent_tiers_witnesses_too(self):
+        # 2026-10-14, the first provisional row (#46): run-python read only the owner's manifest,
+        # so the base gate found the agent tier's Python witnesses absent.
+        agent = self.with_agent()
+        (self.dir / 'scripts/test_late.py').write_text(
+            'import unittest\n\n\nclass Late(unittest.TestCase):\n    def test_late_ack_is_retired(self):\n'
+            '        self.assertTrue(True)\n')
+        run(self.dir, 'git', 'add', '-A')
+        name = self.tool('propose', 'T-9', '--statement', 'S.', '--witness', 'Late.test_late_ack_is_retired',
+                         '--after', 'T-2', '--because', 'x').stdout.strip()
+        self.assertEqual(self.tool('accept', name, '--provisional', '--agent-key', agent).returncode, 0)
+        out = run(self.dir, 'python3', 'scripts/witness-pin.py', 'run-python').stdout
+        self.assertIn('== witness Late.test_late_ack_is_retired scripts/test_late.py', out)
+
     def test_provisional_acceptance_refuses_the_owner_key(self):
         self.with_agent()
         name = self.tool('propose', 'T-9', '--statement', 'S.', '--witness', 'a_late_ack_retires_the_obligation',
