@@ -39,7 +39,12 @@ for m in $(echo "$spans" | grep -oE '(^|[^/a-z0-9_])sokol_[a-z0-9_]+' | grep -oE
     esac
 done
 # Tests: a whole code span that is a long snake_case name, found in the compiler's list.
-if [ -n "${SOKOL_TEST_LIST:-}" ]; then
+if [ -n "${SOKOL_SKIP_TEST_NAMES:-}" ]; then
+    # scripts/pre-push.sh on a machine that cannot build the Linux test list: cited test names
+    # are left to CI, everything else (metrics, flags, ADRs, paths) is checked.
+    test_list="skipped: test"
+    echo "note cited test names not checked (SOKOL_SKIP_TEST_NAMES); CI checks them"
+elif [ -n "${SOKOL_TEST_LIST:-}" ]; then
     test_list=$(cat "$SOKOL_TEST_LIST")
 else
     test_list=$(cargo test --release --locked --lib --bins --tests -- --list --format terse)
@@ -48,7 +53,7 @@ tests=$(echo "$test_list" | sed -n 's/: test$//p' | sed 's/.*:://' | sort -u)
 [ -n "$tests" ] || bad "the test list names no test: nothing to check the cited tests against"
 for id in $(echo "$spans" | grep -oxE '[a-z][a-z0-9]*(_[a-z0-9]+){3,}' | grep -v '^sokol_' | sort -u); do
     n_tests=$((n_tests + 1))
-    grep -qx -- "$id" <<<"$tests" || bad "test $id is cited but no test has that name"
+    [ -n "${SOKOL_SKIP_TEST_NAMES:-}" ] || grep -qx -- "$id" <<<"$tests" || bad "test $id is cited but no test has that name"
 done
 # Kani proofs: a code span `<module>::proofs::<name>` (docs/VERIFICATION.md), a function with
 # #[kani::proof] attached (Kani's own harnesses are not in the test list).
