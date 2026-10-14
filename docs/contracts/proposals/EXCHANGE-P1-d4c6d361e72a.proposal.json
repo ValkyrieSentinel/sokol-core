@@ -1,0 +1,18 @@
+{
+  "after": "OPERATOR-R1",
+  "base_contract_sha256": null,
+  "because": "Requirement: models exchange scoped native counterexamples through existing Warrant records; imported claims must remain distinct from fresh recipient execution and owner acceptance.",
+  "evidence_text": "`Interpretation.test_author_status_cannot_override_transcript`, `Interpretation.test_fixed_isolation_profile_exposes_no_home_key_or_network`, `Interpretation.test_only_named_assertion_red_and_complete_repair_reproduce`, `Interpretation.test_unrun_budget_and_wrong_phase_are_never_success`, `PublicWarrant.test_readdressing_a_changed_witness_cannot_bypass_owner_pin`, `PublicWarrant.test_recipient_reply_is_prior_linked_and_view_does_not_upgrade_execution`",
+  "id": "EXCHANGE-P1",
+  "profile": "sokol.contract-proposal.v1",
+  "statement": "The portable counterexample pilot binds exact source bytes by content address and contract history and witness bodies to recipient-selected owner signers. It refuses unsupported profiles and tampered bytes, and reports reproduction only after a fresh isolated run observes the named assertion-red defect and all repaired and restored witnesses passing. Imported signed observations remain recorded claims and confer no owner acceptance, settlement or deployment authority.",
+  "status": "UNSIGNED_INTENT",
+  "witnesses": [
+    "Interpretation.test_author_status_cannot_override_transcript",
+    "Interpretation.test_fixed_isolation_profile_exposes_no_home_key_or_network",
+    "Interpretation.test_only_named_assertion_red_and_complete_repair_reproduce",
+    "Interpretation.test_unrun_budget_and_wrong_phase_are_never_success",
+    "PublicWarrant.test_readdressing_a_changed_witness_cannot_bypass_owner_pin",
+    "PublicWarrant.test_recipient_reply_is_prior_linked_and_view_does_not_upgrade_execution"
+  ]
+}

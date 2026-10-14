@@ -20,6 +20,7 @@ env:
   CARGO_DENY_SHA256: 9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f
   KANI_VERSION: 0.68.0
   CARGO_MUTANTS_VERSION: 27.1.0
+  WARRANT_VERIFY_VERSION: 0.9.0
 
 jobs:
   # Mutants of the changed lines only (docs/MUTATION.md): each must be caught by a test or
@@ -307,6 +308,12 @@ jobs:
           python3 scripts/test_contract_shadow.py
           python3 scripts/test_contract_tool.py
           python3 scripts/test_contract_task.py
+
+      - name: Portable counterexample and public Warrant integration regressions
+        if: matrix.part == 'test'
+        run: |
+          cargo install --locked --version "$WARRANT_VERIFY_VERSION" --root "$RUNNER_TEMP/sokol-warrant" warrant-verify
+          SOKOL_WARRANT_BIN="$RUNNER_TEMP/sokol-warrant/bin/warrant-rs" python3 scripts/test_counterexample_task.py
 
       - name: CrowdSec stream recovery regression
         if: matrix.part == 'test'
