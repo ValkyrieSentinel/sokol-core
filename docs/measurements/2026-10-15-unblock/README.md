@@ -48,11 +48,14 @@ per round). No run left a layer blocking 20 s after an end.
   plus the snapshot, while digests get through; a lost connection after the reconnect back-off.
   Hard cap in every case: the peer's own end of the claim (its lease cap, ADR-0003).
 
-## Open candidate
+## Closed candidate
 
-A node that restores its state with a clock behind true time and is later stepped forward (the
-RTC-less case of ADR-0017) keeps restored own claims past their signed end by the clock error;
-peers drop them at the signed end. `a_restore_under_a_clock_behind_does_not_outlast_the_signed_end`
-reproduces it and is ignored. The fix sketched with it (cap a restored end at now plus its full
-duration) does not close it — with the clock behind, now plus the duration is past the true end —
-so it needs a design, not a constant: the restored end is wall-clock and the clock is wrong.
+A node that restored its state with a clock behind true time and was later stepped forward (the
+RTC-less case of ADR-0017) kept restored own claims past their signed end by the clock error;
+peers dropped them at the signed end. Capping a restored end at now plus its full duration does
+not close it — with the clock behind, now plus the duration is past the true end. The state file
+now carries its write time, and a restored end is capped at now plus what it had left at that
+write: both differences are on one clock, so the clock's error drops out and the overshoot is at
+most the downtime (ADR-0017, amendment of 2026-10-15).
+`a_restore_under_a_clock_behind_does_not_outlast_the_signed_end` reproduces the defect and now
+passes.

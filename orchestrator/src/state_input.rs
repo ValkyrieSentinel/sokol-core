@@ -158,6 +158,8 @@ struct State {
     events: Vec<(String, u64)>,
     #[serde(default, deserialize_with = "support")]
     support: Vec<Support>,
+    #[serde(default)]
+    saved_ms: Option<u64>,
 }
 
 pub fn parse<R: Read>(input: R) -> Result<Persisted, String> {
@@ -178,6 +180,7 @@ pub fn parse<R: Read>(input: R) -> Result<Persisted, String> {
         peer_ends: state.peer_ends,
         events: state.events,
         support: state.support.into_iter().map(|v| (v.0, v.1)).collect(),
+        saved_ms: state.saved_ms,
     })
 }
 
@@ -308,6 +311,7 @@ mod tests {
                 target.into(),
                 vec![reason; block_table::MAX_SUPPORT_PER_TARGET],
             )],
+            saved_ms: Some(u64::MAX),
             ..Persisted::default()
         };
         assert_eq!(
