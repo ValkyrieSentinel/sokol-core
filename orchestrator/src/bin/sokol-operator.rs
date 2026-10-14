@@ -632,7 +632,9 @@ fn parse_bans(reply: &str) -> Result<(usize, HashSet<String>), String> {
         let target =
             parse_block_target(field).ok_or_else(|| "invalid LIST_BANS target".to_string())?;
         if bans.len() >= MAX_LISTED_BANS {
-            return Err(format!("LIST_BANS lists more than {MAX_LISTED_BANS} targets"));
+            return Err(format!(
+                "LIST_BANS lists more than {MAX_LISTED_BANS} targets"
+            ));
         }
         if !bans.insert(target) {
             return Err("duplicate LIST_BANS target".into());
