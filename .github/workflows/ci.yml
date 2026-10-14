@@ -235,6 +235,15 @@ jobs:
             grep -Fq "PASS live startup intent ${family}:" /tmp/sokol-cargo-test.log
           done
 
+      # Pinned Python witnesses that drive the released Warrant CLI (EXCHANGE-P1) skip without
+      # it; the gate runs pinned witnesses itself and a skip is not a pass. Installed once here
+      # for the gate and the integration step below.
+      - name: Released warrant-verify for the witnesses that need it
+        if: matrix.part == 'test'
+        run: |
+          cargo install --locked --version "$WARRANT_VERIFY_VERSION" --root "$RUNNER_TEMP/sokol-warrant" warrant-verify
+          echo "SOKOL_WARRANT_BIN=$RUNNER_TEMP/sokol-warrant/bin/warrant-rs" >> "$GITHUB_ENV"
+
       - name: Pinned witnesses unchanged without the owner's signature (ADR-0023)
         if: matrix.policy_checks && matrix.part == 'test'
         # The checker and the signers come from the base commit: a pull request that weakened
@@ -312,8 +321,8 @@ jobs:
       - name: Portable counterexample and public Warrant integration regressions
         if: matrix.part == 'test'
         run: |
-          cargo install --locked --version "$WARRANT_VERIFY_VERSION" --root "$RUNNER_TEMP/sokol-warrant" warrant-verify
-          SOKOL_WARRANT_BIN="$RUNNER_TEMP/sokol-warrant/bin/warrant-rs" python3 scripts/test_counterexample_task.py
+          test -x "$SOKOL_WARRANT_BIN"
+          python3 scripts/test_counterexample_task.py
 
       - name: CrowdSec stream recovery regression
         if: matrix.part == 'test'
