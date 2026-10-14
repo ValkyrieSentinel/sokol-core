@@ -115,14 +115,26 @@ impl ControlOutcome {
     }
 }
 
+/// ADR-0005: `OK …; WARNING: not yet durable` is not plain `OK`. The node acknowledged the
+/// command but cannot yet say it is on disk; that warning stays in the answer.
 fn command_json(outcome: ControlOutcome) -> Json<serde_json::Value> {
-    let (status, success, error) = match outcome {
-        ControlOutcome::Confirmed(_) => ("CONFIRMED", true, None),
-        ControlOutcome::Rejected(e) => ("REJECTED", false, Some(e)),
-        ControlOutcome::NotSent(e) => ("NOT_SENT", false, Some(e)),
-        ControlOutcome::Unknown(e) => ("UNKNOWN", false, Some(e)),
+    let (status, success, error, warning) = match outcome {
+        ControlOutcome::Confirmed(reply) => (
+            "CONFIRMED",
+            true,
+            None,
+            reply.split_once("WARNING:").map(|(_, w)| {
+                w.trim()
+                    .chars()
+                    .take(CONTROL_ERROR_CHARS)
+                    .collect::<String>()
+            }),
+        ),
+        ControlOutcome::Rejected(e) => ("REJECTED", false, Some(e), None),
+        ControlOutcome::NotSent(e) => ("NOT_SENT", false, Some(e), None),
+        ControlOutcome::Unknown(e) => ("UNKNOWN", false, Some(e), None),
     };
-    Json(serde_json::json!({"success":success, "outcome":status, "error":error}))
+    Json(serde_json::json!({"success":success, "outcome":status, "error":error, "warning":warning}))
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -1034,8 +1046,8 @@ const HTML_DASHBOARD: &str = r###"
                 UNKNOWN: 'Outcome unknown. The command may have taken effect; read the current state before retrying.'
             };
             const outcome = data.outcome || 'UNKNOWN';
-            box.className = 'rounded-lg border p-3 ' + (outcome === 'CONFIRMED' ? 'border-emerald-800 text-emerald-300' : 'border-amber-800 text-amber-300');
-            box.textContent = (labels[outcome] || labels.UNKNOWN) + (data.error ? ' ' + data.error : '');
+            box.className = 'rounded-lg border p-3 ' + (outcome === 'CONFIRMED' && !data.warning ? 'border-emerald-800 text-emerald-300' : 'border-amber-800 text-amber-300');
+            box.textContent = (labels[outcome] || labels.UNKNOWN) + (data.error ? ' ' + data.error : '') + (data.warning ? ' WARNING: ' + data.warning : '');
         }
 
         async function fetchData() {
@@ -2191,5 +2203,41 @@ mod tests {
         );
         assert_eq!(parse_block_target("10.0.0.1\nFLUSH_BANS"), None);
         assert_eq!(parse_block_target("example.com"), None);
+    }
+
+    /// ADR-0005: the operator's answer tells `OK` from `OK …; WARNING: not yet durable`
+    /// ("невідоме не видається за успіх"). The node applied the ban but cannot yet say it is
+    /// on disk; the operator API must not present that as the same plain success.
+    #[tokio::test]
+    async fn a_not_yet_durable_confirmation_keeps_its_warning() {
+        let dir = scratch("durable");
+        let sock = dir.join("ctl.sock");
+        let st = state();
+        process_trident_telemetry(
+            &st,
+            me(),
+            &format!("HEARTBEAT:ID=5|CTL={}\n", sock.display()),
+        )
+        .await;
+        let node = reply_once(
+            &sock,
+            "OK banned 203.0.113.9; WARNING: not yet durable (state write pending)\n".into(),
+        )
+        .await;
+        let (_, _, body) = call(
+            build_router(st),
+            post_json(
+                "/api/nodes/5/blacklist",
+                serde_json::json!({"ip":"203.0.113.9", "action":"add"}),
+            ),
+        )
+        .await;
+        node.await.unwrap();
+        assert_eq!(body["outcome"], "CONFIRMED", "{body}");
+        assert!(
+            body.to_string().contains("not yet durable"),
+            "the node's durability warning was dropped from the operator answer: {body}"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

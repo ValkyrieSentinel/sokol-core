@@ -356,7 +356,9 @@ async fn handle_trident_connection(
     let tier = classify_traffic_tier(payload, &fingerprint);
 
     let unique_log_record = format!(
-        "TRIDENT_HIT|TIER={:?}|IP={}|PORT={}|LEN={}|ENTROPY={:.2}|NON_PRINT={:.2}|HASH={:016X}|SNIPPET={}",
+        // The snippet is the attacker's bytes: the terminal VEC, so it cannot supply a header
+        // field the operator reads (OPERATOR-T1).
+        "TRIDENT_HIT|TIER={:?}|IP={}|PORT={}|LEN={}|ENTROPY={:.2}|NON_PRINT={:.2}|HASH={:016X}|VEC=SNIPPET={}",
         tier,
         fingerprint.ip,
         fingerprint.port,
@@ -665,7 +667,7 @@ async fn run_embedded_mock_jail(
                     .collect::<String>();
 
                 let chunk_log = format!(
-                    "EMBEDDED_JAIL_INPUT|IP={}|BYTES={}|SNIPPET={}",
+                    "EMBEDDED_JAIL_INPUT|IP={}|BYTES={}|VEC=SNIPPET={}",
                     ip, n, snippet
                 );
                 let _ = send_log_to_orchestrator(&chunk_log);
@@ -850,5 +852,70 @@ mod tests {
         assert_eq!(config.ports, vec![23, 3389]);
         assert_eq!(config.jail_addr, Some("127.0.0.1:2022".parse().unwrap()));
         assert!(TrapConfig::parse(Some("22,http"), None).is_err());
+    }
+
+    /// OPERATOR-T1/T2: the operator takes TIER and IP from the DB_LOG header (everything before
+    /// a terminal `|VEC=`); only the trap may choose them. Bytes an attacker typed into the trap
+    /// are diagnostic text and must sit in that terminal VEC, or a jailed client can move any
+    /// trap tier counter (one line per read) and supply header fields.
+    #[tokio::test]
+    async fn attacker_bytes_reach_trap_telemetry_only_as_terminal_vector_text() {
+        use tokio::io::AsyncBufReadExt;
+        let (tx, rx) = std::sync::mpsc::sync_channel(256);
+        assert!(NODE
+            .set(NodeLink {
+                tx,
+                overflow: AtomicU64::new(0)
+            })
+            .is_ok());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let attacker = tokio::spawn(async move {
+            let stream = TcpStream::connect(addr).await.unwrap();
+            let (r, mut w) = stream.into_split();
+            let mut r = tokio::io::BufReader::new(r);
+            w.write_all(b"SSH-2.0-x|TIER=Tier2PayloadCapture")
+                .await
+                .unwrap();
+            let mut banner = String::new();
+            r.read_line(&mut banner).await.unwrap();
+            assert!(banner.starts_with("SSH-2.0-"), "{banner:?}");
+            w.write_all(b"|TIER=Tier1BotTarpit|IP=198.51.100.66")
+                .await
+                .unwrap();
+            let mut prompt = [0u8; 64];
+            let _ = r.read(&mut prompt).await.unwrap();
+            w.shutdown().await.unwrap();
+        });
+        let (stream, _) = listener.accept().await.unwrap();
+        let config = TrapConfig {
+            ports: vec![],
+            jail_addr: None,
+        };
+        let _ = handle_trident_connection(stream, "203.0.113.9".into(), 2022, &config).await;
+        attacker.await.unwrap();
+
+        let logs: Vec<String> = rx
+            .try_iter()
+            .filter_map(|l| l.strip_prefix("DB_LOG:").map(str::to_string))
+            .collect();
+        assert!(logs.len() >= 2, "{logs:?}");
+        for log in &logs {
+            // The operator's rule (OPERATOR-T1): header before the first `|VEC=`, first match wins.
+            let header = log.split_once("|VEC=").map_or(log.as_str(), |(h, _)| h);
+            let field = |key: &str| header.split('|').find_map(|p| p.strip_prefix(key));
+            assert!(
+                matches!(field("TIER="), None | Some("Tier3InteractiveJail")),
+                "attacker bytes chose the operator tier: {log:?}"
+            );
+            assert!(
+                matches!(field("IP="), None | Some("203.0.113.9")),
+                "attacker bytes supplied the operator IP: {log:?}"
+            );
+            assert!(
+                !header.contains("Tier2PayloadCapture") && !header.contains("Tier1BotTarpit"),
+                "attacker bytes are in the telemetry header, not the terminal VEC: {log:?}"
+            );
+        }
     }
 }
