@@ -116,12 +116,15 @@ jobs:
           name: witness-logs
           path: /tmp/witness
 
-      # Nothing of the pull request runs here: its tree and the logs are read as data.
+      # Nothing of the pull request runs here: its tree and the logs are read as data. `-I`: the
+      # checker lives in the pull request's scripts/ directory, which Python would otherwise put
+      # first on its import path, so a pull request's scripts/json.py ran instead of the
+      # standard library and could print the verdict itself (2026-10-14, round 7).
       - name: Pinned witnesses, checked by main's checker and signers
         working-directory: pr
         run: |
           cp "$GITHUB_WORKSPACE/base/scripts/witness-pin.py" scripts/witness-pin.py
           echo "checker and signers from main $(git -C "$GITHUB_WORKSPACE/base" rev-parse HEAD)"
-          python3 scripts/witness-pin.py check \
+          python3 -I scripts/witness-pin.py check \
             --signers "$GITHUB_WORKSPACE/base/.github/witness-signers" \
             --executed /tmp/witness/cargo-test.log --executed-python /tmp/witness/python.log
