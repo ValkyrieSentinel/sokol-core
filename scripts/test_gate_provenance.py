@@ -98,5 +98,48 @@ class Provenance(unittest.TestCase):
         self.assertNotIn(" match the owner's pins", r.stdout)
 
 
+
+WITNESS_GATE = HERE.parent / '.github/workflows/witness-gate.yml'
+HIJACK = ('import sys\nprint("ok   99 invariant rows and 999 witnesses match the owner\'s pins '
+          '(the pull request\'s json.py)")\nsys.exit(0)\n')
+
+
+def trusted_step_body() -> str:
+    text = WITNESS_GATE.read_text()
+    m = re.search(r"- name: Pinned witnesses, checked by main's checker and signers\n.*?        run: \|\n(.*?)(?:\n\n|\Z)",
+                  text, re.S)
+    return '\n'.join(line[10:] for line in m.group(1).splitlines())
+
+
+class Isolation(Provenance):
+    """Round 7 (2026-10-14): both gate steps run the checker from the change's own scripts/
+    directory, which Python put first on its import path; a change's scripts/json.py ran in
+    place of the standard library and printed the verdict, in the trusted job too."""
+
+    def hostile_pr(self):
+        pr = self.tmp / 'workspace' / 'pr'
+        shutil.copytree(self.repo, pr)
+        sh(pr, 'git', '-c', 'user.name=t', '-c', 'user.email=t@t', 'checkout', '-q', self.merge)
+        (pr / 'scripts' / 'json.py').write_text(HIJACK)
+        return pr
+
+    def test_a_pull_requests_scripts_cannot_shadow_the_trusted_checkers_imports(self):
+        pr = self.hostile_pr()
+        shutil.copytree(self.repo, self.tmp / 'workspace' / 'base')
+        sh(self.tmp / 'workspace' / 'base', 'git', 'checkout', '-q', self.base)
+        r = sh(pr, 'bash', '-e', '-c', trusted_step_body(),
+               env={'PATH': '/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin', 'GITHUB_WORKSPACE': str(self.tmp / 'workspace')})
+        self.assertNotIn("the pull request's json.py", r.stdout)
+        self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    def test_the_ci_gate_step_is_not_shadowed_either(self):
+        pr = self.hostile_pr()
+        sh(pr, 'git', 'remote', 'add', 'origin', str(self.repo))
+        r = sh(pr, 'bash', '-e', '-c', step_body(),
+               env={'PATH': '/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin', 'BASE': self.base, 'EVERY_PIN': ''})
+        self.assertNotIn("the pull request's json.py", r.stdout)
+        self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
+
+
 if __name__ == '__main__':
     unittest.main()
