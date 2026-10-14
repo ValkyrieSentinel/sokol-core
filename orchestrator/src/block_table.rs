@@ -4370,6 +4370,28 @@ mod tests {
         );
     }
 
+    /// A state file holds only this node's own dynamic claims; a peer's claim or a static one
+    /// found in it is refused at restore, each on its own (either alone is enough).
+    #[test]
+    fn a_restore_refuses_a_peers_claim_and_a_static_one() {
+        let mut t = table(1, 64);
+        let own_static = t
+            .add_local(ip("198.51.100.20"), ClaimKind::Static, "--block", T0)
+            .unwrap()
+            .claim;
+        let mut peers = peer_claim(2, "203.0.113.152", T0);
+        peers.expires_ms = Some(T0 + 600 * S);
+        for claim in [own_static, peers] {
+            let mut r = table(1, 64);
+            let state = Persisted {
+                claims: vec![claim],
+                saved_ms: Some(T0),
+                ..Persisted::default()
+            };
+            assert_eq!(r.restore(state, |_| true, T0 + S), (0, 1));
+        }
+    }
+
     /// The bound only shortens: a restart on a right clock keeps the signed end, and a file
     /// written before `saved_ms` existed is restored by its signed ends as before. A peer's
     /// saved lease end is bounded like an own claim.
