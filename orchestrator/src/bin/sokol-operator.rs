@@ -507,7 +507,9 @@ async fn process_trident_telemetry(state: &AppState, uid: u32, raw_msg: &str) {
                 _ => {}
             }
 
-            let new_id = alerts.len() as u64 + 1;
+            // The newest alert is first and survives the cap below: ids keep increasing after
+            // 50 alerts (alerts.len() + 1 stuck at 51).
+            let new_id = alerts.first().map_or(0, |a| a.id) + 1;
             alerts.insert(
                 0,
                 SecurityAlert {
@@ -1728,6 +1730,34 @@ mod tests {
         assert_eq!(
             parse_bans("2 203.0.113.9 203.0.113.9").unwrap_err(),
             "duplicate LIST_BANS target"
+        );
+    }
+
+    #[tokio::test]
+    async fn alert_ids_keep_increasing_past_the_alert_cap() {
+        let st = state();
+        for i in 0..60 {
+            process_trident_telemetry(
+                &st,
+                me(),
+                &format!(
+                    "DB_LOG:NODE=7|TIER=Tier2PayloadCapture|IP=203.0.113.{}|VEC=x\n",
+                    i % 250
+                ),
+            )
+            .await;
+        }
+        let alerts = st.alerts.read().await;
+        let ids: Vec<u64> = alerts.iter().map(|a| a.id).collect();
+        assert_eq!(ids.len(), 50);
+        assert_eq!(
+            ids.first(),
+            Some(&60),
+            "the newest of 60 alerts is alert 60: {ids:?}"
+        );
+        assert!(
+            ids.windows(2).all(|w| w[0] > w[1]),
+            "ids repeat or go back: {ids:?}"
         );
     }
 
