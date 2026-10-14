@@ -12,6 +12,7 @@ import shutil
 import stat
 import subprocess
 import tempfile
+import unicodedata
 import uuid
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -177,6 +178,10 @@ def validate_descriptor(pack, desc, signers):
         if len(data) > inputs.MAX_FILE_BYTES:
             raise ValueError('Source file exceeds input budget')
         total += len(data)
+    # The owner gate writes these names to the recipient's filesystem; a case-insensitive or
+    # normalising one (macOS default) would merge two names and gate another tree.
+    if len({unicodedata.normalize('NFC', unicodedata.normalize('NFC', n).casefold()) for n in files}) != len(files):
+        raise ValueError('Source names collide after case or Unicode folding')
     if total > inputs.MAX_CHECKOUT_BYTES or desc['repair_snapshot'] != digest(encode(files)):
         raise ValueError('Source snapshot differs or exceeds limit')
     source = blob(pack, files[worker.CASE_FILE]['sha256']).decode()
@@ -256,7 +261,8 @@ def verify_owner_closure(pack, files, trust):
             code, _ = inputs.run_bounded(source, argv, timeout=30, env=env)
             if code:
                 raise ValueError('Cannot index received source data')
-        code, output = inputs.run_bounded(source, [shutil.which('python3'), str(gate), 'check',
+        # -I: the gate's directory holds received data; it must never shadow the gate's imports.
+        code, output = inputs.run_bounded(source, [shutil.which('python3'), '-I', str(gate), 'check',
                                                    '--signers', str(signers)], timeout=120, env=env)
         if code:
             raise ValueError('Recipient owner gate refused witness closure/build: '
@@ -290,6 +296,9 @@ def inspect(pack, binary, signers):
             raise ValueError('Proposal must be this pack root')
         if wid != manifest['proposal'] and manifest['proposal'] not in record['prior']:
             raise ValueError('Observation must answer proposal')
+        # Offline-inspectable means self-contained: every address a record cites is in the pack.
+        for address in [*record['evidence'], *(r[f] for r in record['because'] for f in ('check', 'transcript') if f in r)]:
+            blob(pack, address)
     code, raw = warrant(binary, pack, ['verify', '--json'])
     report = document(raw)
     if (code != 0 or report.get('report') != 'warrant.verify-report@v0' or report.get('grade') != 'base'
@@ -473,11 +482,11 @@ def evaluate(execution, descriptor=None):
     phases = execution['phases']
     if not isinstance(phases, list) or [p.get('phase') for p in phases] != ['repair', 'defect', 'restored']:
         return 'REFUSED'
+    # Every phase's measured source first: an early failure must not hide a later mismatch.
+    if descriptor and any(phase.get('snapshot') != descriptor['defect_snapshot' if phase['phase'] == 'defect'
+                                                             else 'repair_snapshot'] for phase in phases):
+        return 'SOURCE_MISMATCH'
     for phase in phases:
-        if descriptor:
-            expected_snapshot = descriptor['defect_snapshot'] if phase['phase'] == 'defect' else descriptor['repair_snapshot']
-            if phase.get('snapshot') != expected_snapshot:
-                return 'SOURCE_MISMATCH'
         if phase['build']['status'] != 'BUILT' or phase['build']['returncode'] != 0:
             return 'BUILD_ERROR'
         rows = phase['witnesses']
@@ -594,13 +603,16 @@ def view(pack, binary, signers):
                 raw = blob(pack, report['native_transcript'])
                 if worker_report(raw, report['native_returncode']) != report['execution']:
                     raise ValueError('Observation differs from native transcript')
-                if report['status'] not in ('REFUSED', 'SOURCE_MISMATCH'):
-                    matching = [r for r in env['body']['because'] if r.get('runtime') == 'cmd@v1'
-                                and r.get('check') == desc['worker_sha256']
+                native = [r for r in env['body']['because'] if r.get('runtime') == 'cmd@v1']
+                if report['status'] in ('REFUSED', 'SOURCE_MISMATCH'):
+                    if native:
+                        raise ValueError('Refused or mismatched observation carries a cmd@v1 verdict')
+                else:
+                    matching = [r for r in native if r.get('check') == desc['worker_sha256']
                                 and r.get('transcript') == report['native_transcript']
                                 and r.get('verdict') == ('pass' if report['native_returncode'] == 0 else 'fail')]
-                    if len(matching) != 1:
-                        raise ValueError('Native check reason/exit/transcript differs')
+                    if len(matching) != 1 or len(native) != 1:
+                        raise ValueError('Native check reason/exit/transcript differs (one cmd@v1 per observation)')
                 observations.append({'warrant': wid, 'actor': env['body']['actor']['id'],
                                      'claimed_status': report['status'], 'execution': 'RECORDED_NOT_REPLAYED',
                                      'method': report.get('method', {'status': 'NOT_RECORDED'}),

@@ -46,6 +46,18 @@ pub struct WitnessStats {
     pub malformed: AtomicU64,
 }
 
+/// The operator telemetry line for a peer block this node enforced: the peer's reason is the
+/// terminal VEC (OPERATOR-T1). The reason is a peer's free text (only its length is bounded),
+/// and the telemetry socket is line-framed: control characters are left out, so a reason
+/// cannot end this line and start forged HEARTBEAT, DB_LOG or DROP_IMMEDIATE lines.
+fn mesh_block_telemetry(node_id: u64, shown: &str, reason: &str) -> String {
+    let reason: String = reason.chars().filter(|c| !c.is_control()).collect();
+    format!(
+        "DB_LOG:NODE={}|TIER=MeshBlock|IP={}|VEC={}\n",
+        node_id, shown, reason
+    )
+}
+
 /// A chain head as the mesh carries it: 64 lowercase hex digits.
 fn valid_head(head: &str) -> bool {
     head.len() == 64
@@ -106,11 +118,7 @@ impl<B: Blocklist + Send + 'static, M: ConfigMap + 'static> MeshDispatch<B, M> {
                             ttl_label(left),
                             reason
                         ));
-                        let telemetry_msg = format!(
-                            "DB_LOG:NODE={}|TIER=MeshBlock|IP={}|VEC={}\n",
-                            self.node_id, shown, reason
-                        );
-                        push_telemetry(&telemetry_msg).await;
+                        push_telemetry(&mesh_block_telemetry(self.node_id, &shown, &reason)).await;
                     }
                     (Adoption::Held(held @ ("quorum" | "quota" | "envelope")), _) => {
                         log::warn!(
@@ -726,5 +734,28 @@ mod tests {
             *n.config.0.lock().unwrap(),
             Some(defense::flags(0, defense::StormMode::Strict, true))
         );
+    }
+
+    /// OPERATOR-T1: the VEC remainder of a DB_LOG line is opaque diagnostic text. A peer's
+    /// claim reason is that text for a mesh block, so it must not be able to end the telemetry
+    /// line and start forged HEARTBEAT / DB_LOG / DROP_IMMEDIATE lines for the operator.
+    #[tokio::test]
+    async fn a_peer_reason_cannot_frame_extra_operator_telemetry_lines() {
+        let mut n = node("reason-frame", None);
+        let mut claim = peer_claim("198.51.100.21");
+        claim.reason = "scan\nHEARTBEAT:ID=1|CTL=/run/sokol.sock\n\
+                        DB_LOG:NODE=1|TIER=Tier3InteractiveJail|IP=203.0.113.66|VEC=x\n\
+                        DROP_IMMEDIATE:203.0.113.66"
+            .into();
+        let reason = claim.reason.clone();
+        n.dispatch.peer(MeshCommand::Claim { claim }).await;
+        assert!(n.in_kernel("198.51.100.21"), "the claim was enforced");
+        let line = mesh_block_telemetry(NODE, "198.51.100.21", &reason);
+        assert_eq!(
+            line.matches('\n').count(),
+            1,
+            "one mesh block became several operator telemetry lines: {line:?}"
+        );
+        assert!(line.ends_with('\n'));
     }
 }

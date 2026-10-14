@@ -207,6 +207,7 @@ python3 scripts/test_contract_task.py
 step "portable counterexample and public Warrant integration"
 cargo install --locked --version "$(pin WARRANT_VERIFY_VERSION)" --root "$CACHE/warrant" warrant-verify
 SOKOL_WARRANT_BIN="$CACHE/warrant/bin/warrant-rs" python3 scripts/test_counterexample_task.py
+SOKOL_WARRANT_BIN="$CACHE/warrant/bin/warrant-rs" python3 scripts/test_counterexample_hostile_pack.py
 timeout 120 python3 scripts/test_crowdsec_stream.py target/release/sokol-crowdsec
 timeout 120 python3 scripts/test_suricata_recovery.py target/release/sokol-suricata
 # CI's kani job proves when something the proofs read changed (scripts/kani-scope.sh).

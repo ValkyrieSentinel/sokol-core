@@ -59,9 +59,12 @@ pub(crate) async fn execute_control<B: block_table::Blocklist>(
                     log::warn!("[Control] Operator ban for {}", shown);
                     format!("OK banned {}", shown)
                 }
+                // The ban is in force in the table and retried into the kernel, as UNBAN's
+                // "kernel removal pending": an operator decision, answered OK so it waits for
+                // disk like every other (R26-04) and is not shown as a refusal.
                 Err(e) => format!(
-                    "ERR kernel map update failed: {:?}; the ban is kept and retried every second",
-                    e
+                    "OK banned {} (kernel update pending, retried every second: {:?})",
+                    shown, e
                 ),
             }
         }
@@ -428,6 +431,76 @@ mod tests {
                 .any(|r| r == "PEERS_RELOADED|Pinned:2|Legacy:[]|Unregistered:[2, 3]"),
             "{:?}",
             records
+        );
+        drop(ctx);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// An operator ban the node keeps (the kernel write failed and is retried, like UNBAN's
+    /// "kernel removal pending") is an operator decision in force: ARCHITECTURE (R26-04) says
+    /// BAN waits for its generation on disk before the answer, and the serving loop does that
+    /// only for an `OK` answer. An `ERR` answer also reads as REJECTED ("Node refused the
+    /// command") in the operator while LIST_BANS shows the ban.
+    #[tokio::test]
+    async fn a_kept_operator_ban_is_not_answered_as_a_refusal() {
+        // Nested: a test-only item at module level would join the closures of the pinned
+        // witnesses here that name block_table.
+        struct FullKernel;
+        impl block_table::Blocklist for FullKernel {
+            fn add(&mut self, _: IpNet) -> Result<(), aya::maps::MapError> {
+                Err(aya::maps::MapError::OutOfBounds {
+                    index: 0,
+                    max_entries: 0,
+                })
+            }
+            fn delete(&mut self, _: IpNet) -> Result<(), aya::maps::MapError> {
+                Ok(())
+            }
+            fn hits(&self, _: IpNet) -> Option<u64> {
+                None
+            }
+        }
+
+        let dir = std::env::temp_dir().join(format!(
+            "sokol-ban-kept-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ttl = TtlPolicy {
+            base: Duration::from_secs(60),
+            max: Duration::from_secs(600),
+        };
+        let ctx = ControlCtx {
+            state: Arc::new(StateStore::new(dir.join("state.json"))),
+            peer_limits: PeerLimits {
+                default: Envelope::unlimited(ttl.max),
+                quorum: Quorum::OFF,
+            },
+            blocks: Arc::new(tokio::sync::Mutex::new(BlockTable::with_lists(
+                FullKernel, ttl, 1,
+            ))),
+            policy: PolicyHandle::new(BlockPolicy::builtin()),
+            sntl_db: Arc::new(
+                SentinelDb::init(dir.join("events.sntl").to_str().unwrap(), None).unwrap(),
+            ),
+            registry: PeerRegistry::new(TrustStore::default()),
+            peers_file: None,
+            node_id: 1,
+            crypto: Arc::new(NodeCrypto::generate()),
+        };
+        let target = block_table::parse_target("203.0.113.44").unwrap();
+        let reply = execute_control(control::ControlCommand::Ban(target), &ctx).await;
+        let kept = ctx
+            .blocks
+            .lock()
+            .await
+            .operator_targets(block_table::local_ms())
+            .contains(&target);
+        assert!(kept, "precondition: the node keeps the ban ({reply})");
+        assert!(
+            reply.starts_with("OK"),
+            "a ban the node keeps and enforces later was answered as a refusal: {reply}"
         );
         drop(ctx);
         std::fs::remove_dir_all(dir).unwrap();
