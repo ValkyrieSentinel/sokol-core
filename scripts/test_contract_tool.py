@@ -234,6 +234,106 @@ class ContractTool(unittest.TestCase):
         self.write_contract(c)
         self.assert_refused('T-2: contract statement, witnesses or decision history changed')
 
+    # The agent's provisional tier (ADR-0028).
+
+    def with_agent(self):
+        agent = str(self.dir.parent / f'{self.dir.name}-agent')
+        subprocess.run(['ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-f', agent], check=True)
+        self.signers.write_text(self.signers.read_text()
+                                + f'agent namespaces="sokol-witness" {Path(agent + ".pub").read_text()}')
+        return agent
+
+    def every_pin(self):
+        return run(self.dir, 'python3', 'scripts/witness-pin.py', 'check', '--signers', str(self.signers), '--every-pin')
+
+    def provisional_row(self, agent, sign=True):
+        name = self.tool('propose', 'T-9', '--statement', 'A late ACK retires the obligation.',
+                         '--witness', 'a_late_ack_retires_the_obligation', '--after', 'T-2',
+                         '--because', 'found by a hunt').stdout.strip()
+        args = ['accept', name, '--provisional'] + (['--agent-key', agent] if sign else [])
+        r = self.tool(*args)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    def test_an_agent_signed_provisional_row_passes_on_main_and_is_marked(self):
+        agent = self.with_agent()
+        self.provisional_row(agent)
+        self.assertIn('| T-9 | [provisional] A late ACK retires the obligation. |', self.invariants())
+        r = self.every_pin()
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertIn('1 provisional rows match the agent', r.stdout)
+        self.assertIn('T-9 | A late ACK retires the obligation.', self.tool('list', '--provisional').stdout)
+
+    def test_an_unsigned_provisional_row_is_refused_on_main(self):
+        self.provisional_row(self.with_agent(), sign=False)
+        r = self.every_pin()
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn('T-9: new provisional row, not pinned yet', r.stdout)
+
+    def test_the_agent_tier_cannot_accept_a_change_to_an_owner_row(self):
+        self.with_agent()
+        name = self.tool('propose', 'T-1', '--statement', 'Weaker.', '--because', 'x').stdout.strip()
+        r = self.tool('accept', name, '--provisional')
+        self.assertEqual(r.returncode, 1)
+        self.assertIn('T-1 is an owner row; only the owner changes it', r.stdout)
+
+    def test_an_owner_row_moved_into_the_agent_tier_is_refused(self):
+        agent = self.with_agent()
+        c = self.read_contract('T-1')
+        c['tier'] = 'provisional'
+        self.write_contract(c)
+        self.tool('regenerate')
+        self.assertEqual(run(self.dir, 'python3', 'scripts/witness-pin.py', 'sign-provisional', '--key', agent).returncode, 0)
+        self.assert_refused('T-1: pinned invariant row was removed')
+
+    def test_a_changed_provisional_witness_needs_the_agent_signature(self):
+        agent = self.with_agent()
+        self.provisional_row(agent)
+        src = self.dir / 'src/gate.rs'
+        src.write_text(src.read_text().replace('assert!(retired());', 'let _ = retired();'))
+        self.assert_refused('witness a_late_ack_retires_the_obligation changed: its body is not the one the agent pinned')
+
+    def test_the_agent_key_cannot_sign_for_the_owner_nor_the_owner_key_for_the_agent(self):
+        agent = self.with_agent()
+        self.assertEqual(run(self.dir, 'python3', 'scripts/witness-pin.py', 'sign', '--key', agent).returncode, 0)
+        self.assert_refused('is not signed by a key in')
+        self.assertEqual(run(self.dir, 'python3', 'scripts/witness-pin.py', 'sign', '--key', self.key).returncode, 0)
+        self.provisional_row(agent, sign=False)
+        self.assertEqual(run(self.dir, 'python3', 'scripts/witness-pin.py', 'sign-provisional', '--key', self.key).returncode, 0)
+        self.assert_refused('docs/witness-provisional.json is not signed by the agent key')
+
+    def test_the_owner_promotes_a_provisional_row_with_one_signature(self):
+        agent = self.with_agent()
+        self.provisional_row(agent)
+        r = self.tool('promote', 'T-9')
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertIn('| T-9 | A late ACK retires the obligation. |', self.invariants())
+        self.assertEqual(run(self.dir, 'python3', 'scripts/witness-pin.py', 'sign', '--key', self.key).returncode, 0)
+        r = self.every_pin()
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertIn('3 invariant rows', r.stdout)
+        self.assertEqual(self.read_contract('T-9')['decisions'][-1]['because'], 'promoted by the owner')
+
+    def test_a_witness_an_owner_row_cites_stays_the_owners_to_change(self):
+        # Shared with a provisional row, it is pinned by the owner only: otherwise the agent's
+        # old pin would refuse the owner's own signed change to it.
+        agent = self.with_agent()
+        name = self.tool('propose', 'T-9', '--statement', 'Shares a witness.',
+                         '--witness', 'a_refusal_creates_no_cooldown', '--witness', 'a_late_ack_retires_the_obligation',
+                         '--after', 'T-2', '--because', 'x').stdout.strip()
+        self.assertEqual(self.tool('accept', name, '--provisional', '--agent-key', agent).returncode, 0)
+        src = self.dir / 'src/gate.rs'
+        src.write_text(src.read_text().replace('assert_eq!(gate(), 0);', 'assert_eq!(gate(), 0, "owner");'))
+        self.assertEqual(run(self.dir, 'python3', 'scripts/witness-pin.py', 'sign', '--key', self.key).returncode, 0)
+        r = self.every_pin()
+        self.assertEqual(r.returncode, 0, r.stdout)
+
+    def test_provisional_acceptance_refuses_the_owner_key(self):
+        self.with_agent()
+        name = self.tool('propose', 'T-9', '--statement', 'S.', '--witness', 'a_late_ack_retires_the_obligation',
+                         '--after', 'T-2', '--because', 'x').stdout.strip()
+        r = self.tool('accept', name, '--provisional', '--key', self.key)
+        self.assertEqual(r.returncode, 1)
+
     def test_a_row_without_a_contract_is_refused(self):
         p = self.dir / 'docs/INVARIANTS.md'
         p.write_text(p.read_text() + '| T-3 | Hand written. | `a_refusal_creates_no_cooldown` |\n')
