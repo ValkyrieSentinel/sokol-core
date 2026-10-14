@@ -1,0 +1,8 @@
+# nodes=3 netem='none' host=aarch64 cpus=10 kernel=6.8.0-142-generic
+# full mesh after 5s: 3/3 nodes see 2 peers
+# bulkflush: 1000 detector blocks at node 1, then FLUSH_BANS
+# node 1's gobgpd holds 1000 of the 1000 rules (19727 ms after every node held the blocks)
+# every node holds 1000 blocks; FLUSH_BANS answered: OK released 1000 dynamic blocks
+node 2 holds none of them 995 ms after the flush; 'frame exceeds limit' in its log: 0
+node 3 holds none of them 1002 ms after the flush; 'frame exceeds limit' in its log: 0
+node 1's gobgpd holds none of the rules 21820 ms after the flush

@@ -1,0 +1,21 @@
+{
+  "annotations": {
+    "status": "UNSIGNED_EXPLANATORY_DRAFT"
+  },
+  "decisions": [
+    {
+      "because": "Round 8 on 9387b10: a flush or unban of more than about 1,900 own claims was one Retract frame over MAX_FRAME_BYTES; peers bailed before reading it and lost the retraction until the next connection's snapshot.",
+      "previous_statement_sha256": null,
+      "proposal_sha256": "69f0dddecfbe75569b4b7962fd8cccc71016e87d0a4636dffd28b3d60b180c54"
+    }
+  ],
+  "evidence_text": "`a_flush_of_many_own_claims_is_retracted_in_frames_a_peer_accepts`, `a_retraction_is_packed_into_full_frames_within_the_budget`",
+  "id": "MESH-F1",
+  "profile": "sokol.contract-shadow.v1",
+  "statement": "Every retraction of this node's own claims that it broadcasts is packed into frames within SNAPSHOT_PAYLOAD_BUDGET, full and in order, so no retraction frame exceeds the transport limit and makes peers drop the connection with it.",
+  "tier": "provisional",
+  "witnesses": [
+    "a_flush_of_many_own_claims_is_retracted_in_frames_a_peer_accepts",
+    "a_retraction_is_packed_into_full_frames_within_the_budget"
+  ]
+}

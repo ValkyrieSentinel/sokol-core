@@ -1,7 +1,44 @@
 {
  "build_v3": {},
- "closures_v4": {},
- "contracts": {},
- "rows": {},
- "witnesses": {}
+ "closures_v4": {
+  "a_flush_of_many_own_claims_is_retracted_in_frames_a_peer_accepts": [
+   "orchestrator/src/control_exec.rs:a2e7caec0d74bfdd687830b5b078afd4002d43a2dfd9712bda39960d027f18f5"
+  ],
+  "a_lifted_retraction_is_on_disk_before_it_is_answered": [
+   "orchestrator/src/ipc.rs:995fc943f94909ba0103bedf641089ef48df97f383ecdd50e401ea61405c2b4c"
+  ],
+  "a_retraction_is_packed_into_full_frames_within_the_budget": [
+   "orchestrator/src/mesh_sync.rs:fe4b4ceeff92b165770cbdb7b280f104f3c31875f378a384f138c4679d40a889"
+  ]
+ },
+ "contracts": {
+  "IPC-D1": "e84369c8467ecde8cf5c7e61a6e6910925171c98c07eb866d125e423644eef3c",
+  "MESH-F1": "dfe5ab17a1d5f4234b3aac1ad052266011a0eb2bb7cd498e4023ae8bbcf420a0"
+ },
+ "rows": {
+  "IPC-D1": {
+   "statement": "090e2e6873d7047b40a8cabcf21137beb099374e741e608e527f474c4d5573c9",
+   "witnesses": [
+    "a_lifted_retraction_is_on_disk_before_it_is_answered"
+   ]
+  },
+  "MESH-F1": {
+   "statement": "456d7145f9803303df214af67ddc9e0ed1c2d3fb9ab7f71bdc7ec546a4007822",
+   "witnesses": [
+    "a_flush_of_many_own_claims_is_retracted_in_frames_a_peer_accepts",
+    "a_retraction_is_packed_into_full_frames_within_the_budget"
+   ]
+  }
+ },
+ "witnesses": {
+  "a_flush_of_many_own_claims_is_retracted_in_frames_a_peer_accepts": [
+   "orchestrator/src/control_exec.rs:dfd6f557596d58b235f4f7e0bef77372074e6e47a3344b4e8b1c4ce2a74ff87b"
+  ],
+  "a_lifted_retraction_is_on_disk_before_it_is_answered": [
+   "orchestrator/src/ipc.rs:6862b4e820c4be51b1f1b47ca3b2612ade65deb3ce0f6ad79006845323dd8ed9"
+  ],
+  "a_retraction_is_packed_into_full_frames_within_the_budget": [
+   "orchestrator/src/mesh_sync.rs:448d38c18ead8985d30c99c6c8ef8e746083b405dc6691fccc0da374d4ceb7b6"
+  ]
+ }
 }

@@ -131,6 +131,38 @@ pub fn pack_snapshot(issuer: u64, claims: Vec<Claim>, retracted: Vec<ClaimId>) -
     out
 }
 
+/// Splits a retraction of this node's own claims into Retract messages whose JSON stays within
+/// SNAPSHOT_PAYLOAD_BUDGET, like `pack_snapshot`: a flush can retract thousands of claims, and a
+/// frame over the transport limit makes every receiver drop the connection unread. None for no ids.
+pub fn pack_retraction(issuer: u64, ids: Vec<ClaimId>) -> Vec<MeshCommand> {
+    let empty = MeshCommand::Retract {
+        issuer,
+        claims: Vec::new(),
+    };
+    let base = serde_json::to_vec(&empty).map_or(128, |v| v.len()) + 64;
+    let mut out = Vec::new();
+    let (mut cur, mut size) = (Vec::new(), base);
+    for id in ids {
+        let n = id.len() + 3;
+        if size + n > SNAPSHOT_PAYLOAD_BUDGET && !cur.is_empty() {
+            out.push(MeshCommand::Retract {
+                issuer,
+                claims: std::mem::take(&mut cur),
+            });
+            size = base;
+        }
+        size += n;
+        cur.push(id);
+    }
+    if !cur.is_empty() {
+        out.push(MeshCommand::Retract {
+            issuer,
+            claims: cur,
+        });
+    }
+    out
+}
+
 /// How often each node sends its digest to its peers.
 pub const DIGEST_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
 /// How often this node offers its audit head to peers, when it changed (ADR-0021).
@@ -412,6 +444,45 @@ impl MeshOrchestrator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// pack_retraction keeps every frame within SNAPSHOT_PAYLOAD_BUDGET, packs them full, and
+    /// loses or reorders no id: ids of one length are chosen so that a frame fills the budget
+    /// to the byte, which also fixes where a frame must end.
+    #[test]
+    fn a_retraction_is_packed_into_full_frames_within_the_budget() {
+        let empty = MeshCommand::Retract {
+            issuer: 2,
+            claims: Vec::new(),
+        };
+        let base = serde_json::to_vec(&empty).unwrap().len() + 64;
+        let len = (20..80)
+            .find(|l| (SNAPSHOT_PAYLOAD_BUDGET - base).is_multiple_of(l + 3))
+            .expect("an id length that fills a frame exactly");
+        let per_frame = (SNAPSHOT_PAYLOAD_BUDGET - base) / (len + 3);
+        let ids: Vec<ClaimId> = (0..per_frame * 2 + 7)
+            .map(|i| format!("{i:0width$}", width = len))
+            .collect();
+        let frames = pack_retraction(2, ids.clone());
+        let mut seen = Vec::new();
+        for (i, frame) in frames.iter().enumerate() {
+            let MeshCommand::Retract { issuer, claims } = frame else {
+                panic!("not a Retract: {frame:?}");
+            };
+            assert_eq!(*issuer, 2);
+            let bytes = serde_json::to_vec(frame).unwrap().len() + 64;
+            assert!(
+                bytes <= SNAPSHOT_PAYLOAD_BUDGET,
+                "frame {i} is {bytes} bytes"
+            );
+            if i + 1 < frames.len() {
+                assert_eq!(claims.len(), per_frame, "frame {i} is not full");
+            }
+            seen.extend(claims.iter().cloned());
+        }
+        assert_eq!(frames.len(), 3);
+        assert_eq!(seen, ids, "ids lost or reordered");
+        assert!(pack_retraction(2, Vec::new()).is_empty());
+    }
 
     #[test]
     fn a_peer_gets_one_snapshot_per_cooldown() {
