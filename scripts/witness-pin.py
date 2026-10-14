@@ -11,6 +11,8 @@ body of each witness, in docs/witness-manifest.json signed by the owner (ssh-key
         # new that is not pinned yet; with --executed also when a pinned witness did not run
         # and pass (the Rust ones in that `cargo test` log; the Python ones are run here)
     witness-pin.py sign --key PRIVATE_KEY   # owner: re-pin the current tree and sign it
+    witness-pin.py sign-provisional --key AGENT_KEY
+                                            # agent: pin the provisional rows (ADR-0028)
     witness-pin.py closure WITNESS          # the test items pinned with a witness
     witness-pin.py run-python               # run the pinned Python witnesses, print a log for
                                             # check --executed-python (the base workflow)
@@ -38,6 +40,8 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 INVARIANTS = ROOT / "docs/INVARIANTS.md"
 MANIFEST = ROOT / "docs/witness-manifest.json"
 SIGNATURE = ROOT / "docs/witness-manifest.json.sig"
+PROVISIONAL = ROOT / "docs/witness-provisional.json"
+PROVISIONAL_SIG = ROOT / "docs/witness-provisional.json.sig"
 SIGNERS = ROOT / ".github/witness-signers"
 NAMESPACE = "sokol-witness"
 ROW = re.compile(r"^\| ([A-Z][A-Z0-9]*-[A-Z0-9-]+) \|")
@@ -77,7 +81,8 @@ def contract_row(contract: dict) -> str:
     for field in ('statement', 'evidence_text'):
         if not isinstance(contract[field], str) or any(c in contract[field] for c in '\n\r|'):
             raise ValueError('Invalid contract table cell')
-    return '| ' + rid + ' | ' + contract['statement'] + ' | ' + contract['evidence_text'] + ' |'
+    marker = '[provisional] ' if contract.get('tier') == 'provisional' else ''
+    return '| ' + rid + ' | ' + marker + contract['statement'] + ' | ' + contract['evidence_text'] + ' |'
 
 
 def project_invariants(text: str, contract: dict) -> str:
@@ -162,6 +167,8 @@ def load_contracts(root: pathlib.Path) -> dict:
             raise ValueError('Contract witness list differs from its evidence text')
         contract_row(contract)
         check_retirement(contract)
+        if contract.get('tier', 'provisional') != 'provisional' or (contract.get('tier') and retired(contract)):
+            raise ValueError(rid + ': tier is absent (owner-accepted) or "provisional", and a provisional row is not retired')
         contracts[rid] = contract
     return contracts
 
@@ -214,11 +221,17 @@ def generated_invariants(text: str, root: pathlib.Path) -> str:
     return text
 
 
-def contract_pins(root: pathlib.Path) -> dict:
-    """What the owner accepts about each contract: the rendered row and its decision history.
-    Unsigned explanations (annotations) are left out on purpose."""
+def provisional(contract: dict) -> bool:
+    return contract.get('tier') == 'provisional'
+
+
+def contract_pins(root: pathlib.Path, tier: str = "owner") -> dict:
+    """What a signer accepts about each contract of its tier: the rendered row and its decision
+    history. Unsigned explanations (annotations) are left out on purpose."""
     pins = {}
     for rid, c in load_contracts(root).items():
+        if provisional(c) != (tier == "provisional"):
+            continue
         accepted = {k: c.get(k) for k in ('statement', 'evidence_text', 'witnesses', 'decisions')}
         if retired(c):
             # Only a retired contract carries these keys, so the pins of active ones keep the
@@ -870,27 +883,35 @@ def build_pins() -> dict[str, str]:
     return pins
 
 
-def current() -> dict:
-    table = rows()
+def current(tier: str = "owner") -> dict:
+    """The pins of one tier (ADR-0028): the owner's rows, or the agent's provisional rows. A
+    witness that an owner row cites belongs to the owner's pins only."""
+    contracts = load_contracts(ROOT)
+    every = rows()
+    agent = {rid for rid, c in contracts.items() if provisional(c)}
+    table = {rid: r for rid, r in every.items() if (rid in agent) == (tier == "provisional")}
     cited = {w for r in table.values() for w in r["witnesses"]}
-    # A REFUTED row's counterexamples are the evidence its tombstone rests on: pinned too.
-    cited |= {w for c in load_contracts(ROOT).values() if retired(c)
-              for w in c['retirement']['counterexamples']}
+    if tier == "provisional":
+        cited -= {w for rid, r in every.items() if rid not in agent for w in r["witnesses"]}
+    else:
+        # A REFUTED row's counterexamples are the evidence its tombstone rests on: pinned too.
+        cited |= {w for c in contracts.values() if retired(c) for w in c['retirement']['counterexamples']}
     bodies = {**rust_bodies({w for w in cited if RUST_TEST.fullmatch(w)}),
               **py_bodies({w for w in cited if PY_TEST.fullmatch(w)})}
     closures = {**rust_closures({w for w in cited if RUST_TEST.fullmatch(w)}),
                 **py_closures({w for w in cited if PY_TEST.fullmatch(w)})}
     return {"rows": table, "witnesses": {w: sorted(bodies.get(w, [])) for w in sorted(cited)},
             CLOSURES: {w: sorted(closures.get(w, [])) for w in sorted(cited)},
-            BUILD: build_pins(),
-            "contracts": contract_pins(ROOT)}
+            BUILD: build_pins() if tier == "owner" else {},
+            "contracts": contract_pins(ROOT, tier)}
 
 
-def verify_manifest(manifest: pathlib.Path, signature: pathlib.Path, signers: pathlib.Path) -> bool:
+def verify_manifest(manifest: pathlib.Path, signature: pathlib.Path, signers: pathlib.Path,
+                    principal: str = "owner") -> bool:
     """Verify owner against the supplied trust file; callers choose its trusted provenance."""
     if not (manifest.exists() and signature.exists() and signers.exists()):
         return False
-    r = subprocess.run(["ssh-keygen", "-Y", "verify", "-f", str(signers), "-I", "owner", "-n", NAMESPACE,
+    r = subprocess.run(["ssh-keygen", "-Y", "verify", "-f", str(signers), "-I", principal, "-n", NAMESPACE,
                         "-s", str(signature)], input=manifest.read_bytes(), capture_output=True, timeout=10)
     return r.returncode == 0
 
@@ -899,18 +920,9 @@ def verify(signers: pathlib.Path) -> bool:
     return verify_manifest(MANIFEST, SIGNATURE, signers)
 
 
-def check(signers: pathlib.Path, every_pin: bool = False, executed_log: pathlib.Path | None = None,
-          python_log_path: pathlib.Path | None = None) -> int:
-    now = current()
+def compare(pinned: dict, now: dict, who: str) -> tuple[list[str], list[str]]:
+    """What changed in one tier against what its signer pinned."""
     problems, notes = [], []
-    for w, where in now["witnesses"].items():
-        if not where:
-            problems.append(f"witness {w} is cited but no test function has that name")
-    if not verify(signers):
-        problems.append(f"{MANIFEST.relative_to(ROOT)} is not signed by a key in {signers}")
-        pinned = {"rows": {}, "witnesses": {}}
-    else:
-        pinned = json.loads(MANIFEST.read_text())
     for rid, row in pinned["rows"].items():
         cur = now["rows"].get(rid)
         if cur is None:
@@ -924,7 +936,7 @@ def check(signers: pathlib.Path, every_pin: bool = False, executed_log: pathlib.
             notes.append(f"{rid}: witness {w} is new and not pinned yet")
     for w, where in pinned["witnesses"].items():
         if w in now["witnesses"] and now["witnesses"][w] != where:
-            problems.append(f"witness {w} changed: its body is not the one the owner pinned")
+            problems.append(f"witness {w} changed: its body is not the one the {who} pinned")
     # closures (#21), closures_v2 (#22), closures_v3 (#40) and build (#22) are earlier rules,
     # kept frozen for checkers of those versions; closures_v4 follows Python imports of local
     # modules, build_v2 adds the Rust toolchain file, build_v3 the base gate workflow.
@@ -935,17 +947,7 @@ def check(signers: pathlib.Path, every_pin: bool = False, executed_log: pathlib.
     else:
         for w, where in closures.items():
             if w in now[CLOSURES] and now[CLOSURES][w] != where and now["witnesses"].get(w) == pinned["witnesses"].get(w):
-                problems.append(f"witness {w} changed: its attributes or a test item it reaches are not the ones the owner pinned")
-    build = pinned.get(BUILD)
-    if build is None:
-        if pinned["witnesses"]:
-            notes.append("build configuration (Cargo targets, .cargo/config, build.rs, toolchain) is not pinned yet")
-    elif build != now[BUILD]:
-        for f in sorted(set(build) | set(now[BUILD])):
-            if build.get(f) != now[BUILD].get(f):
-                problems.append(f"{f}: build configuration changed (how tests are built or run)")
-    if executed_log is not None:
-        problems += executed(executed_log, pinned["witnesses"], python_log_path)
+                problems.append(f"witness {w} changed: its attributes or a test item it reaches are not the ones the {who} pinned")
     for rid in sorted(set(now["rows"]) - set(pinned["rows"])):
         notes.append(f"{rid}: new invariant row, not pinned yet")
     for rid, pin in pinned.get("contracts", {}).items():
@@ -955,6 +957,53 @@ def check(signers: pathlib.Path, every_pin: bool = False, executed_log: pathlib.
             problems.append(f"{rid}: contract statement, witnesses or decision history changed")
     for rid in sorted(set(now["contracts"]) - set(pinned.get("contracts", {}))):
         notes.append(f"{rid}: contract is not pinned yet")
+    return problems, notes
+
+
+def check(signers: pathlib.Path, every_pin: bool = False, executed_log: pathlib.Path | None = None,
+          python_log_path: pathlib.Path | None = None) -> int:
+    now, agent_now = current("owner"), current("provisional")
+    problems, notes = [], []
+    for w, where in {**now["witnesses"], **agent_now["witnesses"]}.items():
+        if not where:
+            problems.append(f"witness {w} is cited but no test function has that name")
+    if not verify(signers):
+        problems.append(f"{MANIFEST.relative_to(ROOT)} is not signed by a key in {signers}")
+        pinned = {"rows": {}, "witnesses": {}}
+    else:
+        pinned = json.loads(MANIFEST.read_text())
+    found, noted = compare(pinned, now, "owner")
+    problems += found
+    notes += noted
+    build = pinned.get(BUILD)
+    if build is None:
+        if pinned["witnesses"]:
+            notes.append("build configuration (Cargo targets, .cargo/config, build.rs, toolchain) is not pinned yet")
+    elif build != now[BUILD]:
+        for f in sorted(set(build) | set(now[BUILD])):
+            if build.get(f) != now[BUILD].get(f):
+                problems.append(f"{f}: build configuration changed (how tests are built or run)")
+    # The agent's tier (ADR-0028): provisional rows, signed by the `agent` principal of the
+    # same signers file. It cannot hold an owner row: those are not in agent_now, so pinning
+    # one there reads as a removed row.
+    agent_pinned = {"rows": {}, "witnesses": {}}
+    if PROVISIONAL.exists() or agent_now["rows"]:
+        if PROVISIONAL.exists() and verify_manifest(PROVISIONAL, PROVISIONAL_SIG, signers, "agent"):
+            agent_pinned = json.loads(PROVISIONAL.read_text())
+        elif PROVISIONAL.exists():
+            problems.append(f"{PROVISIONAL.relative_to(ROOT)} is not signed by the agent key in {signers}")
+        # A row the owner has promoted is the owner's now: the agent's old pin of it lapses.
+        promoted = set(pinned["rows"]) | set(pinned.get("contracts", {}))
+        agent_pinned = {**agent_pinned,
+                        "rows": {r: v for r, v in agent_pinned["rows"].items() if r not in promoted},
+                        "contracts": {r: v for r, v in agent_pinned.get("contracts", {}).items() if r not in promoted},
+                        "witnesses": {k: v for k, v in agent_pinned["witnesses"].items() if k not in now["witnesses"]},
+                        CLOSURES: {k: v for k, v in agent_pinned.get(CLOSURES, {}).items() if k not in now["witnesses"]}}
+        found, noted = compare(agent_pinned, agent_now, "agent")
+        problems += found
+        notes += [x.replace(": new invariant row, not pinned yet", ": new provisional row, not pinned yet") for x in noted]
+    if executed_log is not None:
+        problems += executed(executed_log, {**pinned["witnesses"], **agent_pinned["witnesses"]}, python_log_path)
     for name in open_proposals(ROOT):
         notes.append(f"open proposal {name}: unsigned intent, not accepted")
     if every_pin:
@@ -969,28 +1018,36 @@ def check(signers: pathlib.Path, every_pin: bool = False, executed_log: pathlib.
     if problems:
         print("A pinned witness or invariant changes only with a new owner signature: scripts/witness-pin.py sign")
         return 1
-    print(f"ok   {len(pinned['rows'])} invariant rows and {len(pinned['witnesses'])} witnesses match the owner's pins")
+    extra = f"; {len(agent_pinned['rows'])} provisional rows match the agent's" if agent_pinned["rows"] else ""
+    print(f"ok   {len(pinned['rows'])} invariant rows and {len(pinned['witnesses'])} witnesses match the owner's pins{extra}")
     return 0
 
 
-def sign(key: str) -> int:
-    now = current()
+def write_signed(path: pathlib.Path, signature: pathlib.Path, value: dict, key: str) -> None:
+    path.write_text(json.dumps(value, indent=1, sort_keys=True) + "\n")
+    # ssh-keygen asks before overwriting a signature and, without a terminal, keeps the old
+    # one and still exits 0: a re-pin would leave the previous signature in place.
+    signature.unlink(missing_ok=True)
+    subprocess.run(["ssh-keygen", "-q", "-Y", "sign", "-f", key, "-n", NAMESPACE, str(path)],
+                   stdin=subprocess.DEVNULL, check=True)
+    pathlib.Path(str(path) + ".sig").replace(signature)
+
+
+def sign(key: str, tier: str = "owner") -> int:
+    """The owner pins the owner tier (promoted rows included); the agent's key pins only the
+    provisional tier, in its own manifest (ADR-0028)."""
+    now = current(tier)
     missing = [w for w, where in now["witnesses"].items() if not where]
     if missing:
         print("FAIL refusing to pin witnesses that do not exist:", ", ".join(missing))
         return 1
-    if MANIFEST.exists():
+    path, signature = (MANIFEST, SIGNATURE) if tier == "owner" else (PROVISIONAL, PROVISIONAL_SIG)
+    if tier == "owner" and MANIFEST.exists():
         # Checkers of earlier rules still read their own fields; each stays as pinned.
         for field, value in json.loads(MANIFEST.read_text()).items():
             now.setdefault(field, value)
-    MANIFEST.write_text(json.dumps(now, indent=1, sort_keys=True) + "\n")
-    # ssh-keygen asks before overwriting a signature and, without a terminal, keeps the old
-    # one and still exits 0: a re-pin would leave the previous signature in place.
-    SIGNATURE.unlink(missing_ok=True)
-    subprocess.run(["ssh-keygen", "-q", "-Y", "sign", "-f", key, "-n", NAMESPACE, str(MANIFEST)],
-                   stdin=subprocess.DEVNULL, check=True)
-    pathlib.Path(str(MANIFEST) + ".sig").replace(SIGNATURE)
-    print(f"signed {len(now['rows'])} rows, {len(now['witnesses'])} witnesses")
+    write_signed(path, signature, now, key)
+    print(f"signed {len(now['rows'])} {'provisional ' if tier != 'owner' else ''}rows, {len(now['witnesses'])} witnesses")
     return 0
 
 
@@ -998,6 +1055,8 @@ if __name__ == "__main__":
     args = sys.argv[1:]
     if args[:1] == ["sign"] and "--key" in args:
         sys.exit(sign(args[args.index("--key") + 1]))
+    if args[:1] == ["sign-provisional"] and "--key" in args:
+        sys.exit(sign(args[args.index("--key") + 1], "provisional"))
     if args[:1] == ["closure"] and len(args) == 2:
         w = args[1]
         (rust_closures if RUST_TEST.fullmatch(w) else py_closures)({w})

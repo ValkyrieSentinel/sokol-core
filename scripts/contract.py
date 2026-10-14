@@ -16,8 +16,15 @@
         against, append the decision to the contract's history, regenerate, and with --key
         re-pin through scripts/witness-pin.py sign. Without the owner's signature the gate
         refuses the change, so accepting is the owner's act, not the proposer's.
-    contract.py list [--retired]
-        Open proposals; with --retired, the tombstones of retired rows.
+    contract.py accept <PROPOSAL-FILE> --provisional [--agent-key AGENT_KEY]
+        An agent accepts a new row (or a change to its own provisional row) into the
+        provisional tier: the row is shown as [provisional] and pinned by the agent's key, in
+        docs/witness-provisional.json (ADR-0028). An owner row cannot be touched this way.
+    contract.py promote <ID>...
+        The owner takes provisional rows into the owner tier; then witness-pin.py sign.
+    contract.py list [--retired | --provisional]
+        Open proposals; with --retired, the tombstones of retired rows; with --provisional,
+        the rows waiting for the owner.
 
 A proposal names the reason (a counterexample, a measurement, a requirement). The gate reads
 the contract, never the proposal; an open proposal is reported as a note.
@@ -169,7 +176,7 @@ def propose(rid: str, because: str, statement: str | None, witnesses: list[str],
     return 0
 
 
-def accept(file: str, key: str | None) -> int:
+def accept(file: str, key: str | None, tier: str = "owner", agent_key: str | None = None) -> int:
     ppath = pathlib.Path(file).resolve()
     if ppath.parent != PROPOSALS.resolve() or not ppath.name.endswith('.proposal.json'):
         print('FAIL a proposal is a file in docs/contracts/proposals/')
@@ -180,6 +187,14 @@ def accept(file: str, key: str | None) -> int:
         print('FAIL not a contract proposal')
         return 1
     path = contract_path(p['id'])
+    if tier == 'provisional':
+        existing = json.loads(path.read_text()) if path.exists() else None
+        if existing is not None and not gate.provisional(existing):
+            print('FAIL ' + p['id'] + ' is an owner row; only the owner changes it')
+            return 1
+        if p.get('retire'):
+            print('FAIL a provisional row is withdrawn by removing it, not retired')
+            return 1
     base = sha(path.read_bytes()) if path.exists() else None
     if base != p['base_contract_sha256']:
         print('FAIL stale proposal: the contract changed after it was made; propose again')
@@ -192,6 +207,8 @@ def accept(file: str, key: str | None) -> int:
         'previous_statement_sha256': sha(contract['statement'].encode()) if 'statement' in contract else None,
     })
     contract.update({k: p[k] for k in ('statement', 'evidence_text', 'witnesses')})
+    if tier == 'provisional':
+        contract['tier'] = 'provisional'
     text = INVARIANTS.read_text()
     if p.get('retire'):
         contract.update(status='retired', retirement=p['retire'])
@@ -208,9 +225,33 @@ def accept(file: str, key: str | None) -> int:
     INVARIANTS.write_text(render(text, gate.load_contracts(ROOT)))
     ppath.unlink()
     print(f"accepted {p['id']}: contract, history and {INVARIANTS.relative_to(ROOT)} updated")
+    if tier == 'provisional':
+        if agent_key:
+            return subprocess.run([sys.executable, str(ROOT / 'scripts/witness-pin.py'), 'sign-provisional',
+                                   '--key', agent_key]).returncode
+        print('not signed: the gate refuses this provisional row until the agent key pins it')
+        return 0
     if key:
         return subprocess.run([sys.executable, str(ROOT / 'scripts/witness-pin.py'), 'sign', '--key', key]).returncode
     print('not signed: the gate refuses this change until the owner runs scripts/witness-pin.py sign')
+    return 0
+
+
+def promote(ids: list[str]) -> int:
+    contracts = gate.load_contracts(ROOT)
+    for rid in ids:
+        c = contracts.get(rid)
+        if c is None or not gate.provisional(c):
+            print('FAIL ' + rid + ' is not a provisional row')
+            return 1
+    for rid in ids:
+        c = contracts[rid]
+        del c['tier']
+        c.setdefault('decisions', []).append({'proposal_sha256': None, 'because': 'promoted by the owner',
+                                              'previous_statement_sha256': sha(c['statement'].encode())})
+        contract_path(rid).write_text(dump(c))
+    INVARIANTS.write_text(render(INVARIANTS.read_text(), gate.load_contracts(ROOT)))
+    print('promoted ' + ', '.join(ids) + ': the owner pins them with witness-pin.py sign')
     return 0
 
 
@@ -220,6 +261,9 @@ def main() -> int:
     sub.add_parser('regenerate')
     pl = sub.add_parser('list')
     pl.add_argument('--retired', action='store_true')
+    pl.add_argument('--provisional', action='store_true')
+    pm = sub.add_parser('promote')
+    pm.add_argument('ids', nargs='+')
     pp = sub.add_parser('propose')
     pp.add_argument('id')
     pp.add_argument('--because', required=True)
@@ -233,11 +277,20 @@ def main() -> int:
     pa = sub.add_parser('accept')
     pa.add_argument('proposal')
     pa.add_argument('--key')
+    pa.add_argument('--provisional', action='store_true')
+    pa.add_argument('--agent-key')
     a = parser.parse_args()
     try:
         if a.command == 'regenerate':
             return regenerate()
+        if a.command == 'promote':
+            return promote(a.ids)
         if a.command == 'list':
+            if a.provisional:
+                for rid, c in gate.load_contracts(ROOT).items():
+                    if gate.provisional(c):
+                        print(f"{rid} | {c['statement']} | because: {c['decisions'][-1]['because']}")
+                return 0
             if a.retired:
                 for rid, c in gate.load_contracts(ROOT).items():
                     if gate.retired(c):
@@ -258,7 +311,10 @@ def main() -> int:
                 print('FAIL --loss, --replacement and --counterexample belong to --retire')
                 return 1
             return propose(a.id, a.because, a.statement, a.witness, a.after)
-        return accept(a.proposal, a.key)
+        if a.provisional and a.key:
+            print('FAIL --provisional is the agent tier: sign it with --agent-key, not the owner key')
+            return 1
+        return accept(a.proposal, a.key, 'provisional' if a.provisional else 'owner', a.agent_key)
     except (ValueError, KeyError, OSError, json.JSONDecodeError) as error:
         print('FAIL', error)
         return 1
