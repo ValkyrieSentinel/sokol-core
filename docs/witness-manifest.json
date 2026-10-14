@@ -1997,6 +1997,18 @@
   "RecoveryTests.test_invalid_forwarding_age_leaves_cursor_and_ipc_untouched": [
    "scripts/test_suricata_recovery.py:373b7fa3bedb987deb98e9dfafe6426148c3ec6ab18249d6bd34c4124180d41b"
   ],
+  "RegistryWithinLock.test_a_crate_of_another_project_or_version_is_refused": [
+   "scripts/test_counterexample_registry.py:0d0b12da857149d3d82634e821ce05817919a55e202ae2340d9aa8c07a4e5678"
+  ],
+  "RegistryWithinLock.test_a_dedicated_registry_for_the_lockfile_is_admitted": [
+   "scripts/test_counterexample_registry.py:80a512ddd5007c76cc5f239fde1d9b3d9a5b18660a4849b45cda1300c22ada1d"
+  ],
+  "RegistryWithinLock.test_the_index_cache_is_metadata_and_not_restricted": [
+   "scripts/test_counterexample_registry.py:d50571dda199578ac7d063826a0085250ed910fe66c621cf73b4fac9ca91f5ba"
+  ],
+  "RegistryWithinLock.test_unpacked_sources_of_another_project_are_refused": [
+   "scripts/test_counterexample_registry.py:17fee0d8c21edfe85e6322bc0c3456187ceea93f00cacaeb717973a743a75fee"
+  ],
   "StreamTests.test_zero_pacing_fails_before_lapi_or_ipc_requests": [
    "scripts/test_crowdsec_stream.py:bd57ceda22f3aff046c8f0f6a7e93a34cdb47d98b526d660a8180cb1f43782cf"
   ],
@@ -2661,6 +2673,7 @@
   "CS-P2": "5dd517e4115b6735f6e7477f4118095dccc8075d384adeb95b2bbf1a0069b031",
   "EXCHANGE-H1": "27642a447108fd8a5245d35882d1ff77f947e0a13250aee6d733c770ee157031",
   "EXCHANGE-P1": "1f1fd4ba88f639ccf12ef8b384e15ba6d4556814bdddd7b953ca73f5033f0500",
+  "EXCHANGE-R1": "bf3b59a90682b83620bd46fb433c2fc5b4edcd809e596da709511f40167a3f6f",
   "FASTNETMON-A1": "d7a9f0dd095b399579eb136f5aa8837278f07afe62dcda3c0a93c2eff11d94ec",
   "FLOWSPEC-B1": "4bcfb9a6441b08485e2687a88e162720a37dcc60ed26ca003cb37d23ce3f7289",
   "FLOWSPEC-P1": "23412916e4d4b48929c79ebd1541c49345a29b49377f67aff8ef23ac673153ce",
@@ -2832,6 +2845,15 @@
     "Interpretation.test_unrun_budget_and_wrong_phase_are_never_success",
     "PublicWarrant.test_readdressing_a_changed_witness_cannot_bypass_owner_pin",
     "PublicWarrant.test_recipient_reply_is_prior_linked_and_view_does_not_upgrade_execution"
+   ]
+  },
+  "EXCHANGE-R1": {
+   "statement": "a8ee0caaf9d71dd1ff89a81ae7509d4ec516ca3993fd261dd44b43fec7021822",
+   "witnesses": [
+    "RegistryWithinLock.test_a_crate_of_another_project_or_version_is_refused",
+    "RegistryWithinLock.test_a_dedicated_registry_for_the_lockfile_is_admitted",
+    "RegistryWithinLock.test_the_index_cache_is_metadata_and_not_restricted",
+    "RegistryWithinLock.test_unpacked_sources_of_another_project_are_refused"
    ]
   },
   "FASTNETMON-A1": {
@@ -3380,6 +3402,18 @@
   ],
   "RecoveryTests.test_invalid_forwarding_age_leaves_cursor_and_ipc_untouched": [
    "scripts/test_suricata_recovery.py:782b9d2ef47448c4a191d462bfa94d2ca92ea12f3e3e67f13a68f2911beb4df5"
+  ],
+  "RegistryWithinLock.test_a_crate_of_another_project_or_version_is_refused": [
+   "scripts/test_counterexample_registry.py:9bbbf51d458aa8250b0add13ed9922d463559304c4616484121f686a4dfbb15a"
+  ],
+  "RegistryWithinLock.test_a_dedicated_registry_for_the_lockfile_is_admitted": [
+   "scripts/test_counterexample_registry.py:f7be0606bdad184f9052422d98b68383ff93d69c1da008d7ee855586cc968121"
+  ],
+  "RegistryWithinLock.test_the_index_cache_is_metadata_and_not_restricted": [
+   "scripts/test_counterexample_registry.py:bb174fb99dd4582de7f0ccbac9a9c7e2fa47dfafd3b2b14a05a82b3c0d78220f"
+  ],
+  "RegistryWithinLock.test_unpacked_sources_of_another_project_are_refused": [
+   "scripts/test_counterexample_registry.py:bd55fc05eb61266e566b517931d2bbc7c54bc9f12053f70fd0ac6d01f55d3449"
   ],
   "StreamTests.test_zero_pacing_fails_before_lapi_or_ipc_requests": [
    "scripts/test_crowdsec_stream.py:7a9cc86a61a984b692c1294648017ff8b4d1ae018742129ce070592944dfe8ce"
