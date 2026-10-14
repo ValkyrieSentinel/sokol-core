@@ -438,6 +438,22 @@ class WitnessPin(unittest.TestCase):
                     "--executed", str(self.dir.parent / f"{self.dir.name}-log"), "--executed-python", str(log))
             self.assertEqual(r.returncode, code, r.stdout)
 
+    def test_a_python_witness_that_needs_a_tool_runs_with_the_gates_environment(self):
+        # EXCHANGE-P1, 2026-10-14: its witnesses skip without SOKOL_WARRANT_BIN. The gate runs
+        # pinned Python witnesses in its own environment, and a skip is not a pass.
+        self.edit("scripts/test_recovery.py", "    def test_recovery_keeps_the_cursor",
+                  "    @unittest.skipUnless(__import__('os').environ.get('WITNESS_TOOL'), 'needs WITNESS_TOOL')\n"
+                  "    def test_recovery_keeps_the_cursor")
+        self.assertEqual(self.pin(self.key).returncode, 0)
+        r = self.executed(LOG)
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn("witness RecoveryTests.test_recovery_keeps_the_cursor did not run and pass", r.stdout)
+        log = self.dir.parent / f"{self.dir.name}-log"
+        r = subprocess.run(["python3", "scripts/witness-pin.py", "check", "--signers", str(self.signers),
+                            "--executed", str(log)], cwd=self.dir, capture_output=True, text=True,
+                           stdin=subprocess.DEVNULL, timeout=120, env={**os.environ, "WITNESS_TOOL": "1"})
+        self.assertEqual(r.returncode, 0, r.stdout)
+
     def test_a_failing_python_witness_is_refused(self):
         self.edit("scripts/test_recovery.py", "def cursor(*_):\n    return 7", "def cursor(*_):\n    return 8")
         r = self.executed(LOG)

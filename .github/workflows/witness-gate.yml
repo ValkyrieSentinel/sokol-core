@@ -28,6 +28,7 @@ env:
   CARGO_TERM_COLOR: always
   BPF_LINKER_VERSION: v0.11.1
   BPF_LINKER_SHA256: e058a6aecc9e65fa4c977b298a8e4b738424d7629769fd352eed409fb57e16e8
+  WARRANT_VERIFY_VERSION: 0.9.0
 
 jobs:
   tests:
@@ -56,6 +57,13 @@ jobs:
           curl -sSfL -o /tmp/bpf-linker.tar.zst "https://github.com/aya-rs/bpf-linker/releases/download/${BPF_LINKER_VERSION}/bpf-linker-x86_64-unknown-linux-musl.tar.zst"
           echo "${BPF_LINKER_SHA256}  /tmp/bpf-linker.tar.zst" | sha256sum -c -
           tar --zstd -x -C /usr/local/bin -f /tmp/bpf-linker.tar.zst
+
+      # Pinned Python witnesses that drive the released Warrant CLI (EXCHANGE-P1) skip without
+      # it, and a skip is not a pass.
+      - name: Released warrant-verify for the witnesses that need it
+        run: |
+          cargo install --locked --version "$WARRANT_VERIFY_VERSION" --root "$RUNNER_TEMP/sokol-warrant" warrant-verify
+          echo "SOKOL_WARRANT_BIN=$RUNNER_TEMP/sokol-warrant/bin/warrant-rs" >> "$GITHUB_ENV"
 
       # The commands are main's; what they compile and run is the pull request's. Its build
       # configuration and witness files are pinned, so a change that could forge these logs is
