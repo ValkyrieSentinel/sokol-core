@@ -1,45 +1,7 @@
 {
  "build_v3": {},
- "closures_v4": {
-  "RegistryWithinLock.test_a_crate_of_another_project_or_version_is_refused": [
-   "scripts/test_counterexample_registry.py:0d0b12da857149d3d82634e821ce05817919a55e202ae2340d9aa8c07a4e5678"
-  ],
-  "RegistryWithinLock.test_a_dedicated_registry_for_the_lockfile_is_admitted": [
-   "scripts/test_counterexample_registry.py:80a512ddd5007c76cc5f239fde1d9b3d9a5b18660a4849b45cda1300c22ada1d"
-  ],
-  "RegistryWithinLock.test_the_index_cache_is_metadata_and_not_restricted": [
-   "scripts/test_counterexample_registry.py:d50571dda199578ac7d063826a0085250ed910fe66c621cf73b4fac9ca91f5ba"
-  ],
-  "RegistryWithinLock.test_unpacked_sources_of_another_project_are_refused": [
-   "scripts/test_counterexample_registry.py:17fee0d8c21edfe85e6322bc0c3456187ceea93f00cacaeb717973a743a75fee"
-  ]
- },
- "contracts": {
-  "EXCHANGE-R1": "f82a64a1282cf9032a1226b867301bf358ed2dc8eedc6eece922ba6f050ca237"
- },
- "rows": {
-  "EXCHANGE-R1": {
-   "statement": "8c098b753c2a6d410df9791a7c6d871865b5bc922f07efb4860a9f3cdba96ff1",
-   "witnesses": [
-    "RegistryWithinLock.test_a_crate_of_another_project_or_version_is_refused",
-    "RegistryWithinLock.test_a_dedicated_registry_for_the_lockfile_is_admitted",
-    "RegistryWithinLock.test_the_index_cache_is_metadata_and_not_restricted",
-    "RegistryWithinLock.test_unpacked_sources_of_another_project_are_refused"
-   ]
-  }
- },
- "witnesses": {
-  "RegistryWithinLock.test_a_crate_of_another_project_or_version_is_refused": [
-   "scripts/test_counterexample_registry.py:9bbbf51d458aa8250b0add13ed9922d463559304c4616484121f686a4dfbb15a"
-  ],
-  "RegistryWithinLock.test_a_dedicated_registry_for_the_lockfile_is_admitted": [
-   "scripts/test_counterexample_registry.py:f7be0606bdad184f9052422d98b68383ff93d69c1da008d7ee855586cc968121"
-  ],
-  "RegistryWithinLock.test_the_index_cache_is_metadata_and_not_restricted": [
-   "scripts/test_counterexample_registry.py:bb174fb99dd4582de7f0ccbac9a9c7e2fa47dfafd3b2b14a05a82b3c0d78220f"
-  ],
-  "RegistryWithinLock.test_unpacked_sources_of_another_project_are_refused": [
-   "scripts/test_counterexample_registry.py:bd55fc05eb61266e566b517931d2bbc7c54bc9f12053f70fd0ac6d01f55d3449"
-  ]
- }
+ "closures_v4": {},
+ "contracts": {},
+ "rows": {},
+ "witnesses": {}
 }
