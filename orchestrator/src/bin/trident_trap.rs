@@ -50,6 +50,13 @@ struct NodeLink {
 
 static NODE: OnceLock<NodeLink> = OnceLock::new();
 
+#[cfg(test)]
+thread_local! {
+    /// What this thread submits, for a test: each #[tokio::test] runs on its own thread, so
+    /// tests no longer read each other's lines through the process-wide NODE.
+    static TEST_LINK: std::cell::RefCell<Option<SyncSender<String>>> = const { std::cell::RefCell::new(None) };
+}
+
 /// What happened to a line, as the delivery thread learned it.
 #[derive(Debug, PartialEq, Eq)]
 enum Report {
@@ -65,6 +72,10 @@ enum Report {
 
 /// Queues `line` for the node; false if it was lost before reaching the outbox.
 fn submit(line: String) -> bool {
+    #[cfg(test)]
+    if let Some(tx) = TEST_LINK.with(|l| l.borrow().clone()) {
+        return tx.try_send(line).is_ok();
+    }
     let Some(node) = NODE.get() else {
         eprintln!("[!] node link not started; dropped: {}", line);
         return false;
@@ -888,10 +899,11 @@ mod tests {
     /// are diagnostic text and must sit in that terminal VEC, or a jailed client can move any
     /// trap tier counter (one line per read) and supply header fields.
     /// A jailed client that keeps sending one byte a second never ends its session by
-    /// itself; the session deadline ends it and the source is still blocked. (Same address
-    /// as the other NODE-sharing test, whose assertions read every line this one submits.)
+    /// itself; the session deadline ends it and the source is still blocked.
     #[tokio::test]
     async fn a_trickling_client_cannot_hold_a_trap_slot_past_the_session_deadline() {
+        let (tx, rx) = std::sync::mpsc::sync_channel(256);
+        TEST_LINK.with(|l| *l.borrow_mut() = Some(tx));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let attacker = tokio::spawn(async move {
@@ -916,7 +928,7 @@ mod tests {
             Duration::from_secs(20),
             serve_trap_connection(
                 stream,
-                "203.0.113.9".into(),
+                "203.0.113.77".into(),
                 2022,
                 &config,
                 Duration::from_secs(3),
@@ -930,6 +942,13 @@ mod tests {
             Some("trap port 2022: session exceeded 3 s"),
             "the deadline must end the session with a ban reason"
         );
+        let lines: Vec<String> = rx.try_iter().collect();
+        assert!(
+            lines.contains(
+                &"SIGNAL:trident|203.0.113.77|-|trap port 2022: session exceeded 3 s".to_string()
+            ),
+            "the source was not blocked when the deadline ended its session: {lines:?}"
+        );
         assert!(
             started.elapsed() < Duration::from_secs(6),
             "{:?}",
@@ -941,12 +960,7 @@ mod tests {
     async fn attacker_bytes_reach_trap_telemetry_only_as_terminal_vector_text() {
         use tokio::io::AsyncBufReadExt;
         let (tx, rx) = std::sync::mpsc::sync_channel(256);
-        assert!(NODE
-            .set(NodeLink {
-                tx,
-                overflow: AtomicU64::new(0)
-            })
-            .is_ok());
+        TEST_LINK.with(|l| *l.borrow_mut() = Some(tx));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let attacker = tokio::spawn(async move {

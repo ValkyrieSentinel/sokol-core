@@ -17,6 +17,17 @@
   "orchestrator/build.rs": "0787f7aeb755db116891f6260228cc518db40721e12330a84f99eea58ae43f51",
   "rust-toolchain.toml": "1f561d2101a82b5cb87c3eabea72f54d8225f09ca72f51a65525646f211f36d9"
  },
+ "build_v3": {
+  ".github/workflows/witness-gate.yml": "4bee87957a1c977ae30d0393d9ca4d071259d5510aee9ffd737885db61a826f1",
+  "Cargo.toml": "5417e85cca54fc71d5921ed88e36206166188a83139275125c7e246c4df6542b",
+  "common/Cargo.toml": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "ebpf/.cargo/config.toml": "2971e97c89e2b57030356e3bd41c3e3f42a74e48feb368d12c3417063f4feab2",
+  "ebpf/Cargo.toml": "8d2dbf4c66edf5fe77ec5035f6475afcf9cd3a4f0f1ccc72e1634602650fa589",
+  "ebpf/rust-toolchain.toml": "1f561d2101a82b5cb87c3eabea72f54d8225f09ca72f51a65525646f211f36d9",
+  "orchestrator/Cargo.toml": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "orchestrator/build.rs": "0787f7aeb755db116891f6260228cc518db40721e12330a84f99eea58ae43f51",
+  "rust-toolchain.toml": "1f561d2101a82b5cb87c3eabea72f54d8225f09ca72f51a65525646f211f36d9"
+ },
  "closures": {
   "Monitoring.test_a_renamed_label_value_an_alert_selects_fails": [
    "scripts/test_check_monitoring.py:dda88e903f834696505b77cda5210174fa5def1f65cdc53c7fe142df7d8786ed"
@@ -2257,7 +2268,7 @@
    "orchestrator/src/replay.rs:a9567e10a9bdb51339eff50910223997bb7e87b0e1c5b8bb0a122a5efc16f2f4"
   ],
   "a_trickling_client_cannot_hold_a_trap_slot_past_the_session_deadline": [
-   "orchestrator/src/bin/trident_trap.rs:610f1344040e4ea1889ccf01e5ab1355bce09785bd59d3805ea1088581e2ee07"
+   "orchestrator/src/bin/trident_trap.rs:070303e69f46ca90efde8f0547eb249586a388e285ed6328bdd89a10d5353fb4"
   ],
   "a_used_lease_is_not_renewed_by_a_step_back_within_forget_grace_and_a_resend": [
    "orchestrator/src/block_table.rs:e5317199788a0127cba48ac04270e4ec14b91466b331d6557d90db2650b8b4ed"
@@ -2341,7 +2352,7 @@
    "orchestrator/src/defense.rs:f98f8ffde858e343dca9419447dd063e1d2246a15ef78344a2f9cec730624beb"
   ],
   "attacker_bytes_reach_trap_telemetry_only_as_terminal_vector_text": [
-   "orchestrator/src/bin/trident_trap.rs:1477148a609a865e5cdb5ddbe7f2736b76b39b6dc00b22a006b6fe933fc48b4d"
+   "orchestrator/src/bin/trident_trap.rs:61f4f57bd3aa4bb0f9dfdf46eb9b4739479b244d129c00a79c26ec2c68216fca"
   ],
   "ban_readback_age_is_independent_of_heartbeat_and_wall_time": [
    "orchestrator/src/bin/sokol-operator.rs:2d91e6a52ef215d79f1cd4603713e9f30aaf75ff3fe8c4a0e1d58aba11c710c6"
@@ -3641,7 +3652,7 @@
    "orchestrator/src/replay.rs:e049fdb355842595e7729faba9bcfb3f0f7c355660738165c5ab238b5d9e38ed"
   ],
   "a_trickling_client_cannot_hold_a_trap_slot_past_the_session_deadline": [
-   "orchestrator/src/bin/trident_trap.rs:97ac0650fa39e24122c159acc189c1336cb048b523b83af50391471cfcb9e8e8"
+   "orchestrator/src/bin/trident_trap.rs:4ac79c8d3ca4751813a0a3067f01793759129ac9513156fe78156c3c3899b764"
   ],
   "a_used_lease_is_not_renewed_by_a_step_back_within_forget_grace_and_a_resend": [
    "orchestrator/src/block_table.rs:3d189f541beb8ddbfa252ab9df634c659a7bc64f69b2bfc99549a85f880e32a0"
@@ -3725,7 +3736,7 @@
    "orchestrator/src/defense.rs:11d6740659103750dbfa732e65ea995b2ca81d1f77354a866182eb9100bc2377"
   ],
   "attacker_bytes_reach_trap_telemetry_only_as_terminal_vector_text": [
-   "orchestrator/src/bin/trident_trap.rs:617de1099b5bc83d06f7d55e3bf2a44e1532c9a65d50be9d43d80f28fde4cdd7"
+   "orchestrator/src/bin/trident_trap.rs:58b350b3de7ef52acbfc306f5e838c28e35293b129608448aa0d5ab52a9eae56"
   ],
   "ban_readback_age_is_independent_of_heartbeat_and_wall_time": [
    "orchestrator/src/bin/sokol-operator.rs:f444f36cee5d706da16872cfdab68a41a2193131d8b1dfb7eb650a176be5afb4"

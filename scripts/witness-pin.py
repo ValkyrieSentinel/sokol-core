@@ -839,11 +839,12 @@ TARGET_SECTIONS = ("lib", "bin", "test", "bench", "example", "workspace")
 # Current pin fields. A change of rule gets a new field; the earlier fields stay in the manifest
 # as pinned, so the base branch's checker (which computes them) still accepts the change.
 CLOSURES = "closures_v4"
-BUILD = "build_v2"
+BUILD = "build_v3"
 
 
 def build_pins() -> dict[str, str]:
-    """What decides whether and how tests are built and run, outside the test code: Cargo
+    """What decides whether and how tests are built and run, and how they are checked, outside
+    the test code: Cargo
     target sections, [workspace], [patch.*] and `auto*` keys, whole .cargo/config files (a
     `runner` there could print any test output) and build scripts (they could rewrite sources
     before the crate compiles)."""
@@ -860,7 +861,10 @@ def build_pins() -> dict[str, str]:
                 kept.append(" ".join(line.split()))
         pins[path.relative_to(ROOT).as_posix()] = sha("\n".join(kept))
     for pattern in (".cargo/config", ".cargo/config.toml", "*/.cargo/config", "*/.cargo/config.toml", "build.rs", "*/build.rs",
-                    "rust-toolchain", "rust-toolchain.toml", "*/rust-toolchain", "*/rust-toolchain.toml"):
+                    "rust-toolchain", "rust-toolchain.toml", "*/rust-toolchain", "*/rust-toolchain.toml",
+                    # The gate a change cannot edit runs from main; a change to it must not
+                    # take effect after a merge without the owner having signed it.
+                    ".github/workflows/witness-gate.yml"):
         for path in git_files(pattern):
             pins[path.relative_to(ROOT).as_posix()] = sha(path.read_text())
     return pins
@@ -923,7 +927,7 @@ def check(signers: pathlib.Path, every_pin: bool = False, executed_log: pathlib.
             problems.append(f"witness {w} changed: its body is not the one the owner pinned")
     # closures (#21), closures_v2 (#22), closures_v3 (#40) and build (#22) are earlier rules,
     # kept frozen for checkers of those versions; closures_v4 follows Python imports of local
-    # modules, build_v2 adds the Rust toolchain file.
+    # modules, build_v2 adds the Rust toolchain file, build_v3 the base gate workflow.
     closures = pinned.get(CLOSURES)
     if closures is None:
         if pinned["witnesses"]:

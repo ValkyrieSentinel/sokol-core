@@ -410,6 +410,17 @@ class WitnessPin(unittest.TestCase):
         r = run(self.dir, "python3", "scripts/witness-pin.py", "closure", "RecoveryTests.test_restart_keeps_the_start")
         self.assertIn("scripts/recovery_helper.py import-time code, offset", r.stdout)
 
+    def test_the_base_gate_workflow_is_a_build_pin(self):
+        # It runs from main, so a change to it applies after the merge: without this pin a
+        # pull request could weaken it unsigned, checked only by the version it replaces.
+        wf = self.dir / ".github/workflows/witness-gate.yml"
+        wf.parent.mkdir(parents=True, exist_ok=True)
+        wf.write_text("on: pull_request_target\n")
+        run(self.dir, "git", "add", "-A")
+        self.assertEqual(self.pin(self.key).returncode, 0)
+        wf.write_text("on: pull_request_target\n# the check step removed\n")
+        self.assert_refused(".github/workflows/witness-gate.yml: build configuration changed")
+
     def test_unrelated_helpers_and_production_code_do_not_count(self):
         self.edit("src/helpers.rs", "    fn unrelated() -> u32 {\n        1", "    fn unrelated() -> u32 {\n        2")
         self.edit("src/helpers.rs", "pub fn production(x: u32) -> u32 {\n    x", "pub fn production(x: u32) -> u32 {\n    x + 0")
