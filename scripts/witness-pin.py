@@ -1024,13 +1024,23 @@ def check(signers: pathlib.Path, every_pin: bool = False, executed_log: pathlib.
 
 
 def write_signed(path: pathlib.Path, signature: pathlib.Path, value: dict, key: str) -> None:
-    path.write_text(json.dumps(value, indent=1, sort_keys=True) + "\n")
+    """Signs a staged copy and replaces the manifest and its signature only once signing has
+    succeeded: a wrong passphrase used to leave a rewritten manifest with its signature gone."""
+    staged = path.with_name(path.name + ".staged")
+    staged.write_text(json.dumps(value, indent=1, sort_keys=True) + "\n")
+    staged_sig = pathlib.Path(str(staged) + ".sig")
     # ssh-keygen asks before overwriting a signature and, without a terminal, keeps the old
     # one and still exits 0: a re-pin would leave the previous signature in place.
-    signature.unlink(missing_ok=True)
-    subprocess.run(["ssh-keygen", "-q", "-Y", "sign", "-f", key, "-n", NAMESPACE, str(path)],
-                   stdin=subprocess.DEVNULL, check=True)
-    pathlib.Path(str(path) + ".sig").replace(signature)
+    staged_sig.unlink(missing_ok=True)
+    try:
+        subprocess.run(["ssh-keygen", "-q", "-Y", "sign", "-f", key, "-n", NAMESPACE, str(staged)],
+                       stdin=subprocess.DEVNULL, check=True)
+    except subprocess.CalledProcessError:
+        staged.unlink(missing_ok=True)
+        staged_sig.unlink(missing_ok=True)
+        raise SystemExit(f"FAIL not signed ({key}); {path.name} and its signature are unchanged")
+    staged.replace(path)
+    staged_sig.replace(signature)
 
 
 def sign(key: str, tier: str = "owner") -> int:
