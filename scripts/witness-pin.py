@@ -1064,7 +1064,11 @@ if __name__ == "__main__":
         sys.exit(0)
     if args[:1] == ["run-python"]:
         # The untrusted job of the base workflow: run the pinned Python witnesses, print a log.
-        ran = run_python_witnesses(json.loads(MANIFEST.read_text())["witnesses"])
+        # Both tiers' witnesses (ADR-0028): the gate requires each pinned one to have passed.
+        witnesses = json.loads(MANIFEST.read_text())["witnesses"]
+        if PROVISIONAL.exists():
+            witnesses = {**json.loads(PROVISIONAL.read_text())["witnesses"], **witnesses}
+        ran = run_python_witnesses(witnesses)
         for (w, rel), text in ran.items():
             print(f"== witness {w} {rel}\n{text}")
         sys.exit(0)
