@@ -311,7 +311,6 @@ mod tests {
                 target.into(),
                 vec![reason; block_table::MAX_SUPPORT_PER_TARGET],
             )],
-            saved_ms: Some(u64::MAX),
             ..Persisted::default()
         };
         assert_eq!(
@@ -401,5 +400,21 @@ mod tests {
             let json = serde_json::json!({"claims":[],"operator_lifts":[],"retracted":[],"support":[["198.51.100.1",vec![reason;count]]]});
             assert!(parse(serde_json::to_vec(&json).unwrap().as_slice()).is_err());
         }
+    }
+
+    /// The write time is a bounded atom like any other time in the file, and survives the
+    /// bounded reader; a file without it reads as one written before the field existed.
+    #[test]
+    fn the_write_time_roundtrips_and_may_be_absent() {
+        let saved = Persisted {
+            saved_ms: Some(u64::MAX),
+            ..Persisted::default()
+        };
+        assert_eq!(
+            parse(serde_json::to_vec(&saved).unwrap().as_slice()).unwrap(),
+            saved
+        );
+        let old = parse(&br#"{"claims":[],"operator_lifts":[],"retracted":[]}"#[..]).unwrap();
+        assert_eq!(old.saved_ms, None);
     }
 }
