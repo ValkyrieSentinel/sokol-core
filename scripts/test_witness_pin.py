@@ -44,9 +44,21 @@ mod tests {
 
     use verdict as judged;
 
+    trait Seven {
+        fn seven(&self) -> u32;
+    }
+
+    struct Probe;
+
+    impl self::Seven for Probe {
+        fn seven(&self) -> u32 {
+            7
+        }
+    }
+
     #[test]
     fn a_helper_keeps_its_verdict() {
-        assert_eq!(judged(), 7);
+        assert_eq!(judged(), Probe.seven());
     }
 
     proptest::proptest! {
@@ -347,6 +359,12 @@ class WitnessPin(unittest.TestCase):
         r = self.check()
         self.assertEqual(r.returncode, 0, r.stdout)
 
+    def test_a_helper_types_impl_is_pinned_with_the_type(self):
+        # 2026-10-14: since #22 an impl was named by its trait or module path, so a witness
+        # using Probe did not reach `impl self::Seven for Probe` and its behaviour was unpinned.
+        self.edit("src/helpers.rs", "        fn seven(&self) -> u32 {\n            7", "        fn seven(&self) -> u32 {\n            8")
+        self.assert_refused("witness a_helper_keeps_its_verdict changed: its attributes or a test item")
+
     def test_unrelated_helpers_and_production_code_do_not_count(self):
         self.edit("src/helpers.rs", "    fn unrelated() -> u32 {\n        1", "    fn unrelated() -> u32 {\n        2")
         self.edit("src/helpers.rs", "pub fn production(x: u32) -> u32 {\n    x", "pub fn production(x: u32) -> u32 {\n    x + 0")
@@ -379,7 +397,7 @@ class WitnessPin(unittest.TestCase):
         import json
         manifest = self.dir / "docs/witness-manifest.json"
         pinned = json.loads(manifest.read_text())
-        del pinned["closures_v2"]
+        del pinned["closures_v3"]
         manifest.write_text(json.dumps(pinned, indent=1, sort_keys=True) + "\n")
         (self.dir / "docs/witness-manifest.json.sig").unlink()
         subprocess.run(["ssh-keygen", "-q", "-Y", "sign", "-f", self.key, "-n", "sokol-witness", str(manifest)],
