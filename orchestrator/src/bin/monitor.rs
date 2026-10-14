@@ -672,6 +672,17 @@ mod tests {
             ip, "Unknown",
             "an IP-looking token in the vector was taken as the IP"
         );
+        // Without a split at these, "203.0.113.5,7" or '"203.0.113.5"7' would not parse.
+        for header in [
+            "NODE_START 203.0.113.5,7",
+            "NODE_START \"203.0.113.5\"7",
+            "NODE_START '203.0.113.5'7",
+            "NODE_START|203.0.113.5|7",
+            "NODE_START from=203.0.113.5=7",
+            "NODE_START src203.0.113.5",
+        ] {
+            assert_eq!(display_fields(header, 10).0, "203.0.113.5", "{header}");
+        }
     }
     use super::*;
 
