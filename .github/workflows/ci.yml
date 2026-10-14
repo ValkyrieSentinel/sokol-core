@@ -267,7 +267,8 @@ jobs:
           echo "checker and signers from base $BASE"
           # --executed: every pinned witness also ran and passed in the Test step above.
           # shellcheck disable=SC2086  # empty or one flag
-          python3 scripts/witness-pin.py check --signers /tmp/witness-signers $EVERY_PIN \
+          # -I: the change's own scripts/ must not shadow the checker's standard library.
+          python3 -I scripts/witness-pin.py check --signers /tmp/witness-signers $EVERY_PIN \
             --executed /tmp/sokol-cargo-test.log
           cp /tmp/witness-pin-tree.py scripts/witness-pin.py
 
