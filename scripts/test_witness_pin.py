@@ -421,6 +421,17 @@ class WitnessPin(unittest.TestCase):
         wf.write_text("on: pull_request_target\n# the check step removed\n")
         self.assert_refused(".github/workflows/witness-gate.yml: build configuration changed")
 
+    def test_a_failed_signature_leaves_the_manifest_and_its_signature_intact(self):
+        # 2026-10-15: a wrong passphrase left a rewritten manifest with its signature deleted.
+        manifest = self.dir / "docs/witness-manifest.json"
+        sig = self.dir / "docs/witness-manifest.json.sig"
+        before = (manifest.read_bytes(), sig.read_bytes())
+        self.edit("src/gate.rs", "assert_eq!(gate(url), 0);", "assert_eq!(gate(url), 1);")
+        r = self.pin(str(self.dir.parent / f"{self.dir.name}-no-such-key"))
+        self.assertNotEqual(r.returncode, 0)
+        self.assertEqual((manifest.read_bytes(), sig.read_bytes()), before)
+        self.assertFalse(list((self.dir / "docs").glob("*.staged*")))
+
     def test_unrelated_helpers_and_production_code_do_not_count(self):
         self.edit("src/helpers.rs", "    fn unrelated() -> u32 {\n        1", "    fn unrelated() -> u32 {\n        2")
         self.edit("src/helpers.rs", "pub fn production(x: u32) -> u32 {\n    x", "pub fn production(x: u32) -> u32 {\n    x + 0")

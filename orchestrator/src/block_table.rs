@@ -4314,6 +4314,40 @@ mod tests {
         assert!(!r.is_blocked(ip("203.0.113.124")), "the lift holds");
     }
 
+    /// CANDIDATE (round 8, ADR-0017): a restore converts the wall-clock state file with offset
+    /// 0, trusting the wall clock at the start. A node that starts Δ behind (no RTC, NTP steps
+    /// it forward later: the case ADR-0017 names) restores its own claims Δ past their signed
+    /// end, and the forward step does not shorten them (held ends keep their length). Peers
+    /// drop the claim at its signed end; this node keeps it in XDP and FlowSpec for Δ more.
+    #[test]
+    #[ignore = "CANDIDATE round 8: a restored claim keeps the wall-clock error of the start"]
+    fn a_restore_under_a_clock_behind_does_not_outlast_the_signed_end() {
+        let hour = 3600 * S;
+        let target = ip("203.0.113.150");
+        let mut t = table(1, 64);
+        let added = t.add_local(target, ClaimKind::Detector, "x", T0).unwrap();
+        assert_eq!(
+            added.claim.expires_ms,
+            Some(T0 + 60 * S),
+            "a 60 s block, signed"
+        );
+        let state = t.take_persisted(T0 + S);
+        // Restart at true time T0 + 2 s on a wall clock that reads an hour earlier.
+        let behind = T0 + 2 * S - hour;
+        let mut r = table(1, 64);
+        r.restore(state, |_| true, behind);
+        assert!(r.is_blocked(target), "restored");
+        // NTP steps the wall clock to the true time; the tick takes the new offset.
+        r.set_clock_offset(hour as i64);
+        // True time T0 + 180 s: two minutes past the signed end.
+        let now = behind + 178 * S;
+        r.tick(now);
+        assert!(
+            !r.is_blocked(target),
+            "a restored claim blocks past its signed end by the clock error at the start"
+        );
+    }
+
     /// Observe mode (ADR-0018): the node's own claims leave its snapshot and its digest, so no
     /// peer gets them and a peer that has them drops them at the next repair; peers' claims
     /// are still reported as known.

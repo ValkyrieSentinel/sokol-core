@@ -9,6 +9,8 @@ pub(crate) struct IpcCtx<B: block_table::Blocklist = block_table::KernelBlocklis
     pub(crate) crypto: Arc<NodeCrypto>,
     pub(crate) policy: PolicyHandle,
     pub(crate) reports: Arc<std::sync::Mutex<attack_reports::AttackReports>>,
+    /// Where this node's durable state goes; a retraction waits for it before its answer.
+    pub(crate) state: Option<Arc<StateStore>>,
 }
 
 /// One IPC command; returns the reply a client in ACK mode gets (F09): `OK applied`,
@@ -248,7 +250,12 @@ pub(crate) async fn retract_detection<B: block_table::Blocklist>(
         c.db.append(retraction_record(&shown, &out, now, r));
         (out, table.shares_own(), table.still_blocks(r.target, now))
     };
-    let reply = retraction_reply(&out, still_blocked);
+    let mut reply = retraction_reply(&out, still_blocked);
+    // Everything but a duplicate or a capacity refusal changed what a restart restores.
+    let changed = !matches!(
+        out,
+        block_table::DetectorRetraction::Duplicate | block_table::DetectorRetraction::Refused
+    );
     if let block_table::DetectorRetraction::Lifted {
         retracted,
         reissued,
@@ -273,11 +280,20 @@ pub(crate) async fn retract_detection<B: block_table::Blocklist>(
                 .broadcast(&MeshCommand::Claim { claim }, c.node_id, &c.crypto)
                 .await;
         }
-        let cmd = MeshCommand::Retract {
-            issuer: c.node_id,
-            claims: retracted,
-        };
-        let _ = c.registry.broadcast(&cmd, c.node_id, &c.crypto).await;
+        for cmd in crate::mesh_sync::pack_retraction(c.node_id, retracted) {
+            let _ = c.registry.broadcast(&cmd, c.node_id, &c.crypto).await;
+        }
+    }
+    // ADR-4, as for an operator decision (R26-04): the answer waits until the retraction is on
+    // disk. The outbox takes `OK lifted` as final; a crash before the next tick's write would
+    // otherwise restore the claim and its support, blocking the target again until its end.
+    // An answer with a warning is not one the outbox knows, so it sends the line again later.
+    if changed {
+        if let Some(state) = &c.state {
+            if let Err(e) = persist_now(state, &c.blocks, state_store::DURABLE_WAIT).await {
+                reply = format!("{}; WARNING: {}", reply, e);
+            }
+        }
     }
     reply
 }
@@ -436,6 +452,7 @@ mod tests {
             reports: Arc::new(std::sync::Mutex::new(attack_reports::AttackReports::new(
                 Duration::from_secs(60),
             ))),
+            state: None,
         };
         let count = |label: &str| {
             detections::rows()
@@ -453,6 +470,61 @@ mod tests {
             count(detections::TRAP),
             before,
             "an IPC line was counted as a trap hit of this node"
+        );
+        drop(c);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// ADR-4: `OK lifted` is final for the outbox (it does not send the RETRACT again), so the
+    /// lift must already be on disk when it is answered. Otherwise a crash before the next tick
+    /// restores the detector claim and its support: the target is blocked again here (XDP and
+    /// FlowSpec) until the claim's end, and the node re-offers the claim to the mesh.
+    #[tokio::test]
+    async fn a_lifted_retraction_is_on_disk_before_it_is_answered() {
+        let dir = std::env::temp_dir().join(format!(
+            "sokol-ipc-retract-durable-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = Arc::new(StateStore::new(dir.join("state.json")));
+        let c = IpcCtx {
+            blocks: Arc::new(tokio::sync::Mutex::new(table())),
+            db: Arc::new(SentinelDb::init(dir.join("audit.log").to_str().unwrap(), None).unwrap()),
+            registry: PeerRegistry::new(TrustStore::default()),
+            node_id: 1,
+            crypto: Arc::new(NodeCrypto::generate()),
+            policy: PolicyHandle::new(BlockPolicy::builtin()),
+            reports: Arc::new(std::sync::Mutex::new(attack_reports::AttackReports::new(
+                Duration::from_secs(60),
+            ))),
+            state: Some(state.clone()),
+        };
+        let target = parse_target("198.51.100.62").unwrap();
+        assert_eq!(
+            handle_ipc_line("SIGNAL#17:crowdsec|198.51.100.62|-|scan", &c).await,
+            "OK applied"
+        );
+        // A tick wrote the block.
+        persist_now(&state, &c.blocks, Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(
+            handle_ipc_line("RETRACT#17:crowdsec|198.51.100.62", &c).await,
+            "OK lifted"
+        );
+        // The process dies now, before another tick: the next one restores what is on disk.
+        let saved = match state_store::read_state(&dir.join("state.json")) {
+            Ok(Some(saved)) => saved,
+            _ => panic!("no readable state file"),
+        };
+        let mut next = table();
+        let now = block_table::local_ms();
+        next.restore(saved, |_| true, now);
+        next.tick(now);
+        assert!(
+            !next.still_blocks(target, now),
+            "a retraction answered OK lifted came back as a block after a crash"
         );
         drop(c);
         std::fs::remove_dir_all(dir).unwrap();

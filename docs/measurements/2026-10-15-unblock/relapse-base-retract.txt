@@ -1,0 +1,14 @@
+# nodes=3 netem='none' host=aarch64 cpus=10 kernel=6.8.0-142-generic
+# full mesh after 3s: 3/3 nodes see 2 peers
+# relapse: 10 rounds, end by retract, node 1 killed (SIGKILL) right after the answer
+round 1: 'OK lifted'; after the restart node 1 answers 0/20 pings from 10.240.0.101, blocks_active=1, node 2 5/5, node 3 5/5
+round 2: 'OK lifted'; after the restart node 1 answers 0/20 pings from 10.240.0.102, blocks_active=2, node 2 5/5, node 3 5/5
+round 3: 'OK lifted'; after the restart node 1 answers 0/20 pings from 10.240.0.103, blocks_active=3, node 2 5/5, node 3 5/5
+round 4: 'OK lifted'; after the restart node 1 answers 0/20 pings from 10.240.0.104, blocks_active=4, node 2 5/5, node 3 5/5
+round 5: 'OK lifted'; after the restart node 1 answers 0/20 pings from 10.240.0.105, blocks_active=5, node 2 5/5, node 3 5/5
+round 6: 'OK lifted'; after the restart node 1 answers 0/20 pings from 10.240.0.106, blocks_active=6, node 2 5/5, node 3 5/5
+round 7: 'OK lifted'; after the restart node 1 answers 0/20 pings from 10.240.0.107, blocks_active=7, node 2 5/5, node 3 5/5
+round 8: 'OK lifted'; after the restart node 1 answers 0/20 pings from 10.240.0.108, blocks_active=8, node 2 5/5, node 3 5/5
+round 9: 'OK lifted'; after the restart node 1 answers 0/20 pings from 10.240.0.109, blocks_active=9, node 2 5/5, node 3 5/5
+round 10: 'OK lifted'; after the restart node 1 answers 0/20 pings from 10.240.0.110, blocks_active=10, node 2 5/5, node 3 5/5
+node 1 blocks a lifted target again after a crash in 10 of 10 rounds; peer x round: 0

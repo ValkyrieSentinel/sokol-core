@@ -18,14 +18,10 @@ pub(crate) async fn broadcast_retraction<B: block_table::Blocklist>(
     ctx: &ControlCtx<B>,
     ids: Vec<block_table::ClaimId>,
 ) {
-    if ids.is_empty() {
-        return;
+    // In frames a peer accepts: one oversized frame would drop every peer's connection.
+    for cmd in mesh_sync::pack_retraction(ctx.node_id, ids) {
+        let _ = ctx.registry.broadcast(&cmd, ctx.node_id, &ctx.crypto).await;
     }
-    let cmd = MeshCommand::Retract {
-        issuer: ctx.node_id,
-        claims: ids,
-    };
-    let _ = ctx.registry.broadcast(&cmd, ctx.node_id, &ctx.crypto).await;
 }
 
 pub(crate) async fn execute_control<B: block_table::Blocklist>(
@@ -431,6 +427,100 @@ mod tests {
                 .any(|r| r == "PEERS_RELOADED|Pinned:2|Legacy:[]|Unregistered:[2, 3]"),
             "{:?}",
             records
+        );
+        drop(ctx);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A flush retracts every own detector claim mesh-wide (FLUSH_BANS during an attack can
+    /// lift thousands). Each retraction a peer receives must fit its frame limit: a larger
+    /// frame makes the receiver drop the connection before reading it, so the retraction and
+    /// everything queued behind it is lost until a reconnect resends a snapshot.
+    #[tokio::test]
+    async fn a_flush_of_many_own_claims_is_retracted_in_frames_a_peer_accepts() {
+        let dir = std::env::temp_dir().join(format!(
+            "sokol-flush-frames-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let crypto = Arc::new(NodeCrypto::generate());
+        let mut trust = TrustStore::default();
+        trust.insert(2, crypto.public_key.clone());
+        let registry = PeerRegistry::new(trust);
+        let (urgent, mut urgent_rx) = tokio::sync::mpsc::channel(64);
+        let (bulk, _bulk_rx) = tokio::sync::mpsc::channel(64);
+        let link = p2p::PeerLink {
+            urgent,
+            bulk,
+            features: Arc::from(Vec::new()),
+        };
+        registry
+            .add_peer("127.0.0.2:7946".parse().unwrap(), link, 2, 2)
+            .await;
+        let ttl = TtlPolicy {
+            base: Duration::from_secs(60),
+            max: Duration::from_secs(600),
+        };
+        let blocks = Arc::new(tokio::sync::Mutex::new(BlockTable::with_lists(
+            AcceptLists,
+            ttl,
+            1,
+        )));
+        const CLAIMS: u32 = 3000;
+        {
+            let mut table = blocks.lock().await;
+            let now = block_table::local_ms();
+            for i in 0..CLAIMS {
+                let net =
+                    block_table::parse_target(&format!("10.9.{}.{}", i / 256, i % 256)).unwrap();
+                table
+                    .add_local(net, ClaimKind::Detector, "flood", now)
+                    .unwrap();
+            }
+        }
+        let ctx = ControlCtx {
+            state: Arc::new(StateStore::new(dir.join("state.json"))),
+            peer_limits: PeerLimits {
+                default: Envelope::unlimited(ttl.max),
+                quorum: Quorum::OFF,
+            },
+            blocks,
+            policy: PolicyHandle::new(BlockPolicy::builtin()),
+            sntl_db: Arc::new(
+                SentinelDb::init(dir.join("events.sntl").to_str().unwrap(), None).unwrap(),
+            ),
+            registry,
+            peers_file: None,
+            node_id: 1,
+            crypto,
+        };
+        assert_eq!(
+            execute_control(control::ControlCommand::FlushDynamic, &ctx).await,
+            format!("OK released {} dynamic blocks", CLAIMS)
+        );
+        let mut retracted = std::collections::HashSet::new();
+        while let Ok(envelope) = urgent_rx.try_recv() {
+            let frame = envelope.encode();
+            assert!(
+                frame.len() <= p2p::MAX_FRAME_BYTES,
+                "a retraction frame of {} bytes: the peer drops the connection at {}",
+                frame.len(),
+                p2p::MAX_FRAME_BYTES
+            );
+            let decoded = p2p::SecureEnvelope::decode(&frame).unwrap();
+            match serde_json::from_slice(&decoded.payload).unwrap() {
+                p2p::NetworkMessage::Command(MeshCommand::Retract { issuer, claims }) => {
+                    assert_eq!(issuer, 1);
+                    retracted.extend(claims);
+                }
+                other => panic!("unexpected broadcast {:?}", other),
+            }
+        }
+        assert_eq!(
+            retracted.len(),
+            CLAIMS as usize,
+            "every flushed claim is retracted"
         );
         drop(ctx);
         std::fs::remove_dir_all(dir).unwrap();

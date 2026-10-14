@@ -1,0 +1,6 @@
+round 1: 'OK lifted'; after the restart node 1 answers 20/20 pings from 10.240.0.101, blocks_active=0, rule gone from the RIB 183 ms after the restart, node 2 5/5, node 3 5/5
+round 2: 'OK lifted'; after the restart node 1 answers 20/20 pings from 10.240.0.102, blocks_active=0, rule gone from the RIB 184 ms after the restart, node 2 5/5, node 3 5/5
+round 3: 'OK lifted'; after the restart node 1 answers 20/20 pings from 10.240.0.103, blocks_active=0, rule gone from the RIB 184 ms after the restart, node 2 5/5, node 3 5/5
+round 4: 'OK lifted'; after the restart node 1 answers 20/20 pings from 10.240.0.104, blocks_active=0, rule gone from the RIB 187 ms after the restart, node 2 5/5, node 3 5/5
+round 5: 'OK lifted'; after the restart node 1 answers 20/20 pings from 10.240.0.105, blocks_active=0, rule gone from the RIB 180 ms after the restart, node 2 5/5, node 3 5/5
+node 1 blocks a lifted target again after a crash in 0 of 5 rounds; peer x round: 0

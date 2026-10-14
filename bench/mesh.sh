@@ -10,6 +10,7 @@
 #   sudo bench/mesh.sh clock       <orchestrator> <monitor> 3        (needs libfaketime)
 #   sudo bench/mesh.sh observe     <orchestrator> <monitor> 3
 #   sudo bench/mesh.sh reaction    <orchestrator> <monitor> <N> [rounds]
+#   sudo bench/mesh.sh unblock     <orchestrator> <monitor> <N> [rounds]   (FlowSpec: gobgpd)
 #
 # propagation: a block is issued on node 1 `rounds` times; for every other node the delay
 #              until its MESH_BLOCK record is reported (min / median / p95 / max, and the
@@ -71,6 +72,26 @@
 #                R2 every node stops within 3000 ms;
 #                R3 every node answers the attacker again within 3000 ms of the unban;
 #                R4 the legitimate source loses at most 0.5 % of its pings over the run.
+#
+# unblock:     how long each layer keeps blocking after a block ends. For each way in
+#              $UNBLOCK_WAYS ("retract unban flush expire") and each of `rounds` rounds, a fresh
+#              attacker address (10.240.0.100 + k: no round can merge into an earlier claim,
+#              R26-05) pings every node every 10 ms. A detector signal about it goes to node 1
+#              (`;ttl=$UNBLOCK_TTL`, 4 s, for expire). Once every node is silent to it and node
+#              1's rule is in its gobgpd RIB, the block ends: RETRACT on IPC, UNBAN_IP or
+#              FLUSH_BANS on the control socket, or expiry. The end decision is node 1's audit
+#              record (DETECTOR_RETRACT, OPERATOR_UNBAN_V4, OPERATOR_FLUSH, BLOCK_EXPIRED_V4);
+#              every layer is timed from it (one host clock):
+#                xdp1   node 1's first reply to the attacker (ping interval resolution);
+#                peer   each other node's first reply to it;
+#                rib    node 1's rule absent from its own gobgpd RIB (polled every ~50 ms);
+#                upstr  absent from the upstream gobgpd's RIB (the BGP withdraw arrived);
+#                fsrec  node 1's FLOWSPEC_WITHDRAW audit record.
+#              For expire it also reports BLOCK_EXPIRED minus the signed end (tick lag).
+#              Node 1 runs --flowspec-gobgp against a gobgpd pair in its own namespace, as
+#              scripts/xdp-smoke.sh does; without gobgpd the FlowSpec columns are skipped.
+#              Observations, not limits: a layer still blocking $UNBLOCK_WAIT s (20) after
+#              the end is listed as a stuck round, and the run exits 1 if there is one.
 #
 # netem args are applied to every node's link, e.g. `delay 100ms 20ms loss 10%`.
 set -euo pipefail
@@ -143,8 +164,37 @@ done
 
 node_args() {   # extra arguments for node i in some modes
     [ "$MODE" = observe ] && [ "$1" = 1 ] && echo "--enforce observe"
+    case "$MODE" in unblock|relapse|bulkflush) true ;; *) false ;; esac && [ "$1" = 1 ] && [ -n "$FLOWSPEC" ] \
+        && echo "--flowspec-gobgp $(command -v gobgp) --flowspec-gobgp-arg=-p --flowspec-gobgp-arg=50051"
     return 0
 }
+# unblock: node 1's gobgpd (AS 65001) peers with an "upstream" gobgpd (AS 65002), both on
+# loopback in node 1's namespace, configured as in scripts/xdp-smoke.sh.
+gobgp_config() {
+    local as=$1 local_addr=$2 port=$3 peer_addr=$4 peer_port=$5 peer_as=$6 passive=${7:-false}
+    printf '[global.config]\n  as = %s\n  router-id = "%s"\n  port = %s\n  local-address-list = ["%s"]\n' \
+        "$as" "$local_addr" "$port" "$local_addr"
+    printf '[[neighbors]]\n  [neighbors.config]\n    neighbor-address = "%s"\n    peer-as = %s\n' "$peer_addr" "$peer_as"
+    printf '  [neighbors.transport.config]\n    local-address = "%s"\n    remote-port = %s\n    passive-mode = %s\n' \
+        "$local_addr" "$peer_port" "$passive"
+    printf '  [[neighbors.afi-safis]]\n    [neighbors.afi-safis.config]\n      afi-safi-name = "ipv4-flowspec"\n'
+}
+FLOWSPEC=""
+if case "$MODE" in unblock|relapse|bulkflush) true ;; *) false ;; esac && command -v gobgpd >/dev/null; then
+    gobgp_config 65001 127.0.0.1 1790 127.0.0.2 1791 65002 >"$WORK/gobgp-node.toml"
+    gobgp_config 65002 127.0.0.2 1791 127.0.0.1 1790 65001 true >"$WORK/gobgp-upstream.toml"
+    ip netns exec sk-n1 gobgpd -f "$WORK/gobgp-node.toml" --api-hosts 127.0.0.1:50051 >"$WORK/gobgpd-node.log" 2>&1 &
+    GOBGPD_NODE=$!; PIDS+=($!)
+    ip netns exec sk-n1 gobgpd -f "$WORK/gobgp-upstream.toml" --api-hosts 127.0.0.1:50052 >"$WORK/gobgpd-upstream.log" 2>&1 &
+    PIDS+=($!)
+    for _ in $(seq 1 40); do
+        if in_ns 1 gobgp -p 50052 neighbor >/dev/null 2>&1 && in_ns 1 gobgp -p 50051 neighbor 2>/dev/null | grep -q Establ; then
+            FLOWSPEC=1; break
+        fi
+        sleep 0.5
+    done
+    [ -n "$FLOWSPEC" ] || echo "# WARNING the gobgpd pair did not establish: FlowSpec layer not measured"
+fi
 start_node() {   # start_node <i> [last seed]: (re)starts node i with its key, state and audit log
     local i=$1 seeds=()
     for j in $(seq 1 "${2:-$N}"); do [ "$j" != "$i" ] && seeds+=(--seed-peer "10.240.0.$j:7946"); done
@@ -210,6 +260,40 @@ stats() {
         printf "n=%d min=%d median=%d p95=%d max=%d (ms)\n", NR, v[1], v[int((NR + 1) / 2)], p95, v[NR]
     }'
 }
+
+# unblock/relapse/bulkflush: an attacker namespace on the bridge; rounds add their own addresses.
+attacker_ns() {
+    ip netns add sk-atk
+    ip link add skva-h type veth peer name skva
+    ip link set skva-h master "$BR" up
+    ip link set skva netns sk-atk
+    ip netns exec sk-atk ip addr add 10.240.0.200/24 dev skva
+    ip netns exec sk-atk ip link set skva up
+}
+now_ms() { date +%s%3N; }
+send() {   # send <ipc|ctl> <line>: one line to node 1's socket, its first reply line printed
+    in_ns 1 python3 - "$WORK/n1/$1.sock" "$2" <<'PY'
+import socket, sys
+s = socket.socket(socket.AF_UNIX); s.settimeout(5); s.connect(sys.argv[1])
+ipc = sys.argv[1].endswith("/ipc.sock")   # the IPC socket answers only after ACK (F09)
+s.sendall((b"ACK\n" if ipc else b"") + sys.argv[2].encode() + b"\n")
+f = s.makefile()
+if ipc:
+    f.readline()
+print(f.readline().strip())
+PY
+}
+audit_after() {   # audit_after <node> <record prefix> <t_min>: first matching record at or after t_min
+    "$MON" --dump "$WORK/n$1/audit.log" 2>/dev/null \
+        | awk -F'\t' -v p="$2" -v t="$3" 'index($3, p) == 1 && $2 >= t { print $2; exit }'
+}
+rib_has() {   # rib_has <api port> <prefix>: 0 present, 1 absent, 2 unreadable (never absent)
+    local rib
+    rib=$(in_ns 1 gobgp -p "$1" global rib -a ipv4-flowspec 2>/dev/null) || return 2
+    case "$rib" in *"source: $2]"*) return 0 ;; *) return 1 ;; esac
+}
+first_reply() { awk -F'[][]' -v a="$2" '/bytes from/ { t = int($2 * 1000); if (t >= a) { print t; exit } }' "$1"; }
+last_reply() { awk -F'[][]' '/bytes from/ { t = int($2 * 1000) } END { if (t != "") print t }' "$1"; }
 
 case "$MODE" in
 propagation)
@@ -567,6 +651,209 @@ reaction)
     if [ "$(worst <"$WORK/restore")" -le 3000 ]; then echo "PASS R3 every node restored within 3000 ms"; else echo "FAIL R3 a node not restored within 3000 ms"; fail=1; fi
     if [ "$sent" -gt 0 ] && [ $(( (sent - got) * 1000 )) -le $(( sent * 5 )) ]; then echo "PASS R4 legitimate loss <= 0.5 %"
     else echo "FAIL R4 legitimate loss $((sent - got)) of $sent"; fail=1; fi
+    exit $fail
+    ;;
+unblock)
+    ROUNDS=$ARG; WAYS=${UNBLOCK_WAYS:-retract unban flush expire}; ETTL=${UNBLOCK_TTL:-6}
+    WAIT=${UNBLOCK_WAIT:-20}
+    read -ra ways <<<"$WAYS"
+    [ $((ROUNDS * ${#ways[@]})) -le 99 ] || { echo "unblock: rounds x ways must be at most 99 (one address each)"; exit 2; }
+    attacker_ns
+    stuck=(); k=0
+    echo "# unblock: ways '$WAYS', $ROUNDS rounds each, expire ttl ${ETTL}s, FlowSpec ${FLOWSPEC:+on}"
+    for way in "${ways[@]}"; do
+        for col in xdp1 peer rib upstr fsrec lag; do : >"$WORK/u-$way-$col"; done
+        for r in $(seq 1 "$ROUNDS"); do
+            k=$((k + 1)); a="10.240.0.$((100 + k))"
+            ip netns exec sk-atk ip addr add "$a/24" dev skva
+            pings=()
+            for n in $(seq 1 "$N"); do
+                ip netns exec sk-atk ping -D -n -i 0.01 -I "$a" "10.240.0.$n" >"$WORK/p$k.$n" 2>&1 &
+                pings+=($!)
+            done
+            sleep 0.5
+            t_sig=$(now_ms)
+            ttl=""; [ "$way" = expire ] && ttl=";ttl=$ETTL"
+            send ipc "SIGNAL#ub$k$ttl:bench|$a|-|unblock $way round $r" >/dev/null
+            # In force: every node silent to the attacker for 300 ms, node 1's rule in both RIBs.
+            ok=""
+            for _ in $(seq 1 150); do
+                sleep 0.1
+                quiet=1; t=$(now_ms)
+                for n in $(seq 1 "$N"); do
+                    l=$(last_reply "$WORK/p$k.$n"); [ -n "$l" ] && [ $((t - l)) -lt 300 ] && quiet=""
+                done
+                [ -n "$quiet" ] || continue
+                if [ -n "$FLOWSPEC" ]; then
+                    rib_has 50051 "$a/32" && rib_has 50052 "$a/32" || continue
+                fi
+                ok=1; break
+            done
+            if [ -z "$ok" ]; then
+                echo "round $way/$r ($a): block not in force on every layer within 15 s; skipped"
+                for p in "${pings[@]}"; do kill "$p" 2>/dev/null || true; done
+                continue
+            fi
+            case "$way" in
+            retract) send ipc "RETRACT#ub$k:bench|$a" >/dev/null; prefix="DETECTOR_RETRACT|IP:$a|" ;;
+            unban) send ctl "UNBAN_IP:$a" >/dev/null; prefix="OPERATOR_UNBAN_V4|IP:$a|" ;;
+            stall)
+                # Node 1's gobgpd stops answering for $UNBLOCK_STALL s (7) right after the unban;
+                # the FlowSpec columns are then counted from when it answers again.
+                [ -n "$FLOWSPEC" ] || { echo "stall needs gobgpd"; exit 2; }
+                kill -STOP "$GOBGPD_NODE"; send ctl "UNBAN_IP:$a" >/dev/null
+                sleep "${UNBLOCK_STALL:-7}"; kill -CONT "$GOBGPD_NODE"; t_cont=$(now_ms)
+                prefix="OPERATOR_UNBAN_V4|IP:$a|" ;;
+            flush) send ctl "FLUSH_BANS" >/dev/null; prefix="OPERATOR_FLUSH|" ;;
+            expire) prefix="BLOCK_EXPIRED_V4|IP:$a" ;;
+            *) echo "unknown way $way"; exit 2 ;;
+            esac
+            t_end=""
+            for _ in $(seq 1 $((WAIT * 10 + ETTL * 10))); do
+                t_end=$(audit_after 1 "$prefix" "$t_sig"); [ -n "$t_end" ] && break; sleep 0.1
+            done
+            if [ -z "$t_end" ]; then
+                echo "round $way/$r ($a): no end record on node 1"; stuck+=("$way/$r:no-end-record")
+                for p in "${pings[@]}"; do kill "$p" 2>/dev/null || true; done
+                continue
+            fi
+            t_rib=""; t_up=""
+            if [ -n "$FLOWSPEC" ]; then
+                while [ $(($(now_ms) - t_end)) -lt $((WAIT * 1000)) ]; do
+                    if [ -z "$t_rib" ]; then s=0; rib_has 50051 "$a/32" || s=$?; [ "$s" = 1 ] && t_rib=$(now_ms); fi
+                    if [ -z "$t_up" ]; then s=0; rib_has 50052 "$a/32" || s=$?; [ "$s" = 1 ] && t_up=$(now_ms); fi
+                    [ -n "$t_rib" ] && [ -n "$t_up" ] && break
+                    sleep 0.05
+                done
+                t_from=$t_end; [ "$way" = stall ] && t_from=$t_cont
+                if [ -n "$t_rib" ]; then echo $((t_rib - t_from)) >>"$WORK/u-$way-rib"; else stuck+=("$way/$r:rib"); fi
+                if [ -n "$t_up" ]; then echo $((t_up - t_from)) >>"$WORK/u-$way-upstr"; else stuck+=("$way/$r:upstream"); fi
+                f=$(audit_after 1 "FLOWSPEC_WITHDRAW|IP:$a" "$t_end"); [ -n "$f" ] && echo $((f - t_from)) >>"$WORK/u-$way-fsrec"
+            fi
+            # Every node answers again, or WAIT runs out.
+            while [ $(($(now_ms) - t_end)) -lt $((WAIT * 1000)) ]; do
+                all=1
+                for n in $(seq 1 "$N"); do [ -n "$(first_reply "$WORK/p$k.$n" "$t_end")" ] || all=""; done
+                [ -n "$all" ] && break
+                sleep 0.1
+            done
+            sleep 0.2
+            for p in "${pings[@]}"; do kill "$p" 2>/dev/null || true; done
+            for n in $(seq 1 "$N"); do
+                f=$(first_reply "$WORK/p$k.$n" "$t_end")
+                if [ -z "$f" ]; then stuck+=("$way/$r:node$n"); continue; fi
+                if [ "$n" = 1 ]; then echo $((f - t_end)) >>"$WORK/u-$way-xdp1"; else echo $((f - t_end)) >>"$WORK/u-$way-peer"; fi
+            done
+            if [ "$way" = expire ]; then
+                b=$(audit_after 1 "DYNAMIC_BLOCK_V4|IP:$a|" "$t_sig")
+                [ -n "$b" ] && echo $((t_end - b - ETTL * 1000)) >>"$WORK/u-$way-lag"
+            fi
+            ip netns exec sk-atk ip addr del "$a/24" dev skva
+        done
+        echo "== $way"
+        echo "   xdp1  node 1 answers again:        $(stats <"$WORK/u-$way-xdp1")"
+        echo "   peer  another node answers again:  $(stats <"$WORK/u-$way-peer")"
+        if [ -n "$FLOWSPEC" ]; then
+            echo "   rib   rule gone from node gobgpd:  $(stats <"$WORK/u-$way-rib")"
+            echo "   upstr rule gone upstream:          $(stats <"$WORK/u-$way-upstr")"
+            echo "   fsrec FLOWSPEC_WITHDRAW record:    $(stats <"$WORK/u-$way-fsrec")"
+        fi
+        [ "$way" = expire ] && echo "   lag   BLOCK_EXPIRED - signed end:  $(stats <"$WORK/u-$way-lag")"
+    done
+    if [ ${#stuck[@]} -gt 0 ]; then echo "STUCK (still blocking ${WAIT} s after the end): ${stuck[*]}"; exit 1; fi
+    echo "no layer kept blocking ${WAIT} s after an end"
+    ;;
+relapse)
+    ROUNDS=$ARG; WAY=${RELAPSE_WAY:-retract}
+    [ "$ROUNDS" -le 99 ] || { echo "relapse: at most 99 rounds (one address each)"; exit 2; }
+    attacker_ns
+    relapsed=0; peers_relapsed=0
+    echo "# relapse: $ROUNDS rounds, end by $WAY, node 1 killed (SIGKILL) right after the answer"
+    for r in $(seq 1 "$ROUNDS"); do
+        a="10.240.0.$((100 + r))"
+        ip netns exec sk-atk ip addr add "$a/24" dev skva
+        send ipc "SIGNAL#rl$r:bench|$a|-|relapse round $r" >/dev/null
+        sleep 3   # over one tick (the block is on disk) and one FlowSpec round (announced)
+        case "$WAY" in
+        retract) reply=$(send ipc "RETRACT#rl$r:bench|$a") ;;
+        unban) reply=$(send ctl "UNBAN_IP:$a") ;;
+        *) echo "unknown way $WAY"; exit 2 ;;
+        esac
+        kill -KILL "${NODE_PID[1]}" 2>/dev/null || true
+        wait "${NODE_PID[1]}" 2>/dev/null || true
+        t_restart=$(now_ms)
+        start_node 1
+        for _ in $(seq 1 100); do send ctl LIST_BANS >/dev/null 2>&1 && break; sleep 0.1; done
+        rib=""
+        if [ -n "$FLOWSPEC" ]; then
+            # The lift was answered before the rule was withdrawn: when does the new process do it?
+            rib="still in node 1's gobgpd RIB 20 s after the restart"
+            while [ $(($(now_ms) - t_restart)) -lt 20000 ]; do
+                s=0; rib_has 50051 "$a/32" || s=$?
+                [ "$s" = 1 ] && { rib="gone from the RIB $(($(now_ms) - t_restart)) ms after the restart"; break; }
+                sleep 0.05
+            done
+        fi
+        sleep 2   # the restored table is applied and a tick ran
+        got=$(ip netns exec sk-atk ping -n -c 20 -i 0.05 -W 1 -I "$a" 10.240.0.1 2>/dev/null | awk '/packets transmitted/ { print $4 }' || true)
+        active=$(metric 1 'sokol_blocks_active{family="ipv4"}' || true)
+        line="round $r: '$reply'; after the restart node 1 answers ${got:-0}/20 pings from $a, blocks_active=${active:-?}${rib:+, rule $rib}"
+        for n in $(seq 2 "$N"); do
+            pg=$(ip netns exec sk-atk ping -n -c 5 -i 0.05 -W 1 -I "$a" "10.240.0.$n" 2>/dev/null | awk '/packets transmitted/ { print $4 }' || true)
+            line="$line, node $n ${pg:-0}/5"
+            [ "${pg:-0}" = 0 ] && peers_relapsed=$((peers_relapsed + 1))
+        done
+        echo "$line"
+        [ "${got:-0}" = 0 ] && relapsed=$((relapsed + 1))
+        ip netns exec sk-atk ip addr del "$a/24" dev skva
+    done
+    echo "node 1 blocks a lifted target again after a crash in $relapsed of $ROUNDS rounds; peer x round: $peers_relapsed"
+    [ "$relapsed" = 0 ]
+    ;;
+bulkflush)
+    COUNT=$ARG; [ "$COUNT" = 20 ] && COUNT=3000   # ARG defaults to 20 for the other modes
+    echo "# bulkflush: $COUNT detector blocks at node 1, then FLUSH_BANS"
+    awk -v n="$COUNT" 'BEGIN { for (i = 0; i < n; i++)
+        printf "SIGNAL#bf-%d:bulk|100.%d.%d.%d|-|bulk flush\n", i, 64 + int(i / 65536) % 64, int(i / 256) % 256, i % 256 }' \
+        | in_ns 1 nc -U -q1 "$WORK/n1/ipc.sock" >/dev/null
+    t0=$SECONDS; held=""
+    while [ $((SECONDS - t0)) -lt 180 ]; do
+        held=1
+        for n in $(seq 1 "$N"); do [ "$(metric "$n" 'sokol_blocks_active{family="ipv4"}')" = "$COUNT" ] || held=""; done
+        [ -n "$held" ] && break
+        sleep 1
+    done
+    [ -n "$held" ] || { echo "FAIL not every node holds $COUNT blocks after 180 s"; exit 1; }
+    rules() { in_ns 1 gobgp -p 50051 global rib -a ipv4-flowspec 2>/dev/null | grep -c "source: 100\." || true; }
+    if [ -n "$FLOWSPEC" ]; then
+        # 64 FlowSpec operations per round (MAX_OPS_PER_ROUND): the announcements take a while.
+        t1=$(now_ms)
+        while [ "$(rules)" != "$COUNT" ] && [ $(($(now_ms) - t1)) -lt 600000 ]; do sleep 1; done
+        echo "# node 1's gobgpd holds $(rules) of the $COUNT rules ($(($(now_ms) - t1)) ms after every node held the blocks)"
+    fi
+    t_ask=$(now_ms)
+    echo "# every node holds $COUNT blocks; FLUSH_BANS answered: $(send ctl FLUSH_BANS)"
+    t_end=$(audit_after 1 "OPERATOR_FLUSH|" "$t_ask")
+    fail=0
+    for n in $(seq 2 "$N"); do
+        gone=""
+        while [ $(($(now_ms) - t_end)) -lt 120000 ]; do
+            [ "$(metric "$n" 'sokol_blocks_active{family="ipv4"}')" = 0 ] && { gone=$(now_ms); break; }
+            sleep 0.05
+        done
+        dropped=$(grep -c "exceeds limit" "$WORK/n$n/node.log" || true)
+        if [ -n "$gone" ]; then echo "node $n holds none of them $((gone - t_end)) ms after the flush; 'frame exceeds limit' in its log: $dropped"
+        else echo "node $n still holds $(metric "$n" 'sokol_blocks_active{family="ipv4"}') of them 120 s after the flush"; fail=1; fi
+    done
+    if [ -n "$FLOWSPEC" ]; then
+        gone=""
+        while [ $(($(now_ms) - t_end)) -lt 600000 ]; do
+            [ "$(rules)" = 0 ] && { gone=$(now_ms); break; }
+            sleep 0.5
+        done
+        if [ -n "$gone" ]; then echo "node 1's gobgpd holds none of the rules $((gone - t_end)) ms after the flush"
+        else echo "node 1's gobgpd still holds $(rules) rules 600 s after the flush"; fail=1; fi
+    fi
     exit $fail
     ;;
 *) echo "unknown mode $MODE"; exit 2 ;;

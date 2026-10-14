@@ -1765,6 +1765,7 @@ async fn main() -> Result<(), anyhow::Error> {
     let ipc_delayed = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let ipc_delayed_metrics = ipc_delayed.clone();
     let reports_unix = attack_reports.clone();
+    let state_unix = state_store.clone();
 
     let socket_path_log = socket_path.to_string();
     let ipc_tasks = producers.spawner();
@@ -1792,6 +1793,7 @@ async fn main() -> Result<(), anyhow::Error> {
                     let crypto_stream = crypto_unix.clone();
                     let policy_stream = policy_unix.clone();
                     let reports_stream = reports_unix.clone();
+                    let state_stream = state_unix.clone();
                     let peer_uid = stream.peer_cred().map(|c| c.uid()).ok();
 
                     let ipc = IpcCtx {
@@ -1802,6 +1804,7 @@ async fn main() -> Result<(), anyhow::Error> {
                         crypto: crypto_stream,
                         policy: policy_stream,
                         reports: reports_stream,
+                        state: Some(state_stream),
                     };
                     let (total, delayed) = (ipc_total.clone(), ipc_delayed.clone());
                     ipc_tasks.spawn(async move {
