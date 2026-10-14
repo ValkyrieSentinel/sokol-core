@@ -568,6 +568,18 @@
   ]
  },
  "closures_v2": {
+  "Interpretation.test_author_status_cannot_override_transcript": [
+   "scripts/test_counterexample_task.py:c324a3fbd6bff29df830cd2ae39602d7123a5dd3ce0cad51edaf664417d71293"
+  ],
+  "Interpretation.test_fixed_isolation_profile_exposes_no_home_key_or_network": [
+   "scripts/test_counterexample_task.py:2ce98013c63694e2a625c397478873207b1734dc4f9ef4a11592d24751015b84"
+  ],
+  "Interpretation.test_only_named_assertion_red_and_complete_repair_reproduce": [
+   "scripts/test_counterexample_task.py:e5afabc599e87261395733b6b2bab13219e971c2cd37d2c714c99ac2ab6677de"
+  ],
+  "Interpretation.test_unrun_budget_and_wrong_phase_are_never_success": [
+   "scripts/test_counterexample_task.py:8f1117b2b2235f350a34d9015843bac8bbead43eb242b7dea0ff7be194f11547"
+  ],
   "Monitoring.test_a_renamed_label_value_an_alert_selects_fails": [
    "scripts/test_check_monitoring.py:255c3e43d61e5e034ac3d90723db2ffda946a6e351d1c4923385be7dd5de0683"
   ],
@@ -579,6 +591,12 @@
   ],
   "ProtectionTypes.test_production_diagnostic_strings_cannot_construct_protection": [
    "scripts/test_protection_types.py:c0b9b8b04f6aa651208aed9586454d7d9cbb3ff55afdeb9ef071b200963cc973"
+  ],
+  "PublicWarrant.test_readdressing_a_changed_witness_cannot_bypass_owner_pin": [
+   "scripts/test_counterexample_task.py:26b6945aea4704055609be83be190e7e74685b1601a88d11233b4ea8096a325e"
+  ],
+  "PublicWarrant.test_recipient_reply_is_prior_linked_and_view_does_not_upgrade_execution": [
+   "scripts/test_counterexample_task.py:0fba5a1240a2faa8b34508ee2707bb5100cb9f00a7ccc87409b2ed72ab3ae81e"
   ],
   "RecoveryTests.test_cooldown_diagnostics_aggregate_across_batches_without_losing_counts": [
    "scripts/test_suricata_recovery.py:9415b7760e04c3a243e90d9a2708bc6fcd95ca770a501b1e41f22ea8fe64dd74"
@@ -1226,6 +1244,7 @@
   "CONTROL-L1": "83962842fe5c87c27c1f73144ed55d6c7d59c20750343e264a175b195e83df39",
   "CS-P1": "20c86421cdf4044134642a59a00621fbcd7356166a8643864fb02dad24cb2687",
   "CS-P2": "5dd517e4115b6735f6e7477f4118095dccc8075d384adeb95b2bbf1a0069b031",
+  "EXCHANGE-P1": "1f1fd4ba88f639ccf12ef8b384e15ba6d4556814bdddd7b953ca73f5033f0500",
   "FASTNETMON-A1": "d7a9f0dd095b399579eb136f5aa8837278f07afe62dcda3c0a93c2eff11d94ec",
   "FLOWSPEC-B1": "4bcfb9a6441b08485e2687a88e162720a37dcc60ed26ca003cb37d23ce3f7289",
   "FLOWSPEC-P1": "23412916e4d4b48929c79ebd1541c49345a29b49377f67aff8ef23ac673153ce",
@@ -1365,6 +1384,17 @@
    "witnesses": [
     "ipc_pacing_interval_does_not_round_below_the_configured_budget",
     "ipc_pacing_intervals_are_positive_minimal_integer_budgets"
+   ]
+  },
+  "EXCHANGE-P1": {
+   "statement": "fe447c6d4245e8e9b0c8fb40a2d06db26dc38adf931c87024c33443a6d5b1065",
+   "witnesses": [
+    "Interpretation.test_author_status_cannot_override_transcript",
+    "Interpretation.test_fixed_isolation_profile_exposes_no_home_key_or_network",
+    "Interpretation.test_only_named_assertion_red_and_complete_repair_reproduce",
+    "Interpretation.test_unrun_budget_and_wrong_phase_are_never_success",
+    "PublicWarrant.test_readdressing_a_changed_witness_cannot_bypass_owner_pin",
+    "PublicWarrant.test_recipient_reply_is_prior_linked_and_view_does_not_upgrade_execution"
    ]
   },
   "FASTNETMON-A1": {
@@ -1832,6 +1862,18 @@
   }
  },
  "witnesses": {
+  "Interpretation.test_author_status_cannot_override_transcript": [
+   "scripts/test_counterexample_task.py:1060fb739c829deedd236628b6bc66e539349e16b91d38c5690a2db5e3667fba"
+  ],
+  "Interpretation.test_fixed_isolation_profile_exposes_no_home_key_or_network": [
+   "scripts/test_counterexample_task.py:c8ff36552fdef42620cdbf01c49a73675965422b3b2baae0cd814793d2c7293f"
+  ],
+  "Interpretation.test_only_named_assertion_red_and_complete_repair_reproduce": [
+   "scripts/test_counterexample_task.py:f0497590762442091fb4956d97c8bae8bcd718946f71f8137c7b7f14d2076e2d"
+  ],
+  "Interpretation.test_unrun_budget_and_wrong_phase_are_never_success": [
+   "scripts/test_counterexample_task.py:be8a3de53530cb1c076e81a80ff8e5d92013971acc517693f01d02ab42ffc91a"
+  ],
   "Monitoring.test_a_renamed_label_value_an_alert_selects_fails": [
    "scripts/test_check_monitoring.py:50502f160489313368bd3035aff1d3f977eb214da3e0f5b30ffc1cbb70bfda35"
   ],
@@ -1843,6 +1885,12 @@
   ],
   "ProtectionTypes.test_production_diagnostic_strings_cannot_construct_protection": [
    "scripts/test_protection_types.py:182e91bb48538b8d95c75bf7c9836d07a644e453d7df8997df0e0968ca8029dd"
+  ],
+  "PublicWarrant.test_readdressing_a_changed_witness_cannot_bypass_owner_pin": [
+   "scripts/test_counterexample_task.py:bfeb2700e689c601691ea45418f7f74facf0923d5dcee1a1b4d3830983571f69"
+  ],
+  "PublicWarrant.test_recipient_reply_is_prior_linked_and_view_does_not_upgrade_execution": [
+   "scripts/test_counterexample_task.py:61aac580aa12c223dc3423e89529e9f01b2af0baac5adb24c5a4c3a5432119bc"
   ],
   "RecoveryTests.test_cooldown_diagnostics_aggregate_across_batches_without_losing_counts": [
    "scripts/test_suricata_recovery.py:9901e28f9d7fa253f827045c1b71b164453154cd1aac8290db91c038b4c3a777"
