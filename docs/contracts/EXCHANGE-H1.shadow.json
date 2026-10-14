@@ -1,12 +1,18 @@
 {
-  "after": "EXCHANGE-P1",
-  "base_contract_sha256": null,
-  "because": "Round 7 on 27d0ea0: a pack's scripts/json.py was imported by the recipient's owner gate and ran unsandboxed during inspect/view/export/replay; a later phase on another source was hidden behind an earlier failure; view accepted a refused observation claiming a native pass; names colliding on case-insensitive filesystems and records citing absent blobs were accepted.",
+  "annotations": {
+    "status": "UNSIGNED_EXPLANATORY_DRAFT"
+  },
+  "decisions": [
+    {
+      "because": "Round 7 on 27d0ea0: a pack's scripts/json.py was imported by the recipient's owner gate and ran unsandboxed during inspect/view/export/replay; a later phase on another source was hidden behind an earlier failure; view accepted a refused observation claiming a native pass; names colliding on case-insensitive filesystems and records citing absent blobs were accepted.",
+      "previous_statement_sha256": null,
+      "proposal_sha256": "0d9925778d1f9bdb5b093d9a61f7d584da04ee142382efbc4545a94e95d00ee3"
+    }
+  ],
   "evidence_text": "`HostilePack.test_a_record_citing_bytes_outside_the_pack_is_refused_by_inspect`, `HostilePack.test_names_that_collide_after_case_or_unicode_folding_are_refused`, `HostilePack.test_received_python_never_runs_in_the_recipient_owner_gate`, `HostilePack.test_refused_observation_cannot_carry_a_native_pass_verdict`, `Interpretation.test_a_later_phase_on_another_source_is_source_mismatch_whatever_an_earlier_phase_says`",
   "id": "EXCHANGE-H1",
-  "profile": "sokol.contract-proposal.v1",
+  "profile": "sokol.contract-shadow.v1",
   "statement": "Received pack data never runs in the recipient's tools: the recipient's owner gate runs isolated, so the pack's files cannot shadow its imports. inspect reads every blob a record cites against its address; descriptor names that collide after case folding or Unicode normalisation are refused; every phase's source snapshot is compared before any phase is classified; a refused or source-mismatched observation carries no native verdict and any other exactly one, matching its report.",
-  "status": "UNSIGNED_INTENT",
   "witnesses": [
     "HostilePack.test_a_record_citing_bytes_outside_the_pack_is_refused_by_inspect",
     "HostilePack.test_names_that_collide_after_case_or_unicode_folding_are_refused",

@@ -428,6 +428,10 @@ def rust_item_name(masked: str, head: int, end: int) -> tuple[str | None, str | 
         bound = [n for n in re.findall(r"([A-Za-z_]\w*)\s*[,;}]", masked[m.end():end])
                  if n not in ("self", "super", "crate")]
         return keyword, ",".join(bound) or None
+    if keyword == "impl":
+        # Named by its self type: `impl Blocklist for FakeLists` belongs to FakeLists, so a
+        # witness using FakeLists reaches the behaviour it gets (2026-10-14: since #22 this
+        # branch was unreachable and impls were named by their trait or module path).
         n = RUST_IMPL.match(masked, m.end(), end)
         return keyword, n.group(1) if n else None
     n = IDENT.match(masked, m.end(), end)
@@ -819,7 +823,7 @@ def current() -> dict:
     closures = {**rust_closures({w for w in cited if RUST_TEST.fullmatch(w)}),
                 **py_closures({w for w in cited if PY_TEST.fullmatch(w)})}
     return {"rows": table, "witnesses": {w: sorted(bodies.get(w, [])) for w in sorted(cited)},
-            "closures_v2": {w: sorted(closures.get(w, [])) for w in sorted(cited)},
+            "closures_v3": {w: sorted(closures.get(w, [])) for w in sorted(cited)},
             "build": build_pins(),
             "contracts": contract_pins(ROOT)}
 
@@ -863,15 +867,15 @@ def check(signers: pathlib.Path, every_pin: bool = False, executed_log: pathlib.
     for w, where in pinned["witnesses"].items():
         if w in now["witnesses"] and now["witnesses"][w] != where:
             problems.append(f"witness {w} changed: its body is not the one the owner pinned")
-    # `closures` is the first closure rule (2026-10-12, #21), kept frozen for checkers of that
-    # version; `closures_v2` adds aliases, enclosing modules, module declarations.
-    closures = pinned.get("closures_v2")
+    # `closures` (#21) and `closures_v2` (#22) are earlier closure rules, kept frozen for
+    # checkers of those versions; `closures_v3` names an impl by its self type again.
+    closures = pinned.get("closures_v3")
     if closures is None:
         if pinned["witnesses"]:
             notes.append("witness closures (attributes, helpers) are not pinned yet")
     else:
         for w, where in closures.items():
-            if w in now["closures_v2"] and now["closures_v2"][w] != where and now["witnesses"].get(w) == pinned["witnesses"].get(w):
+            if w in now["closures_v3"] and now["closures_v3"][w] != where and now["witnesses"].get(w) == pinned["witnesses"].get(w):
                 problems.append(f"witness {w} changed: its attributes or a test item it reaches are not the ones the owner pinned")
     build = pinned.get("build")
     if build is None:
@@ -917,10 +921,11 @@ def sign(key: str) -> int:
         print("FAIL refusing to pin witnesses that do not exist:", ", ".join(missing))
         return 1
     if MANIFEST.exists():
-        # Checkers of the first closure rule still read `closures`; it stays as it was pinned.
-        legacy = json.loads(MANIFEST.read_text()).get("closures")
-        if legacy is not None:
-            now["closures"] = legacy
+        # Checkers of earlier closure rules still read their own field; each stays as pinned.
+        pinned_before = json.loads(MANIFEST.read_text())
+        for legacy in ("closures", "closures_v2"):
+            if legacy in pinned_before:
+                now[legacy] = pinned_before[legacy]
     MANIFEST.write_text(json.dumps(now, indent=1, sort_keys=True) + "\n")
     # ssh-keygen asks before overwriting a signature and, without a terminal, keeps the old
     # one and still exits 0: a re-pin would leave the previous signature in place.
