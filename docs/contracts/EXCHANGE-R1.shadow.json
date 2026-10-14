@@ -1,0 +1,23 @@
+{
+  "annotations": {
+    "status": "UNSIGNED_EXPLANATORY_DRAFT"
+  },
+  "decisions": [
+    {
+      "because": "Review of #33, fixed in #36: a developer's whole registry made the digest change with every other project built, often exceeded the input budget and exposed other projects' sources.",
+      "previous_statement_sha256": null,
+      "proposal_sha256": "84c2e1f934ddc7d1d52410f2c1ccfe8e26451c0f86ee3c709b3a38bc4c56ba6c"
+    }
+  ],
+  "evidence_text": "`RegistryWithinLock.test_a_crate_of_another_project_or_version_is_refused`, `RegistryWithinLock.test_a_dedicated_registry_for_the_lockfile_is_admitted`, `RegistryWithinLock.test_the_index_cache_is_metadata_and_not_restricted`, `RegistryWithinLock.test_unpacked_sources_of_another_project_are_refused`",
+  "id": "EXCHANGE-R1",
+  "profile": "sokol.contract-shadow.v1",
+  "statement": "A replay refuses a Cargo registry whose crate archives or unpacked sources are not crates.io packages of the received Cargo.lock, so the recorded registry digest is a function of the inputs and no other project's sources reach the candidate code; the index cache, public metadata without sources, is not restricted.",
+  "tier": "provisional",
+  "witnesses": [
+    "RegistryWithinLock.test_a_crate_of_another_project_or_version_is_refused",
+    "RegistryWithinLock.test_a_dedicated_registry_for_the_lockfile_is_admitted",
+    "RegistryWithinLock.test_the_index_cache_is_metadata_and_not_restricted",
+    "RegistryWithinLock.test_unpacked_sources_of_another_project_are_refused"
+  ]
+}
