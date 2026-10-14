@@ -290,8 +290,9 @@ forwards client text under `DB_LOG:NODE=...`; this change separates audit record
 not the operator telemetry consumer.
 The reply still acknowledges queue submission, not durable storage. Internal node
 writers continue using `append` and their original tags. Trap finalisation is now
-client data, still visible in monitor dumps; the TUI tier is now `CLIENT_LOG` unless
-a later `TIER=` field supplies a display tier. Existing unwrapped logs are not migrated;
+client data, still visible in monitor dumps; the TUI tier is `CLIENT_LOG` unless a
+`TIER=` field in the header before a terminal `VEC=` supplies one (first match wins;
+since 2026-10-14 text after `VEC=` supplies neither tier nor IP). Existing unwrapped logs are not migrated;
 replay still requires the same build. This is separation at the socket entry point,
 not a signature, isolation from filesystem writers or a claim that client text is true.
 

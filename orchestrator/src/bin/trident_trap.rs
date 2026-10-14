@@ -167,6 +167,11 @@ const DEFAULT_TRAP_PORTS: [u16; 6] = [22, 80, 443, 3306, 6379, 8443];
 use common::ADMIN_SSH_PORT;
 const MAX_CONCURRENT_CONNECTIONS: usize = 256;
 
+/// No trap session holds one of those slots longer than this. A client trickling a byte per
+/// read (each read waits up to 8 s), or one that never reads a tarpit's writes, held its slot
+/// indefinitely, and the ban came only when the session ended.
+const MAX_SESSION: Duration = Duration::from_secs(300);
+
 pub struct TrapConfig {
     pub ports: Vec<u16>,
     /// External interactive jail to proxy SSH attackers to. None = embedded mock jail.
@@ -314,7 +319,7 @@ impl UltimateTridentOrchestrator {
                     let config = config.clone();
 
                     tokio::spawn(async move {
-                        let _ = handle_trident_connection(stream, ip, port, &config).await;
+                        let _ = serve_trap_connection(stream, ip, port, &config, MAX_SESSION).await;
                         drop(permit);
                     });
                 }
@@ -328,6 +333,30 @@ impl UltimateTridentOrchestrator {
         }
 
         Ok(())
+    }
+}
+
+/// One trap connection, ended after `max`; a session the deadline ends still blocks its
+/// source, with that reason, which is returned.
+async fn serve_trap_connection(
+    stream: TcpStream,
+    ip: String,
+    port: u16,
+    config: &TrapConfig,
+    max: Duration,
+) -> Option<String> {
+    match timeout(
+        max,
+        handle_trident_connection(stream, ip.clone(), port, config),
+    )
+    .await
+    {
+        Ok(_) => None,
+        Err(_) => {
+            let reason = format!("trap port {}: session exceeded {} s", port, max.as_secs());
+            let _ = trigger_xdp_drop(&ip, &reason);
+            Some(reason)
+        }
     }
 }
 
@@ -858,6 +887,56 @@ mod tests {
     /// a terminal `|VEC=`); only the trap may choose them. Bytes an attacker typed into the trap
     /// are diagnostic text and must sit in that terminal VEC, or a jailed client can move any
     /// trap tier counter (one line per read) and supply header fields.
+    /// A jailed client that keeps sending one byte a second never ends its session by
+    /// itself; the session deadline ends it and the source is still blocked. (Same address
+    /// as the other NODE-sharing test, whose assertions read every line this one submits.)
+    #[tokio::test]
+    async fn a_trickling_client_cannot_hold_a_trap_slot_past_the_session_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let attacker = tokio::spawn(async move {
+            let mut stream = TcpStream::connect(addr).await.unwrap();
+            stream.write_all(b"SSH-2.0-trickle").await.unwrap();
+            let mut sink = [0u8; 256];
+            loop {
+                let _ = timeout(Duration::from_millis(300), stream.read(&mut sink)).await;
+                if stream.write_all(b"x").await.is_err() {
+                    break;
+                }
+                sleep(Duration::from_millis(700)).await;
+            }
+        });
+        let (stream, _) = listener.accept().await.unwrap();
+        let config = TrapConfig {
+            ports: vec![],
+            jail_addr: None,
+        };
+        let started = std::time::Instant::now();
+        let ended = timeout(
+            Duration::from_secs(20),
+            serve_trap_connection(
+                stream,
+                "203.0.113.9".into(),
+                2022,
+                &config,
+                Duration::from_secs(3),
+            ),
+        )
+        .await;
+        attacker.abort();
+        let reason = ended.expect("a trickling client held the trap session past its deadline");
+        assert_eq!(
+            reason.as_deref(),
+            Some("trap port 2022: session exceeded 3 s"),
+            "the deadline must end the session with a ban reason"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(6),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
     #[tokio::test]
     async fn attacker_bytes_reach_trap_telemetry_only_as_terminal_vector_text() {
         use tokio::io::AsyncBufReadExt;
