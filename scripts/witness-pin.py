@@ -14,6 +14,7 @@ body of each witness, in docs/witness-manifest.json signed by the owner (ssh-key
     witness-pin.py sign-provisional --key AGENT_KEY
                                             # agent: pin the provisional rows (ADR-0028)
     witness-pin.py closure WITNESS          # the test items pinned with a witness
+    witness-pin.py --root CANDIDATE check   # trusted checker, candidate bytes left intact
     witness-pin.py run-python               # run the pinned Python witnesses, print a log for
                                             # check --executed-python (the base workflow)
 
@@ -32,6 +33,7 @@ import json
 from itertools import islice
 import pathlib
 import re
+import stat
 import subprocess
 import sys
 import unicodedata
@@ -853,6 +855,50 @@ TARGET_SECTIONS = ("lib", "bin", "test", "bench", "example", "workspace")
 # as pinned, so the base branch's checker (which computes them) still accepts the change.
 CLOSURES = "closures_v4"
 BUILD = "build_v3"
+TRUST = "trust_root_v1"
+TRUST_PATHS = (".github/witness-signers", "scripts/witness-pin.py",
+               ".github/workflows/witness-gate.yml")
+MAX_TRUST_BYTES = 262_144
+
+
+def trust_pins() -> dict:
+    """The proposed NEXT base, authenticated by the current owner's manifest and trust.
+
+    Always inspect candidate bytes, even when this checker is executed outside that tree.
+    Missing optional workflow files in small fixtures are pinned as absent, not omitted.
+    """
+    pins = {}
+    for rel in TRUST_PATHS:
+        path = ROOT / rel
+        for component in (path, *path.parents):
+            if component == ROOT:
+                break
+            if component.is_symlink():
+                raise ValueError('Symlink trust root refused: ' + rel)
+        if not path.exists():
+            pins[rel] = None
+            continue
+        mode = path.stat().st_mode
+        if not stat.S_ISREG(mode):
+            raise ValueError('Non-regular trust root refused: ' + rel)
+        with path.open('rb') as stream:
+            data = stream.read(MAX_TRUST_BYTES + 1)
+        if len(data) > MAX_TRUST_BYTES:
+            raise ValueError('Oversized trust root refused: ' + rel)
+        pins[rel] = {'sha256': hashlib.sha256(data).hexdigest(), 'executable': bool(mode & 0o111)}
+    return pins
+
+
+def configure_root(root: pathlib.Path) -> None:
+    """CLI boundary: run a trusted checker without replacing candidate source files."""
+    global ROOT, INVARIANTS, MANIFEST, SIGNATURE, PROVISIONAL, PROVISIONAL_SIG, SIGNERS
+    ROOT = root.resolve(strict=True)
+    INVARIANTS = ROOT / 'docs/INVARIANTS.md'
+    MANIFEST = ROOT / 'docs/witness-manifest.json'
+    SIGNATURE = ROOT / 'docs/witness-manifest.json.sig'
+    PROVISIONAL = ROOT / 'docs/witness-provisional.json'
+    PROVISIONAL_SIG = ROOT / 'docs/witness-provisional.json.sig'
+    SIGNERS = ROOT / '.github/witness-signers'
 
 
 def build_pins() -> dict[str, str]:
@@ -903,6 +949,7 @@ def current(tier: str = "owner") -> dict:
     return {"rows": table, "witnesses": {w: sorted(bodies.get(w, [])) for w in sorted(cited)},
             CLOSURES: {w: sorted(closures.get(w, [])) for w in sorted(cited)},
             BUILD: build_pins() if tier == "owner" else {},
+            TRUST: trust_pins() if tier == "owner" else {},
             "contracts": contract_pins(ROOT, tier)}
 
 
@@ -975,6 +1022,10 @@ def check(signers: pathlib.Path, every_pin: bool = False, executed_log: pathlib.
     found, noted = compare(pinned, now, "owner")
     problems += found
     notes += noted
+    if TRUST not in pinned:
+        problems.append('trust root is not pinned by the owner; bootstrap requires owner acceptance')
+    elif pinned[TRUST] != now[TRUST]:
+        problems.append('trust root changed without the current owner authorizing its exact bytes')
     build = pinned.get(BUILD)
     if build is None:
         if pinned["witnesses"]:
@@ -1063,6 +1114,9 @@ def sign(key: str, tier: str = "owner") -> int:
 
 if __name__ == "__main__":
     args = sys.argv[1:]
+    if args[:1] == ['--root'] and len(args) >= 3:
+        configure_root(pathlib.Path(args[1]))
+        args = args[2:]
     if args[:1] == ["sign"] and "--key" in args:
         sys.exit(sign(args[args.index("--key") + 1]))
     if args[:1] == ["sign-provisional"] and "--key" in args:

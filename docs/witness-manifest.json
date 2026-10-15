@@ -18,7 +18,7 @@
   "rust-toolchain.toml": "1f561d2101a82b5cb87c3eabea72f54d8225f09ca72f51a65525646f211f36d9"
  },
  "build_v3": {
-  ".github/workflows/witness-gate.yml": "4bee87957a1c977ae30d0393d9ca4d071259d5510aee9ffd737885db61a826f1",
+  ".github/workflows/witness-gate.yml": "a59ebe48a188a7a85686688f34a4534af57ac6b22ed94dadee5384f8a171bf50",
   "Cargo.toml": "5417e85cca54fc71d5921ed88e36206166188a83139275125c7e246c4df6542b",
   "common/Cargo.toml": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
   "ebpf/.cargo/config.toml": "2971e97c89e2b57030356e3bd41c3e3f42a74e48feb368d12c3417063f4feab2",
@@ -3349,6 +3349,20 @@
    "witnesses": [
     "a_failed_stats_read_keeps_the_last_counters_and_is_counted"
    ]
+  }
+ },
+ "trust_root_v1": {
+  ".github/witness-signers": {
+   "executable": false,
+   "sha256": "a56bd2d321cf1247fa9471fbc03ade04d90542b5d61986927e6645096f99ce93"
+  },
+  ".github/workflows/witness-gate.yml": {
+   "executable": false,
+   "sha256": "a59ebe48a188a7a85686688f34a4534af57ac6b22ed94dadee5384f8a171bf50"
+  },
+  "scripts/witness-pin.py": {
+   "executable": true,
+   "sha256": "3fa96cda46d822dfcd0bb9624e51cab23cda24f73b64c120589869469ca9caae"
   }
  },
  "witnesses": {

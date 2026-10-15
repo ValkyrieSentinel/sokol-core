@@ -34,6 +34,8 @@ jobs:
   tests:
     name: witness-gate tests (pull request code)
     runs-on: ubuntu-24.04
+    outputs:
+      candidate: ${{ steps.identity.outputs.sha }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -45,6 +47,11 @@ jobs:
           ref: refs/pull/${{ github.event.pull_request.number }}/merge
           path: pr
           persist-credentials: false
+
+      - name: Freeze the merge candidate before running its code
+        id: identity
+        working-directory: pr
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Install the pinned Rust toolchain (rust-toolchain.toml)
         working-directory: pr
@@ -78,8 +85,7 @@ jobs:
           (cd ebpf && cargo build --release --locked)
           cargo build --release --locked
           cargo test --release --locked 2>&1 | tee /tmp/witness/cargo-test.log
-          cp "$GITHUB_WORKSPACE/base/scripts/witness-pin.py" scripts/witness-pin.py
-          python3 scripts/witness-pin.py run-python | tee /tmp/witness/python.log
+          python3 -I "$GITHUB_WORKSPACE/base/scripts/witness-pin.py" --root "$PWD" run-python | tee /tmp/witness/python.log
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -107,7 +113,7 @@ jobs:
 
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          ref: refs/pull/${{ github.event.pull_request.number }}/merge
+          ref: ${{ needs.tests.outputs.candidate }}
           path: pr
           persist-credentials: false
 
@@ -123,8 +129,7 @@ jobs:
       - name: Pinned witnesses, checked by main's checker and signers
         working-directory: pr
         run: |
-          cp "$GITHUB_WORKSPACE/base/scripts/witness-pin.py" scripts/witness-pin.py
           echo "checker and signers from main $(git -C "$GITHUB_WORKSPACE/base" rev-parse HEAD)"
-          python3 -I scripts/witness-pin.py check \
+          python3 -I "$GITHUB_WORKSPACE/base/scripts/witness-pin.py" --root "$PWD" check --every-pin \
             --signers "$GITHUB_WORKSPACE/base/.github/witness-signers" \
             --executed /tmp/witness/cargo-test.log --executed-python /tmp/witness/python.log
