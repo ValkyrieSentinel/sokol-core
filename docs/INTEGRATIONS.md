@@ -538,6 +538,16 @@ before it reaches this node's link. Expired or lifted blocks are withdrawn. With
 is attempted within the shutdown budget. Colliding owned paths can remain upstream
 until their shared-daemon ownership is resolved.
 
+**Upstream acceptance.** These rules match a source prefix only. Under RFC 8955 §6, by default
+a received Flow Specification is feasible only if it embeds a destination prefix component
+(rule a); rule a may be relaxed only by explicit configuration, and rules b and c are then
+disregarded. A router that applies the default procedure therefore does not install Sokol's
+rules, and nothing on this node shows it: the local RIB, `sokol_flowspec_discard_rules` and
+convergence describe the node's gobgpd, not the router. The lab and smoke upstream is GoBGP,
+which kept the rules in its RIB; that does not show acceptance by a validating router. Before
+relying on FlowSpec, the operator configures the receiving routers to relax rule a for this
+session and confirms on the router that the rules are installed and discarding.
+
 Every rule carries the node's ownership community (`--flowspec-community`, default
 `64512:<node-id>`; give each node that shares a gobgpd its own). Every second a separate worker
 reconciles the active blocks with local, tagged paths reported as ID-zero and matching one full source prefix
