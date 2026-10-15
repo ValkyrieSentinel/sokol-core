@@ -19,10 +19,10 @@ COMMAND_SECONDS = 5
 TOTAL_SECONDS = 60
 
 
-def capture(argv, seconds=COMMAND_SECONDS, bound=MAX_OUTPUT):
+def capture(argv, seconds=COMMAND_SECONDS, bound=MAX_OUTPUT, cwd=None):
     start = time.monotonic()
     try:
-        child = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
+        child = subprocess.Popen(argv, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
     except OSError as error:
         return {'status': 'UNAVAILABLE', 'returncode': None, 'output': str(error)}
     output, state = bytearray(), 'COMPLETE'

@@ -48,6 +48,22 @@ fn worker_states_have_one_bounded_shared_observation() {
         health.set(state);
         assert_eq!(observer.get(), expected);
     }
+    for (value, label) in [
+        (0, "UNKNOWN"),
+        (1, "RUNNING"),
+        (2, "FAILED"),
+        (3, "STOPPED"),
+        (255, "UNKNOWN"),
+    ] {
+        let snapshot = Snapshot {
+            mesh_worker: value,
+            kernel_worker: value,
+            ..Default::default()
+        };
+        let rendered = metrics::status_at(&snapshot, Instant::now());
+        assert_eq!(rendered["workers"]["mesh_listener"], label);
+        assert_eq!(rendered["workers"]["kernel_events"], label);
+    }
 }
 
 #[test]

@@ -1,0 +1,25 @@
+name: Native fuzz calibration
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native-fuzz:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Pinned compiler and fuzz driver
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustup toolchain install stable --profile minimal
+          cargo +stable install cargo-fuzz --version 0.13.2 --locked
+      - name: Native assertions and production-fault controls
+        run: python3 scripts/fuzz-check.py --seconds 60 --output "$RUNNER_TEMP/native-fuzz"
+      - name: Scoped unsigned experiment receipt
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: native-fuzz-${{ github.sha }}
+          path: ${{ runner.temp }}/native-fuzz
+          if-no-files-found: error

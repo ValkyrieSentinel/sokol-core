@@ -2,7 +2,7 @@
 # Runbook rehearsal: follows docs/RUNBOOK.md on a clean host as an operator would, with its
 # commands as written, and reports every place where the runbook and the software disagree.
 #
-#   sudo scripts/runbook-rehearsal.sh <dir with orchestrator, monitor> <dir with another build>
+#   sudo scripts/runbook-rehearsal.sh <dir with orchestrator, monitor> <dir with another build> [product root]
 #
 # Needs a fresh systemd host (it creates the sokol user, groups, unit and /etc files) and root.
 # Traffic runs over a veth pair to a network namespace ("remote"), not over the host's own
@@ -12,7 +12,7 @@
 set -uo pipefail
 
 A=$(cd "$1" && pwd); B=$(cd "$2" && pwd)
-REPO=$(cd "$(dirname "$0")/.." && pwd)
+REPO=$(cd "${3:-$(dirname "$0")/..}" && pwd)
 IF=pilot0; PEER_IF=pilot1; NS=remote
 HOST_IP=10.250.0.1; REMOTE_IP=10.250.0.2; SUSPECT=10.250.0.7
 fails=0; deviations=0
