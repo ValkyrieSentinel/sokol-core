@@ -930,34 +930,34 @@ const HTML_DASHBOARD: &str = r###"
                 </div>
                 <div class="text-right">
                     <div class="text-[10px]">SYS CPU</div>
-                    <div id="m-cpu" class="text-xl font-bold text-emerald-400">0.0%</div>
+                    <div id="m-cpu" class="text-xl font-bold text-emerald-400">—</div>
                 </div>
             </div>
             <div class="bg-zinc-900 border border-zinc-800 p-4 rounded-xl flex items-center justify-between">
                 <div>
                     <div class="text-[10px] text-zinc-500">TRAP TIER-1 (TARPIT)</div>
-                    <div id="trap-t1" class="text-xl font-bold text-cyan-400">0</div>
+                    <div id="trap-t1" class="text-xl font-bold text-cyan-400">—</div>
                 </div>
                 <div class="text-right text-[10px] text-zinc-500">Scanners</div>
             </div>
             <div class="bg-zinc-900 border border-zinc-800 p-4 rounded-xl flex items-center justify-between">
                 <div>
                     <div class="text-[10px] text-zinc-500">TRAP TIER-1.5 (SLOW DRIP)</div>
-                    <div id="trap-t15" class="text-xl font-bold text-amber-400">0</div>
+                    <div id="trap-t15" class="text-xl font-bold text-amber-400">—</div>
                 </div>
                 <div class="text-right text-[10px] text-zinc-500">Floods</div>
             </div>
             <div class="bg-zinc-900 border border-zinc-800 p-4 rounded-xl flex items-center justify-between">
                 <div>
                     <div class="text-[10px] text-zinc-500">TRAP TIER-2 (PAYLOAD CAPTURE)</div>
-                    <div id="trap-t2" class="text-xl font-bold text-purple-400">0</div>
+                    <div id="trap-t2" class="text-xl font-bold text-purple-400">—</div>
                 </div>
                 <div class="text-right text-[10px] text-zinc-500">Shellcode-like</div>
             </div>
             <div class="bg-zinc-900 border border-zinc-800 p-4 rounded-xl flex items-center justify-between">
                 <div>
                     <div class="text-[10px] text-zinc-500">TRAP TIER-3 (JAIL)</div>
-                    <div id="trap-t3" class="text-xl font-bold text-red-500">0</div>
+                    <div id="trap-t3" class="text-xl font-bold text-red-500">—</div>
                 </div>
                 <div class="text-right text-[10px] text-zinc-500">Interactive</div>
             </div>
@@ -966,16 +966,15 @@ const HTML_DASHBOARD: &str = r###"
         <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
             <div class="bg-zinc-900 border border-zinc-800 p-4 rounded-xl flex items-center justify-between">
                 <div>
-                    <div class="text-[10px] text-zinc-500">P2P MESH SWARM</div>
-                    <div class="font-bold text-zinc-100"><span id="m-peers" class="text-cyan-400">0</span> Active Nodes | DAG Tips: <span id="m-dag" class="text-cyan-500">0</span></div>
+                    <div class="text-[10px] text-zinc-500">NODE OBSERVATIONS</div>
+                    <div class="font-bold text-zinc-100"><span id="m-peers" class="text-cyan-400">—</span> observed nodes</div>
                 </div>
             </div>
             <div class="bg-zinc-900 border border-zinc-800 p-4 rounded-xl flex items-center justify-between">
                 <div>
-                    <div class="text-[10px] text-zinc-500">AUDIT LOG STORAGE</div>
-                    <div class="font-bold text-zinc-100">Latency: <span id="m-dblat" class="text-amber-400">0 ms</span> | Banned IPs: <span id="trap-banned" class="text-red-400">0</span></div>
+                    <div class="text-[10px] text-zinc-500">REPORTED BLOCKS</div>
+                    <div class="font-bold text-zinc-100">Banned IPs: <span id="trap-banned" class="text-red-400">—</span></div>
                 </div>
-            </div>
             </div>
         </div>
 
@@ -985,8 +984,8 @@ const HTML_DASHBOARD: &str = r###"
                     <div class="flex justify-between items-center mb-4">
                         <h3 class="font-bold text-zinc-100">Operator-host RX · reported node drops</h3>
                         <div class="flex gap-4 text-xs">
-                            <div>RX: <span id="m-pps-rx" class="text-emerald-400 font-bold">0</span> pps</div>
-                            <div>DROPS: <span id="m-drops" class="text-red-400 font-bold">0</span> /sec</div>
+                            <div>RX: <span id="m-pps-rx" class="text-emerald-400 font-bold">—</span> pps</div>
+                            <div>DROPS: <span id="m-drops" class="text-red-400 font-bold">—</span> /sec</div>
                         </div>
                     </div>
                     <div class="h-48 w-full"><canvas id="trafficChart"></canvas></div>
@@ -1098,8 +1097,6 @@ const HTML_DASHBOARD: &str = r###"
                 document.getElementById('data-status').textContent = 'Node observations received ' + new Date(data.timestamp).toLocaleTimeString();
                 document.getElementById('data-status').className = 'text-xs text-zinc-400';
                 document.getElementById('m-peers').innerText = data.metrics.p2p_active_peers;
-                document.getElementById('m-dag').innerText = data.metrics.dag_tips;
-                document.getElementById('m-dblat').innerText = data.metrics.db_latency_ms.toFixed(1) + ' ms';
                 
                 document.getElementById('trap-t1').innerText = data.metrics.traps.tier1_bot_tarpit;
                 document.getElementById('trap-t15').innerText = data.metrics.traps.tier1_5_slow_drip;
@@ -1171,6 +1168,9 @@ const HTML_DASHBOARD: &str = r###"
                     `).join('');
                 }
             } catch (e) {
+                for (const id of ['m-peers','trap-t1','trap-t15','trap-t2','trap-t3','trap-banned']) {
+                    document.getElementById(id).innerText = '—';
+                }
                 document.getElementById('data-status').textContent = 'Operator API unavailable — displayed observations may be stale. ' + e.message;
                 document.getElementById('data-status').className = 'text-xs text-amber-400';
             }

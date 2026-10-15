@@ -34,7 +34,7 @@ const world = {document:{getElementById:element,addEventListener(){listeners++},
  EventSource:class {constructor(){streams.push(this)} close(){}}};
 vm.createContext(world);
 vm.runInContext(fs.readFileSync(process.argv[2],'utf8'),world);
-setImmediate(()=>{
+setImmediate(async()=>{
   assert.equal(polls,1); assert.equal(reads,1); assert.equal(listeners,1); assert.equal(streams.length,1);
   assert.match(element('data-status').textContent,/observations received/);
   streams[0].onmessage({data:JSON.stringify({cpu:12,pps_rx:9,drops_sec:3})});
@@ -42,6 +42,10 @@ setImmediate(()=>{
   streams[0].onerror(); assert.equal(element('m-cpu').innerText,'—');
   world.report({outcome:'UNKNOWN'});
   assert.match(element('command-status').textContent,/may have taken effect/);
+  world.fetch = async()=>{throw Error('offline')};
+  await world.fetchData();
+  assert.equal(element('m-peers').innerText,'—');
+  assert.equal(element('trap-t1').innerText,'—');
   console.log('PASS offline startup, readback, unavailable canvas, stream loss, UNKNOWN command');
 });
 '''
