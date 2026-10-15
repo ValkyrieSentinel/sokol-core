@@ -42,3 +42,4 @@
 | [0026](0026-verified-streaming-replay.md) | Перевірка і replay одного префікса, обмежений звіт | Реалізовано; UNSIGNED_INTENT, прийняття за власником |
 | [0027](0027-peer-address-binding.md) | Вузол прив'язаний до своєї тунельної адреси | Реалізовано; UNSIGNED_INTENT, прийняття за власником |
 | [0028](0028-provisional-agent-tier.md) | Ярус агента: provisional-рядки, підписані ключем агента | Реалізовано; діє, коли власник додасть ключ агента |
+| [0029](0029-replay-floors-survive-the-process.md) | Пороги replay переживають процес | Реалізовано; MESH-N2 `[provisional]` |

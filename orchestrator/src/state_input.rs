@@ -14,10 +14,10 @@ pub const MAX_JSON_STRING_BYTES: usize = 6 * block_table::MAX_REASON_BYTES;
 pub const MAX_JSON_ATOM_BYTES: usize = 32; // u64 uses at most 20 decimal bytes
 pub const READ_BUFFER_BYTES: usize = 65_536; // 64 KiB prefetch, independent of admission
 /// Input policy ceiling, derived for the current maximal compact writer profile:
-/// known*(6*reason+256+3*128) + events*80 + support*(128+8*80) + 1024.
+/// known*(6*reason+256+3*128) + events*80 + support*(128+8*80) + mesh_floors*48 + 1024.
 /// Its named runtime counts/record sizes are checked against real serialization below;
 /// increasing them beyond this ceiling requires a new input policy, not a silent larger cap.
-pub const MAX_STATE_BYTES: usize = 1_028_654_080;
+pub const MAX_STATE_BYTES: usize = 1_028_850_688;
 
 struct JsonReader<R> {
     inner: R,
@@ -160,6 +160,11 @@ struct State {
     support: Vec<Support>,
     #[serde(default)]
     saved_ms: Option<u64>,
+    #[serde(default, deserialize_with = "floors")]
+    mesh_floors: Vec<(u64, u64)>,
+}
+fn floors<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<(u64, u64)>, D::Error> {
+    entries(d, block_table::MAX_MESH_FLOORS, |_: &(u64, u64)| true)
 }
 
 pub fn parse<R: Read>(input: R) -> Result<Persisted, String> {
@@ -181,6 +186,7 @@ pub fn parse<R: Read>(input: R) -> Result<Persisted, String> {
         events: state.events,
         support: state.support.into_iter().map(|v| (v.0, v.1)).collect(),
         saved_ms: state.saved_ms,
+        mesh_floors: state.mesh_floors,
     })
 }
 
@@ -311,6 +317,8 @@ mod tests {
                 target.into(),
                 vec![reason; block_table::MAX_SUPPORT_PER_TARGET],
             )],
+            saved_ms: Some(u64::MAX),
+            mesh_floors: vec![(u64::MAX, u64::MAX)],
             ..Persisted::default()
         };
         assert_eq!(
@@ -345,6 +353,10 @@ mod tests {
             (
                 block_table::MAX_SUPPORT_TARGETS,
                 serde_json::to_vec(&saved.support[0]).unwrap().len(),
+            ),
+            (
+                block_table::MAX_MESH_FLOORS,
+                serde_json::to_vec(&saved.mesh_floors[0]).unwrap().len(),
             ),
         ];
         for (count, bytes) in tables {
@@ -416,5 +428,21 @@ mod tests {
         );
         let old = parse(&br#"{"claims":[],"operator_lifts":[],"retracted":[]}"#[..]).unwrap();
         assert_eq!(old.saved_ms, None);
+    }
+
+    /// Saved mesh floors are bounded like every other table in the file.
+    #[test]
+    fn mesh_floors_roundtrip_within_their_bound_and_refuse_past_it() {
+        let full = Persisted {
+            mesh_floors: (0..block_table::MAX_MESH_FLOORS as u64)
+                .map(|i| (i, u64::MAX))
+                .collect(),
+            ..Persisted::default()
+        };
+        let bytes = serde_json::to_vec(&full).unwrap();
+        assert_eq!(parse(bytes.as_slice()).unwrap(), full);
+        let mut over = full;
+        over.mesh_floors.push((u64::MAX, 0));
+        assert!(parse(serde_json::to_vec(&over).unwrap().as_slice()).is_err());
     }
 }

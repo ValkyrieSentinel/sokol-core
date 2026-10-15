@@ -447,6 +447,7 @@ impl Default for Persisted {
             events: Vec::new(),
             support: Vec::new(),
             saved_ms: None,
+            mesh_floors: Vec::new(),
         }
     }
 }
@@ -504,7 +505,15 @@ pub struct Persisted {
     /// predates the field and is restored by its signed ends alone.
     #[serde(default)]
     pub saved_ms: Option<u64>,
+    /// Per mesh sender, the newest envelope timestamp the process accepted or refused
+    /// (MESH-N2): the next process refuses those again, even stamped after its start. Filled
+    /// by the node, not the table; at most [`MAX_MESH_FLOORS`].
+    #[serde(default)]
+    pub mesh_floors: Vec<(u64, u64)>,
 }
+
+/// Saved mesh replay floors a state file may hold: one per trusted sender.
+pub const MAX_MESH_FLOORS: usize = 4096;
 
 /// Block decisions (claims) with owners, and the kernel maps kept in line with them.
 ///
@@ -2184,6 +2193,7 @@ impl<B: Blocklist> BlockTable<B> {
             events,
             support,
             saved_ms: Some(self.to_wall(now_ms)),
+            mesh_floors: Vec::new(),
         }
     }
 

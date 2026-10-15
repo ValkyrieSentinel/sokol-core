@@ -661,6 +661,34 @@ impl ReplayGuard {
         self.senders.values().map(|w| w.seen.len()).sum()
     }
 
+    /// Per sender, the newest timestamp this guard accepted or refuses: what the next process
+    /// must refuse too, saved with the node's state (MESH-N2).
+    pub fn floors(&self) -> Vec<(u64, u64)> {
+        let mut floors: Vec<(u64, u64)> = self
+            .senders
+            .iter()
+            .filter_map(|(sender, w)| {
+                let newest = w.order.iter().map(|(_, _, stamped)| *stamped).max();
+                newest.max(w.floor).map(|f| (*sender, f))
+            })
+            .collect();
+        floors.sort_unstable();
+        floors
+    }
+
+    /// Floors saved by the previous process: each sender's window starts at or above its own,
+    /// so an envelope that process accepted is refused even when stamped after this start.
+    pub fn restore_floors(&mut self, floors: impl IntoIterator<Item = (u64, u64)>) {
+        let fence = self.fence;
+        for (sender, saved) in floors {
+            let w = self.senders.entry(sender).or_insert_with(|| SenderWindow {
+                floor: fence,
+                ..SenderWindow::default()
+            });
+            w.floor = common::replay::raise(w.floor, saved);
+        }
+    }
+
     fn check_and_record(
         &mut self,
         sender_id: u64,
@@ -1049,6 +1077,29 @@ impl PeerRegistry {
     pub fn with_startup_fence(self, started: u64) -> Self {
         *self.replay.lock().unwrap_or_else(|p| p.into_inner()) = ReplayGuard::starting_at(started);
         self
+    }
+
+    /// Floors the previous process saved (MESH-N2), for senders this trust store still knows:
+    /// a removed peer's floor would hold room for no one.
+    pub fn with_saved_floors(self, floors: &[(u64, u64)]) -> Self {
+        let trust = self.trust.read().unwrap_or_else(|p| p.into_inner()).clone();
+        let known = floors
+            .iter()
+            .copied()
+            .filter(|(id, _)| trust.get(*id).is_some());
+        self.replay
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .restore_floors(known);
+        self
+    }
+
+    /// The replay floors to save with the node's state (MESH-N2).
+    pub fn replay_floors(&self) -> Vec<(u64, u64)> {
+        self.replay
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .floors()
     }
 
     /// Another per-peer frame rate (tests: reach the pacing path with a few frames).
@@ -2360,6 +2411,45 @@ mod tests {
             "the boundary moved: a restart now refuses envelopes the previous process saw; \
              update MESH-N1"
         );
+    }
+
+    /// MESH-N2: with the floors the previous process saved, the envelope it accepted with a
+    /// stamp after the new start is refused, and the same sender's next envelope still passes.
+    /// A floor for a peer no longer trusted is not restored.
+    #[test]
+    fn saved_floors_refuse_what_the_previous_process_accepted_after_the_start() {
+        let peer = NodeCrypto::generate();
+        let t = 1_000_000;
+        let ahead = ping_at(&peer, t + MAX_CLOCK_SKEW_MS, 3);
+        let before = PeerRegistry::new(trust_with(7, &peer)).with_startup_fence(t);
+        assert!(before.open_at(&ahead, t).is_ok());
+        let saved = before.replay_floors();
+        assert_eq!(saved, vec![(7, t + MAX_CLOCK_SKEW_MS)]);
+        let after = PeerRegistry::new(trust_with(7, &peer))
+            .with_startup_fence(t + 1)
+            .with_saved_floors(&saved);
+        assert_eq!(
+            after.open_at(&ahead, t + 1).err(),
+            Some(EnvelopeError::BeforeWindow)
+        );
+        let next = ping_at(&peer, t + MAX_CLOCK_SKEW_MS + 1, 4);
+        assert!(
+            after.open_at(&next, t + 1).is_ok(),
+            "an honest later one passes"
+        );
+        assert_eq!(
+            after.replay_floors(),
+            vec![(7, t + MAX_CLOCK_SKEW_MS + 1)],
+            "carried on to the next write"
+        );
+        let idle = PeerRegistry::new(trust_with(7, &peer)).with_saved_floors(&saved);
+        assert_eq!(
+            idle.replay_floors(),
+            saved,
+            "a sender silent since is carried on"
+        );
+        let stranger = PeerRegistry::new(trust_with(8, &peer)).with_saved_floors(&saved);
+        assert!(stranger.replay_floors().is_empty(), "only trusted senders");
     }
 
     #[tokio::test]
