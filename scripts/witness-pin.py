@@ -14,6 +14,7 @@ body of each witness, in docs/witness-manifest.json signed by the owner (ssh-key
     witness-pin.py sign-provisional --key AGENT_KEY
                                             # agent: pin the provisional rows (ADR-0028)
     witness-pin.py closure WITNESS          # the test items pinned with a witness
+    witness-pin.py --root CANDIDATE check   # trusted checker, candidate bytes left intact
     witness-pin.py run-python               # run the pinned Python witnesses, print a log for
                                             # check --executed-python (the base workflow)
 

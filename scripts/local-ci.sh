@@ -205,6 +205,8 @@ python3 scripts/test_outbox_task.py
 python3 scripts/test_contract_shadow.py
 python3 scripts/test_contract_tool.py
 python3 scripts/test_contract_task.py
+step "complete owner/provisional pins and candidate trust root"
+python3 -I scripts/witness-pin.py check --every-pin
 step "portable counterexample and public Warrant integration"
 cargo install --locked --version "$(pin WARRANT_VERIFY_VERSION)" --root "$CACHE/warrant" warrant-verify
 SOKOL_WARRANT_BIN="$CACHE/warrant/bin/warrant-rs" python3 scripts/test_counterexample_task.py
