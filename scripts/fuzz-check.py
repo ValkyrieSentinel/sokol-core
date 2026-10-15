@@ -28,7 +28,7 @@ def main():
     if version != 'cargo-fuzz 0.13.2':
         parser.error('install cargo-fuzz 0.13.2 with --locked first')
     out = args.output.resolve(); out.mkdir(mode=0o700, parents=True, exist_ok=False)
-    files = subprocess.check_output(['git', 'ls-files', '-z', 'common', 'fuzz'], cwd=ROOT).decode().split('\0')
+    files = subprocess.check_output(['git', 'ls-files', '-z', 'common', 'fuzz', 'rust-toolchain.toml'], cwd=ROOT).decode().split('\0')
     files = [p for p in files if p]
     if len(files) > 256:
         parser.error('too many fuzz inputs')

@@ -136,12 +136,16 @@ kani() {
 # CI's mutants job: the mutants of this change against origin/main (docs/MUTATION.md).
 mutants() {
     step "mutants of the change (against origin/main)"
+    local base
+    base=$(git merge-base HEAD origin/main) || { echo "no origin/main to compare with"; exit 2; }
+    if [ "$(scripts/mutants-scope.sh "$base")" = skip ]; then
+        echo "mutation inputs unchanged; no cargo-mutants installation or execution needed"
+        return
+    fi
     command -v cargo-mutants >/dev/null || {
         echo "cargo-mutants is not installed: cargo +stable install --locked cargo-mutants --version $(pin CARGO_MUTANTS_VERSION)"
         exit 2
     }
-    local base
-    base=$(git merge-base HEAD origin/main) || { echo "no origin/main to compare with"; exit 2; }
     MUTANTS_JOBS=${MUTANTS_JOBS:-4} scripts/mutants-diff.sh "$base"
 }
 
@@ -194,6 +198,7 @@ python3 scripts/test_anchor_scripts.py
 python3 scripts/test_kani_scope.py
 python3 scripts/test_proof_task.py
 python3 scripts/test_mutants_diff.py
+python3 scripts/test_mutants_scope.py
 python3 scripts/test_check_agents_rules.py
 python3 scripts/test_check_claims.py
 python3 scripts/test_witness_pin.py

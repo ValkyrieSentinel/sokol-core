@@ -40,16 +40,29 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
+      - name: Mutation input scope before installing tools
+        id: mutation-scope
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          result=$(scripts/mutants-scope.sh "$BASE")
+          case "$result" in mutate|skip) ;; *) exit 1 ;; esac
+          echo "result=$result" >> "$GITHUB_OUTPUT"
+          echo "Mutation scope: $result (native tests and required witness gate remain independent)"
       - name: Install the pinned Rust toolchain (rust-toolchain.toml)
+        if: steps.mutation-scope.outputs.result == 'mutate'
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        if: steps.mutation-scope.outputs.result == 'mutate'
         with:
           shared-key: mutants
       - name: Install cargo-mutants (crates.io, --locked)
+        if: steps.mutation-scope.outputs.result == 'mutate'
         run: |
           rustup toolchain install stable --profile minimal
           cargo +stable install --locked cargo-mutants --version "$CARGO_MUTANTS_VERSION"
       - name: Mutants of the change (scripts/mutants-diff.sh)
+        if: steps.mutation-scope.outputs.result == 'mutate'
         env:
           BASE: ${{ github.event.pull_request.base.sha }}
           MUTANTS_SHARD: ${{ matrix.shard }}/4
@@ -320,6 +333,7 @@ jobs:
           python3 scripts/test_kani_scope.py
           python3 scripts/test_proof_task.py
           python3 scripts/test_mutants_diff.py
+          python3 scripts/test_mutants_scope.py
           python3 scripts/test_check_agents_rules.py
           python3 scripts/test_check_claims.py
           python3 scripts/test_witness_pin.py
