@@ -787,15 +787,23 @@ async fn send_snapshot<B: block_table::Blocklist>(
 /// Writes the durable part of the table atomically (temp file + rename, mode 0600).
 use state_store::{Restore, StateStore};
 
+/// The mesh registry whose replay floors are saved with each state write (MESH-N2); set once
+/// the registry exists. Read after the table's durable part is taken, so the floors cover
+/// every envelope whose effect that part records.
+static REPLAY_FLOORS: std::sync::OnceLock<p2p::PeerRegistry> = std::sync::OnceLock::new();
+
 /// Hands the table's durable part to the state writer if it changed; never waits for the disk.
 async fn submit_state<B: block_table::Blocklist>(
     store: &StateStore,
     blocks: &SharedBlockTable<B>,
 ) -> Option<u64> {
     let mut table = blocks.lock().await;
-    let state = table
+    let mut state = table
         .dirty()
         .then(|| table.take_persisted(block_table::local_ms()))?;
+    if let Some(registry) = REPLAY_FLOORS.get() {
+        state.mesh_floors = registry.replay_floors();
+    }
     // Clearing dirty, capturing the snapshot and assigning its generation are
     // one ordered handoff. Neither a newer capture nor a clean caller may pass
     // between them. submit does no filesystem work; wait_durable runs after unlock.
@@ -1419,9 +1427,11 @@ async fn main() -> Result<(), anyhow::Error> {
 
     // R27-04: a state file that cannot be restored is not a first start. Its bytes are kept, and
     // the node stays DEGRADED until the operator accepts the loss (ACCEPT_STATE_LOSS).
+    let mut saved_floors = Vec::new();
     let restore = match state_store.read() {
         Ok(None) => Restore::Fresh,
-        Ok(Some(state)) => {
+        Ok(Some(mut state)) => {
+            saved_floors = std::mem::take(&mut state.mesh_floors);
             let (restored, refused) = blocks.lock().await.restore(
                 state,
                 |net| block_policy.current().check_net(net).is_ok(),
@@ -1465,9 +1475,13 @@ async fn main() -> Result<(), anyhow::Error> {
     })?;
 
     // Envelopes stamped before this start are refused: the previous process may have accepted
-    // them and its nonces are gone. One it accepted with a later stamp is not (MESH-N1); an
-    // honest peer whose clock is behind can be refused for up to MAX_CLOCK_SKEW_MS.
-    let peer_registry = PeerRegistry::new(trust_store).with_startup_fence(p2p::now_ms());
+    // them and its nonces are gone (MESH-N1); an honest peer whose clock is behind can be
+    // refused for up to MAX_CLOCK_SKEW_MS. The floors it saved refuse, per sender, what it
+    // accepted with a later stamp, up to its last state write (MESH-N2).
+    let peer_registry = PeerRegistry::new(trust_store)
+        .with_startup_fence(p2p::now_ms())
+        .with_saved_floors(&saved_floors);
+    let _ = REPLAY_FLOORS.set(peer_registry.clone());
     let (mesh_cmd_tx, mesh_cmd_rx) = mpsc::channel::<MeshCommand>(1000);
     // This node's own detections and storm latch; never on the wire (review 2026-10-05 W3.2).
     let (local_cmd_tx, local_cmd_rx) = mpsc::channel::<mesh_sync::LocalCommand>(1000);

@@ -11,6 +11,7 @@
 #   sudo bench/mesh.sh observe     <orchestrator> <monitor> 3
 #   sudo bench/mesh.sh reaction    <orchestrator> <monitor> <N> [rounds]
 #   sudo bench/mesh.sh unblock     <orchestrator> <monitor> <N> [rounds]   (FlowSpec: gobgpd)
+#   sudo bench/mesh.sh floors      <orchestrator> <monitor> 3
 #
 # propagation: a block is issued on node 1 `rounds` times; for every other node the delay
 #              until its MESH_BLOCK record is reported (min / median / p95 / max, and the
@@ -578,6 +579,45 @@ observe)
     printf 'SIGNAL:obs|198.18.9.2|-|enforced\n' | in_ns 2 nc -U -q1 "$WORK/n2/ipc.sock" >/dev/null
     ok=""; for _ in $(seq 1 25); do [ "$(active 3)" = 1 ] && [ "$(active 1)" = 2 ] && { ok=1; break; }; sleep 0.2; done
     if [ -n "$ok" ]; then echo "PASS O3 node 2's decision reached nodes 1 and 3"; else echo "FAIL O3 node 1 holds $(active 1), node 3 holds $(active 3)"; fail=1; fi
+    exit $fail
+    ;;
+floors)
+    # MESH-N2 end to end: node 1 saves its peers' replay floors with its state, a SIGKILL and
+    # restart carries them on, and its peers' later envelopes still pass.
+    [ "$N" = 3 ] || { echo "floors mode runs on 3 nodes"; exit 2; }
+    fail=0
+    floors() { python3 -c 'import json,sys; print(" ".join(f"{a}:{b}" for a, b in json.load(open(sys.argv[1])).get("mesh_floors", [])))' "$WORK/n1/audit.log.blocks.json"; }
+    active() { local v; v=$(metric 1 'sokol_blocks_active{family="ipv4"}'); echo "${v:-down}"; }
+    for j in 2 3; do printf 'SIGNAL:fl|198.18.10.%s|-|floors\n' "$j" | in_ns "$j" nc -U -q1 "$WORK/n$j/ipc.sock" >/dev/null; done
+    sleep 3
+    before=$(floors); now=$(now_ms)
+    echo "# node 1 saved floors (sender:ms): ${before:-none}; now $now"
+    ok=1
+    for j in 2 3; do
+        f=$(tr ' ' '\n' <<<"$before" | sed -n "s/^$j://p")
+        [ -n "$f" ] && [ $((f - now)) -le 30000 ] && [ $((now - f)) -le 60000 ] || ok=""
+    done
+    if [ -n "$ok" ]; then echo "PASS F1 node 1's state file holds a current floor for nodes 2 and 3"
+    else echo "FAIL F1 floors in node 1's state: ${before:-none}"; fail=1; fi
+    kill -KILL "${NODE_PID[1]}" 2>/dev/null || true
+    wait "${NODE_PID[1]}" 2>/dev/null || true
+    start_node 1
+    for _ in $(seq 1 100); do send ctl LIST_BANS >/dev/null 2>&1 && break; sleep 0.1; done
+    sleep 5   # the peers reconnect
+    printf 'SIGNAL:fl|198.18.10.9|-|after the restart\n' | in_ns 2 nc -U -q1 "$WORK/n2/ipc.sock" >/dev/null
+    ok=""; for _ in $(seq 1 50); do [ "$(active)" = 3 ] && { ok=1; break; }; sleep 0.2; done
+    if [ -n "$ok" ]; then echo "PASS F2 after the restart node 2's new decision reaches node 1 (3 blocks)"
+    else echo "FAIL F2 node 1 holds $(active) blocks after the restart"; fail=1; fi
+    sleep 2
+    after=$(floors)
+    echo "# node 1 floors after the restart: ${after:-none}"
+    ok=1
+    for j in 2 3; do
+        b=$(tr ' ' '\n' <<<"$before" | sed -n "s/^$j://p"); a=$(tr ' ' '\n' <<<"$after" | sed -n "s/^$j://p")
+        [ -n "$a" ] && [ -n "$b" ] && [ "$a" -ge "$b" ] || ok=""
+    done
+    if [ -n "$ok" ]; then echo "PASS F3 every floor is carried on, none lowered"
+    else echo "FAIL F3 floors went from '${before:-none}' to '${after:-none}'"; fail=1; fi
     exit $fail
     ;;
 reaction)
