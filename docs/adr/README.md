@@ -43,3 +43,4 @@
 | [0027](0027-peer-address-binding.md) | Вузол прив'язаний до своєї тунельної адреси | Реалізовано; UNSIGNED_INTENT, прийняття за власником |
 | [0028](0028-provisional-agent-tier.md) | Ярус агента: provisional-рядки, підписані ключем агента | Реалізовано; діє, коли власник додасть ключ агента |
 | [0029](0029-replay-floors-survive-the-process.md) | Пороги replay переживають процес | Реалізовано; MESH-N2 `[provisional]` |
+| [0031](0031-rc1-responsibility-and-operating-targets.md) | RC-1: відповідальність, цілі SLO/RPO/RTO і правило допуску | Прийнято (агент за делегуванням власника) |

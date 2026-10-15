@@ -7,10 +7,10 @@ for vulnerabilities. It is enabled on this repository. Include the exact commit,
 deployment profile, attacker privileges, reproduction and observed effect. Do not
 publish secrets, customer traffic or a live exploit in a public issue.
 
-There is no released production support commitment. Main is a lab candidate;
-native-NIC/router qualification and the field pilot are pending. A responsible
-incident responder, response-time commitment, supported release horizon and
-deployment SLO/RPO/RTO remain unresolved owner decisions. No response SLA is implied.
+The owner, `s0fractal`, is the responsible release owner and incident responder.
+Operating targets, the RC admission rule, the support horizon and a response target
+(7 days, not yet measured) are in [ADR-0031](docs/adr/0031-rc1-responsibility-and-operating-targets.md).
+No RC has been admitted yet; native-NIC/router qualification and the field pilot are pending.
 
 ## System and boundaries
 
