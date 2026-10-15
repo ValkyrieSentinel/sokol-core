@@ -5,6 +5,12 @@
 #   scripts/pre-push.sh                      by hand
 #   git config core.hooksPath .githooks      to run it before every push
 set -euo pipefail
+# A hook runs with GIT_DIR (and, in a linked worktree, more) exported for this repository. The
+# regressions below build fixture repositories with git init/commit/tag; with these variables
+# inherited they wrote into this repository instead (2026-10-15: core.bare=true, an archive
+# tag moved, fixture commits on the checked-out branch). Clear them before anything runs.
+# shellcheck disable=SC2046  # the names are single words
+unset $(git rev-parse --local-env-vars)
 cd "$(dirname "$0")/.."
 step() { printf '== %s\n' "$*"; }
 step "format"
