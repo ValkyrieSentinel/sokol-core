@@ -315,6 +315,7 @@ jobs:
           python3 scripts/test_witness_gate.py
           python3 scripts/test_local_ci.py
           python3 scripts/test_runbook_preflight.py
+          python3 scripts/test_mesh_preflight.py
           python3 scripts/test_anchor_scripts.py
           python3 scripts/test_kani_scope.py
           python3 scripts/test_proof_task.py

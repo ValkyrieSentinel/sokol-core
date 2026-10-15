@@ -99,6 +99,25 @@ set -euo pipefail
 
 MODE=$1; BIN=$2; MON=$3; N=$4; shift 4
 ARG=${1:-20}; [ $# -gt 0 ] && shift
+case "$MODE" in propagation|partition|soak|recover|clock|observe|floors|reaction|unblock|relapse|bulkflush) ;;
+    *) echo "REFUSED unknown mesh mode"; exit 2 ;; esac
+[[ "$N" =~ ^[0-9]+$ ]] && [ "$N" -ge 2 ] && [ "$N" -le 32 ] \
+    || { echo "REFUSED mesh node count (2..32)"; exit 2; }
+[ -x "$BIN" ] && [ -x "$MON" ] || { echo "REFUSED missing executable"; exit 2; }
+# These names belong to one experiment at a time. Never remove another user's resources,
+# even on refusal: cleanup is armed only AFTER the exclusive preflight succeeds.
+exec 9>"${BENCH_LOCK:-/run/lock/sokol-mesh-bench.lock}"
+flock -n 9 || { echo "REFUSED another mesh experiment holds the lock"; exit 2; }
+for link in skbr0 skva-h skvl-h $(printf 'skv%s-h\n' $(seq 1 "$N")); do
+    if ip link show "$link" >/dev/null 2>&1; then echo "REFUSED existing mesh interface $link"; exit 2; fi
+done
+namespaces=$(ip netns list) || { echo "REFUSED mesh namespace inventory unavailable"; exit 2; }
+if grep -qE '^sk-(n[0-9]+|atk|leg)( |$)' <<<"$namespaces"; then
+    echo "REFUSED existing mesh namespace"; exit 2
+fi
+BENCH_SEED=${BENCH_SEED:-1729}
+[[ "$BENCH_SEED" =~ ^[0-9]{1,9}$ ]] || { echo "REFUSED invalid BENCH_SEED"; exit 2; }
+RANDOM=$BENCH_SEED
 [ "$MODE" = clock ] && TTL=${TTL:-60}
 if [ "$MODE" = clock ]; then
     [ "$N" = 3 ] || { echo "clock mode runs on 3 nodes"; exit 2; }
@@ -142,9 +161,7 @@ audit_ts() {
     "$MON" --dump "$WORK/n$1/audit.log" 2>/dev/null | awk -F'\t' -v p="$2|IP:$3|" 'index($3, p) == 1 { print $2; exit }'
 }
 
-# Leftovers from an earlier run would make the setup below fail. Deleting a namespace frees
-# its veth pair asynchronously, so delete the host ends explicitly.
-remove_topology
+# Preflight established that these names are free; cleanup owns only this run's topology.
 ip link add "$BR" type bridge
 ip link set "$BR" up
 for i in $(seq 1 "$N"); do
@@ -355,6 +372,8 @@ soak)
     MINUTES=$ARG
     OUT=${BENCH_OUT:-$WORK}; mkdir -p "$OUT"
     CSV="$OUT/soak.csv"
+    TRACE="$OUT/events.csv"
+    echo "t_s,node,event_id" >"$TRACE"
     echo "t_s,node,rss_kb,fds,audit_bytes,state_bytes,blocks_active,blocks_pending,tick_max_s,peers" >"$CSV"
     sample() {
         local t=$1
@@ -380,12 +399,13 @@ soak)
     next_sample=$start; RESTART_EVERY=${RESTART_EVERY:-600}; CUT_EVERY=${CUT_EVERY:-900}
     next_restart=$((start + RESTART_EVERY)); next_cut=$((start + CUT_EVERY))
     k=0; restarts=0; cuts=0; cutters=(); DIED=()
-    echo "# soak ${MINUTES} min, TTL ${TTL:-3600} s"
+    echo "# soak ${MINUTES} min, TTL ${TTL:-3600} s, seed $BENCH_SEED (OS scheduling remains uncontrolled)"
     while [ $SECONDS -lt $end ]; do
         for _ in 1 2 3 4 5; do
             i=$((RANDOM % N + 1))
             # One signal in ten repeats the previous event id (a resend): the node must dedup it.
             [ $((RANDOM % 10)) = 0 ] || k=$((k + 1))
+            printf '%s,%s,%s\n' "$((SECONDS - start))" "$i" "$k" >>"$TRACE"
             printf 'SIGNAL#soak-%s:soak|100.%s.%s.%s|-|soak\n' "$k" $((64 + k / 65536 % 8)) $((k / 256 % 256)) $((k % 256)) \
                 | in_ns "$i" nc -U -q0 "$WORK/n$i/ipc.sock" >/dev/null 2>&1 || true
         done
