@@ -158,6 +158,8 @@ struct State {
     events: Vec<(String, u64)>,
     #[serde(default, deserialize_with = "support")]
     support: Vec<Support>,
+    #[serde(default)]
+    saved_ms: Option<u64>,
 }
 
 pub fn parse<R: Read>(input: R) -> Result<Persisted, String> {
@@ -178,6 +180,7 @@ pub fn parse<R: Read>(input: R) -> Result<Persisted, String> {
         peer_ends: state.peer_ends,
         events: state.events,
         support: state.support.into_iter().map(|v| (v.0, v.1)).collect(),
+        saved_ms: state.saved_ms,
     })
 }
 
@@ -397,5 +400,21 @@ mod tests {
             let json = serde_json::json!({"claims":[],"operator_lifts":[],"retracted":[],"support":[["198.51.100.1",vec![reason;count]]]});
             assert!(parse(serde_json::to_vec(&json).unwrap().as_slice()).is_err());
         }
+    }
+
+    /// The write time is a bounded atom like any other time in the file, and survives the
+    /// bounded reader; a file without it reads as one written before the field existed.
+    #[test]
+    fn the_write_time_roundtrips_and_may_be_absent() {
+        let saved = Persisted {
+            saved_ms: Some(u64::MAX),
+            ..Persisted::default()
+        };
+        assert_eq!(
+            parse(serde_json::to_vec(&saved).unwrap().as_slice()).unwrap(),
+            saved
+        );
+        let old = parse(&br#"{"claims":[],"operator_lifts":[],"retracted":[]}"#[..]).unwrap();
+        assert_eq!(old.saved_ms, None);
     }
 }

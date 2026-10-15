@@ -446,6 +446,7 @@ impl Default for Persisted {
             peer_ends: Vec::new(),
             events: Vec::new(),
             support: Vec::new(),
+            saved_ms: None,
         }
     }
 }
@@ -498,6 +499,11 @@ pub struct Persisted {
     /// wall end or none)]). Saved with the claims, so a retraction after a restart still works.
     #[serde(default)]
     pub support: Vec<(String, SavedReasons)>,
+    /// Wall-clock time of this write. A restore keeps no claim longer than it had left then,
+    /// so a clock that is wrong at the restart cannot stretch it (ADR-0017). A file without it
+    /// predates the field and is restored by its signed ends alone.
+    #[serde(default)]
+    pub saved_ms: Option<u64>,
 }
 
 /// Block decisions (claims) with owners, and the kernel maps kept in line with them.
@@ -2177,6 +2183,7 @@ impl<B: Blocklist> BlockTable<B> {
             peer_ends,
             events,
             support,
+            saved_ms: Some(self.to_wall(now_ms)),
         }
     }
 
@@ -2188,6 +2195,18 @@ impl<B: Blocklist> BlockTable<B> {
         allowed: impl Fn(IpNet) -> bool,
         now_ms: u64,
     ) -> (usize, usize) {
+        // What an end had left when the file was written, measured on one clock, bounds what
+        // it has left now: a wall clock that reads early at the restart (no RTC, ADR-0017)
+        // would otherwise hold a restored block past its signed end by the clock's error.
+        // A clock that is right gives the signed end; the cost is at most the downtime.
+        let saved = state.saved_ms;
+        let restored_end = |table: &Self, wall_end: u64| {
+            let local = table.to_local(wall_end);
+            match saved {
+                Some(at) => local.min(now_ms.saturating_add(wall_end.saturating_sub(at))),
+                None => local,
+            }
+        };
         let mut events: Vec<([u8; 16], u64)> = state
             .events
             .iter()
@@ -2240,7 +2259,10 @@ impl<B: Blocklist> BlockTable<B> {
             }
         }
         for (id, end, expires) in state.peer_ends {
-            let (end, expires) = (self.to_local(end), expires.map(|e| self.to_local(e)));
+            let (end, expires) = (
+                restored_end(self, end),
+                expires.map(|e| restored_end(self, e)),
+            );
             if lease_kept(expires, now_ms) && self.lease_ends.len() < MAX_KNOWN_CLAIMS {
                 self.lease_ends.insert(id, (end, expires));
             }
@@ -2277,9 +2299,10 @@ impl<B: Blocklist> BlockTable<B> {
                 refused += 1;
                 continue;
             };
+            let end = claim.expires_ms.map(|e| restored_end(self, e));
             if claim.issuer != self.node_id
                 || claim.kind == ClaimKind::Static
-                || !self.claim_live(&claim, now_ms)
+                || end.is_some_and(|e| e <= now_ms)
             {
                 refused += 1;
                 continue;
@@ -2300,8 +2323,8 @@ impl<B: Blocklist> BlockTable<B> {
             self.insert_held(
                 id,
                 Held {
-                    until_ms: self.end_of(&claim),
-                    end_local: self.end_of(&claim),
+                    until_ms: end,
+                    end_local: end,
                     claim,
                     net,
                     allowed: ok,
@@ -4320,7 +4343,6 @@ mod tests {
     /// end, and the forward step does not shorten them (held ends keep their length). Peers
     /// drop the claim at its signed end; this node keeps it in XDP and FlowSpec for Δ more.
     #[test]
-    #[ignore = "CANDIDATE round 8: a restored claim keeps the wall-clock error of the start"]
     fn a_restore_under_a_clock_behind_does_not_outlast_the_signed_end() {
         let hour = 3600 * S;
         let target = ip("203.0.113.150");
@@ -4346,6 +4368,62 @@ mod tests {
             !r.is_blocked(target),
             "a restored claim blocks past its signed end by the clock error at the start"
         );
+    }
+
+    /// A state file holds only this node's own dynamic claims; a peer's claim or a static one
+    /// found in it is refused at restore, each on its own (either alone is enough).
+    #[test]
+    fn a_restore_refuses_a_peers_claim_and_a_static_one() {
+        let mut t = table(1, 64);
+        let own_static = t
+            .add_local(ip("198.51.100.20"), ClaimKind::Static, "--block", T0)
+            .unwrap()
+            .claim;
+        let mut peers = peer_claim(2, "203.0.113.152", T0);
+        peers.expires_ms = Some(T0 + 600 * S);
+        for claim in [own_static, peers] {
+            let mut r = table(1, 64);
+            let state = Persisted {
+                claims: vec![claim],
+                saved_ms: Some(T0),
+                ..Persisted::default()
+            };
+            assert_eq!(r.restore(state, |_| true, T0 + S), (0, 1));
+        }
+    }
+
+    /// The bound only shortens: a restart on a right clock keeps the signed end, and a file
+    /// written before `saved_ms` existed is restored by its signed ends as before. A peer's
+    /// saved lease end is bounded like an own claim.
+    #[test]
+    fn a_restore_bounds_ends_by_what_they_had_left_when_saved() {
+        let target = ip("203.0.113.151");
+        let mut t = table(1, 64);
+        t.add_local(target, ClaimKind::Detector, "x", T0).unwrap();
+        let state = t.take_persisted(T0 + S);
+        assert_eq!(state.saved_ms, Some(T0 + S), "the write time is wall-clock");
+        for (saved, restart, end) in [
+            (Some(T0 + S), T0 + 30 * S, T0 + 60 * S), // right clock: the signed end
+            (None, T0 + 30 * S - 3600 * S, T0 + 60 * S), // no write time: as before
+            (
+                Some(T0 + S),
+                T0 + 30 * S - 3600 * S,
+                T0 + 30 * S - 3600 * S + 59 * S,
+            ),
+        ] {
+            let mut r = table(1, 64);
+            let state = Persisted {
+                saved_ms: saved,
+                peer_ends: vec![("peer".to_string(), T0 + 60 * S, Some(T0 + 60 * S))],
+                ..t.take_persisted(T0 + S)
+            };
+            r.restore(state, |_| true, restart);
+            r.tick(end - 1);
+            assert!(r.is_blocked(target), "still held before {end}");
+            assert_eq!(r.lease_ends.get("peer").map(|e| e.0), Some(end));
+            r.tick(end);
+            assert!(!r.is_blocked(target), "ended at {end}");
+        }
     }
 
     /// Observe mode (ADR-0018): the node's own claims leave its snapshot and its digest, so no
