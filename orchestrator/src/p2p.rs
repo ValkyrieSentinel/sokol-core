@@ -2448,6 +2448,18 @@ mod tests {
             saved,
             "a sender silent since is carried on"
         );
+        // A floor older than the new start does not lower the start's fence (MESH-N1).
+        let late = t + 10 * MAX_CLOCK_SKEW_MS;
+        let restarted_late = PeerRegistry::new(trust_with(7, &peer))
+            .with_startup_fence(late)
+            .with_saved_floors(&saved);
+        assert_eq!(
+            restarted_late
+                .open_at(&ping_at(&peer, late - 1, 5), late)
+                .err(),
+            Some(EnvelopeError::BeforeWindow),
+            "stamped before the start, above the saved floor"
+        );
         let stranger = PeerRegistry::new(trust_with(8, &peer)).with_saved_floors(&saved);
         assert!(stranger.replay_floors().is_empty(), "only trusted senders");
     }
