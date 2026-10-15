@@ -30,7 +30,7 @@ def step_body() -> str:
     text = CI.read_text()
     m = re.search(r"- name: Pinned witnesses unchanged.*?\n        run: \|\n(.*?)\n\n", text, re.S)
     body = '\n'.join(line[10:] for line in m.group(1).splitlines())
-    return body.replace('\\\n  --executed /tmp/sokol-cargo-test.log', '')
+    return re.sub(r'\\\n\s+--executed /tmp/sokol-cargo-test.log', '', body)
 
 
 class Provenance(unittest.TestCase):
