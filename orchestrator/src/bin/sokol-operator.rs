@@ -879,9 +879,34 @@ const HTML_DASHBOARD: &str = r###"
 <head>
     <meta charset="UTF-8">
     <title>SOKOL-CORE // Operations Center</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
     <style>
+        :root { color-scheme: dark; font: 15px/1.5 system-ui, sans-serif; background:#0d141c; color:#dbe5ef; }
+        body { margin:0; padding:24px; } h1,h3,p { margin:0; } h1 { font-size:20px; } h3 { font-size:16px; }
+        button,input { font:inherit; } button { cursor:pointer; padding:6px 10px; border:1px solid #405467; border-radius:6px; background:#1a2b3c; color:inherit; }
+        button:hover { border-color:#8cacc8; } input { min-width:0; padding:7px; background:#101d29; color:inherit; border:1px solid #405467; border-radius:6px; }
+        button:focus-visible,input:focus-visible { outline:2px solid #6dc7ee; outline-offset:2px; }
+        table { border-collapse:collapse; } th,td { border-bottom:1px solid #2a3b4c; padding:9px; vertical-align:top; } th { color:#adbfce; font-weight:600; }
+        .hidden { display:none !important; } .grid { display:grid; } .grid-cols-1 { grid-template-columns:1fr; }
+        .flex { display:flex; } .flex-col { flex-direction:column; } .flex-wrap { flex-wrap:wrap; } .flex-1 { flex:1; }
+        .items-center { align-items:center; } .items-start { align-items:flex-start; } .justify-between { justify-content:space-between; }
+        .gap-1 { gap:5px; } .gap-2 { gap:9px; } .gap-4 { gap:18px; } .space-y-4 > *+* { margin-top:18px; }
+        .space-y-1 > *+* { margin-top:5px; } .mx-auto { margin-inline:auto; } .max-w-screen-2xl { max-width:1440px; }
+        .bg-zinc-900 { background:#152330; } .bg-zinc-950 { background:#101b26; } .bg-zinc-800 { background:#263b4d; }
+        .border { border:1px solid #304354; } .rounded-lg,.rounded-xl { border-radius:10px; } .rounded { border-radius:5px; }
+        .p-4 { padding:18px; } .p-3 { padding:13px; } .p-2 { padding:9px; } .px-2 { padding-inline:9px; } .py-1 { padding-block:5px; }
+        .mb-4 { margin-bottom:18px; } .mb-3 { margin-bottom:13px; } .mb-2 { margin-bottom:9px; } .mt-10 { margin-top:32px; }
+        .text-xs,.text-\[10px\],.text-\[9px\] { font-size:12px; } .text-xl { font-size:23px; } .font-bold { font-weight:650; }
+        .text-zinc-500,.text-zinc-400,.text-zinc-600 { color:#a4b7c8; } .text-zinc-100 { color:#f0f5fa; }
+        .text-emerald-400,.text-emerald-500 { color:#7cdbc0; } .text-amber-300,.text-amber-400,.text-amber-500 { color:#f0cb80; }
+        .text-red-300,.text-red-400,.text-red-500 { color:#ffb0ad; } .text-cyan-400,.text-cyan-500 { color:#8cd4ed; } .text-purple-400 { color:#c9b3ed; }
+        .text-right { text-align:right; } .text-left { text-align:left; } .text-center { text-align:center; }
+        .h-48 { height:192px; } .w-full { width:100%; } .h-full { height:100%; } .overflow-x-auto { overflow:auto; }
+        .overflow-y-auto { overflow-y:auto; } .opacity-60 { opacity:.65; } .whitespace-nowrap { white-space:nowrap; }
+        .sticky { position:sticky; } .top-0 { top:0; } .truncate { max-width:280px; overflow:hidden; text-overflow:ellipsis; }
+        canvas { display:block; width:100%; height:100%; } [role=status] { padding:10px 0; }
+        @media(min-width:900px) { .md\:grid-cols-5 { grid-template-columns:repeat(5,minmax(0,1fr)); } .md\:grid-cols-3 { grid-template-columns:repeat(3,minmax(0,1fr)); } }
+        @media(min-width:1100px) { .lg\:grid-cols-3 { grid-template-columns:repeat(3,minmax(0,1fr)); } .lg\:col-span-2 { grid-column:span 2; } }
         ::-webkit-scrollbar { width: 6px; height: 6px; }
         ::-webkit-scrollbar-track { background: #18181b; }
         ::-webkit-scrollbar-thumb { background: #3f3f46; border-radius: 3px; }
@@ -905,34 +930,34 @@ const HTML_DASHBOARD: &str = r###"
                 </div>
                 <div class="text-right">
                     <div class="text-[10px]">SYS CPU</div>
-                    <div id="m-cpu" class="text-xl font-bold text-emerald-400">0.0%</div>
+                    <div id="m-cpu" class="text-xl font-bold text-emerald-400">—</div>
                 </div>
             </div>
             <div class="bg-zinc-900 border border-zinc-800 p-4 rounded-xl flex items-center justify-between">
                 <div>
                     <div class="text-[10px] text-zinc-500">TRAP TIER-1 (TARPIT)</div>
-                    <div id="trap-t1" class="text-xl font-bold text-cyan-400">0</div>
+                    <div id="trap-t1" class="text-xl font-bold text-cyan-400">—</div>
                 </div>
                 <div class="text-right text-[10px] text-zinc-500">Scanners</div>
             </div>
             <div class="bg-zinc-900 border border-zinc-800 p-4 rounded-xl flex items-center justify-between">
                 <div>
                     <div class="text-[10px] text-zinc-500">TRAP TIER-1.5 (SLOW DRIP)</div>
-                    <div id="trap-t15" class="text-xl font-bold text-amber-400">0</div>
+                    <div id="trap-t15" class="text-xl font-bold text-amber-400">—</div>
                 </div>
                 <div class="text-right text-[10px] text-zinc-500">Floods</div>
             </div>
             <div class="bg-zinc-900 border border-zinc-800 p-4 rounded-xl flex items-center justify-between">
                 <div>
                     <div class="text-[10px] text-zinc-500">TRAP TIER-2 (PAYLOAD CAPTURE)</div>
-                    <div id="trap-t2" class="text-xl font-bold text-purple-400">0</div>
+                    <div id="trap-t2" class="text-xl font-bold text-purple-400">—</div>
                 </div>
                 <div class="text-right text-[10px] text-zinc-500">Shellcode-like</div>
             </div>
             <div class="bg-zinc-900 border border-zinc-800 p-4 rounded-xl flex items-center justify-between">
                 <div>
                     <div class="text-[10px] text-zinc-500">TRAP TIER-3 (JAIL)</div>
-                    <div id="trap-t3" class="text-xl font-bold text-red-500">0</div>
+                    <div id="trap-t3" class="text-xl font-bold text-red-500">—</div>
                 </div>
                 <div class="text-right text-[10px] text-zinc-500">Interactive</div>
             </div>
@@ -941,16 +966,15 @@ const HTML_DASHBOARD: &str = r###"
         <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
             <div class="bg-zinc-900 border border-zinc-800 p-4 rounded-xl flex items-center justify-between">
                 <div>
-                    <div class="text-[10px] text-zinc-500">P2P MESH SWARM</div>
-                    <div class="font-bold text-zinc-100"><span id="m-peers" class="text-cyan-400">0</span> Active Nodes | DAG Tips: <span id="m-dag" class="text-cyan-500">0</span></div>
+                    <div class="text-[10px] text-zinc-500">NODE OBSERVATIONS</div>
+                    <div class="font-bold text-zinc-100"><span id="m-peers" class="text-cyan-400">—</span> observed nodes</div>
                 </div>
             </div>
             <div class="bg-zinc-900 border border-zinc-800 p-4 rounded-xl flex items-center justify-between">
                 <div>
-                    <div class="text-[10px] text-zinc-500">AUDIT LOG STORAGE</div>
-                    <div class="font-bold text-zinc-100">Latency: <span id="m-dblat" class="text-amber-400">0 ms</span> | Banned IPs: <span id="trap-banned" class="text-red-400">0</span></div>
+                    <div class="text-[10px] text-zinc-500">REPORTED BLOCKS</div>
+                    <div class="font-bold text-zinc-100">Banned IPs: <span id="trap-banned" class="text-red-400">—</span></div>
                 </div>
-            </div>
             </div>
         </div>
 
@@ -958,13 +982,14 @@ const HTML_DASHBOARD: &str = r###"
             <div class="lg:col-span-2 space-y-4">
                 <div class="bg-zinc-900 border border-zinc-800 p-4 rounded-xl">
                     <div class="flex justify-between items-center mb-4">
-                        <h3 class="font-bold text-zinc-100">Global Network Traffic (Real-time PPS)</h3>
+                        <h3 class="font-bold text-zinc-100">Operator-host RX · reported node drops</h3>
                         <div class="flex gap-4 text-xs">
-                            <div>RX: <span id="m-pps-rx" class="text-emerald-400 font-bold">0</span> pps</div>
-                            <div>DROPS: <span id="m-drops" class="text-red-400 font-bold">0</span> /sec</div>
+                            <div>RX: <span id="m-pps-rx" class="text-emerald-400 font-bold">—</span> pps</div>
+                            <div>DROPS: <span id="m-drops" class="text-red-400 font-bold">—</span> /sec</div>
                         </div>
                     </div>
                     <div class="h-48 w-full"><canvas id="trafficChart"></canvas></div>
+                    <div id="stream-status" role="status" class="text-xs text-amber-400">Stream not observed yet</div>
                 </div>
 
                 <div class="bg-zinc-900 border border-zinc-800 p-4 rounded-xl">
@@ -990,7 +1015,7 @@ const HTML_DASHBOARD: &str = r###"
 
             <div class="bg-zinc-900 border border-zinc-800 p-4 rounded-xl flex flex-col h-full">
                 <h3 class="font-bold text-zinc-100 mb-3 flex justify-between items-center">
-                    <span>Trident Defense Nodes</span>
+                    <span>Node state and operator decisions</span>
                     <button onclick="fetchData()" class="text-xs text-zinc-500 hover:text-zinc-300">↻ Refresh</button>
                 </h3>
                 <div id="nodes-container" class="space-y-4 overflow-y-auto flex-1 pr-2">
@@ -1001,15 +1026,27 @@ const HTML_DASHBOARD: &str = r###"
     </div>
 
     <script>
-        const ctx = document.getElementById('trafficChart').getContext('2d');
-        const trafficChart = new Chart(ctx, {
-            type: 'line',
-            data: { labels: Array(20).fill(''), datasets: [
-                { label: 'RX Packets', borderColor: '#34d399', backgroundColor: 'rgba(52, 211, 153, 0.1)', data: Array(20).fill(0), tension: 0.4, fill: true, pointRadius: 0 },
-                { label: 'Dropped', borderColor: '#f87171', data: Array(20).fill(0), tension: 0.4, pointRadius: 0 }
-            ]},
-            options: { responsive: true, maintainAspectRatio: false, animation: false, scales: { x: { display: false }, y: { grid: { color: '#27272a' }, ticks: { color: '#71717a' }, beginAtZero: true}}, plugins: { legend: { display: false } }}
-        });
+        const trafficChart = {
+            data: { datasets: [{ data: Array(20).fill(0) }, { data: Array(20).fill(0) }] },
+            update() {
+                try {
+                    const canvas = document.getElementById('trafficChart');
+                    const ctx = canvas?.getContext('2d');
+                    if (!ctx) return;
+                    canvas.width = canvas.clientWidth || 600; canvas.height = 192;
+                    ctx.clearRect(0, 0, canvas.width, canvas.height);
+                    const ceiling = Math.max(1, ...this.data.datasets.flatMap(d => d.data));
+                    this.data.datasets.forEach((dataset, index) => {
+                        ctx.beginPath(); ctx.strokeStyle = index ? '#ffb0ad' : '#7cdbc0'; ctx.lineWidth = 2;
+                        dataset.data.forEach((value, i) => {
+                            const x = i * canvas.width / 19, y = 180 - Math.max(0, value) / ceiling * 170;
+                            if (i) ctx.lineTo(x, y); else ctx.moveTo(x, y);
+                        });
+                        ctx.stroke();
+                    });
+                } catch (_) { /* Optional graph cannot stop state readback or commands. */ }
+            }
+        };
 
         function esc(v) {
             return String(v).replace(/[&<>"'`]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;','`':'&#96;'}[c]));
@@ -1060,8 +1097,6 @@ const HTML_DASHBOARD: &str = r###"
                 document.getElementById('data-status').textContent = 'Node observations received ' + new Date(data.timestamp).toLocaleTimeString();
                 document.getElementById('data-status').className = 'text-xs text-zinc-400';
                 document.getElementById('m-peers').innerText = data.metrics.p2p_active_peers;
-                document.getElementById('m-dag').innerText = data.metrics.dag_tips;
-                document.getElementById('m-dblat').innerText = data.metrics.db_latency_ms.toFixed(1) + ' ms';
                 
                 document.getElementById('trap-t1').innerText = data.metrics.traps.tier1_bot_tarpit;
                 document.getElementById('trap-t15').innerText = data.metrics.traps.tier1_5_slow_drip;
@@ -1133,6 +1168,9 @@ const HTML_DASHBOARD: &str = r###"
                     `).join('');
                 }
             } catch (e) {
+                for (const id of ['m-peers','trap-t1','trap-t15','trap-t2','trap-t3','trap-banned']) {
+                    document.getElementById(id).innerText = '—';
+                }
                 document.getElementById('data-status').textContent = 'Operator API unavailable — displayed observations may be stale. ' + e.message;
                 document.getElementById('data-status').className = 'text-xs text-amber-400';
             }
@@ -1144,6 +1182,7 @@ const HTML_DASHBOARD: &str = r###"
             evtSource = new EventSource("/metrics/stream");
             evtSource.onmessage = function(e) {
                 const data = JSON.parse(e.data);
+                document.getElementById('stream-status').textContent = 'Stream observed at ' + new Date().toLocaleTimeString();
                 document.getElementById('m-cpu').innerText = data.cpu.toFixed(1) + '%';
                 document.getElementById('m-pps-rx').innerText = data.pps_rx.toLocaleString();
                 document.getElementById('m-drops').innerText = data.drops_sec;
@@ -1153,6 +1192,10 @@ const HTML_DASHBOARD: &str = r###"
                 trafficChart.data.datasets[1].data.shift();
                 trafficChart.data.datasets[1].data.push(data.drops_sec);
                 trafficChart.update();
+            }
+            evtSource.onerror = function() {
+                for (const id of ['m-cpu', 'm-pps-rx', 'm-drops']) document.getElementById(id).innerText = '—';
+                document.getElementById('stream-status').textContent = 'Stream unavailable — current traffic observations unknown';
             }
         }
 

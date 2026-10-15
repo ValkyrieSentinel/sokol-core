@@ -1358,6 +1358,7 @@ impl PeerRegistry {
 }
 
 pub struct P2PNetwork {
+    health: crate::metrics::WorkerHealth,
     bind_addr: SocketAddr,
     node_id: u64,
     crypto: Arc<NodeCrypto>,
@@ -1378,6 +1379,7 @@ impl P2PNetwork {
         registry: PeerRegistry,
     ) -> Self {
         Self {
+            health: crate::metrics::WorkerHealth::default(),
             bind_addr,
             node_id,
             crypto,
@@ -1388,11 +1390,26 @@ impl P2PNetwork {
         }
     }
 
+    pub fn with_health(mut self, health: crate::metrics::WorkerHealth) -> Self {
+        self.health = health;
+        self
+    }
+
     pub async fn run(&self) -> Result<()> {
-        let listener = TcpListener::bind(self.bind_addr)
-            .await
-            .context("Failed to bind P2P listener")?;
-        self.serve(listener).await
+        let result = async {
+            let listener = TcpListener::bind(self.bind_addr)
+                .await
+                .context("Failed to bind P2P listener")?;
+            self.health.set(crate::metrics::WorkerState::Running);
+            self.serve(listener).await
+        }
+        .await;
+        self.health.set(if result.is_ok() {
+            crate::metrics::WorkerState::Stopped
+        } else {
+            crate::metrics::WorkerState::Failed
+        });
+        result
     }
 
     pub async fn serve(&self, listener: TcpListener) -> Result<()> {

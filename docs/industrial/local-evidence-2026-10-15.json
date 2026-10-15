@@ -1,0 +1,91 @@
+{
+  "profile": "sokol.local-industrial-evidence.v1",
+  "authority": "UNSIGNED_EXPERIMENT_NOT_ACCEPTANCE",
+  "date": "2026-10-15",
+  "records": [
+    {
+      "scope": "trust bootstrap",
+      "source_commit": "591b3ae697f8216b2c111d9162b33f26d90b88a7",
+      "result": "REQUIRED_CHECKS_PASS",
+      "receipt": "https://github.com/s0fractal/sokol-core/actions/runs/38683970050",
+      "merge": "d502c3f3d9284729a19c2572f53f2cde89643c29"
+    },
+    {
+      "scope": "ARM64 workspace tests + Clippy + release binaries",
+      "source_commit": "6585af6cf75f2aad6f4c73ee1321e0763c5ee4ae",
+      "result": "PASS",
+      "counts": {
+        "passed": 694,
+        "ignored": 3
+      },
+      "log": "sokol-lab:/tmp/sokol-ops-final-native.log",
+      "limits": "VM generic XDP; no native NIC or router qualification"
+    },
+    {
+      "scope": "package-selected daemon A -> B -> A, packaged A service/support, existing single-node systemd/veth runbook",
+      "source_commits": [
+        "e222b105551d253f3b281101d74a3aac240ae3df",
+        "6585af6cf75f2aad6f4c73ee1321e0763c5ee4ae"
+      ],
+      "result": "PASS",
+      "failures": 0,
+      "deviations": 0,
+      "log": "sokol-lab:/tmp/sokol-package-compat-9_zp8y6q/runbook.log",
+      "archive_sha256": [
+        "c2b7b5004f3bc0bda5da1a95b455a662643e946c31ba5053d21d86abdf68e6d5",
+        "dd77035e6f69bd4ea3aa5dfe39f1b376d01126c23c03a4b409fbc8b04775661d"
+      ]
+    },
+    {
+      "scope": "15 mutants of changed Rust lines, after worker-label assertions",
+      "source_commit": "9cfad11",
+      "result": "PASS",
+      "caught": 14,
+      "unviable": 1,
+      "missed": 0,
+      "log": "sokol-lab:/tmp/sokol-industrial-mutants-final.log",
+      "limits": "changed-line sweep, not a new full-crate sweep"
+    },
+    {
+      "scope": "native libFuzzer + ASan, original parser sources, max_len 16384, seed 1729",
+      "source_commit": "6585af6cf75f2aad6f4c73ee1321e0763c5ee4ae",
+      "result": "NO_CRASH_OBSERVED",
+      "wire_runs": 54877830,
+      "canonical_runs": 8478848,
+      "seconds_per_target": 61,
+      "logs": "sokol-lab:/tmp/sokol-fuzz-6585/",
+      "limits": "original parsers; new target files were then uncommitted; not exhaustive proof"
+    },
+    {
+      "scope": "two baseline targets and split-offset/duplicate-refusal production faults",
+      "source_commit": "9cfad11",
+      "working_change": "copy pinned rust-toolchain.toml into the private verifier tree",
+      "result": "CALIBRATED_RUN",
+      "baseline_seconds_per_target": 10,
+      "faults_caught": 2,
+      "receipt": "sokol-lab:/tmp/sokol-fuzz-calibrated-pinned/report.json"
+    },
+    {
+      "scope": "pinned promtool rules, persistent 70m partition and cold isolated node",
+      "result": "PASS; OLD_RULE_CAUGHT",
+      "logs": [
+        "/tmp/sokol-prom-current-control.log",
+        "/tmp/sokol-prom-old-rule-control.log"
+      ],
+      "limits": "synthetic time series; not a real 70m partition"
+    },
+    {
+      "scope": "one hosted CI run, not a latency distribution",
+      "run": "https://github.com/s0fractal/sokol-core/actions/runs/38683970050",
+      "runner_seconds": 3138,
+      "kani_seconds": 756,
+      "mutation_shard_seconds": [
+        82,
+        87,
+        86,
+        92
+      ],
+      "limits": "job elapsed seconds, not billed minutes; queue delay excluded; no measured after-change savings yet"
+    }
+  ]
+}

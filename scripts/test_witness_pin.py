@@ -505,6 +505,9 @@ class WitnessPin(unittest.TestCase):
         r = self.executed(LOG)
         self.assertEqual(r.returncode, 1, r.stdout)
         self.assertIn("witness RecoveryTests.test_recovery_keeps_the_cursor did not run and pass", r.stdout)
+        # Future argument policy needs acceptance independently of the old base's
+        # execution override. Signing it must not make this invocation use it yet.
+        self.assertEqual(self.pin(self.key).returncode, 0)
         base = self.dir.parent / f"{self.dir.name}-base-ci.yml"
         base.write_text("run: python3 scripts/test_recovery.py\n")
         log = self.dir.parent / f"{self.dir.name}-log"

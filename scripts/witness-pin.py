@@ -708,13 +708,14 @@ def py_module_part(path: pathlib.Path, names: set[str]) -> str:
 TEST_LINE = re.compile(r"^test (\S+)(?: - should panic)? \.\.\. (\w+)", re.M)
 
 
-def ci_arguments(rel: str) -> list[str]:
+def ci_arguments(rel: str, ci: str | None = None) -> list[str]:
     """The arguments CI passes to a Python test file (adapter tests take a binary path). The
     base workflow points WITNESS_PIN_CI at the base's ci.yml: a pull request's own ci.yml must
     not choose the arguments its pinned witnesses run with."""
-    import os
-    path = pathlib.Path(os.environ.get("WITNESS_PIN_CI") or ROOT / ".github/workflows/ci.yml")
-    ci = path.read_text() if path.exists() else ""
+    if ci is None:
+        import os
+        path = pathlib.Path(os.environ.get("WITNESS_PIN_CI") or ROOT / ".github/workflows/ci.yml")
+        ci = path.read_text() if path.exists() else ""
     m = re.search(rf"python3 {re.escape(rel)}((?: [^\s|&;]+)*)", ci)
     return m.group(1).split() if m else []
 
@@ -855,13 +856,33 @@ TARGET_SECTIONS = ("lib", "bin", "test", "bench", "example", "workspace")
 # as pinned, so the base branch's checker (which computes them) still accepts the change.
 CLOSURES = "closures_v4"
 BUILD = "build_v3"
-TRUST = "trust_root_v1"
+TRUST = "trust_root_v2"
 TRUST_PATHS = (".github/witness-signers", "scripts/witness-pin.py",
                ".github/workflows/witness-gate.yml")
 MAX_TRUST_BYTES = 262_144
+MAX_PYTHON_INPUTS = 512
 
 
-def trust_pins() -> dict:
+def trust_input(rel: str) -> tuple[bytes, bool] | None:
+    path = ROOT / rel
+    for component in (path, *path.parents):
+        if component == ROOT:
+            break
+        if component.is_symlink():
+            raise ValueError('Symlink trust root refused: ' + rel)
+    if not path.exists():
+        return None
+    mode = path.stat().st_mode
+    if not stat.S_ISREG(mode):
+        raise ValueError('Non-regular trust root refused: ' + rel)
+    with path.open('rb') as stream:
+        data = stream.read(MAX_TRUST_BYTES + 1)
+    if len(data) > MAX_TRUST_BYTES:
+        raise ValueError('Oversized trust root refused: ' + rel)
+    return data, bool(mode & 0o111)
+
+
+def trust_pins(include_arguments: bool = True) -> dict:
     """The proposed NEXT base, authenticated by the current owner's manifest and trust.
 
     Always inspect candidate bytes, even when this checker is executed outside that tree.
@@ -869,23 +890,29 @@ def trust_pins() -> dict:
     """
     pins = {}
     for rel in TRUST_PATHS:
-        path = ROOT / rel
-        for component in (path, *path.parents):
-            if component == ROOT:
-                break
-            if component.is_symlink():
-                raise ValueError('Symlink trust root refused: ' + rel)
-        if not path.exists():
+        value = trust_input(rel)
+        if value is None:
             pins[rel] = None
             continue
-        mode = path.stat().st_mode
-        if not stat.S_ISREG(mode):
-            raise ValueError('Non-regular trust root refused: ' + rel)
-        with path.open('rb') as stream:
-            data = stream.read(MAX_TRUST_BYTES + 1)
-        if len(data) > MAX_TRUST_BYTES:
-            raise ValueError('Oversized trust root refused: ' + rel)
-        pins[rel] = {'sha256': hashlib.sha256(data).hexdigest(), 'executable': bool(mode & 0o111)}
+        data, executable = value
+        pins[rel] = {'sha256': hashlib.sha256(data).hexdigest(), 'executable': executable}
+    if not include_arguments:
+        return pins
+    # Sign the next base's execution arguments using the SAME projection as run-python.
+    # Never use WITNESS_PIN_CI here: that override selects execution policy from the old
+    # trusted base, whereas these pins authorize the candidate's future policy.
+    value = trust_input('.github/workflows/ci.yml')
+    ci = value[0].decode('utf-8') if value else ''
+    paths = git_files('*.py')
+    if len(paths) > MAX_PYTHON_INPUTS:
+        raise ValueError('Too many Python trust inputs')
+    arguments = {}
+    for path in paths:
+        rel = path.relative_to(ROOT).as_posix()
+        args = ci_arguments(rel, ci)
+        if args:
+            arguments[rel] = args
+    pins['python_arguments'] = arguments
     return pins
 
 
@@ -949,6 +976,7 @@ def current(tier: str = "owner") -> dict:
     return {"rows": table, "witnesses": {w: sorted(bodies.get(w, [])) for w in sorted(cited)},
             CLOSURES: {w: sorted(closures.get(w, [])) for w in sorted(cited)},
             BUILD: build_pins() if tier == "owner" else {},
+            "trust_root_v1": trust_pins(False) if tier == "owner" else {},
             TRUST: trust_pins() if tier == "owner" else {},
             "contracts": contract_pins(ROOT, tier)}
 

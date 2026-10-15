@@ -40,16 +40,29 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
+      - name: Mutation input scope before installing tools
+        id: mutation-scope
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          result=$(scripts/mutants-scope.sh "$BASE")
+          case "$result" in mutate|skip) ;; *) exit 1 ;; esac
+          echo "result=$result" >> "$GITHUB_OUTPUT"
+          echo "Mutation scope: $result (native tests and required witness gate remain independent)"
       - name: Install the pinned Rust toolchain (rust-toolchain.toml)
+        if: steps.mutation-scope.outputs.result == 'mutate'
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        if: steps.mutation-scope.outputs.result == 'mutate'
         with:
           shared-key: mutants
       - name: Install cargo-mutants (crates.io, --locked)
+        if: steps.mutation-scope.outputs.result == 'mutate'
         run: |
           rustup toolchain install stable --profile minimal
           cargo +stable install --locked cargo-mutants --version "$CARGO_MUTANTS_VERSION"
       - name: Mutants of the change (scripts/mutants-diff.sh)
+        if: steps.mutation-scope.outputs.result == 'mutate'
         env:
           BASE: ${{ github.event.pull_request.base.sha }}
           MUTANTS_SHARD: ${{ matrix.shard }}/4
@@ -316,15 +329,23 @@ jobs:
           python3 scripts/test_local_ci.py
           python3 scripts/test_pre_push_env.py
           python3 scripts/test_runbook_preflight.py
+          python3 scripts/test_mesh_preflight.py
           python3 scripts/test_anchor_scripts.py
           python3 scripts/test_kani_scope.py
           python3 scripts/test_proof_task.py
           python3 scripts/test_mutants_diff.py
+          python3 scripts/test_mutants_scope.py
           python3 scripts/test_check_agents_rules.py
           python3 scripts/test_check_claims.py
           python3 scripts/test_witness_pin.py
           python3 scripts/test_gate_provenance.py
           python3 scripts/test_trust_root.py
+          python3 scripts/test_sokol_dev.py
+          python3 scripts/test_exchange_gate_root.py
+          python3 scripts/test_candidate.py
+          python3 scripts/test_build_identity.py
+          python3 scripts/test_support_bundle.py
+          python3 scripts/test_operator_offline.py
           python3 scripts/test_check_retired.py
           python3 scripts/test_counterexample_registry.py
           python3 scripts/test_check_monitoring.py
@@ -382,7 +403,7 @@ jobs:
         if: always() && matrix.part == 'test'
         run: |
           mkdir -p dist
-          for b in orchestrator sokol-operator sokol-suricata sokol-crowdsec sokol-fastnetmon-notify trident_trap; do
+          for b in orchestrator monitor sokol-operator sokol-suricata sokol-crowdsec sokol-fastnetmon-notify trident_trap; do
             if [ -x "target/release/$b" ]; then cp "target/release/$b" dist/; fi
           done
           cp target/bpfel-unknown-none/release/ebpf-probe dist/ebpf-probe.o 2>/dev/null || true
@@ -407,6 +428,20 @@ jobs:
           name: sokol-${{ github.sha }}-${{ matrix.arch }}
           path: dist/
           if-no-files-found: warn
+
+      - name: Complete candidate from the single product inventory
+        if: success() && matrix.part == 'test'
+        run: |
+          mkdir -p candidates
+          python3 scripts/candidate.py build --binaries target/release --output "candidates/candidate-${{ matrix.arch }}.tar.gz" > "candidates/candidate-${{ matrix.arch }}.json"
+          tar -xOf "candidates/candidate-${{ matrix.arch }}.tar.gz" SBOM.spdx.json > "candidates/SBOM-${{ matrix.arch }}.spdx.json"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: success() && matrix.part == 'test'
+        with:
+          name: candidate-${{ github.sha }}-${{ matrix.arch }}
+          path: candidates/
+          if-no-files-found: error
 
       # Last: it rebuilds the orchestrator with another build id (the "upgrade"), which replaces
       # the binary the artifacts above were made from.
@@ -440,6 +475,35 @@ jobs:
           ARCH: ${{ matrix.arch }}
         run: |
           gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs?filter=latest&per_page=100" \
-            --jq ".jobs[] | select(.name | endswith(\" ($ARCH)\")) | \"\(.name) \(.conclusion)\"" | tee parts.txt
+            --jq ".jobs[] | select(.name == \"test ($ARCH)\" or .name == \"smoke ($ARCH)\" or .name == \"demo ($ARCH)\") | \"\(.name) \(.conclusion)\"" | tee parts.txt
           [ "$(wc -l < parts.txt)" = 3 ] || { echo "expected 3 parts of $ARCH"; exit 1; }
           ! grep -v ' success$' parts.txt
+
+  candidate-provenance:
+    name: candidate origin [${{ matrix.arch }}]
+    # Origin attestations only, after the native suites; no public RC or admission.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [build-test-smoke, kani]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+      attestations: write
+    strategy:
+      matrix:
+        arch: [x86_64, aarch64]
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: candidate-${{ github.sha }}-${{ matrix.arch }}
+          path: candidate
+      - name: Attest the archive's build origin
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4, origin only
+        with:
+          subject-path: candidate/candidate-${{ matrix.arch }}.tar.gz
+      - name: Attest the declared dependency inventory
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
+        with:
+          subject-path: candidate/candidate-${{ matrix.arch }}.tar.gz
+          sbom-path: candidate/SBOM-${{ matrix.arch }}.spdx.json
