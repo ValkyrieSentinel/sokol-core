@@ -198,6 +198,8 @@ python3 scripts/test_check_claims.py
 python3 scripts/test_witness_pin.py
 python3 scripts/test_gate_provenance.py
 python3 scripts/test_trust_root.py
+python3 scripts/test_sokol_dev.py
+python3 scripts/test_exchange_gate_root.py
 python3 scripts/test_check_retired.py
 python3 scripts/test_counterexample_registry.py
 python3 scripts/test_check_monitoring.py

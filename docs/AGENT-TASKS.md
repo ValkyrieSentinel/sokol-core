@@ -1,5 +1,25 @@
 # Contract tasks and witness runs
 
+## One entry point
+
+`python3 scripts/sokol-dev.py next` shows current signature correspondence, provisional
+owner-action candidates and the fixed challenge catalog. `inventory` and `map` project
+the same contracts and declared witness locations; the map is not a compiler call graph.
+`context IPC-A1` (also `explain IPC-A1`) delegates to the existing bounded context;
+`check IPC-A1` invokes its existing native runner. `challenge genesis` runs the existing
+calibrated Kani method, including its deliberate fault. These are explicit executions.
+
+`verify /absolute/report.json` remains correspondence-only; adding replay explicitly
+requests fresh execution. `exchange` forwards caller arguments to the existing portable
+counterexample tool: the caller still chooses its verifier digest, trust, actor and key.
+No text in a contract's annotations, a map or an imported report becomes a recipe.
+Essential inventory/map output above 64 KiB is refused; select a contract instead.
+An inventory MATCH never establishes execution, semantic adequacy or deployment authority.
+The detailed owners and limits below apply unchanged.
+
+The recipient gate runs outside received source using its explicit-root interface. The
+producer's checker stays data, so a recipient does not replace bytes of its signed root.
+
 `python3 scripts/contract-task.py context IPC-A1` produces a read-only packet of at most
 16 KiB. The same command accepts any contract ID: for example `MESH-K1`. It uses the gate's
 normalizers and signed manifest, reports the selected binding, and leaves execution `UNKNOWN`.

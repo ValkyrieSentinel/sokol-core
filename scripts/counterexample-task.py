@@ -251,7 +251,9 @@ def verify_owner_closure(pack, files, trust):
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(blob(pack, entry['sha256']))
             target.chmod(0o755 if entry['executable'] else 0o644)
-        gate = source / 'scripts/witness-pin.py'
+        # The recipient owns execution; the producer's checker stays DATA and is part of
+        # its signed future root. Replacing it would hash recipient bytes as producer bytes.
+        gate = root / 'recipient-checker.py'
         gate.write_bytes(read(ROOT / 'scripts/witness-pin.py'))
         signers = root / 'recipient-signers'
         signers.write_bytes(trust)
@@ -262,7 +264,8 @@ def verify_owner_closure(pack, files, trust):
             if code:
                 raise ValueError('Cannot index received source data')
         # -I: the gate's directory holds received data; it must never shadow the gate's imports.
-        code, output = inputs.run_bounded(source, [shutil.which('python3'), '-I', str(gate), 'check',
+        code, output = inputs.run_bounded(source, [shutil.which('python3'), '-I', str(gate),
+                                                   '--root', str(source), 'check', '--every-pin',
                                                    '--signers', str(signers)], timeout=120, env=env)
         if code:
             raise ValueError('Recipient owner gate refused witness closure/build: '
