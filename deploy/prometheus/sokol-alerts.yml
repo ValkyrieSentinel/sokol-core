@@ -135,12 +135,33 @@ groups:
   - name: sokol-mesh
     rules:
       - alert: SokolPeersLost
-        expr: sokol_p2p_active_peers < max_over_time(sokol_p2p_active_peers[1h])
+        expr: sokol_p2p_active_peers{job="sokol"} < on (instance, job) sokol_p2p_expected_peers{job="sokol"}
         for: 5m
         labels: { severity: warning }
         annotations:
-          summary: "{{ $labels.instance }}: {{ $value }} mesh peers, fewer than in the last hour"
+          summary: "{{ $labels.instance }}: {{ $value }} connected peers, below configured mesh size"
           runbook: "RUNBOOK §5.5"
+      - alert: SokolMeshObservationMissing
+        expr: up{job="sokol"} == 1 unless on (instance, job) (sokol_p2p_expected_peers{job="sokol"} and on (instance, job) sokol_p2p_active_peers{job="sokol"})
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.instance }}: mesh observations missing from a reachable exporter"
+          runbook: "RUNBOOK §5.5"
+      - alert: SokolSnapshotStale
+        expr: sokol_snapshot_age_seconds > 5 or sokol_snapshot_age_seconds < 0
+        for: 1m
+        labels: { severity: critical }
+        annotations:
+          summary: "{{ $labels.instance }}: main-loop observations are stale or not sampled"
+          runbook: "RUNBOOK §4"
+      - alert: SokolWorkerStopped
+        expr: sokol_worker_state != 1
+        for: 1m
+        labels: { severity: critical }
+        annotations:
+          summary: "{{ $labels.instance }}: {{ $labels.worker }} is not running (state {{ $value }})"
+          runbook: "RUNBOOK §4"
       - alert: SokolPeerWrongAddress
         expr: increase(sokol_mesh_handshakes_wrong_address_total[10m]) > 0
         labels: { severity: critical }

@@ -202,6 +202,8 @@ python3 scripts/test_sokol_dev.py
 python3 scripts/test_exchange_gate_root.py
 python3 scripts/test_candidate.py
 python3 scripts/test_build_identity.py
+python3 scripts/test_support_bundle.py
+python3 scripts/test_operator_offline.py
 python3 scripts/test_check_retired.py
 python3 scripts/test_counterexample_registry.py
 python3 scripts/test_check_monitoring.py

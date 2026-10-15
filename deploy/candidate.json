@@ -11,6 +11,7 @@
     {"source": "deploy/sokol-orchestrator.service", "path": "etc/systemd/system/sokol-orchestrator.service", "mode": 420},
     {"source": "scripts/candidate.py", "path": "usr/local/share/sokol/candidate.py", "mode": 493},
     {"source": "scripts/support-bundle.sh", "path": "usr/local/bin/sokol-support-bundle", "mode": 493},
+    {"source": "scripts/support_bundle.py", "path": "usr/local/share/sokol/support_bundle.py", "mode": 420},
     {"source": "docs/RUNBOOK.md", "path": "usr/local/share/sokol/RUNBOOK.md", "mode": 420},
     {"source": "docs/SUPPORT.md", "path": "usr/local/share/sokol/SUPPORT.md", "mode": 420},
     {"source": "LICENSE", "path": "usr/local/share/sokol/LICENSE", "mode": 420},

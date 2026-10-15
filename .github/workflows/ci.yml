@@ -328,6 +328,8 @@ jobs:
           python3 scripts/test_exchange_gate_root.py
           python3 scripts/test_candidate.py
           python3 scripts/test_build_identity.py
+          python3 scripts/test_support_bundle.py
+          python3 scripts/test_operator_offline.py
           python3 scripts/test_check_retired.py
           python3 scripts/test_counterexample_registry.py
           python3 scripts/test_check_monitoring.py
@@ -457,11 +459,12 @@ jobs:
           ARCH: ${{ matrix.arch }}
         run: |
           gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs?filter=latest&per_page=100" \
-            --jq ".jobs[] | select(.name | endswith(\" ($ARCH)\")) | \"\(.name) \(.conclusion)\"" | tee parts.txt
+            --jq ".jobs[] | select(.name == \"test ($ARCH)\" or .name == \"smoke ($ARCH)\" or .name == \"demo ($ARCH)\") | \"\(.name) \(.conclusion)\"" | tee parts.txt
           [ "$(wc -l < parts.txt)" = 3 ] || { echo "expected 3 parts of $ARCH"; exit 1; }
           ! grep -v ' success$' parts.txt
 
   candidate-provenance:
+    name: candidate origin [${{ matrix.arch }}]
     # Origin attestations only, after the native suites; no public RC or admission.
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: [build-test-smoke, kani]

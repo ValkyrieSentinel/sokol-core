@@ -42,6 +42,8 @@ mod signal;
 mod sokol;
 mod state_input;
 mod state_store;
+#[cfg(test)]
+mod status_tests;
 
 use aya::maps::{Array, LpmTrie, MapData, PerCpuArray, RingBuf};
 use aya::programs::Xdp;
@@ -1339,6 +1341,8 @@ async fn main() -> Result<(), anyhow::Error> {
         .unwrap_or_else(|| std::path::PathBuf::from(format!("{}.blocks.json", args.db_path)));
     let state_store = Arc::new(StateStore::new(state_file.clone()));
     let mut producers = shutdown::Producers::new();
+    let mesh_worker_health = metrics::WorkerHealth::default();
+    let kernel_worker_health = metrics::WorkerHealth::default();
 
     let stats_map_data = bpf
         .take_map("STATS")
@@ -1349,6 +1353,8 @@ async fn main() -> Result<(), anyhow::Error> {
         match RingBuf::try_from(events_map_data) {
             Ok(ring_buf) => match AsyncFd::new(ring_buf) {
                 Ok(mut async_fd) => {
+                    let worker = kernel_worker_health.clone();
+                    worker.set(metrics::WorkerState::Running);
                     let db_events = sntl_db.clone();
                     let node_id_ev = args.node_id;
                     producers.spawn(async move {
@@ -1372,6 +1378,7 @@ async fn main() -> Result<(), anyhow::Error> {
                                     guard.clear_ready();
                                 }
                                 Err(e) => {
+                                    worker.set(metrics::WorkerState::Failed);
                                     log::error!(
                                         "[eBPF RingBuf] Failed to get readable guard: {}",
                                         e
@@ -1383,6 +1390,7 @@ async fn main() -> Result<(), anyhow::Error> {
                     });
                 }
                 Err(e) => {
+                    kernel_worker_health.set(metrics::WorkerState::Failed);
                     log::error!(
                         "[eBPF RingBuf] Failed to wrap ring buffer in AsyncFd: {}",
                         e
@@ -1390,12 +1398,15 @@ async fn main() -> Result<(), anyhow::Error> {
                 }
             },
             Err(e) => {
+                kernel_worker_health.set(metrics::WorkerState::Failed);
                 log::error!(
                     "[eBPF RingBuf] Failed to create RingBuf from map data: {}",
                     e
                 );
             }
         }
+    } else {
+        kernel_worker_health.set(metrics::WorkerState::Failed);
     }
 
     for ip_str in &args.block {
@@ -1501,7 +1512,8 @@ async fn main() -> Result<(), anyhow::Error> {
         100,
         shutdown_rx.clone(),
         peer_registry.clone(),
-    );
+    )
+    .with_health(mesh_worker_health.clone());
 
     producers.spawn(async move {
         if let Err(e) = p2p_network.run().await {
@@ -1922,25 +1934,37 @@ async fn main() -> Result<(), anyhow::Error> {
             .await
             .map_err(|e| anyhow::anyhow!("Failed to bind metrics endpoint {}: {}", addr, e))?;
         let snapshot = metrics_snapshot.clone();
+        let status_snapshot = metrics_snapshot.clone();
         let readback = flowspec_readback.clone();
-        let app = axum::Router::new().route(
-            "/metrics",
-            axum::routing::get(move || {
-                let snapshot = snapshot.clone();
-                let readback = readback.clone();
-                async move {
-                    let snapshot = snapshot.read().unwrap_or_else(|p| p.into_inner()).clone();
-                    let body = metrics::render_with_flowspec(&snapshot, &readback);
-                    (
-                        [(
-                            axum::http::header::CONTENT_TYPE,
-                            "text/plain; version=0.0.4",
-                        )],
-                        body,
-                    )
-                }
-            }),
-        );
+        let app = axum::Router::new()
+            .route(
+                "/metrics",
+                axum::routing::get(move || {
+                    let snapshot = snapshot.clone();
+                    let readback = readback.clone();
+                    async move {
+                        let snapshot = snapshot.read().unwrap_or_else(|p| p.into_inner()).clone();
+                        let body = metrics::render_with_flowspec(&snapshot, &readback);
+                        (
+                            [(
+                                axum::http::header::CONTENT_TYPE,
+                                "text/plain; version=0.0.4",
+                            )],
+                            body,
+                        )
+                    }
+                }),
+            )
+            .route(
+                "/status",
+                axum::routing::get(move || {
+                    let snapshot = status_snapshot.clone();
+                    async move {
+                        let snapshot = snapshot.read().unwrap_or_else(|p| p.into_inner()).clone();
+                        axum::Json(metrics::status_at(&snapshot, std::time::Instant::now()))
+                    }
+                }),
+            );
         log::info!("[Metrics] Prometheus endpoint on http://{}/metrics", addr);
         producers.spawn(async move {
             if let Err(e) = axum::serve(listener, app).await {
@@ -2238,6 +2262,9 @@ async fn main() -> Result<(), anyhow::Error> {
                     sntl_db.append(format!("BLOCKLIST_WATERMARK|{}", message));
                 }
                 snapshot.p2p_peers = peer_registry.peer_count().await;
+                snapshot.p2p_expected = peer_registry.pinned_peers();
+                snapshot.mesh_worker = mesh_worker_health.get();
+                snapshot.kernel_worker = kernel_worker_health.get();
                 snapshot.audit_queue_overflow = sntl_db.overflow_total();
                 // R26-08: a CONFIG write that failed at a latch transition is retried here.
                 if defense.pending() {
@@ -2338,6 +2365,7 @@ async fn main() -> Result<(), anyhow::Error> {
                 if flowspec_worker.is_some() {
                     flowspec::update_wanted(&flowspec_tx, blocks.lock().await.active_ips());
                 }
+                snapshot.sampled_at = Some(std::time::Instant::now());
                 *metrics_snapshot.write().unwrap_or_else(|p| p.into_inner()) = snapshot;
 
                 let delta_packets = total_rx_packets.saturating_sub(prev_packets);

@@ -21,6 +21,7 @@ pub struct OutcomeStats {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Snapshot {
+    pub sampled_at: Option<Instant>,
     pub rx_packets: u64,
     pub rx_bytes: u64,
     pub dropped_packets: u64,
@@ -49,6 +50,9 @@ pub struct Snapshot {
     pub strikes_evicted: u64,
     pub claims_waiting: usize,
     pub p2p_peers: usize,
+    pub p2p_expected: usize,
+    pub mesh_worker: u8,
+    pub kernel_worker: u8,
     pub audit_queue_overflow: u64,
     pub defense_strict: bool,
     pub audit_healthy: bool,
@@ -92,6 +96,60 @@ pub struct Snapshot {
     pub cluster_nodes: usize,
     pub cluster_attacked: usize,
     pub cluster_storm_engaged: bool,
+}
+
+/// Fixed worker inventory: unknown before admission, running after resource acquisition,
+/// failed after a terminal error, stopped after an orderly exit.
+#[derive(Clone, Default)]
+pub struct WorkerHealth(std::sync::Arc<std::sync::atomic::AtomicU8>);
+
+#[derive(Clone, Copy)]
+#[repr(u8)]
+pub enum WorkerState {
+    Unknown = 0,
+    Running = 1,
+    Failed = 2,
+    Stopped = 3,
+}
+
+impl WorkerHealth {
+    pub fn set(&self, state: WorkerState) {
+        self.0
+            .store(state as u8, std::sync::atomic::Ordering::Relaxed);
+    }
+    pub fn get(&self) -> u8 {
+        self.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+pub fn status_at(s: &Snapshot, now: Instant) -> serde_json::Value {
+    let age = s.sampled_at.and_then(|at| now.checked_duration_since(at));
+    let freshness = match age {
+        Some(age) if age <= std::time::Duration::from_secs(5) => "FRESH",
+        Some(_) => "STALE",
+        None => "UNKNOWN",
+    };
+    let worker = |state| match state {
+        1 => "RUNNING",
+        2 => "FAILED",
+        3 => "STOPPED",
+        _ => "UNKNOWN",
+    };
+    serde_json::json!({
+        "profile": "sokol.node-status.v1", "authority": "READ_ONLY_OBSERVATION_NOT_ADMISSION",
+        "build": env!("SOKOL_BUILD_ID"), "freshness": freshness,
+        "age_ms": age.map(|age| age.as_millis().min(u64::MAX as u128) as u64),
+        "configured": {"expected_mesh_peers": s.p2p_expected, "flowspec": s.flowspec_enabled,
+                       "enforcement": if s.observe_only { "OBSERVE" } else { "DROP" }},
+        "desired": {"pending_kernel_updates": s.blocks_pending},
+        "applied": {"kernel_blocks_v4": s.blocks_active_v4, "kernel_blocks_v6": s.blocks_active_v6},
+        "observed": {"connected_peers": s.p2p_peers, "audit_healthy": s.audit_healthy,
+                     "state_healthy": s.state_healthy, "restore_ok": s.state_restore_ok,
+                     "protected_refresh_ok": s.protected_refresh_ok},
+        "workers": {"mesh_listener": worker(s.mesh_worker), "kernel_events": worker(s.kernel_worker)},
+        "limits": ["All values belong to the stated snapshot age; stale values are not current facts.",
+                   "Counts and worker states do not establish hardware qualification or router enforcement."]
+    })
 }
 
 fn family(out: &mut String, name: &str, kind: &str, help: &str) {
@@ -416,6 +474,41 @@ fn render_at(s: &Snapshot, now: Instant) -> String {
         "Authenticated mesh nodes connected (a node with two connections counts once).",
     );
     let _ = writeln!(out, "sokol_p2p_active_peers {}", s.p2p_peers);
+    family(
+        &mut out,
+        "sokol_p2p_expected_peers",
+        "gauge",
+        "Peers in the current trust configuration, not a historical high-water mark.",
+    );
+    let _ = writeln!(out, "sokol_p2p_expected_peers {}", s.p2p_expected);
+    family(
+        &mut out,
+        "sokol_snapshot_age_seconds",
+        "gauge",
+        "Monotonic age of this snapshot, -1 before the first sample.",
+    );
+    let age = s
+        .sampled_at
+        .and_then(|at| now.checked_duration_since(at))
+        .map(|age| age.as_secs_f64())
+        .unwrap_or(-1.0);
+    let _ = writeln!(out, "sokol_snapshot_age_seconds {}", age);
+    family(
+        &mut out,
+        "sokol_worker_state",
+        "gauge",
+        "0 unknown, 1 running, 2 failed, 3 stopped; snapshot age applies.",
+    );
+    let _ = writeln!(
+        out,
+        "sokol_worker_state{{worker=\"mesh_listener\"}} {}",
+        s.mesh_worker
+    );
+    let _ = writeln!(
+        out,
+        "sokol_worker_state{{worker=\"kernel_events\"}} {}",
+        s.kernel_worker
+    );
     family(
         &mut out,
         "sokol_audit_queue_overflow_total",
