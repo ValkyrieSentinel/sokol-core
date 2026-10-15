@@ -15,13 +15,15 @@ The field is mandatory. Legacy build/closure fields remain frozen for the base
 checker which must authorize the bootstrap. Only the owner signs this field;
 the provisional manifest cannot authorize a trust transition.
 
-The next-base policy also includes the non-empty CI argument vectors of tracked
+The follow-up `trust_root_v2` policy also includes the non-empty CI argument vectors of tracked
 Python files, projected with the same function used by `run-python`. A future
 base cannot silently replace a native test's binary argument with a fixture.
 Candidate pins ignore the old base's `WITNESS_PIN_CI` execution override. CI
 comments, artifact retention and new argument-free tests do not change this
 projection; an execution-policy change requires owner acceptance. The CI input
 has the same regular-file, symlink and size limits as the other trust inputs.
+Signing computes both v1 (exactly its original projection) and v2, so the current
+v1 base can authorize the next checker without misinterpreting the new field.
 
 The trusted checker executes outside the candidate using its explicit `--root`
 option. It never replaces the future checker before hashing it. The required

@@ -856,7 +856,7 @@ TARGET_SECTIONS = ("lib", "bin", "test", "bench", "example", "workspace")
 # as pinned, so the base branch's checker (which computes them) still accepts the change.
 CLOSURES = "closures_v4"
 BUILD = "build_v3"
-TRUST = "trust_root_v1"
+TRUST = "trust_root_v2"
 TRUST_PATHS = (".github/witness-signers", "scripts/witness-pin.py",
                ".github/workflows/witness-gate.yml")
 MAX_TRUST_BYTES = 262_144
@@ -882,7 +882,7 @@ def trust_input(rel: str) -> tuple[bytes, bool] | None:
     return data, bool(mode & 0o111)
 
 
-def trust_pins() -> dict:
+def trust_pins(include_arguments: bool = True) -> dict:
     """The proposed NEXT base, authenticated by the current owner's manifest and trust.
 
     Always inspect candidate bytes, even when this checker is executed outside that tree.
@@ -896,6 +896,8 @@ def trust_pins() -> dict:
             continue
         data, executable = value
         pins[rel] = {'sha256': hashlib.sha256(data).hexdigest(), 'executable': executable}
+    if not include_arguments:
+        return pins
     # Sign the next base's execution arguments using the SAME projection as run-python.
     # Never use WITNESS_PIN_CI here: that override selects execution policy from the old
     # trusted base, whereas these pins authorize the candidate's future policy.
@@ -974,6 +976,7 @@ def current(tier: str = "owner") -> dict:
     return {"rows": table, "witnesses": {w: sorted(bodies.get(w, [])) for w in sorted(cited)},
             CLOSURES: {w: sorted(closures.get(w, [])) for w in sorted(cited)},
             BUILD: build_pins() if tier == "owner" else {},
+            "trust_root_v1": trust_pins(False) if tier == "owner" else {},
             TRUST: trust_pins() if tier == "owner" else {},
             "contracts": contract_pins(ROOT, tier)}
 

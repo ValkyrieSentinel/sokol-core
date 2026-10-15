@@ -128,8 +128,8 @@ class TrustRoot(unittest.TestCase):
     def test_an_owner_signed_manifest_without_the_root_field_is_refused(self):
         path = self.root / 'docs/witness-manifest.json'
         value = json.loads(path.read_text())
-        self.assertIn('trust_root_v1', value)
-        value.pop('trust_root_v1')
+        self.assertIn('trust_root_v2', value)
+        value.pop('trust_root_v2')
         path.write_text(json.dumps(value))
         Path(str(path) + '.sig').unlink()
         self.call('ssh-keygen', '-q', '-Y', 'sign', '-f', str(self.keys['owner']), '-n', 'sokol-witness', str(path))
