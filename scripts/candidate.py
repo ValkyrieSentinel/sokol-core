@@ -87,7 +87,7 @@ def sbom(commit):
             'name': 'sokol-core-build-graph',
             'documentNamespace': 'https://github.com/s0fractal/sokol-core/sbom/' + commit + '/' + arch(),
             'creationInfo': {'creators': ['Tool: sokol-candidate'], 'created': created},
-            'documentComment': 'Union of resolved Cargo metadata graphs, not measured symbol-level binary dependencies.',
+            'comment': 'Union of resolved Cargo metadata graphs, not measured symbol-level binary dependencies.',
             'packages': [packages[k] for k in sorted(packages)],
             'relationships': [{'spdxElementId': 'SPDXRef-DOCUMENT', 'relationshipType': 'DESCRIBES',
                                'relatedSpdxElement': k} for k in sorted(packages)]}
