@@ -20,11 +20,16 @@ pub(crate) async fn handle_ipc_line<B: block_table::Blocklist>(
     content: &str,
     c: &IpcCtx<B>,
 ) -> String {
-    // One policy snapshot per line: the decision and its answer read the same never-block set,
-    // so a refusal the policy does not explain is the table's, not a policy change in between.
+    // The target is picked with this snapshot; the decision reads the policy again under the
+    // table lock, where the host refresh changes it, and the answer reads it after the
+    // decision: a refresh between them only adds protection the decision may not have seen.
     let policy = c.policy.current();
     let outcome = |e: Enforcement, target: IpNet| {
-        let protected = policy.check_net(block_table::canonical(target)).is_err();
+        let protected = c
+            .policy
+            .current()
+            .check_net(block_table::canonical(target))
+            .is_err();
         enforcement_reply(e, protected)
     };
     if content.starts_with('{') {
@@ -46,7 +51,7 @@ pub(crate) async fn handle_ipc_line<B: block_table::Blocklist>(
                         &c.registry,
                         c.node_id,
                         &c.crypto,
-                        &policy,
+                        &c.policy,
                         Detection {
                             source: crate::detections::TRAP,
                             ..Detection::default()
@@ -131,7 +136,7 @@ pub(crate) async fn handle_ipc_line<B: block_table::Blocklist>(
                             &c.registry,
                             c.node_id,
                             &c.crypto,
-                            &policy,
+                            &c.policy,
                             Detection {
                                 source: detections::adapter_label(&sig.source),
                                 event,

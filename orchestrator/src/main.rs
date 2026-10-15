@@ -934,7 +934,7 @@ async fn enforce_block_local<B: block_table::Blocklist>(
     registry: &PeerRegistry,
     node_id: u64,
     node_crypto: &Arc<NodeCrypto>,
-    policy: &BlockPolicy,
+    policy: &PolicyHandle,
     detection: Detection<'_>,
 ) -> Enforcement {
     let Detection {
@@ -948,7 +948,12 @@ async fn enforce_block_local<B: block_table::Blocklist>(
     };
     let ip = block_table::canonical(target);
     let shown = show(&ip);
-    if let Err(why) = policy.check_net(ip) {
+    // The decision time is read, and the decision record submitted, under the
+    // table lock, so audit order is lock order and no tick applied a later time first.
+    let mut table = blocks.lock().await;
+    // The policy too: the host refresh replaces it and rechecks the table under this lock, so
+    // a check before the lock could add an address that has been protected since.
+    if let Err(why) = policy.current().check_net(ip) {
         log::error!(
             "[Local Security] Refusing to block {} ({}) | Requested for: {}",
             shown,
@@ -961,9 +966,6 @@ async fn enforce_block_local<B: block_table::Blocklist>(
         ));
         return counted(Enforcement::Refused);
     }
-    // The decision time is read, and the decision record submitted, under the
-    // table lock, so audit order is lock order and no tick applied a later time first.
-    let mut table = blocks.lock().await;
     let now = block_table::local_ms();
     // Replay context (ADR-0016): the exact decision time and the event id go into every
     // decision record; the audit record's own timestamp is when it was written.
@@ -1633,7 +1635,7 @@ async fn main() -> Result<(), anyhow::Error> {
                                     &registry_trap,
                                     node_id_trap,
                                     &crypto_trap,
-                                    &policy_trap.current(),
+                                    &policy_trap,
                                     Detection {
                                         source: detections::TRAP,
                                         ..Detection::default()
@@ -2719,6 +2721,65 @@ mod tests {
     /// value unnoticed (mutation sweep 2026-10-07).
     /// Every decision is counted under its source and result (`sokol_detections_total`): a
     /// detector that misfires shows as a surge of its own, before the map fills.
+    /// A local decision that read the policy before a protection change took the table lock
+    /// is refused once the address is protected (the host refresh rechecks only what the
+    /// table holds when it runs).
+    #[tokio::test]
+    async fn a_detection_racing_a_protection_change_is_refused() {
+        let path = std::env::temp_dir()
+            .join(format!("sokol-detect-race-{}", std::process::id()))
+            .to_string_lossy()
+            .into_owned();
+        let _ = std::fs::remove_file(&path);
+        let db = Arc::new(SentinelDb::init(&path, None).unwrap());
+        let blocks = Arc::new(tokio::sync::Mutex::new(BlockTable::with_lists(
+            AcceptLists,
+            TtlPolicy {
+                base: Duration::from_secs(60),
+                max: Duration::from_secs(600),
+            },
+            1,
+        )));
+        let (registry, crypto) = (
+            PeerRegistry::new(TrustStore::default()),
+            Arc::new(NodeCrypto::generate()),
+        );
+        let handle = PolicyHandle::new(BlockPolicy::builtin());
+        let target = parse_target("198.51.100.80").unwrap();
+        let held = blocks.lock().await;
+        let change = async {
+            for _ in 0..10 {
+                tokio::task::yield_now().await;
+            }
+            let mut policy = BlockPolicy::builtin();
+            policy.protect(target, "test");
+            handle.replace(policy);
+            let current = handle.current();
+            let mut table = held;
+            table.recheck(|n| current.check_net(n).is_ok(), block_table::local_ms());
+        };
+        let (outcome, ()) = tokio::join!(
+            enforce_block_local(
+                target,
+                "race test",
+                &blocks,
+                &db,
+                &registry,
+                1,
+                &crypto,
+                &handle,
+                Detection::default(),
+            ),
+            change
+        );
+        assert!(
+            !blocks.lock().await.is_blocked(target),
+            "a protected address is blocked"
+        );
+        assert_eq!(outcome, Enforcement::Refused);
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[tokio::test]
     async fn each_decision_is_counted_under_its_source() {
         let path = temp_log("detections");
@@ -2735,6 +2796,7 @@ mod tests {
         let crypto = Arc::new(NodeCrypto::generate());
         let mut policy = BlockPolicy::builtin();
         policy.protect("198.51.100.99/32".parse().unwrap(), "test");
+        let policy = PolicyHandle::new(policy);
         // The counters are process-wide: a name no other test uses.
         let source = "count-test-source";
         let decide = |target: &'static str, event: Option<(&'static str, &'static str)>| {
@@ -2799,7 +2861,7 @@ mod tests {
         )));
         let registry = PeerRegistry::new(TrustStore::default());
         let crypto = Arc::new(NodeCrypto::generate());
-        let policy = BlockPolicy::builtin();
+        let policy = PolicyHandle::new(BlockPolicy::builtin());
         let target = parse_target("198.51.100.79").unwrap();
         // The tick holds the lock while the detection is submitted.
         let held = blocks.clone().lock_owned().await;
@@ -2866,7 +2928,7 @@ mod tests {
                 .add_peer("127.0.0.1:1".parse().unwrap(), link, 2, 1)
                 .await;
             let crypto = Arc::new(NodeCrypto::generate());
-            let policy = BlockPolicy::builtin();
+            let policy = PolicyHandle::new(BlockPolicy::builtin());
             let target = parse_target("198.51.100.78").unwrap();
             enforce_block_local(
                 target,
@@ -2911,7 +2973,7 @@ mod tests {
         let peers = registry.peers_for_test();
         let guard = peers.write().await;
         let crypto = Arc::new(NodeCrypto::generate());
-        let policy = BlockPolicy::builtin();
+        let policy = PolicyHandle::new(BlockPolicy::builtin());
         let target = parse_target("198.51.100.77").unwrap();
         let (b, d) = (blocks.clone(), db.clone());
         let mut producers = shutdown::Producers::new();

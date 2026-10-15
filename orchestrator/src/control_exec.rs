@@ -29,15 +29,16 @@ pub(crate) async fn execute_control<B: block_table::Blocklist>(
     ctx: &ControlCtx<B>,
 ) -> String {
     use control::ControlCommand;
-    let (blocks, policy, sntl_db) = (&ctx.blocks, &ctx.policy.current(), &ctx.sntl_db);
+    let (blocks, sntl_db) = (&ctx.blocks, &ctx.sntl_db);
     match cmd {
         ControlCommand::Ban(ip) => {
             let shown = show(&ip);
-            if let Err(why) = policy.check_net(ip) {
+            // Time, record and policy under the table lock (audit order = lock order; the host
+            // refresh replaces the policy and rechecks the table under it, ADR-0012).
+            let mut table = blocks.lock().await;
+            if let Err(why) = ctx.policy.current().check_net(ip) {
                 return format!("ERR {} is protected ({})", shown, why);
             }
-            // Time and record under the table lock (audit order = lock order).
-            let mut table = blocks.lock().await;
             let at = block_table::local_ms();
             let added = match table.add_local(ip, ClaimKind::Operator, "operator", at) {
                 Ok(added) => added,
@@ -169,7 +170,7 @@ pub(crate) async fn execute_control<B: block_table::Blocklist>(
                 Ok(trust) => {
                     let per_peer = ctx.peer_limits.per_peer(&trust);
                     let legacy = trust.legacy_peers().to_vec();
-                    {
+                    let pinned = {
                         let mut table = ctx.blocks.lock().await;
                         if !table.configure_trusted_peers(
                             ctx.peer_limits.default,
@@ -181,8 +182,12 @@ pub(crate) async fn execute_control<B: block_table::Blocklist>(
                             return "ERR known-claims share below currently held claims; previous trust store kept"
                                 .to_string();
                         }
-                    }
-                    let pinned = ctx.registry.reload(trust);
+                        // The registry takes the store under the same table lock: a concurrent
+                        // reload cannot leave the table and the registry on different stores.
+                        #[cfg(test)]
+                        tests::reload_pause().await;
+                        ctx.registry.reload(trust)
+                    };
                     // Nodes no longer pinned, or bound elsewhere, get no broadcast from now on.
                     let dropped = ctx.registry.drop_untrusted().await;
                     log_inbound_budget(pinned);
@@ -217,6 +222,21 @@ pub(crate) async fn execute_control<B: block_table::Blocklist>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    thread_local! {
+        /// (reached, release): a reload in this thread stops between taking the new trust
+        /// into the table and into the registry, once.
+        static RELOAD_PAUSE: std::cell::RefCell<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) async fn reload_pause() {
+        if let Some((reached, release)) = RELOAD_PAUSE.with(|p| p.borrow_mut().take()) {
+            reached.notify_one();
+            release.notified().await;
+        }
+    }
+
     struct AcceptLists;
     impl block_table::Blocklist for AcceptLists {
         fn add(&mut self, _: IpNet) -> Result<(), aya::maps::MapError> {
@@ -228,6 +248,165 @@ mod tests {
         fn hits(&self, _: IpNet) -> Option<u64> {
             Some(0)
         }
+    }
+
+    /// A ban that checked the policy before a protection change took the table lock must not
+    /// block the newly protected address: the host refresh rechecks the table under that lock,
+    /// so a ban added after it would hold the address until the next change (forever, for an
+    /// operator ban).
+    #[tokio::test]
+    async fn a_ban_racing_a_protection_change_does_not_block_the_protected_address() {
+        let dir = std::env::temp_dir().join(format!(
+            "sokol-ban-race-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ttl = TtlPolicy {
+            base: Duration::from_secs(60),
+            max: Duration::from_secs(600),
+        };
+        let ctx = ControlCtx {
+            state: Arc::new(StateStore::new(dir.join("state.json"))),
+            peer_limits: PeerLimits {
+                default: Envelope::unlimited(ttl.max),
+                quorum: Quorum::OFF,
+            },
+            blocks: Arc::new(tokio::sync::Mutex::new(BlockTable::with_lists(
+                AcceptLists,
+                ttl,
+                1,
+            ))),
+            policy: PolicyHandle::new(BlockPolicy::builtin()),
+            sntl_db: Arc::new(
+                SentinelDb::init(dir.join("events.sntl").to_str().unwrap(), None).unwrap(),
+            ),
+            registry: PeerRegistry::new(TrustStore::default()),
+            peers_file: None,
+            node_id: 1,
+            crypto: Arc::new(NodeCrypto::generate()),
+        };
+        let target: IpNet = "198.51.100.77/32".parse().unwrap();
+        let held = ctx.blocks.lock().await;
+        let change = async {
+            for _ in 0..10 {
+                tokio::task::yield_now().await;
+            }
+            let mut policy = BlockPolicy::builtin();
+            policy.protect(target, "test");
+            ctx.policy.replace(policy);
+            let current = ctx.policy.current();
+            let mut table = held;
+            table.recheck(|n| current.check_net(n).is_ok(), block_table::local_ms());
+        };
+        let (reply, ()) = tokio::join!(
+            execute_control(control::ControlCommand::Ban(target), &ctx),
+            change
+        );
+        assert!(
+            !ctx.blocks.lock().await.is_blocked(target),
+            "a protected address is blocked: {reply}"
+        );
+        assert!(reply.starts_with("ERR"), "{reply}");
+        drop(ctx);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Two reloads at once leave the table and the registry on the same trust store: one
+    /// that read the file before the other wrote it into the table cannot then put its older
+    /// store into the registry alone (a revoked peer authenticated by the mesh while the
+    /// table no longer enforces it, or the reverse).
+    #[tokio::test]
+    async fn concurrent_reloads_leave_table_and_registry_on_one_trust_store() {
+        let dir = std::env::temp_dir().join(format!(
+            "sokol-reload-race-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("peers.json");
+        let crypto = Arc::new(NodeCrypto::generate());
+        let key = crypto.public_key_hex();
+        let peer = |id| serde_json::json!({"node_id": id, "public_key": key, "envelope": {"max_known": 3}});
+        let both = serde_json::to_vec(&vec![peer(2), peer(3)]).unwrap();
+        std::fs::write(&file, &both).unwrap();
+        let ttl = TtlPolicy {
+            base: Duration::from_secs(60),
+            max: Duration::from_secs(600),
+        };
+        let blocks = Arc::new(tokio::sync::Mutex::new(BlockTable::with_lists(
+            AcceptLists,
+            ttl,
+            1,
+        )));
+        let ctx = ControlCtx {
+            state: Arc::new(StateStore::new(dir.join("state.json"))),
+            peer_limits: PeerLimits {
+                default: Envelope {
+                    max_known: 1,
+                    ..Envelope::unlimited(ttl.max)
+                },
+                quorum: Quorum::OFF,
+            },
+            blocks,
+            policy: PolicyHandle::new(BlockPolicy::builtin()),
+            sntl_db: Arc::new(
+                SentinelDb::init(dir.join("events.sntl").to_str().unwrap(), None).unwrap(),
+            ),
+            registry: PeerRegistry::new(TrustStore::load(&file).unwrap()),
+            peers_file: Some(file.clone()),
+            node_id: 1,
+            crypto,
+        };
+        assert_eq!(
+            execute_control(control::ControlCommand::ReloadPeers, &ctx).await,
+            "OK 2 pinned peers"
+        );
+        let target: IpNet = "203.0.113.30/32".parse().unwrap();
+        let claim = block_table::Claim {
+            issuer: 3,
+            kind: ClaimKind::Detector,
+            target: "203.0.113.30".into(),
+            issued_ms: p2p::now_ms(),
+            expires_ms: None,
+            reason: "test".into(),
+        };
+        let now = block_table::local_ms();
+        ctx.blocks.lock().await.adopt(claim, true, now);
+        assert!(ctx.blocks.lock().await.is_blocked(target));
+        let (reached, release) = (
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(tokio::sync::Notify::new()),
+        );
+        RELOAD_PAUSE.with(|p| *p.borrow_mut() = Some((reached.clone(), release.clone())));
+        // The first reload reads {2, 3} and stops; the file then revokes 3 and a second
+        // reload runs while the first is stopped.
+        let first = execute_control(control::ControlCommand::ReloadPeers, &ctx);
+        let second = async {
+            reached.notified().await;
+            std::fs::write(&file, serde_json::to_vec(&vec![peer(2)]).unwrap()).unwrap();
+            let resume = async {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                release.notify_one();
+            };
+            tokio::join!(
+                execute_control(control::ControlCommand::ReloadPeers, &ctx),
+                resume
+            )
+            .0
+        };
+        let (first, second) = tokio::join!(first, second);
+        assert!(
+            first.starts_with("OK") && second.starts_with("OK"),
+            "{first} / {second}"
+        );
+        assert_eq!(
+            ctx.registry.trusts(3),
+            ctx.blocks.lock().await.is_blocked(target),
+            "the registry and the table disagree on whether node 3 is trusted"
+        );
+        drop(ctx);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]

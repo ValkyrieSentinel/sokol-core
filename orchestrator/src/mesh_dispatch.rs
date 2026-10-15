@@ -90,14 +90,15 @@ impl<B: Blocklist + Send + 'static, M: ConfigMap + 'static> MeshDispatch<B, M> {
                 let reason = claim.reason.clone();
                 let issuer = claim.issuer;
                 let expires = claim.expires_ms;
-                let refusal = claim
-                    .net()
-                    .and_then(|n| self.policy.current().check_net(n).err());
                 // Time is read once the table is held: a wait for it must not shorten the lease.
-                let (result, wall) = {
+                // The policy too: the host refresh changes it under this lock (ADR-0012).
+                let (result, wall, refusal) = {
                     let mut table = self.blocks.lock().await;
+                    let refusal = claim
+                        .net()
+                        .and_then(|n| self.policy.current().check_net(n).err());
                     let (now, wall) = (block_table::local_ms(), now_ms());
-                    (table.adopt(claim, refusal.is_none(), now), wall)
+                    (table.adopt(claim, refusal.is_none(), now), wall, refusal)
                 };
                 crate::detections::record_peer(issuer, &result);
                 match (result, refusal) {
@@ -180,9 +181,6 @@ impl<B: Blocklist + Send + 'static, M: ConfigMap + 'static> MeshDispatch<B, M> {
                 let mut adopted = 0;
                 for claim in claims {
                     let wall = now_ms();
-                    let refusal = claim
-                        .net()
-                        .and_then(|n| self.policy.current().check_net(n).err());
                     let (shown, secs) = (
                         claim.target.clone(),
                         claim.expires_ms.map(|e| e.saturating_sub(wall) / 1000),
@@ -190,6 +188,10 @@ impl<B: Blocklist + Send + 'static, M: ConfigMap + 'static> MeshDispatch<B, M> {
                     let tag = parse_target(&shown).map(ip_tag).unwrap_or("V4");
                     let adoption = {
                         let mut table = self.blocks.lock().await;
+                        // Under the lock the host refresh changes the policy in (ADR-0012).
+                        let refusal = claim
+                            .net()
+                            .and_then(|n| self.policy.current().check_net(n).err());
                         table.adopt(claim, refusal.is_none(), block_table::local_ms())
                     };
                     crate::detections::record_peer(issuer, &adoption);
@@ -315,7 +317,7 @@ impl<B: Blocklist + Send + 'static, M: ConfigMap + 'static> MeshDispatch<B, M> {
                         &self.registry,
                         self.node_id,
                         &self.crypto,
-                        &self.policy.current(),
+                        &self.policy,
                         Detection {
                             source: crate::detections::TELEMETRY,
                             ..Detection::default()
@@ -465,6 +467,46 @@ mod tests {
             issued_ms: now,
             expires_ms: Some(now + 60_000),
             reason: "peer detector".into(),
+        }
+    }
+
+    /// A peer's claim, alone or in a sync, that was checked against the policy before a
+    /// protection change took the table lock is not enforced once the address is protected.
+    #[tokio::test]
+    async fn a_peer_claim_racing_a_protection_change_is_not_enforced() {
+        for (name, target, sync) in [
+            ("race-claim", "198.51.100.78", false),
+            ("race-sync", "198.51.100.79", true),
+        ] {
+            let mut n = node(name, None);
+            let claim = peer_claim(target);
+            let cmd = if sync {
+                MeshCommand::BlockSync {
+                    issuer: PEER,
+                    claims: vec![claim],
+                    retracted: Vec::new(),
+                }
+            } else {
+                MeshCommand::Claim { claim }
+            };
+            let (blocks, handle) = (n.dispatch.blocks.clone(), n.dispatch.policy.clone());
+            let held = blocks.lock().await;
+            let change = async move {
+                for _ in 0..10 {
+                    tokio::task::yield_now().await;
+                }
+                let mut policy = BlockPolicy::builtin();
+                policy.protect(parse_target(target).unwrap(), "test");
+                handle.replace(policy);
+                let current = handle.current();
+                let mut table = held;
+                table.recheck(|n| current.check_net(n).is_ok(), block_table::local_ms());
+            };
+            tokio::join!(n.dispatch.peer(cmd), change);
+            assert!(
+                !n.in_kernel(target),
+                "{name}: a protected address is enforced"
+            );
         }
     }
 
