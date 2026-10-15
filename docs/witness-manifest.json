@@ -24,8 +24,9 @@
   "ebpf/.cargo/config.toml": "2971e97c89e2b57030356e3bd41c3e3f42a74e48feb368d12c3417063f4feab2",
   "ebpf/Cargo.toml": "8d2dbf4c66edf5fe77ec5035f6475afcf9cd3a4f0f1ccc72e1634602650fa589",
   "ebpf/rust-toolchain.toml": "1f561d2101a82b5cb87c3eabea72f54d8225f09ca72f51a65525646f211f36d9",
+  "fuzz/Cargo.toml": "cb4c76e442754880f612b1cf03fa854cfaa1a5d47ddf3c9929cfc6b37ea4b360",
   "orchestrator/Cargo.toml": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-  "orchestrator/build.rs": "0787f7aeb755db116891f6260228cc518db40721e12330a84f99eea58ae43f51",
+  "orchestrator/build.rs": "a2902b653dbb3611e27e4ffa651e922da157f5a136d7521bd6fd7ae71036f9e9",
   "rust-toolchain.toml": "1f561d2101a82b5cb87c3eabea72f54d8225f09ca72f51a65525646f211f36d9"
  },
  "closures": {
@@ -3362,7 +3363,45 @@
   },
   "scripts/witness-pin.py": {
    "executable": true,
-   "sha256": "3fa96cda46d822dfcd0bb9624e51cab23cda24f73b64c120589869469ca9caae"
+   "sha256": "5109560fefd2ef3793ed88b4871da2f10278ead1dcecfce58121b6daff48d65b"
+  }
+ },
+ "trust_root_v2": {
+  ".github/witness-signers": {
+   "executable": false,
+   "sha256": "a56bd2d321cf1247fa9471fbc03ade04d90542b5d61986927e6645096f99ce93"
+  },
+  ".github/workflows/witness-gate.yml": {
+   "executable": false,
+   "sha256": "a59ebe48a188a7a85686688f34a4534af57ac6b22ed94dadee5384f8a171bf50"
+  },
+  "python_arguments": {
+   "scripts/candidate.py": [
+    "build",
+    "--binaries",
+    "target/release",
+    "--output",
+    "\"candidates/candidate-${{",
+    "matrix.arch",
+    "}}.tar.gz\"",
+    ">",
+    "\"candidates/candidate-${{",
+    "matrix.arch",
+    "}}.json\""
+   ],
+   "scripts/proof-task.py": [
+    "run"
+   ],
+   "scripts/test_crowdsec_stream.py": [
+    "target/release/sokol-crowdsec"
+   ],
+   "scripts/test_suricata_recovery.py": [
+    "target/release/sokol-suricata"
+   ]
+  },
+  "scripts/witness-pin.py": {
+   "executable": true,
+   "sha256": "5109560fefd2ef3793ed88b4871da2f10278ead1dcecfce58121b6daff48d65b"
   }
  },
  "witnesses": {
