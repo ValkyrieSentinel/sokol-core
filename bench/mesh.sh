@@ -12,6 +12,16 @@
 #   sudo bench/mesh.sh reaction    <orchestrator> <monitor> <N> [rounds]
 #   sudo bench/mesh.sh unblock     <orchestrator> <monitor> <N> [rounds]   (FlowSpec: gobgpd)
 #   sudo bench/mesh.sh floors      <orchestrator> <monitor> 3
+#   sudo bench/mesh.sh restart     <orchestrator> <monitor> <N> [rounds]
+#
+# restart:     recovery time after a crash (RTO, ADR-0031). Each round: a detector block on node 1
+#              is on disk, the attacker pings node 1 every 10 ms, node 1 is SIGKILLed and started
+#              again. Times from the kill: control socket answering, the attacker's last reply
+#              (the window in which nothing dropped it; 0 = none), all peers back. Limits, fixed
+#              before the first run: X1 control answers <= 10 s, X2 the block holds again
+#              <= 10 s and the attacker gets no reply in the last second of the probe, X3 all
+#              peers back <= 30 s, in every round. RESTART_CONTROL=1 lifts the block before the
+#              kill (a node that restores nothing): X2 must then fail.
 #
 # propagation: a block is issued on node 1 `rounds` times; for every other node the delay
 #              until its MESH_BLOCK record is reported (min / median / p95 / max, and the
@@ -99,7 +109,7 @@ set -euo pipefail
 
 MODE=$1; BIN=$2; MON=$3; N=$4; shift 4
 ARG=${1:-20}; [ $# -gt 0 ] && shift
-case "$MODE" in propagation|partition|soak|recover|clock|observe|floors|reaction|unblock|relapse|bulkflush) ;;
+case "$MODE" in propagation|partition|soak|recover|clock|observe|floors|reaction|unblock|relapse|bulkflush|restart) ;;
     *) echo "REFUSED unknown mesh mode"; exit 2 ;; esac
 [[ "$N" =~ ^[0-9]+$ ]] && [ "$N" -ge 2 ] && [ "$N" -le 32 ] \
     || { echo "REFUSED mesh node count (2..32)"; exit 2; }
@@ -822,6 +832,45 @@ unblock)
     done
     if [ ${#stuck[@]} -gt 0 ]; then echo "STUCK (still blocking ${WAIT} s after the end): ${stuck[*]}"; exit 1; fi
     echo "no layer kept blocking ${WAIT} s after an end"
+    ;;
+restart)
+    ROUNDS=$ARG; fail=0
+    [ "$ROUNDS" -le 40 ] || { echo "restart: at most 40 rounds (one address each)"; exit 2; }
+    attacker_ns
+    echo "# restart: $ROUNDS rounds, node 1 SIGKILLed with a detector block on disk; X1<=10000 X2<=10000 X3<=30000 ms"
+    for r in $(seq 1 "$ROUNDS"); do
+        a="10.240.0.$((150 + r))"
+        ip netns exec sk-atk ip addr add "$a/24" dev skva
+        send ipc "SIGNAL#rs$r:bench|$a|-|restart round $r" >/dev/null
+        sleep 3   # over one tick: the block is on disk
+        [ -n "${RESTART_CONTROL:-}" ] && { send ctl "UNBAN_IP:$a" >/dev/null; sleep 1.5; }
+        ip netns exec sk-atk ping -D -n -i 0.01 -I "$a" 10.240.0.1 >"$WORK/rs$r" 2>&1 &
+        pinger=$!
+        sleep 0.5
+        t0=$(now_ms)
+        kill -KILL "${NODE_PID[1]}" 2>/dev/null || true
+        wait "${NODE_PID[1]}" 2>/dev/null || true
+        start_node 1
+        ctl=""; peers=""
+        while [ $(($(now_ms) - t0)) -lt 30000 ]; do
+            [ -z "$ctl" ] && send ctl LIST_BANS >/dev/null 2>&1 && ctl=$(($(now_ms) - t0))
+            if [ -n "$ctl" ] && [ "$(metric 1 sokol_p2p_active_peers || true)" = $((N - 1)) ]; then
+                peers=$(($(now_ms) - t0)); break
+            fi
+            sleep 0.05
+        done
+        sleep 2
+        t_stop=$(now_ms)
+        kill "$pinger" 2>/dev/null || true; wait "$pinger" 2>/dev/null || true
+        # The last reply after the kill (ping -D prints [epoch.micro]); none = the block never lapsed.
+        last=$(awk -v t0="$t0" '/bytes from/ { gsub(/[\[\]]/, "", $1); ms = int($1 * 1000); if (ms >= t0) l = ms - t0 } END { print l + 0 }' "$WORK/rs$r")
+        echo "round $r: control ${ctl:-none} ms, attacker last reply ${last} ms, peers ${peers:-none} ms"
+        { [ -n "$ctl" ] && [ "$ctl" -le 10000 ]; } || { echo "FAIL X1 round $r"; fail=1; }
+        { [ "$last" -le 10000 ] && [ "$last" -lt $((t_stop - t0 - 1000)) ]; } || { echo "FAIL X2 round $r (the attacker still got replies)"; fail=1; }
+        { [ -n "$peers" ] && [ "$peers" -le 30000 ]; } || { echo "FAIL X3 round $r"; fail=1; }
+        ip netns exec sk-atk ip addr del "$a/24" dev skva
+    done
+    exit $fail
     ;;
 relapse)
     ROUNDS=$ARG; WAY=${RELAPSE_WAY:-retract}
