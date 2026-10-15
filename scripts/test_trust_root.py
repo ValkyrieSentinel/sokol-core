@@ -5,6 +5,7 @@ running Python witnesses. This also exercises the exact candidate bytes during b
 """
 from pathlib import Path
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -90,6 +91,31 @@ class TrustRoot(unittest.TestCase):
         r = self.check(external=True)
         self.assertNotEqual(r.returncode, 0, r.stdout)
         self.assertIn('trust root', r.stdout)
+
+    def test_python_arguments_are_future_authority_but_ci_comments_are_not(self):
+        test = self.root / 'scripts/test_adapter.py'
+        test.write_text('import unittest\n')
+        ci = self.root / '.github/workflows/ci.yml'
+        ci.write_text('run: python3 scripts/test_adapter.py target/debug/adapter\n')
+        self.call('git', 'add', '.')
+        self.sign()
+        ci.write_text(ci.read_text() + '# artifact retention changed\n')
+        r = self.check(external=True)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        ci.write_text('run: python3 scripts/test_adapter.py fixtures/fake-adapter\n')
+        # The base's execution-policy override must not hide candidate changes from pins.
+        base_ci = self.tmp / 'base-ci.yml'
+        base_ci.write_text('run: python3 scripts/test_adapter.py target/debug/adapter\n')
+        from unittest.mock import patch
+        with patch.dict(os.environ, {'WITNESS_PIN_CI': str(base_ci)}):
+            r = self.check(external=True)
+            self.assertNotEqual(r.returncode, 0, r.stdout)
+            self.assertIn('trust root', r.stdout)
+        ci.write_text('run: python3 scripts/test_adapter.py\n')
+        self.assertNotEqual(self.check(external=True).returncode, 0)
+        ci.unlink()
+        ci.symlink_to(base_ci)
+        self.assertNotEqual(self.check(external=True).returncode, 0)
 
     def test_a_missing_or_symlinked_trust_input_is_refused(self):
         self.signers.unlink()

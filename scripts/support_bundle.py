@@ -72,7 +72,7 @@ def commands():
         'bans.txt': [sys.executable, '-c',
                      'import socket,sys; s=socket.socket(socket.AF_UNIX); s.settimeout(2); '
                      's.connect(sys.argv[1]); s.sendall(b"LIST_BANS\\n"); '
-                     'data=s.recv(131073); sys.stdout.buffer.write(data); '
+                     'data=s.makefile("rb").readline(131073); sys.stdout.buffer.write(data); '
                      'raise SystemExit(0 if data.endswith(b"\\n") else 3)',
                      get('CONTROL', '/run/sokol/control.sock')],
         'peers.txt': [sys.executable, '-c',
