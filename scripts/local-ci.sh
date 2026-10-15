@@ -200,6 +200,8 @@ python3 scripts/test_gate_provenance.py
 python3 scripts/test_trust_root.py
 python3 scripts/test_sokol_dev.py
 python3 scripts/test_exchange_gate_root.py
+python3 scripts/test_candidate.py
+python3 scripts/test_build_identity.py
 python3 scripts/test_check_retired.py
 python3 scripts/test_counterexample_registry.py
 python3 scripts/test_check_monitoring.py

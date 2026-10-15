@@ -326,6 +326,8 @@ jobs:
           python3 scripts/test_trust_root.py
           python3 scripts/test_sokol_dev.py
           python3 scripts/test_exchange_gate_root.py
+          python3 scripts/test_candidate.py
+          python3 scripts/test_build_identity.py
           python3 scripts/test_check_retired.py
           python3 scripts/test_counterexample_registry.py
           python3 scripts/test_check_monitoring.py
@@ -383,7 +385,7 @@ jobs:
         if: always() && matrix.part == 'test'
         run: |
           mkdir -p dist
-          for b in orchestrator sokol-operator sokol-suricata sokol-crowdsec sokol-fastnetmon-notify trident_trap; do
+          for b in orchestrator monitor sokol-operator sokol-suricata sokol-crowdsec sokol-fastnetmon-notify trident_trap; do
             if [ -x "target/release/$b" ]; then cp "target/release/$b" dist/; fi
           done
           cp target/bpfel-unknown-none/release/ebpf-probe dist/ebpf-probe.o 2>/dev/null || true
@@ -408,6 +410,20 @@ jobs:
           name: sokol-${{ github.sha }}-${{ matrix.arch }}
           path: dist/
           if-no-files-found: warn
+
+      - name: Complete candidate from the single product inventory
+        if: success() && matrix.part == 'test'
+        run: |
+          mkdir -p candidates
+          python3 scripts/candidate.py build --binaries target/release --output "candidates/candidate-${{ matrix.arch }}.tar.gz" > "candidates/candidate-${{ matrix.arch }}.json"
+          tar -xOf "candidates/candidate-${{ matrix.arch }}.tar.gz" SBOM.spdx.json > "candidates/SBOM-${{ matrix.arch }}.spdx.json"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: success() && matrix.part == 'test'
+        with:
+          name: candidate-${{ github.sha }}-${{ matrix.arch }}
+          path: candidates/
+          if-no-files-found: error
 
       # Last: it rebuilds the orchestrator with another build id (the "upgrade"), which replaces
       # the binary the artifacts above were made from.
@@ -444,3 +460,31 @@ jobs:
             --jq ".jobs[] | select(.name | endswith(\" ($ARCH)\")) | \"\(.name) \(.conclusion)\"" | tee parts.txt
           [ "$(wc -l < parts.txt)" = 3 ] || { echo "expected 3 parts of $ARCH"; exit 1; }
           ! grep -v ' success$' parts.txt
+
+  candidate-provenance:
+    # Origin attestations only, after the native suites; no public RC or admission.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [build-test-smoke, kani]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+      attestations: write
+    strategy:
+      matrix:
+        arch: [x86_64, aarch64]
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: candidate-${{ github.sha }}-${{ matrix.arch }}
+          path: candidate
+      - name: Attest the archive's build origin
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4, origin only
+        with:
+          subject-path: candidate/candidate-${{ matrix.arch }}.tar.gz
+      - name: Attest the declared dependency inventory
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
+        with:
+          subject-path: candidate/candidate-${{ matrix.arch }}.tar.gz
+          sbom-path: candidate/SBOM-${{ matrix.arch }}.spdx.json
