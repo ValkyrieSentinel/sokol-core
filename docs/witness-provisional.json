@@ -9,11 +9,18 @@
   ],
   "a_retraction_is_packed_into_full_frames_within_the_budget": [
    "orchestrator/src/mesh_sync.rs:fe4b4ceeff92b165770cbdb7b280f104f3c31875f378a384f138c4679d40a889"
+  ],
+  "mesh_floors_roundtrip_within_their_bound_and_refuse_past_it": [
+   "orchestrator/src/state_input.rs:77f2f3fc0e17d53dbbacba9fc992c7fd8b708e37b34885b2457e67c195444fd6"
+  ],
+  "saved_floors_refuse_what_the_previous_process_accepted_after_the_start": [
+   "orchestrator/src/p2p.rs:cded7635f7430061e522011f253e0516f9640d13c25fa62c26b1041cf3b2a35e"
   ]
  },
  "contracts": {
   "IPC-D1": "e84369c8467ecde8cf5c7e61a6e6910925171c98c07eb866d125e423644eef3c",
-  "MESH-F1": "dfe5ab17a1d5f4234b3aac1ad052266011a0eb2bb7cd498e4023ae8bbcf420a0"
+  "MESH-F1": "dfe5ab17a1d5f4234b3aac1ad052266011a0eb2bb7cd498e4023ae8bbcf420a0",
+  "MESH-N2": "2ca92c41d28fc77f962e195ea3eaca6a5c8214b6724ea14e85ea4ecbad4f6cd9"
  },
  "rows": {
   "IPC-D1": {
@@ -28,6 +35,13 @@
     "a_flush_of_many_own_claims_is_retracted_in_frames_a_peer_accepts",
     "a_retraction_is_packed_into_full_frames_within_the_budget"
    ]
+  },
+  "MESH-N2": {
+   "statement": "ec8449838ce065a5f637d0a584ea33384fb90527a7d9a9c3c586b6d93899c3bb",
+   "witnesses": [
+    "mesh_floors_roundtrip_within_their_bound_and_refuse_past_it",
+    "saved_floors_refuse_what_the_previous_process_accepted_after_the_start"
+   ]
   }
  },
  "witnesses": {
@@ -39,6 +53,12 @@
   ],
   "a_retraction_is_packed_into_full_frames_within_the_budget": [
    "orchestrator/src/mesh_sync.rs:448d38c18ead8985d30c99c6c8ef8e746083b405dc6691fccc0da374d4ceb7b6"
+  ],
+  "mesh_floors_roundtrip_within_their_bound_and_refuse_past_it": [
+   "orchestrator/src/state_input.rs:a379546ec86207520cfe807169fa3c84e15b3d3bef46ff395245ae0f2a101eb1"
+  ],
+  "saved_floors_refuse_what_the_previous_process_accepted_after_the_start": [
+   "orchestrator/src/p2p.rs:05f67b5f672f26df26620838472e55195935cba75ff5eda06adc2c48e82600c0"
   ]
  }
 }

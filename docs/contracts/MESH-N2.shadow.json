@@ -1,0 +1,21 @@
+{
+  "annotations": {
+    "status": "UNSIGNED_EXPLANATORY_DRAFT"
+  },
+  "decisions": [
+    {
+      "because": "Round-9 closure of the MESH-N1 limit (ADR-0029): an envelope the previous process accepted with a stamp after the new start was accepted again; the floors saved with the state refuse it. Live: bench/mesh.sh floors F1-F3, control without the wiring fails F1/F3.",
+      "previous_statement_sha256": null,
+      "proposal_sha256": "0aa97299f444231c460a2e5dfd4a8404238c6dfe13c3da9843b41d9d6b0ec7e4"
+    }
+  ],
+  "evidence_text": "`mesh_floors_roundtrip_within_their_bound_and_refuse_past_it`, `saved_floors_refuse_what_the_previous_process_accepted_after_the_start`",
+  "id": "MESH-N2",
+  "profile": "sokol.contract-shadow.v1",
+  "statement": "A restarted node starts each trusted sender's replay window at or above the floor the previous process saved with its state, so an envelope that process accepted is refused again, even stamped after the new start, if a state write after its acceptance reached disk; a sender silent since keeps its floor, a floor is never lowered, and a sender no longer trusted gets none. The saved floors are bounded by MAX_MESH_FLOORS within MAX_STATE_BYTES.",
+  "tier": "provisional",
+  "witnesses": [
+    "mesh_floors_roundtrip_within_their_bound_and_refuse_past_it",
+    "saved_floors_refuse_what_the_previous_process_accepted_after_the_start"
+  ]
+}
