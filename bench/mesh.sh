@@ -108,6 +108,7 @@
 set -euo pipefail
 
 MODE=$1; BIN=$2; MON=$3; N=$4; shift 4
+BENCH_DIR=$(cd "$(dirname "$0")" && pwd)
 ARG=${1:-20}; [ $# -gt 0 ] && shift
 case "$MODE" in propagation|partition|soak|recover|clock|observe|floors|reaction|unblock|relapse|bulkflush|restart) ;;
     *) echo "REFUSED unknown mesh mode"; exit 2 ;; esac
@@ -148,7 +149,10 @@ cleanup() {
     # explained by its own log (panic=abort writes nothing to the kernel log).
     if [ -n "${BENCH_OUT:-}" ]; then
         mkdir -p "$BENCH_OUT/logs"
-        for d in "$WORK"/n*; do [ -f "$d/node.log" ] && cp "$d/node.log" "$BENCH_OUT/logs/$(basename "$d").log"; done
+        for d in "$WORK"/n*; do
+            [ -f "$d/node.log.1" ] && cp "$d/node.log.1" "$BENCH_OUT/logs/$(basename "$d").log.1"
+            [ -f "$d/node.log" ] && cp "$d/node.log" "$BENCH_OUT/logs/$(basename "$d").log"
+        done
     fi
     rm -rf "$WORK"
 }
@@ -239,8 +243,8 @@ start_node() {   # start_node <i> [last seed]: (re)starts node i with its key, s
         --ipc-socket "$WORK/n$i/ipc.sock" --control-socket "$WORK/n$i/ctl.sock" \
         --p2p-bind "10.240.0.$i:7946" --peers-file "$WORK/n$i/peers.json" \
         --metrics-bind 127.0.0.1:9470 --block-ttl "${TTL:-3600}" "${seeds[@]}" $(node_args "$i") \
-        >>"$WORK/n$i/node.log" 2>&1 </dev/null &
-    NODE_PID[$i]=$!
+        > >(python3 -I "$BENCH_DIR/bounded-log.py" "$WORK/n$i/node.log" "${NODE_LOG_MAX:-33554432}") 2>&1 </dev/null &
+    NODE_PID[$i]=$!   # the node itself: the log writer is a process substitution
     PIDS+=($!)
 }
 declare -A NODE_PID
@@ -455,7 +459,7 @@ soak)
     if [ -n "$agreed" ]; then echo "PASS all $N nodes agree on the active blocks ($actives)"; else echo "FAIL active blocks still differ between nodes after 30 s: $actives"; fail=1; fi
     for i in $(seq 1 "$N"); do
         "$MON" --verify "$WORK/n$i/audit.log" >/dev/null 2>&1 || { echo "FAIL node $i audit chain does not verify"; fail=1; }
-        grep -q "panicked" "$WORK/n$i/node.log" && { echo "FAIL node $i panicked"; fail=1; }
+        cat "$WORK/n$i"/node.log* | grep -q "panicked" && { echo "FAIL node $i panicked"; fail=1; }
     done
     [ $fail = 0 ] && echo "PASS every audit chain verifies; no node panicked"
     awk -F, 'NR > 1 && $1 >= 300 { if (!($2 in first)) first[$2] = $3; last[$2] = $3; seen[$2]++; rows++ }

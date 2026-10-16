@@ -3363,7 +3363,7 @@
   },
   "scripts/witness-pin.py": {
    "executable": true,
-   "sha256": "5109560fefd2ef3793ed88b4871da2f10278ead1dcecfce58121b6daff48d65b"
+   "sha256": "2b8603e0faa8b1a6627bedcc148d92ec989156d363516eda84177b2c4b6b2977"
   }
  },
  "trust_root_v2": {
@@ -3401,7 +3401,7 @@
   },
   "scripts/witness-pin.py": {
    "executable": true,
-   "sha256": "5109560fefd2ef3793ed88b4871da2f10278ead1dcecfce58121b6daff48d65b"
+   "sha256": "2b8603e0faa8b1a6627bedcc148d92ec989156d363516eda84177b2c4b6b2977"
   }
  },
  "witnesses": {

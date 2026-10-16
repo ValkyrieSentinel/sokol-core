@@ -663,7 +663,7 @@ def py_closures(names: set[str]) -> dict[str, list[str]]:
                                 reached.append(hit)
                                 queue.append(hit)
                 parts = [segment(fn), *(segment(f) for f in fixtures)]
-                parts += [ast.dump(d) for d in cls.decorator_list]
+                parts += [ast_dump(d) for d in cls.decorator_list]
                 parts += sorted(segment(n) for n in reached)
                 parts.append(import_time({id(fn), *map(id, fixtures), *map(id, reached)}))
                 used: dict[str, set[str]] = {}
@@ -777,6 +777,24 @@ def executed(log: pathlib.Path, pinned: dict, python: pathlib.Path | None = None
             if not re.search(rf"^{re.escape(method)} \(.*\) \.\.\. ok$", ran.get((w, rel), ""), re.M):
                 problems.append(f"witness {w} did not run and pass ({rel})")
     return problems
+
+
+def ast_dump(node) -> str:
+    """ast.dump as Python 3.9-3.12 print it, on any version. From 3.13 ast.dump leaves out empty
+    lists (`keywords=[]`), so a class decorator such as @unittest.skipUnless(...) hashed
+    differently under a newer interpreter and every witness of that class failed locally
+    (2026-10-16, Homebrew Python 3.15), while the owner's pins and CI (3.12) agreed."""
+    if isinstance(node, ast.AST):
+        fields = []
+        for name in node._fields:
+            value = getattr(node, name, None)
+            if value is None and getattr(type(node), name, ...) is None:
+                continue
+            fields.append(f"{name}={ast_dump(value)}")
+        return f"{type(node).__name__}({', '.join(fields)})"
+    if isinstance(node, list):
+        return "[" + ", ".join(ast_dump(x) for x in node) + "]"
+    return repr(node)
 
 
 def strip_py(code: str) -> str:
