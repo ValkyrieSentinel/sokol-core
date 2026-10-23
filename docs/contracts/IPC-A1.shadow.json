@@ -1,0 +1,38 @@
+{
+  "annotations": {
+    "agent_objective": "Reproduce a counterexample without weakening the preserved statement or witnesses.",
+    "answer": "Повна розпізнана кінцева відповідь вузла завершує зобов’язання. Невідома чи незавершена відповідь залишає непрострочене повідомлення в черзі. Переповнення та ввімкнений дедлайн можуть прибрати його як окремо обліковану локальну втрату; запис у сокет сам по собі не є підтвердженням.",
+    "coverage_gap": "The legacy evidence text says overflow test above; IPC-A1 pins only the two named ACK witnesses. Overflow/deadline coverage requires separately inspecting SUR-Q1 and IPC-T1.",
+    "non_claims": [
+      "ACK does not prove durable storage or completed kernel enforcement.",
+      "No exactly-once delivery, durable outbox or eventual progress guarantee.",
+      "Witness helpers and runtime implementation are not pinned by witness-body hashes."
+    ],
+    "owner_path": "orchestrator/src/delivery.rs",
+    "policy_reference": "docs/adr/0023-owner-pinned-witnesses.md",
+    "question": "Коли адаптер може прибрати повідомлення з черги?",
+    "scope": "ACK-mode delivery::Outbox; unexpired queued obligations; adapter-to-node acknowledgement.",
+    "status": "UNSIGNED_EXPLANATORY_DRAFT",
+    "stop_conditions": [
+      "Changing the pinned statement or witnesses requires owner re-pin.",
+      "New delivery guarantees require a separate accepted decision."
+    ]
+  },
+  "decisions": [
+    {
+      "because": "Counterexample (hunt 2026-10-10): a recognized line already buffered before a signal was written was taken as its answer. A node answering one request with two lines settled the next signal, whose own answer was unknown, as Applied; a line appended to the ACK answer retired a signal the node never answered. Fix: Conn::exchange refuses bytes that arrived before the request and drops the connection, keeping the signal queued.",
+      "previous_statement_sha256": "92729d9c94dad884353091082bed03a9a49265b45baf26d170ce17883b9cc335",
+      "proposal_sha256": "8b4b07db3408197738ffa5a54425a680040f0b5b110ddedd3608d0887d0d0b81"
+    }
+  ],
+  "evidence_text": "`unknown_reply_keeps_the_obligation_and_a_later_ack_retires_it`, `an_unterminated_ack_does_not_retire_the_signal`, overflow test above, `a_line_sent_before_the_request_does_not_retire_it`, `a_surplus_answer_does_not_settle_the_next_signal`",
+  "id": "IPC-A1",
+  "profile": "sokol.contract-shadow.v1",
+  "statement": "Transport failure, unknown reply or missing terminating LF retains an unexpired obligation. A complete recognized final reply removes it; bounded overflow and an opt-in forwarding deadline are explicit, separately counted local loss paths. ACK outcome is node acceptance/refusal, not proof of durable storage or completed kernel enforcement.",
+  "witnesses": [
+    "a_line_sent_before_the_request_does_not_retire_it",
+    "a_surplus_answer_does_not_settle_the_next_signal",
+    "an_unterminated_ack_does_not_retire_the_signal",
+    "unknown_reply_keeps_the_obligation_and_a_later_ack_retires_it"
+  ]
+}

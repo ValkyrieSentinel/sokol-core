@@ -1,0 +1,12 @@
+{
+  "annotations": {
+    "status": "UNSIGNED_EXPLANATORY_DRAFT"
+  },
+  "evidence_text": "`a_partially_reproduced_audit_is_not_a_successful_cli_result` (real chained files and `print_report`), XDP smoke requires zero insufficient decisions",
+  "id": "REPLAY-R2",
+  "profile": "sokol.contract-shadow.v1",
+  "statement": "Any insufficient decision prevents CLI success even when earlier/later decisions reproduce. Actual mismatches retain exit 1; complete nonempty replay has exit 0; incomplete/empty replay has exit 2.",
+  "witnesses": [
+    "a_partially_reproduced_audit_is_not_a_successful_cli_result"
+  ]
+}

@@ -31,11 +31,14 @@ cargo test --locked --bins -p orchestrator   # unit tests; no eBPF object or bpf
 cargo test --locked -p common
 cargo clippy --locked --all-targets -- -D warnings   # needs the eBPF object (below)
 cargo fmt --all -- --check
-scripts/check-claims.sh && scripts/check-retired.sh
+scripts/check-claims.sh && scripts/check-retired.sh   # check-claims builds all binaries: eBPF object
 ```
 
-The full `cargo test`, clippy over all targets and the XDP smoke need the eBPF object first:
-`cd ebpf && cargo build --release --locked` (bpf-linker, see README).
+The full `cargo test`, clippy over all targets, `scripts/check-claims.sh` and the XDP smoke need
+the eBPF object first: `cd ebpf && cargo build --release --locked` (bpf-linker, see README).
+Run the tests as a non-root user, as CI does: under root
+`an_unreadable_state_file_is_kept_aside_and_survives_the_next_save` fails, since root reads a
+mode-000 file. A cloud container often runs as root; there that one failure is the host's.
 
 **Run CI before pushing:** `scripts/local-ci.sh` runs the CI job on this host in the same order,
 with the pins and checksums read from `ci.yml` (bpf-linker, GoBGP, cargo-deny), including the
@@ -83,6 +86,13 @@ on a rule here that does neither, and on a cited test, path or flag that does no
 - Documentation claims only what a named test, metric, flag or path shows. *Checked by:*
   `scripts/check-claims.sh`, which checks that what is cited exists (a test in the compiler's
   own list of tests, a proof with `#[kani::proof]` attached), not that it proves the claim.
+- A row of [docs/INVARIANTS.md](docs/INVARIANTS.md) is generated from its contract in
+  `docs/contracts/`; it is never edited by hand. To change a boundary, record an intent with
+  `scripts/contract.py propose` naming the reason (a counterexample, a measurement, a
+  requirement), and stop: accepting it and re-pinning is the owner's act (ADR-0023, ADR-0024).
+  A pinned witness is not weakened, renamed or dropped either; if one is in the way, propose.
+  *Checked by:* `scripts/witness-pin.py check`, run from the base branch in CI
+  (`scripts/test_witness_pin.py` and `scripts/test_contract_tool.py` for the checkers).
 - A retired subject stays retired. *Checked by:* `scripts/check-retired.sh` (see
   [Removing things](#removing-things)).
 

@@ -39,20 +39,23 @@ use common::canonical::CanonicalParser;
 /// FIPS 204 context string of every envelope signature: a signature made for anything else
 /// with the same key never verifies as a mesh envelope.
 const SIGNATURE_CONTEXT: &[u8] = b"sokol-mesh-envelope";
-/// Every frame starts with these bytes and the wire version.
-const WIRE_MAGIC: &[u8; 3] = b"SKM";
+/// Every frame starts with these bytes and the wire version (`common::wire`, proved there).
+const WIRE_MAGIC: &[u8; 3] = common::wire::MAGIC;
 /// Wire versions this node speaks. Handshakes are always sent as v2 envelopes (the stable
 /// bootstrap format). Only v2 exists, so every frame is sealed as v2; a v3 must make the writer
 /// use the version negotiated for its connection (see [`negotiate`]).
-pub const WIRE_VERSION_MIN: u8 = 2;
-pub const WIRE_VERSION_MAX: u8 = 2;
+pub const WIRE_VERSION_MIN: u8 = common::wire::VERSION_MIN;
+pub const WIRE_VERSION_MAX: u8 = common::wire::VERSION_MAX;
 /// Public keys in the peers file and `--print-public-key` carry their algorithm.
 pub const KEY_PREFIX: &str = "mldsa65:";
 /// Node key file: this magic, then the 32-byte ML-DSA seed (FIPS 204 KeyGen_internal input).
 const KEY_FILE_MAGIC: &[u8; 4] = b"SKK2";
 /// A pre-v2 key file: raw Dilithium3 public key (1952 bytes) and secret key (4000 bytes).
 const LEGACY_KEY_FILE_LEN: usize = 1952 + 4000;
-pub const MAX_CLOCK_SKEW_MS: u64 = 30_000;
+pub const MAX_CLOCK_SKEW_MS: u64 = common::replay::MAX_CLOCK_SKEW_MS;
+/// How long a nonce is remembered after it arrived (`common::replay`, proved there to fit
+/// MAX_CLOCK_SKEW_MS).
+const REPLAY_WINDOW_MS: u64 = common::replay::REPLAY_WINDOW_MS;
 /// Measured cost of verifying a small envelope (ADR-0013, `measure_resource_costs`, aarch64).
 pub const VERIFY_SMALL_MICROS: f64 = 25.0;
 
@@ -71,10 +74,6 @@ pub fn inbound_worst_case(peers: usize) -> (f64, f64, f64) {
     )
 }
 
-/// How long a nonce is remembered after it arrived: a timestamp accepted then is at most
-/// MAX_CLOCK_SKEW_MS ahead, so it is stale this long after arrival. Both bounds are inclusive:
-/// at exactly this age the frame is still acceptable, so its nonce is still remembered.
-const REPLAY_WINDOW_MS: u64 = 2 * MAX_CLOCK_SKEW_MS;
 pub const MAX_FRAME_BYTES: usize = 128 * 1024;
 
 // ---- Resource limits of the mesh transport (see ARCHITECTURE, ADR-0013) ----
@@ -85,6 +84,8 @@ pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 /// party cannot hold the slots pinned peers need.
 pub const MAX_PENDING_HANDSHAKES: usize = 16;
 pub const MAX_PENDING_PER_ADDRESS: usize = 2;
+/// Authenticated connections one node may hold here: one it dialled, one this node dialled.
+pub const MAX_CONNECTIONS_PER_NODE: usize = 2;
 /// Frames and bytes an authenticated peer may send, per second and as a burst (a full snapshot
 /// fits the burst). Past that the reader waits: the peer is slowed by TCP, nothing is dropped.
 pub const FRAMES_PER_SEC: f64 = 500.0;
@@ -135,7 +136,10 @@ pub struct MeshStats {
     pub dropped_bulk: std::sync::atomic::AtomicU64,
     /// Envelopes refused, by `EnvelopeError::LABELS`. `stale_timestamp` rising from one peer
     /// means its clock and this node's disagree by more than the envelope window.
-    pub rejected: [std::sync::atomic::AtomicU64; 5],
+    pub rejected: [std::sync::atomic::AtomicU64; EnvelopeError::LABELS.len()],
+    /// Handshakes refused: a pinned node connected from an address its peers-file entry does
+    /// not bind it to (ADR-0027). Its key was used from somewhere it is not.
+    pub wrong_address: std::sync::atomic::AtomicU64,
 }
 
 /// Admission of connections that have not authenticated yet.
@@ -446,6 +450,10 @@ struct PeerEntry {
     /// What this peer may impose on this node (ADR-7); unset fields take the command-line defaults.
     #[serde(default)]
     envelope: Option<EnvelopeSpec>,
+    /// The only source address this node's connections are accepted from (its WireGuard tunnel
+    /// address, ADR-0027). Unset: any address, as before.
+    #[serde(default)]
+    address: Option<std::net::IpAddr>,
 }
 
 /// Per-peer overrides of the envelope defaults, from the peers file.
@@ -453,6 +461,7 @@ struct PeerEntry {
 #[serde(deny_unknown_fields)]
 pub struct EnvelopeSpec {
     pub max_active: Option<usize>,
+    pub max_known: Option<usize>,
     pub max_ttl_secs: Option<u64>,
     pub min_prefix_v4: Option<u8>,
     pub min_prefix_v6: Option<u8>,
@@ -465,6 +474,8 @@ pub struct TrustStore {
     envelopes: HashMap<u64, EnvelopeSpec>,
     /// Peers listed with only a pre-v2 key: not trusted until their ML-DSA key is listed.
     legacy: Vec<u64>,
+    /// Source addresses peers are bound to (ADR-0027).
+    addresses: HashMap<u64, std::net::IpAddr>,
 }
 
 impl TrustStore {
@@ -531,8 +542,45 @@ impl TrustStore {
             if let Some(spec) = entry.envelope {
                 store.envelopes.insert(id, spec);
             }
+            if let Some(address) = entry.address {
+                let address = address.to_canonical();
+                if let Some((other, _)) = store.addresses.iter().find(|(_, a)| **a == address) {
+                    bail!(
+                        "peers file binds address {} to node {} and node {}",
+                        address,
+                        other,
+                        id
+                    );
+                }
+                store.addresses.insert(id, address);
+            }
         }
         Ok(store)
+    }
+
+    /// Binds a pinned node to the only source address its connections are accepted from.
+    pub fn bind_address(&mut self, node_id: u64, address: std::net::IpAddr) {
+        self.addresses.insert(node_id, address.to_canonical());
+    }
+
+    /// Whether a connection from `address` may speak as `node_id`: always for a node the peers
+    /// file binds to no address (ADR-0027).
+    pub fn address_allows(&self, node_id: u64, address: std::net::IpAddr) -> bool {
+        self.addresses
+            .get(&node_id)
+            .is_none_or(|bound| *bound == address.to_canonical())
+    }
+
+    /// Pinned nodes bound to no source address, in order.
+    pub fn unbound(&self) -> Vec<u64> {
+        let mut ids: Vec<u64> = self
+            .keys
+            .keys()
+            .filter(|id| !self.addresses.contains_key(id))
+            .copied()
+            .collect();
+        ids.sort_unstable();
+        ids
     }
 
     pub fn insert(&mut self, node_id: u64, key: VerifyingKey<MlDsa65>) {
@@ -569,60 +617,129 @@ impl TrustStore {
 const REPLAY_PER_SENDER: usize =
     2 * (FRAME_BURST as usize + FRAMES_PER_SEC as usize * (REPLAY_WINDOW_MS / 1000) as usize);
 
-/// One sender's remembered nonces, in arrival order.
+/// One sender's remembered nonces, in arrival order, and the floor its purged ones left
+/// (`common::replay`): an envelope stamped at or below it is refused.
 #[derive(Default)]
 struct SenderWindow {
-    order: std::collections::VecDeque<(u64, u64)>,
+    /// (arrival, nonce, timestamp) of each remembered envelope.
+    order: std::collections::VecDeque<(u64, u64, u64)>,
     seen: std::collections::HashSet<u64>,
+    floor: common::replay::Floor,
 }
 
-/// Remembers `(sender, nonce)` pairs for as long as their timestamp could still be accepted.
+/// Remembers `(sender, nonce)` pairs for as long as their timestamp could still be accepted,
+/// and refuses, per sender, every envelope stamped at or below the newest one it let go.
 ///
 /// Kept per sender and bounded per sender (N02, 2026-09-28): one peer at its full frame rate
 /// fills only its own window, never another's. Only authenticated senders reach it (the
 /// signature is checked first), so the number of windows is bounded by the trust store.
 /// Expiry pops the oldest arrivals, so a frame costs O(1) amortized, not a scan of the cache.
-/// Arrival is wall-clock time, like the acceptance check: after a backward step an entry is
-/// kept longer (the safe side), after a forward step what it guards is stale anyway.
+/// Arrival is wall-clock time, like the acceptance check. Whatever that clock does, an
+/// accepted envelope is in the cache or under its sender's floor, so it is never accepted
+/// twice in one process; a process started with `starting_at` also refuses envelopes stamped
+/// before its start (review of #26, MESH-N1; proved in `common::replay`).
 #[derive(Default)]
 pub struct ReplayGuard {
     senders: HashMap<u64, SenderWindow>,
+    /// The floor a sender's window starts with: this process's start, or none.
+    fence: common::replay::Floor,
 }
 
 impl ReplayGuard {
+    /// A guard for a process started at `started` (wall-clock ms): its cache is empty, so an
+    /// envelope stamped before the start, which the previous process may have accepted, is
+    /// refused.
+    pub fn starting_at(started: u64) -> Self {
+        Self {
+            senders: HashMap::new(),
+            fence: common::replay::fence(started),
+        }
+    }
+
     #[cfg(test)]
     fn remembered(&self) -> usize {
         self.senders.values().map(|w| w.seen.len()).sum()
+    }
+
+    /// Per sender, the newest timestamp this guard accepted or refuses: what the next process
+    /// must refuse too, saved with the node's state (MESH-N2).
+    pub fn floors(&self) -> Vec<(u64, u64)> {
+        let mut floors: Vec<(u64, u64)> = self
+            .senders
+            .iter()
+            .filter_map(|(sender, w)| {
+                let newest = w.order.iter().map(|(_, _, stamped)| *stamped).max();
+                newest.max(w.floor).map(|f| (*sender, f))
+            })
+            .collect();
+        floors.sort_unstable();
+        floors
+    }
+
+    /// Floors saved by the previous process: each sender's window starts at or above its own,
+    /// so an envelope that process accepted is refused even when stamped after this start.
+    pub fn restore_floors(&mut self, floors: impl IntoIterator<Item = (u64, u64)>) {
+        let fence = self.fence;
+        for (sender, saved) in floors {
+            let w = self.senders.entry(sender).or_insert_with(|| SenderWindow {
+                floor: fence,
+                ..SenderWindow::default()
+            });
+            w.floor = common::replay::raise(w.floor, saved);
+        }
     }
 
     fn check_and_record(
         &mut self,
         sender_id: u64,
         nonce: u64,
-        _timestamp_ms: u64,
+        timestamp_ms: u64,
         now: u64,
     ) -> bool {
-        let w = self.senders.entry(sender_id).or_default();
-        while let Some(&(arrived, old)) = w.order.front() {
+        self.admit(sender_id, nonce, timestamp_ms, now).is_ok()
+    }
+
+    /// Records the envelope's nonce, or says why it is refused: under its sender's floor
+    /// (`BeforeWindow`), or a nonce still remembered or a full window (`Replay`).
+    fn admit(
+        &mut self,
+        sender_id: u64,
+        nonce: u64,
+        timestamp_ms: u64,
+        now: u64,
+    ) -> Result<(), EnvelopeError> {
+        let fence = self.fence;
+        let w = self
+            .senders
+            .entry(sender_id)
+            .or_insert_with(|| SenderWindow {
+                floor: fence,
+                ..SenderWindow::default()
+            });
+        while let Some(&(arrived, old, stamped)) = w.order.front() {
             // Kept while the frame could still pass the timestamp check (`<=` skew, inclusive):
             // dropping it at exactly REPLAY_WINDOW_MS let that frame through twice (review
             // 2026-10-05 F4).
-            if arrived.saturating_add(REPLAY_WINDOW_MS) >= now {
+            if common::replay::remembered(arrived, now) {
                 break;
             }
             w.order.pop_front();
             w.seen.remove(&old);
+            w.floor = common::replay::raise(w.floor, stamped);
+        }
+        if !common::replay::admits(timestamp_ms, w.floor) {
+            return Err(EnvelopeError::BeforeWindow);
         }
         if w.seen.contains(&nonce) {
-            return false;
+            return Err(EnvelopeError::Replay);
         }
         // Over its own budget a sender is refused (fail-closed), others are not affected.
         if w.seen.len() >= REPLAY_PER_SENDER {
-            return false;
+            return Err(EnvelopeError::Replay);
         }
         w.seen.insert(nonce);
-        w.order.push_back((now, nonce));
-        true
+        w.order.push_back((now, nonce, timestamp_ms));
+        Ok(())
     }
 }
 
@@ -638,36 +755,10 @@ pub struct SecureEnvelope {
 }
 
 /// Bytes before the payload: magic, version, sender, timestamp, nonce, payload length.
-const ENVELOPE_HEADER_LEN: usize = 3 + 1 + 8 + 8 + 8 + 4;
+const ENVELOPE_HEADER_LEN: usize = common::wire::HEADER_LEN;
 
-/// Why a frame is not a v2 envelope.
-#[derive(Debug, PartialEq, Eq)]
-pub enum WireError {
-    /// Does not start with `SKM`: the pre-versioned protocol (v1, Dilithium3 over bincode).
-    Legacy,
-    /// `SKM` with a version this node does not speak.
-    Unsupported(u8),
-    Malformed(&'static str),
-}
-
-impl std::fmt::Display for WireError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Legacy => write!(
-                f,
-                "peer speaks the pre-versioned mesh protocol (v1: Dilithium3 over bincode); \
-                 this node speaks v{}..v{}: upgrade the peer",
-                WIRE_VERSION_MIN, WIRE_VERSION_MAX
-            ),
-            Self::Unsupported(v) => write!(
-                f,
-                "peer sent mesh wire version {}; this node speaks v{}..v{}",
-                v, WIRE_VERSION_MIN, WIRE_VERSION_MAX
-            ),
-            Self::Malformed(why) => write!(f, "malformed envelope: {}", why),
-        }
-    }
-}
+/// Why a frame is not a v2 envelope (`common::wire`).
+pub use common::wire::WireError;
 
 impl SecureEnvelope {
     /// Wire format v2, all integers little-endian:
@@ -692,39 +783,12 @@ impl SecureEnvelope {
     }
 
     pub fn decode(frame: &[u8]) -> Result<Self, WireError> {
-        let Some((magic, rest)) = frame.split_first_chunk::<3>() else {
-            return Err(WireError::Legacy);
-        };
-        if magic != WIRE_MAGIC {
-            return Err(WireError::Legacy);
-        }
-        let Some((&version, rest)) = rest.split_first() else {
-            return Err(WireError::Malformed("no version"));
-        };
-        if !(WIRE_VERSION_MIN..=WIRE_VERSION_MAX).contains(&version) {
-            return Err(WireError::Unsupported(version));
-        }
-        let field =
-            |rest: &[u8], at: usize| -> Option<[u8; 8]> { rest.get(at..at + 8)?.try_into().ok() };
-        let (Some(sender), Some(timestamp), Some(nonce)) =
-            (field(rest, 0), field(rest, 8), field(rest, 16))
-        else {
-            return Err(WireError::Malformed("short header"));
-        };
-        let payload_len = rest
-            .get(24..28)
-            .and_then(|b| <[u8; 4]>::try_from(b).ok())
-            .map(u32::from_le_bytes)
-            .ok_or(WireError::Malformed("short header"))? as usize;
-        let body = rest.get(28..).unwrap_or_default();
-        let (payload, signature) = body
-            .split_at_checked(payload_len)
-            .ok_or(WireError::Malformed("payload longer than the frame"))?;
+        let (h, payload, signature) = common::wire::split(frame)?;
         Ok(Self {
-            version,
-            sender_id: u64::from_le_bytes(sender),
-            timestamp_ms: u64::from_le_bytes(timestamp),
-            nonce: u64::from_le_bytes(nonce),
+            version: h.version,
+            sender_id: h.sender_id,
+            timestamp_ms: h.timestamp_ms,
+            nonce: h.nonce,
             payload: payload.to_vec(),
             signature: signature.to_vec(),
         })
@@ -740,12 +804,13 @@ fn unsigned_bytes(
     payload: &[u8],
 ) -> Vec<u8> {
     let mut msg = Vec::with_capacity(ENVELOPE_HEADER_LEN + payload.len() + 3309);
-    msg.extend_from_slice(WIRE_MAGIC);
-    msg.push(version);
-    msg.extend_from_slice(&sender_id.to_le_bytes());
-    msg.extend_from_slice(&timestamp_ms.to_le_bytes());
-    msg.extend_from_slice(&nonce.to_le_bytes());
-    msg.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    let h = common::wire::Header {
+        version,
+        sender_id,
+        timestamp_ms,
+        nonce,
+    };
+    msg.extend_from_slice(&common::wire::header(&h, payload.len() as u32));
     msg.extend_from_slice(payload);
     msg
 }
@@ -805,16 +870,21 @@ pub enum EnvelopeError {
     StaleTimestamp,
     Replay,
     MalformedPayload,
+    /// Stamped at or below its sender's floor: older than an envelope of the same sender this
+    /// node already let go, or than this process's start (`common::replay`). After this node's
+    /// clock stepped back, honest envelopes can show up here too.
+    BeforeWindow,
 }
 
 impl EnvelopeError {
     /// Metric label and counter slot, in `MeshStats::rejected` order.
-    pub const LABELS: [&'static str; 5] = [
+    pub const LABELS: [&'static str; 6] = [
         "unknown_sender",
         "bad_signature",
         "stale_timestamp",
         "replay",
         "malformed_payload",
+        "before_window",
     ];
 
     fn slot(&self) -> usize {
@@ -824,6 +894,7 @@ impl EnvelopeError {
             Self::StaleTimestamp => 2,
             Self::Replay => 3,
             Self::MalformedPayload => 4,
+            Self::BeforeWindow => 5,
         }
     }
 }
@@ -866,6 +937,17 @@ pub fn open(
     envelope: &SecureEnvelope,
     now: u64,
 ) -> Result<NetworkMessage, EnvelopeError> {
+    authenticate(trust, envelope, now)?;
+    record_and_decode(replay, envelope, now)
+}
+
+/// Sender, signature and clock window: everything before the replay cache. It reads no shared
+/// state but the trust store, so it runs without the replay lock (`PeerRegistry::open_at`).
+fn authenticate(
+    trust: &TrustStore,
+    envelope: &SecureEnvelope,
+    now: u64,
+) -> Result<(), EnvelopeError> {
     let keys = trust
         .get(envelope.sender_id)
         .ok_or(EnvelopeError::UnknownSender)?;
@@ -886,18 +968,24 @@ pub fn open(
         return Err(EnvelopeError::BadSignature);
     }
 
-    if envelope.timestamp_ms.abs_diff(now) > MAX_CLOCK_SKEW_MS {
+    if !common::replay::fresh(envelope.timestamp_ms, now) {
         return Err(EnvelopeError::StaleTimestamp);
     }
+    Ok(())
+}
 
-    if !replay.check_and_record(
+/// The replay check of an authenticated envelope, then its message.
+fn record_and_decode(
+    replay: &mut ReplayGuard,
+    envelope: &SecureEnvelope,
+    now: u64,
+) -> Result<NetworkMessage, EnvelopeError> {
+    replay.admit(
         envelope.sender_id,
         envelope.nonce,
         envelope.timestamp_ms,
         now,
-    ) {
-        return Err(EnvelopeError::Replay);
-    }
+    )?;
 
     let payload_str =
         std::str::from_utf8(&envelope.payload).map_err(|_| EnvelopeError::MalformedPayload)?;
@@ -984,6 +1072,36 @@ impl PeerRegistry {
         }
     }
 
+    /// The replay guard of a process started at `started` (wall-clock ms): envelopes stamped
+    /// before it are refused, since the previous process's nonces are gone (MESH-N1).
+    pub fn with_startup_fence(self, started: u64) -> Self {
+        *self.replay.lock().unwrap_or_else(|p| p.into_inner()) = ReplayGuard::starting_at(started);
+        self
+    }
+
+    /// Floors the previous process saved (MESH-N2), for senders this trust store still knows:
+    /// a removed peer's floor would hold room for no one.
+    pub fn with_saved_floors(self, floors: &[(u64, u64)]) -> Self {
+        let trust = self.trust.read().unwrap_or_else(|p| p.into_inner()).clone();
+        let known = floors
+            .iter()
+            .copied()
+            .filter(|(id, _)| trust.get(*id).is_some());
+        self.replay
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .restore_floors(known);
+        self
+    }
+
+    /// The replay floors to save with the node's state (MESH-N2).
+    pub fn replay_floors(&self) -> Vec<(u64, u64)> {
+        self.replay
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .floors()
+    }
+
     /// Another per-peer frame rate (tests: reach the pacing path with a few frames).
     #[cfg(test)]
     fn with_frame_limit(mut self, per_sec: f64, burst: f64) -> Self {
@@ -1006,6 +1124,43 @@ impl PeerRegistry {
         {
             let _ = tx.send(addr);
         }
+    }
+
+    /// Registers an authenticated connection unless its node already holds
+    /// MAX_CONNECTIONS_PER_NODE others: the bounds of ADR-0013 (`inbound_worst_case`,
+    /// REPLAY_PER_SENDER) assume a pair of nodes holds at most two connections.
+    pub async fn admit_peer(
+        &self,
+        addr: SocketAddr,
+        link: PeerLink,
+        node_id: u64,
+        conn_id: u64,
+    ) -> bool {
+        {
+            // Checked and inserted under one write lock: two handshakes racing cannot both fit.
+            let mut peers = self.peers.write().await;
+            let held = peers
+                .iter()
+                .filter(|(a, (_, id, _))| *id == node_id && **a != addr)
+                .count();
+            if held >= MAX_CONNECTIONS_PER_NODE {
+                return false;
+            }
+            peers.insert(addr, (link, node_id, conn_id));
+        }
+        info!(
+            "[P2P] Registered authenticated peer: {} [Node ID: {}]",
+            addr, node_id
+        );
+        if let Some(tx) = self
+            .peer_up
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+        {
+            let _ = tx.send(addr);
+        }
+        true
     }
 
     pub fn on_peer_up(&self, tx: mpsc::UnboundedSender<SocketAddr>) {
@@ -1068,10 +1223,37 @@ impl PeerRegistry {
         Ok(())
     }
 
+    /// Whether a connection from `address` may speak as `node_id` under the current store.
+    pub fn address_allows(&self, node_id: u64, address: std::net::IpAddr) -> bool {
+        self.trust
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .address_allows(node_id, address)
+    }
+
     pub fn reload(&self, trust: TrustStore) -> usize {
         let pinned = trust.len();
         *self.trust.write().unwrap_or_else(|p| p.into_inner()) = Arc::new(trust);
         pinned
+    }
+
+    /// Unregisters the connections of nodes the current trust store no longer pins, or binds
+    /// to another address (ADR-0027), so broadcasts stop at the reload rather than at the node's
+    /// next envelope. Their connections still close on that envelope. Returns the node ids.
+    pub async fn drop_untrusted(&self) -> Vec<u64> {
+        let trust = self.trust.read().unwrap_or_else(|p| p.into_inner()).clone();
+        let mut peers = self.peers.write().await;
+        let mut dropped: Vec<u64> = Vec::new();
+        peers.retain(|addr, (_, id, _)| {
+            let keep = trust.get(*id).is_some() && trust.address_allows(*id, addr.ip());
+            if !keep {
+                dropped.push(*id);
+            }
+            keep
+        });
+        dropped.sort_unstable();
+        dropped.dedup();
+        dropped
     }
 
     pub fn pinned_peers(&self) -> usize {
@@ -1108,9 +1290,13 @@ impl PeerRegistry {
         envelope: &SecureEnvelope,
         now: u64,
     ) -> Result<NetworkMessage, EnvelopeError> {
-        let mut replay = self.replay.lock().unwrap_or_else(|p| p.into_inner());
+        // The signature check runs without the replay lock, so connections verify in parallel;
+        // only the cache lookup and insert are serialised.
         let trust = self.trust.read().unwrap_or_else(|p| p.into_inner()).clone();
-        let opened = open(&trust, &mut replay, envelope, now);
+        let opened = authenticate(&trust, envelope, now).and_then(|()| {
+            let mut replay = self.replay.lock().unwrap_or_else(|p| p.into_inner());
+            record_and_decode(&mut replay, envelope, now)
+        });
         if let Err(e) = &opened {
             if let Some(counter) = self.stats.rejected.get(e.slot()) {
                 counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1172,6 +1358,7 @@ impl PeerRegistry {
 }
 
 pub struct P2PNetwork {
+    health: crate::metrics::WorkerHealth,
     bind_addr: SocketAddr,
     node_id: u64,
     crypto: Arc<NodeCrypto>,
@@ -1192,6 +1379,7 @@ impl P2PNetwork {
         registry: PeerRegistry,
     ) -> Self {
         Self {
+            health: crate::metrics::WorkerHealth::default(),
             bind_addr,
             node_id,
             crypto,
@@ -1202,11 +1390,26 @@ impl P2PNetwork {
         }
     }
 
+    pub fn with_health(mut self, health: crate::metrics::WorkerHealth) -> Self {
+        self.health = health;
+        self
+    }
+
     pub async fn run(&self) -> Result<()> {
-        let listener = TcpListener::bind(self.bind_addr)
-            .await
-            .context("Failed to bind P2P listener")?;
-        self.serve(listener).await
+        let result = async {
+            let listener = TcpListener::bind(self.bind_addr)
+                .await
+                .context("Failed to bind P2P listener")?;
+            self.health.set(crate::metrics::WorkerState::Running);
+            self.serve(listener).await
+        }
+        .await;
+        self.health.set(if result.is_ok() {
+            crate::metrics::WorkerState::Stopped
+        } else {
+            crate::metrics::WorkerState::Failed
+        });
+        result
     }
 
     pub async fn serve(&self, listener: TcpListener) -> Result<()> {
@@ -1531,10 +1734,23 @@ async fn handle_reader_loop(
                     envelope.sender_id
                 );
             }
+            // A reload may have bound the node to another address since it authenticated.
+            if !registry.address_allows(peer_id, peer_addr.ip()) {
+                bail!(
+                    "node {} is no longer accepted from {} (peers file)",
+                    peer_id,
+                    peer_addr.ip()
+                );
+            }
         }
 
         let net_msg = match registry.open(&envelope) {
             Ok(msg) => msg,
+            Err(EnvelopeError::Replay) if authenticated_peer.is_none() => {
+                // The first frame must authenticate (ADR-0013): a copy of someone else's frame
+                // does not, and skipping it let a stranger buy a verification per copy.
+                bail!("first frame is a replay, not a handshake");
+            }
             Err(EnvelopeError::Replay) => {
                 warn!(
                     "[P2P] Replayed envelope from {} (node {}, nonce {}) ignored",
@@ -1587,12 +1803,32 @@ async fn handle_reader_loop(
                 if node_id == local_node_id {
                     bail!("peer presented this node's own identity");
                 }
+                // A signed handshake names neither its recipient nor its connection: another
+                // peer could relay one (ADR-0027). The tunnel address it comes from cannot be.
+                if !registry.address_allows(node_id, peer_addr.ip()) {
+                    registry.stats.wrong_address.fetch_add(1, Ordering::Relaxed);
+                    error!(
+                        "[SECURITY ALERT] Node {}'s handshake came from {}, not its peers-file address",
+                        node_id,
+                        peer_addr.ip()
+                    );
+                    bail!(
+                        "node {} connected from an address it is not bound to",
+                        node_id
+                    );
+                }
                 authenticated_peer = Some(node_id);
                 let link = PeerLink {
                     features: features.into(),
                     ..link.clone()
                 };
-                registry.add_peer(peer_addr, link, node_id, conn_id).await;
+                if !registry.admit_peer(peer_addr, link, node_id, conn_id).await {
+                    bail!(
+                        "node {} already holds {} connections",
+                        node_id,
+                        MAX_CONNECTIONS_PER_NODE
+                    );
+                }
                 spawn_ping_loop(writer_tx.clone(), local_node_id, crypto.clone());
             }
             (None, _) => bail!("first message was not a handshake"),
@@ -2065,6 +2301,186 @@ mod tests {
         );
     }
 
+    /// MESH-N1 (review of #26): an accepted envelope is refused again at any moment it is
+    /// fresh, whatever this node's clock did. While its nonce is retained the cache refuses it;
+    /// once a later envelope of the same sender purged the nonce, the sender's floor does
+    /// (`before_window`). Before the floor, the purged case was accepted again after the clock
+    /// returned to the first moment.
+    #[test]
+    fn an_accepted_envelope_is_refused_again_after_a_purge_and_a_step_back() {
+        let peer = NodeCrypto::generate();
+        let trust = trust_with(7, &peer);
+        let at = |timestamp_ms: u64, nonce: u64| {
+            let mut env = seal(&peer, 7, &NetworkMessage::Ping).unwrap();
+            env.timestamp_ms = timestamp_ms;
+            env.nonce = nonce;
+            env.signature = peer
+                .sign(&unsigned_bytes(
+                    env.version,
+                    env.sender_id,
+                    env.timestamp_ms,
+                    env.nonce,
+                    &env.payload,
+                ))
+                .unwrap();
+            env
+        };
+        let original = seal(&peer, 7, &NetworkMessage::Ping).unwrap();
+        let first = original.timestamp_ms;
+        for (later, why) in [
+            (first + REPLAY_WINDOW_MS, EnvelopeError::Replay),
+            (first + REPLAY_WINDOW_MS + 1, EnvelopeError::BeforeWindow),
+        ] {
+            let mut guard = ReplayGuard::default();
+            assert!(open(&trust, &mut guard, &original, first).is_ok());
+            let advance = at(later, original.nonce.wrapping_add(1));
+            assert!(open(&trust, &mut guard, &advance, later).is_ok());
+            assert_eq!(
+                open(&trust, &mut guard, &original, first).unwrap_err(),
+                why,
+                "the original was accepted again after the clock returned"
+            );
+            // An honest envelope stamped after the purged one passes the floor.
+            let honest = at(first + 1, original.nonce.wrapping_add(2));
+            assert!(open(&trust, &mut guard, &honest, first + 1).is_ok());
+        }
+    }
+
+    /// MESH-N1: a restarted node's cache is empty, so an envelope stamped before its start,
+    /// which the previous process may have accepted, is refused (`before_window`); one stamped
+    /// at or after the start passes.
+    #[test]
+    fn a_restarted_node_refuses_envelopes_stamped_before_its_start() {
+        let peer = NodeCrypto::generate();
+        let start = now_ms();
+        let registry = PeerRegistry::new(trust_with(7, &peer)).with_startup_fence(start);
+        let mut before = seal(&peer, 7, &NetworkMessage::Ping).unwrap();
+        before.timestamp_ms = start - 1;
+        before.signature = peer
+            .sign(&unsigned_bytes(
+                before.version,
+                before.sender_id,
+                before.timestamp_ms,
+                before.nonce,
+                &before.payload,
+            ))
+            .unwrap();
+        assert_eq!(
+            registry.open_at(&before, start).unwrap_err(),
+            EnvelopeError::BeforeWindow
+        );
+        let after = seal(&peer, 7, &NetworkMessage::Ping).unwrap();
+        assert!(after.timestamp_ms >= start);
+        assert!(registry.open_at(&after, after.timestamp_ms).is_ok());
+    }
+
+    /// A Ping from node 7, stamped `timestamp_ms` with `nonce`, signed by `peer`.
+    fn ping_at(peer: &NodeCrypto, timestamp_ms: u64, nonce: u64) -> SecureEnvelope {
+        let mut env = seal(peer, 7, &NetworkMessage::Ping).unwrap();
+        env.timestamp_ms = timestamp_ms;
+        env.nonce = nonce;
+        env.signature = peer
+            .sign(&unsigned_bytes(
+                env.version,
+                env.sender_id,
+                env.timestamp_ms,
+                env.nonce,
+                &env.payload,
+            ))
+            .unwrap();
+        env
+    }
+
+    /// MESH-N1's cost at startup (review of #27): with no clock step, an honest peer whose
+    /// clock is 2 ms behind is refused right after the start (`before_window`), and from
+    /// MAX_CLOCK_SKEW_MS after the start on, any envelope fresh here passes the fence.
+    #[test]
+    fn a_peer_whose_clock_is_behind_is_fenced_off_only_just_after_the_start() {
+        let peer = NodeCrypto::generate();
+        let start = 1_000_000;
+        let registry = PeerRegistry::new(trust_with(7, &peer)).with_startup_fence(start);
+        let behind = ping_at(&peer, start - 1, 1);
+        assert!(common::replay::fresh(behind.timestamp_ms, start + 1));
+        assert_eq!(
+            registry.open_at(&behind, start + 1).unwrap_err(),
+            EnvelopeError::BeforeWindow
+        );
+        let settled = start + MAX_CLOCK_SKEW_MS;
+        let oldest_fresh = ping_at(&peer, settled - MAX_CLOCK_SKEW_MS, 2);
+        assert!(registry.open_at(&oldest_fresh, settled).is_ok());
+    }
+
+    /// The fence's reach (review of #27): it refuses only what was stamped before the start.
+    /// An envelope the previous process accepted with a later stamp (its sender's clock ahead)
+    /// is accepted again by the new one; refusing it would need replay state that outlives the
+    /// process.
+    #[test]
+    fn an_envelope_stamped_after_a_restart_passes_the_fence_even_if_seen_before() {
+        let peer = NodeCrypto::generate();
+        let trust = trust_with(7, &peer);
+        let t = 1_000_000;
+        let ahead = ping_at(&peer, t + MAX_CLOCK_SKEW_MS, 3);
+        let before = PeerRegistry::new(trust_with(7, &peer)).with_startup_fence(t);
+        assert!(before.open_at(&ahead, t).is_ok());
+        let after = PeerRegistry::new(trust).with_startup_fence(t + 1);
+        assert!(
+            after.open_at(&ahead, t + 1).is_ok(),
+            "the boundary moved: a restart now refuses envelopes the previous process saw; \
+             update MESH-N1"
+        );
+    }
+
+    /// MESH-N2: with the floors the previous process saved, the envelope it accepted with a
+    /// stamp after the new start is refused, and the same sender's next envelope still passes.
+    /// A floor for a peer no longer trusted is not restored.
+    #[test]
+    fn saved_floors_refuse_what_the_previous_process_accepted_after_the_start() {
+        let peer = NodeCrypto::generate();
+        let t = 1_000_000;
+        let ahead = ping_at(&peer, t + MAX_CLOCK_SKEW_MS, 3);
+        let before = PeerRegistry::new(trust_with(7, &peer)).with_startup_fence(t);
+        assert!(before.open_at(&ahead, t).is_ok());
+        let saved = before.replay_floors();
+        assert_eq!(saved, vec![(7, t + MAX_CLOCK_SKEW_MS)]);
+        let after = PeerRegistry::new(trust_with(7, &peer))
+            .with_startup_fence(t + 1)
+            .with_saved_floors(&saved);
+        assert_eq!(
+            after.open_at(&ahead, t + 1).err(),
+            Some(EnvelopeError::BeforeWindow)
+        );
+        let next = ping_at(&peer, t + MAX_CLOCK_SKEW_MS + 1, 4);
+        assert!(
+            after.open_at(&next, t + 1).is_ok(),
+            "an honest later one passes"
+        );
+        assert_eq!(
+            after.replay_floors(),
+            vec![(7, t + MAX_CLOCK_SKEW_MS + 1)],
+            "carried on to the next write"
+        );
+        let idle = PeerRegistry::new(trust_with(7, &peer)).with_saved_floors(&saved);
+        assert_eq!(
+            idle.replay_floors(),
+            saved,
+            "a sender silent since is carried on"
+        );
+        // A floor older than the new start does not lower the start's fence (MESH-N1).
+        let late = t + 10 * MAX_CLOCK_SKEW_MS;
+        let restarted_late = PeerRegistry::new(trust_with(7, &peer))
+            .with_startup_fence(late)
+            .with_saved_floors(&saved);
+        assert_eq!(
+            restarted_late
+                .open_at(&ping_at(&peer, late - 1, 5), late)
+                .err(),
+            Some(EnvelopeError::BeforeWindow),
+            "stamped before the start, above the saved floor"
+        );
+        let stranger = PeerRegistry::new(trust_with(8, &peer)).with_saved_floors(&saved);
+        assert!(stranger.replay_floors().is_empty(), "only trusted senders");
+    }
+
     #[tokio::test]
     async fn replay_and_stale_envelopes_are_rejected() {
         let peer = NodeCrypto::generate();
@@ -2120,6 +2536,38 @@ mod tests {
             (1, 1, 1)
         );
         assert_eq!(count("bad_signature") + count("malformed_payload"), 0);
+    }
+
+    /// The ML-DSA check is the expensive step of every inbound message; under the shared replay
+    /// mutex it ran one connection at a time on one core (ROADMAP, round-5 mesh candidates).
+    /// The signature is verified without that lock: a forged envelope is refused while another
+    /// connection holds it, and the cache is still written only after a valid signature.
+    #[test]
+    fn a_signature_is_verified_without_holding_the_replay_lock() {
+        let peer = NodeCrypto::generate();
+        let registry = PeerRegistry::new(trust_with(7, &peer));
+        let forged = seal(&NodeCrypto::generate(), 7, &block_cmd("10.0.0.9")).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::scope(|s| {
+            let held = registry.replay.lock().unwrap();
+            s.spawn(|| {
+                let _ = tx.send(registry.open_at(&forged, forged.timestamp_ms));
+            });
+            let outcome = rx.recv_timeout(std::time::Duration::from_secs(10));
+            drop(held);
+            assert_eq!(
+                outcome.ok().map(|r| r.unwrap_err()),
+                Some(EnvelopeError::BadSignature),
+                "a forged envelope is refused while another connection holds the replay lock"
+            );
+        });
+        let env = seal(&peer, 7, &block_cmd("10.0.0.9")).unwrap();
+        assert!(registry.open_at(&env, env.timestamp_ms).is_ok());
+        assert_eq!(
+            registry.open_at(&env, env.timestamp_ms).unwrap_err(),
+            EnvelopeError::Replay,
+            "the replay check still runs, under the lock"
+        );
     }
 
     #[test]
@@ -2937,6 +3385,24 @@ mod tests {
         }
     }
 
+    /// A v1 key file on disk is a raw Dilithium3 public key and secret key, 1952 + 4000 bytes:
+    /// such a file is recognised as one by its size, not taken for a damaged v2 file.
+    #[test]
+    fn a_key_file_of_the_v1_size_on_disk_is_recognised_as_legacy() {
+        let dir = std::env::temp_dir().join(format!("sokol-v1-size-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("node.key");
+        std::fs::write(&path, vec![3u8; 5952]).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        NodeCrypto::load_or_create(&path).unwrap();
+        assert_eq!(
+            std::fs::read(dir.join("node.key.dilithium3.retired")).unwrap(),
+            vec![3u8; 5952]
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn a_legacy_key_file_is_retired_and_a_new_identity_created() {
         let dir = std::env::temp_dir().join(format!("sokol-legacy-key-{}", std::process::id()));
@@ -3513,5 +3979,405 @@ mod tests {
             "bulk went before urgent: {:?}",
             msg
         );
+    }
+
+    fn frame_of(env: &SecureEnvelope) -> Vec<u8> {
+        let bytes = env.encode();
+        let mut frame = (bytes.len() as u32).to_be_bytes().to_vec();
+        frame.extend_from_slice(&bytes);
+        frame
+    }
+
+    async fn connections_of(registry: &PeerRegistry, node: u64) -> usize {
+        registry
+            .peers_for_test()
+            .read()
+            .await
+            .values()
+            .filter(|(_, id, _)| *id == node)
+            .count()
+    }
+
+    /// ADR-0013: the first frame has to authenticate; ARCHITECTURE 7.1: the first message
+    /// must be a handshake. A replayed frame before the handshake is skipped instead of closing
+    /// the connection, so an unauthenticated connection can make the node verify (ML-DSA, under
+    /// the shared replay mutex, unpaced) every copy it sends for HANDSHAKE_TIMEOUT.
+    #[tokio::test]
+    async fn an_unauthenticated_connection_cannot_buy_more_than_one_verification() {
+        use std::sync::atomic::Ordering;
+        let (addr, registry, peer, _rx, _stop) = listening_node().await;
+        let hello = seal(&peer, 2, &NetworkMessage::handshake(2)).unwrap();
+        let mut real = TcpStream::connect(addr).await.unwrap();
+        real.write_all(&frame_of(&hello)).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            registry.peer_count().await,
+            1,
+            "setup: node 2 authenticated"
+        );
+
+        // Whoever saw that frame on the wire sends it again and again, never authenticating.
+        let mut stranger = TcpStream::connect(addr).await.unwrap();
+        let copy = frame_of(&hello);
+        for _ in 0..50 {
+            if stranger.write_all(&copy).await.is_err() {
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+        let verified = registry.stats.rejected[3].load(Ordering::Relaxed);
+        assert_eq!(
+            verified, 1,
+            "an unauthenticated connection had {} replayed frames signature-checked; the first \
+             frame that does not authenticate must end it",
+            verified
+        );
+        drop(real);
+    }
+
+    /// ADR-0013: "a pair of nodes can hold two connections", from which the node-wide
+    /// worst case (`inbound_worst_case`) and the per-sender replay bound (REPLAY_PER_SENDER) are
+    /// derived. Nothing enforces it: one pinned peer can authenticate any number of inbound
+    /// connections (up to the 100 the listener allows, starving every other peer's inbound slot).
+    #[tokio::test]
+    async fn one_peer_cannot_hold_more_connections_than_the_bounds_assume() {
+        let (addr, registry, peer, _rx, _stop) = listening_node().await;
+        let mut open = Vec::new();
+        for _ in 0..4 {
+            let mut s = TcpStream::connect(addr).await.unwrap();
+            let hello = seal(&peer, 2, &NetworkMessage::handshake(2)).unwrap();
+            s.write_all(&frame_of(&hello)).await.unwrap();
+            open.push(s);
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        let held = connections_of(&registry, 2).await;
+        assert!(
+            held <= 2,
+            "node 2 holds {} authenticated connections; inbound_worst_case and REPLAY_PER_SENDER \
+             assume at most two per pair",
+            held
+        );
+        drop(open);
+    }
+
+    /// The per-node cap counts that node's connections only: other peers' connections do not
+    /// use up its slots.
+    #[tokio::test]
+    async fn other_peers_connections_do_not_use_up_a_nodes_slots() {
+        let peers: Vec<NodeCrypto> = (0..3).map(|_| NodeCrypto::generate()).collect();
+        let mut trust = TrustStore::default();
+        for (i, c) in peers.iter().enumerate() {
+            trust.insert(2 + i as u64, c.public_key.clone());
+        }
+        let (addr, registry, _peer, _rx, _stop) =
+            listening_node_with(move |_| PeerRegistry::new(trust)).await;
+        let mut open = Vec::new();
+        for (i, c) in peers.iter().enumerate() {
+            let id = 2 + i as u64;
+            let mut s = TcpStream::connect(addr).await.unwrap();
+            let hello = seal(c, id, &NetworkMessage::handshake(id)).unwrap();
+            s.write_all(&frame_of(&hello)).await.unwrap();
+            open.push(s);
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        for id in 2..5 {
+            assert_eq!(
+                connections_of(&registry, id).await,
+                1,
+                "node {id} was refused its first connection"
+            );
+        }
+        drop(open);
+    }
+
+    /// After the handshake a replayed frame is ignored, not fatal: only an unauthenticated
+    /// connection is closed by one.
+    #[tokio::test]
+    async fn an_authenticated_connection_survives_a_replayed_frame() {
+        let (addr, registry, peer, _rx, _stop) = listening_node().await;
+        let hello = seal(&peer, 2, &NetworkMessage::handshake(2)).unwrap();
+        let mut s = TcpStream::connect(addr).await.unwrap();
+        s.write_all(&frame_of(&hello)).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            connections_of(&registry, 2).await,
+            1,
+            "setup: node 2 authenticated"
+        );
+        s.write_all(&frame_of(&hello)).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            connections_of(&registry, 2).await,
+            1,
+            "a replayed frame on an authenticated connection closed it"
+        );
+        drop(s);
+    }
+
+    /// A connection to `to` from a chosen loopback source address (Linux routes all of
+    /// 127.0.0.0/8 to lo).
+    async fn connect_from(source: &str, to: SocketAddr) -> TcpStream {
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind(format!("{source}:0").parse().unwrap()).unwrap();
+        socket.connect(to).await.unwrap()
+    }
+
+    /// ADR-0027: a signed handshake names neither its recipient nor its connection, so node 3
+    /// (a pinned, possibly compromised peer) could take the handshake node 2 sent *to node 3*
+    /// and replay it to node 1, which authenticated the relaying connection as node 2 and sent
+    /// node 2's broadcasts to node 3. With node 2 bound to its address, the relay is refused
+    /// and the real node 2 keeps receiving.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_handshake_relayed_by_another_peer_does_not_take_over_its_delivery() {
+        let c1 = Arc::new(NodeCrypto::generate());
+        let c2 = Arc::new(NodeCrypto::generate());
+        let c3 = NodeCrypto::generate();
+        let mut t1 = TrustStore::default();
+        t1.insert(2, c2.public_key.clone());
+        t1.insert(3, c3.public_key.clone());
+        t1.bind_address(2, "127.0.0.1".parse().unwrap());
+        t1.bind_address(3, "127.0.0.3".parse().unwrap());
+        let mut t2 = TrustStore::default();
+        t2.insert(1, c1.public_key.clone());
+        t2.insert(3, c3.public_key.clone());
+        let reg1 = PeerRegistry::new(t1);
+        let reg2 = PeerRegistry::new(t2);
+
+        let (tx1, _rx1) = mpsc::channel(64);
+        let (_stop1, stop_rx1) = watch::channel(false);
+        let l1 = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr1 = l1.local_addr().unwrap();
+        let net1 = P2PNetwork::new(addr1, 1, c1.clone(), tx1, 16, stop_rx1, reg1.clone());
+        tokio::spawn(async move { net1.serve(l1).await });
+
+        // The real node 2 dials node 1 (from 127.0.0.1, its bound address) and authenticates.
+        let (tx2, mut rx2) = mpsc::channel(64);
+        tokio::spawn(connect_to_peer(
+            addr1,
+            2,
+            c2.clone(),
+            reg2.clone(),
+            tx2.clone(),
+        ));
+        for _ in 0..50 {
+            if reg1.peer_count().await == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            reg1.peer_count().await,
+            1,
+            "setup: node 2 connected to node 1"
+        );
+
+        // Node 2 also dials node 3 (a seed) and sends it its handshake.
+        let l3 = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr3 = l3.local_addr().unwrap();
+        tokio::spawn(connect_to_peer(addr3, 2, c2.clone(), reg2.clone(), tx2));
+        let (mut from2, _) = l3.accept().await.unwrap();
+        let mut len = [0u8; 4];
+        from2.read_exact(&mut len).await.unwrap();
+        let mut hs = vec![0u8; u32::from_be_bytes(len) as usize];
+        from2.read_exact(&mut hs).await.unwrap();
+
+        // Node 3 relays that handshake to node 1 from its own address.
+        let mut relay = connect_from("127.0.0.3", addr1).await;
+        relay.write_all(&len).await.unwrap();
+        relay.write_all(&hs).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            reg1.stats
+                .wrong_address
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the relayed handshake was not refused for its address"
+        );
+
+        reg1.broadcast(&alert("203.0.113.7"), 1, &c1).await.unwrap();
+        let got = timeout(Duration::from_secs(2), rx2.recv()).await;
+        assert!(
+            matches!(got, Ok(Some(MeshCommand::Alert { .. }))),
+            "node 2 did not get node 1's broadcast: node 3's connection, authenticated by node 2's \
+             relayed handshake, took it (node 1 holds {} connections as node 2)",
+            connections_of(&reg1, 2).await
+        );
+        drop(relay);
+    }
+
+    /// ADR-0027: a node bound to an address authenticates only from it; any other source is
+    /// refused and counted. A node bound to no address is accepted from anywhere, as before.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_bound_node_authenticates_only_from_its_address() {
+        let peer = NodeCrypto::generate();
+        let other = NodeCrypto::generate();
+        let mut trust = trust_with(2, &peer);
+        trust.insert(3, other.public_key.clone());
+        trust.bind_address(2, "127.0.0.2".parse().unwrap());
+        let (addr, registry, _p, _rx, _stop) =
+            listening_node_with(move |_| PeerRegistry::new(trust)).await;
+        let hello = |c: &NodeCrypto, id: u64| {
+            frame_of(&seal(c, id, &NetworkMessage::handshake(id)).unwrap())
+        };
+
+        let mut wrong = connect_from("127.0.0.5", addr).await;
+        wrong.write_all(&hello(&peer, 2)).await.unwrap();
+        let mut right = connect_from("127.0.0.2", addr).await;
+        right.write_all(&hello(&peer, 2)).await.unwrap();
+        let mut unbound = connect_from("127.0.0.5", addr).await;
+        unbound.write_all(&hello(&other, 3)).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        assert_eq!(
+            registry
+                .stats
+                .wrong_address
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            connections_of(&registry, 2).await,
+            1,
+            "node 2 from its own address"
+        );
+        let peers = registry.peers_for_test();
+        let from: Vec<_> = peers
+            .read()
+            .await
+            .iter()
+            .filter(|(_, (_, id, _))| *id == 2)
+            .map(|(a, _)| a.ip())
+            .collect();
+        assert_eq!(from, vec!["127.0.0.2".parse::<std::net::IpAddr>().unwrap()]);
+        assert_eq!(
+            connections_of(&registry, 3).await,
+            1,
+            "an unbound node is accepted anywhere"
+        );
+        drop((wrong, right, unbound));
+    }
+
+    /// `drop_untrusted` names exactly the nodes it unregistered: revoked (2) and bound to an
+    /// address they are not connected from (3, both of its connections); a kept node (4) and an
+    /// unbound one connected from anywhere (5) stay.
+    #[tokio::test]
+    async fn drop_untrusted_unregisters_and_names_revoked_and_moved_nodes() {
+        let keys: Vec<NodeCrypto> = (0..4).map(|_| NodeCrypto::generate()).collect();
+        let mut trust = TrustStore::default();
+        for (id, key) in (2u64..).zip(&keys) {
+            trust.insert(id, key.public_key.clone());
+        }
+        let registry = PeerRegistry::new(trust);
+        let mut rxs = Vec::new();
+        for (addr, id, conn) in [
+            ("127.0.0.2:1", 2u64, 1u64),
+            ("127.0.0.3:1", 3, 2),
+            ("127.0.0.3:2", 3, 3),
+            ("192.0.2.4:1", 4, 4),
+            ("198.51.100.5:1", 5, 5),
+        ] {
+            let (tx, rx) = mpsc::channel(1);
+            rxs.push(rx);
+            registry
+                .add_peer(addr.parse().unwrap(), one_queue(tx), id, conn)
+                .await;
+        }
+        let mut next = TrustStore::default();
+        for (id, key) in (3u64..).zip(&keys[1..]) {
+            next.insert(id, key.public_key.clone());
+        }
+        next.bind_address(3, "192.0.2.3".parse().unwrap());
+        next.bind_address(4, "192.0.2.4".parse().unwrap());
+        registry.reload(next);
+        assert_eq!(registry.drop_untrusted().await, vec![2, 3]);
+        assert_eq!(
+            (
+                connections_of(&registry, 2).await,
+                connections_of(&registry, 3).await,
+                connections_of(&registry, 4).await,
+                connections_of(&registry, 5).await
+            ),
+            (0, 0, 1, 1)
+        );
+        assert!(
+            registry.drop_untrusted().await.is_empty(),
+            "nothing left to drop"
+        );
+    }
+
+    /// ADR-0027: a reload that binds a connected node to another address closes its connection
+    /// on the node's next envelope.
+    #[tokio::test]
+    async fn a_reload_that_moves_a_node_closes_its_connection() {
+        let (addr, registry, peer, _rx, _stop) = listening_node().await;
+        let mut s = TcpStream::connect(addr).await.unwrap();
+        s.write_all(&frame_of(
+            &seal(&peer, 2, &NetworkMessage::handshake(2)).unwrap(),
+        ))
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            connections_of(&registry, 2).await,
+            1,
+            "setup: node 2 authenticated"
+        );
+
+        let mut moved = trust_with(2, &peer);
+        moved.bind_address(2, "192.0.2.2".parse().unwrap());
+        registry.reload(moved);
+        s.write_all(&frame_of(&seal(&peer, 2, &NetworkMessage::Ping).unwrap()))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            connections_of(&registry, 2).await,
+            0,
+            "node 2 kept speaking from an address the peers file no longer binds it to"
+        );
+    }
+
+    /// ADR-0027: `address` is read from the peers file (an IPv4-mapped IPv6 form is the IPv4
+    /// address), one address cannot be bound to two nodes, and unbound nodes are listed.
+    #[test]
+    fn peers_file_addresses_are_parsed_and_checked() {
+        let a = NodeCrypto::generate();
+        let b = NodeCrypto::generate();
+        let (ka, kb) = (a.public_key_hex(), b.public_key_hex());
+        let path = peers_file(
+            "address",
+            &format!(
+                r#"[{{"node_id": 2, "public_key": "{ka}", "address": "::ffff:10.99.0.2"}},
+                    {{"node_id": 3, "public_key": "{kb}"}}]"#
+            ),
+        );
+        let store = TrustStore::load(&path).unwrap();
+        assert!(store.address_allows(2, "10.99.0.2".parse().unwrap()));
+        assert!(!store.address_allows(2, "10.99.0.3".parse().unwrap()));
+        assert!(store.address_allows(3, "203.0.113.1".parse().unwrap()));
+        assert_eq!(store.unbound(), vec![3]);
+
+        let path = peers_file(
+            "address-twice",
+            &format!(
+                r#"[{{"node_id": 2, "public_key": "{ka}", "address": "10.99.0.2"}},
+                    {{"node_id": 3, "public_key": "{kb}", "address": "10.99.0.2"}}]"#
+            ),
+        );
+        let err = TrustStore::load(&path)
+            .err()
+            .expect("one address for two nodes");
+        assert!(
+            format!("{err:#}").contains("binds address 10.99.0.2"),
+            "{err:#}"
+        );
+
+        let path = peers_file(
+            "address-garbage",
+            &format!(r#"[{{"node_id": 2, "public_key": "{ka}", "address": "10.99.0"}}]"#),
+        );
+        assert!(TrustStore::load(&path).is_err());
     }
 }

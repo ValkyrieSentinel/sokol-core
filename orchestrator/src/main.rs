@@ -35,11 +35,15 @@ mod mesh_dispatch;
 mod mesh_sync;
 mod metrics;
 mod p2p;
+mod protection;
 mod replay;
 mod shutdown;
 mod signal;
 mod sokol;
+mod state_input;
 mod state_store;
+#[cfg(test)]
+mod status_tests;
 
 use aya::maps::{Array, LpmTrie, MapData, PerCpuArray, RingBuf};
 use aya::programs::Xdp;
@@ -69,6 +73,7 @@ use crate::ipc::*;
 use crate::p2p::{
     maintain_peer_connection, now_ms, NodeCrypto, P2PNetwork, PeerRegistry, TrustStore,
 };
+use crate::protection::ProtectionReason;
 use ipnet::IpNet;
 
 /// Audit trail writer. Records are queued (bounded, so a flood cannot exhaust memory) and
@@ -429,9 +434,14 @@ struct Args {
     storm_mode: defense::StormMode,
     /// A peer's claims enforced here at once (ADR-7); further ones wait for a free slot.
     /// A peer can be given its own limits in the peers file: "envelope": {"max_active": ..,
-    /// "max_ttl_secs": .., "min_prefix_v4": .., "min_prefix_v6": ..}.
+    /// "max_known": .., "max_ttl_secs": .., "min_prefix_v4": .., "min_prefix_v6": ..}.
     #[arg(long, default_value = "16384")]
     peer_max_active: usize,
+
+    /// A peer's claims known here at once, enforced or waiting (ADR-0025); further ones are
+    /// refused. Peers together never take the room kept for this node's own decisions.
+    #[arg(long, default_value = "65536")]
+    peer_max_known: usize,
 
     /// Longest a peer's claim is enforced here, in seconds (default: --block-ttl-max).
     #[arg(long)]
@@ -617,8 +627,9 @@ struct Args {
     #[arg(long, default_value = "48")]
     min_block_prefix_v6: u8,
 
-    /// Share of live nodes under attack above which the cluster is in a distributed storm.
-    #[arg(long, default_value = "0.5")]
+    /// Share of live nodes under attack above which the cluster is in a distributed storm;
+    /// finite and in [0, 1), anything else is refused at startup.
+    #[arg(long, default_value = "0.5", value_parser = cluster_state::parse_storm_threshold)]
     storm_threshold: f64,
 }
 
@@ -660,7 +671,7 @@ fn build_block_policy(args: &Args) -> anyhow::Result<BlockPolicy> {
     policy.set_min_prefix(args.min_block_prefix_v4, args.min_block_prefix_v6);
     for seed in &args.seed_peer {
         if let Ok(addr) = seed.trim().parse::<std::net::SocketAddr>() {
-            policy.protect_ip(addr.ip(), "mesh seed peer");
+            policy.protect_ip(addr.ip(), ProtectionReason::MeshSeedPeer);
         }
     }
     let cidr = |flag: &str, raw: &str| -> anyhow::Result<ipnet::IpNet> {
@@ -672,10 +683,13 @@ fn build_block_policy(args: &Args) -> anyhow::Result<BlockPolicy> {
         })
     };
     for raw in &args.never_block {
-        policy.protect(cidr("--never-block", raw)?, "operator never-block range");
+        policy.protect(
+            cidr("--never-block", raw)?,
+            ProtectionReason::OperatorNeverBlock,
+        );
     }
     for raw in &args.home_net {
-        policy.protect(cidr("--home-net", raw)?, block_policy::HOME_NETWORK);
+        policy.protect(cidr("--home-net", raw)?, ProtectionReason::HomeNetwork);
     }
     Ok(policy)
 }
@@ -707,6 +721,7 @@ impl PeerLimits {
         Self {
             default: Envelope {
                 max_active: args.peer_max_active,
+                max_known: args.peer_max_known,
                 max_ttl: Duration::from_secs(args.peer_max_ttl.unwrap_or(args.block_ttl_max)),
                 min_prefix_v4: 0,
                 min_prefix_v6: 0,
@@ -728,6 +743,7 @@ impl PeerLimits {
                     *id,
                     Envelope {
                         max_active: spec.max_active.unwrap_or(self.default.max_active),
+                        max_known: spec.max_known.unwrap_or(self.default.max_known),
                         max_ttl: spec
                             .max_ttl_secs
                             .map_or(self.default.max_ttl, Duration::from_secs),
@@ -773,15 +789,23 @@ async fn send_snapshot<B: block_table::Blocklist>(
 /// Writes the durable part of the table atomically (temp file + rename, mode 0600).
 use state_store::{Restore, StateStore};
 
+/// The mesh registry whose replay floors are saved with each state write (MESH-N2); set once
+/// the registry exists. Read after the table's durable part is taken, so the floors cover
+/// every envelope whose effect that part records.
+static REPLAY_FLOORS: std::sync::OnceLock<p2p::PeerRegistry> = std::sync::OnceLock::new();
+
 /// Hands the table's durable part to the state writer if it changed; never waits for the disk.
 async fn submit_state<B: block_table::Blocklist>(
     store: &StateStore,
     blocks: &SharedBlockTable<B>,
 ) -> Option<u64> {
     let mut table = blocks.lock().await;
-    let state = table
+    let mut state = table
         .dirty()
         .then(|| table.take_persisted(block_table::local_ms()))?;
+    if let Some(registry) = REPLAY_FLOORS.get() {
+        state.mesh_floors = registry.replay_floors();
+    }
     // Clearing dirty, capturing the snapshot and assigning its generation are
     // one ordered handoff. Neither a newer capture nor a clean caller may pass
     // between them. submit does no filesystem work; wait_durable runs after unlock.
@@ -912,7 +936,7 @@ async fn enforce_block_local<B: block_table::Blocklist>(
     registry: &PeerRegistry,
     node_id: u64,
     node_crypto: &Arc<NodeCrypto>,
-    policy: &BlockPolicy,
+    policy: &PolicyHandle,
     detection: Detection<'_>,
 ) -> Enforcement {
     let Detection {
@@ -926,7 +950,12 @@ async fn enforce_block_local<B: block_table::Blocklist>(
     };
     let ip = block_table::canonical(target);
     let shown = show(&ip);
-    if let Err(why) = policy.check_net(ip) {
+    // The decision time is read, and the decision record submitted, under the
+    // table lock, so audit order is lock order and no tick applied a later time first.
+    let mut table = blocks.lock().await;
+    // The policy too: the host refresh replaces it and rechecks the table under this lock, so
+    // a check before the lock could add an address that has been protected since.
+    if let Err(why) = policy.current().check_net(ip) {
         log::error!(
             "[Local Security] Refusing to block {} ({}) | Requested for: {}",
             shown,
@@ -954,11 +983,8 @@ async fn enforce_block_local<B: block_table::Blocklist>(
     }
     // One step under the table lock (event, strike and claim together, so no state save sees
     // one without the others); the same step audit replay takes (ADR-0016).
-    let (detected, shares_own) = {
-        let mut table = blocks.lock().await;
-        let detected = table.detect(ip, reason, now, event, requested);
-        (detected, table.shares_own())
-    };
+    let detected = table.detect(ip, reason, now, event, requested);
+    let shares_own = table.shares_own();
     let added = match detected {
         block_table::Detected::Duplicate => {
             // The exact wording is an operator-facing contract (xdp-smoke greps it).
@@ -1025,6 +1051,7 @@ async fn enforce_block_local<B: block_table::Blocklist>(
             Enforcement::Pending
         }
     });
+    drop(table);
     // Mutation and audit submission share one poll. Shutdown may cancel publication or
     // the reply afterwards; a missing ACK is not evidence that the decision was refused.
     if added.new && shares_own {
@@ -1034,13 +1061,31 @@ async fn enforce_block_local<B: block_table::Blocklist>(
             .await;
     }
     if outcome == Enforcement::Enforced {
-        let telemetry_msg = format!(
-            "DROP_IMMEDIATE:{}\nDB_LOG:NODE={}|TIER=Tier1BotTarpit|IP={}|VEC={}\n",
-            shown, node_id, shown, reason
-        );
-        push_telemetry(&telemetry_msg).await;
+        push_telemetry(&enforced_telemetry(node_id, &shown, reason)).await;
     }
     outcome
+}
+
+/// The startup warning naming pinned peers the peers file binds to no address (ADR-0027).
+fn unbound_peers_warning(trust: &TrustStore) -> Option<String> {
+    let unbound = trust.unbound();
+    (!unbound.is_empty()).then(|| {
+        format!(
+            "[P2P] Peers {:?} have no \"address\" in the peers file: a handshake relayed by another \
+             peer can authenticate as them (ADR-0027). Bind each to its WireGuard tunnel address.",
+            unbound
+        )
+    })
+}
+
+/// What an enforced local block tells the operator: the ban (`DROP_IMMEDIATE`) and an alert.
+/// A block is not a trap hit: its tier is `LocalBlock`, which no trap tier counter takes
+/// (OPERATOR-T1: an unknown tier stays alert-visible). A trap hit reports its own tier.
+fn enforced_telemetry(node_id: u64, shown: &str, reason: &str) -> String {
+    format!(
+        "DROP_IMMEDIATE:{}\nDB_LOG:NODE={}|TIER=LocalBlock|IP={}|VEC={}\n",
+        shown, node_id, shown, reason
+    )
 }
 
 /// Build the first FlowSpec intent before its worker can run. Called after static
@@ -1094,6 +1139,9 @@ async fn main() -> Result<(), anyhow::Error> {
         }
     };
     log_inbound_budget(trust_store.len());
+    if let Some(warning) = unbound_peers_warning(&trust_store) {
+        log::warn!("{}", warning);
+    }
 
     // The static part (built-in ranges, seeds, --never-block) plus the host's own addresses and
     // gateways, which are re-read while the node runs (the protected set follows the host).
@@ -1293,6 +1341,8 @@ async fn main() -> Result<(), anyhow::Error> {
         .unwrap_or_else(|| std::path::PathBuf::from(format!("{}.blocks.json", args.db_path)));
     let state_store = Arc::new(StateStore::new(state_file.clone()));
     let mut producers = shutdown::Producers::new();
+    let mesh_worker_health = metrics::WorkerHealth::default();
+    let kernel_worker_health = metrics::WorkerHealth::default();
 
     let stats_map_data = bpf
         .take_map("STATS")
@@ -1303,6 +1353,8 @@ async fn main() -> Result<(), anyhow::Error> {
         match RingBuf::try_from(events_map_data) {
             Ok(ring_buf) => match AsyncFd::new(ring_buf) {
                 Ok(mut async_fd) => {
+                    let worker = kernel_worker_health.clone();
+                    worker.set(metrics::WorkerState::Running);
                     let db_events = sntl_db.clone();
                     let node_id_ev = args.node_id;
                     producers.spawn(async move {
@@ -1318,13 +1370,15 @@ async fn main() -> Result<(), anyhow::Error> {
                                         if let Some(log_msg) = kernel_events::audit_line(&item) {
                                             db_events.append(log_msg.clone());
 
-                                            let telemetry_msg = format!("DB_LOG:NODE={}|TIER=Tier1BotTarpit|IP=0.0.0.0|VEC={}\n", node_id_ev, log_msg);
+                                            let telemetry_msg =
+                                                kernel_events::telemetry_line(node_id_ev, &log_msg);
                                             push_telemetry(&telemetry_msg).await;
                                         }
                                     }
                                     guard.clear_ready();
                                 }
                                 Err(e) => {
+                                    worker.set(metrics::WorkerState::Failed);
                                     log::error!(
                                         "[eBPF RingBuf] Failed to get readable guard: {}",
                                         e
@@ -1336,6 +1390,7 @@ async fn main() -> Result<(), anyhow::Error> {
                     });
                 }
                 Err(e) => {
+                    kernel_worker_health.set(metrics::WorkerState::Failed);
                     log::error!(
                         "[eBPF RingBuf] Failed to wrap ring buffer in AsyncFd: {}",
                         e
@@ -1343,12 +1398,15 @@ async fn main() -> Result<(), anyhow::Error> {
                 }
             },
             Err(e) => {
+                kernel_worker_health.set(metrics::WorkerState::Failed);
                 log::error!(
                     "[eBPF RingBuf] Failed to create RingBuf from map data: {}",
                     e
                 );
             }
         }
+    } else {
+        kernel_worker_health.set(metrics::WorkerState::Failed);
     }
 
     for ip_str in &args.block {
@@ -1382,9 +1440,11 @@ async fn main() -> Result<(), anyhow::Error> {
 
     // R27-04: a state file that cannot be restored is not a first start. Its bytes are kept, and
     // the node stays DEGRADED until the operator accepts the loss (ACCEPT_STATE_LOSS).
+    let mut saved_floors = Vec::new();
     let restore = match state_store.read() {
         Ok(None) => Restore::Fresh,
-        Ok(Some(state)) => {
+        Ok(Some(mut state)) => {
+            saved_floors = std::mem::take(&mut state.mesh_floors);
             let (restored, refused) = blocks.lock().await.restore(
                 state,
                 |net| block_policy.current().check_net(net).is_ok(),
@@ -1427,7 +1487,14 @@ async fn main() -> Result<(), anyhow::Error> {
         let _ = shutdown_tx_ctrlc.send(true);
     })?;
 
-    let peer_registry = PeerRegistry::new(trust_store);
+    // Envelopes stamped before this start are refused: the previous process may have accepted
+    // them and its nonces are gone (MESH-N1); an honest peer whose clock is behind can be
+    // refused for up to MAX_CLOCK_SKEW_MS. The floors it saved refuse, per sender, what it
+    // accepted with a later stamp, up to its last state write (MESH-N2).
+    let peer_registry = PeerRegistry::new(trust_store)
+        .with_startup_fence(p2p::now_ms())
+        .with_saved_floors(&saved_floors);
+    let _ = REPLAY_FLOORS.set(peer_registry.clone());
     let (mesh_cmd_tx, mesh_cmd_rx) = mpsc::channel::<MeshCommand>(1000);
     // This node's own detections and storm latch; never on the wire (review 2026-10-05 W3.2).
     let (local_cmd_tx, local_cmd_rx) = mpsc::channel::<mesh_sync::LocalCommand>(1000);
@@ -1445,7 +1512,8 @@ async fn main() -> Result<(), anyhow::Error> {
         100,
         shutdown_rx.clone(),
         peer_registry.clone(),
-    );
+    )
+    .with_health(mesh_worker_health.clone());
 
     producers.spawn(async move {
         if let Err(e) = p2p_network.run().await {
@@ -1579,7 +1647,7 @@ async fn main() -> Result<(), anyhow::Error> {
                                     &registry_trap,
                                     node_id_trap,
                                     &crypto_trap,
-                                    &policy_trap.current(),
+                                    &policy_trap,
                                     Detection {
                                         source: detections::TRAP,
                                         ..Detection::default()
@@ -1661,17 +1729,24 @@ async fn main() -> Result<(), anyhow::Error> {
                 let mut line = String::new();
                 let mut budget = p2p::Bucket::new(CONTROL_LINES_PER_SEC, CONTROL_LINE_BURST);
                 loop {
-                    line.clear();
-                    let mut limited = (&mut reader).take(control::MAX_LINE);
-                    match tokio::time::timeout(CONTROL_IDLE, limited.read_line(&mut line)).await {
-                        Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
-                        Ok(Ok(_)) => {}
-                    }
+                    let next =
+                        tokio::time::timeout(CONTROL_IDLE, control::next(&mut reader, &mut line));
+                    let parsed = match next.await {
+                        Ok(control::Next::Line(parsed)) => parsed,
+                        Ok(control::Next::Refuse(e)) => {
+                            log::warn!("[Control] {}", e);
+                            let _ = write_half
+                                .write_all(format!("ERR {}\n", e).as_bytes())
+                                .await;
+                            break;
+                        }
+                        Ok(control::Next::Close) | Err(_) => break,
+                    };
                     let wait = budget.take(1.0, std::time::Instant::now());
                     if !wait.is_zero() {
                         tokio::time::sleep(wait).await;
                     }
-                    let reply = match control::parse(&line) {
+                    let reply = match parsed {
                         Ok(cmd) => {
                             use control::ControlCommand as C;
                             let mutating = matches!(
@@ -1718,6 +1793,7 @@ async fn main() -> Result<(), anyhow::Error> {
     let ipc_delayed = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let ipc_delayed_metrics = ipc_delayed.clone();
     let reports_unix = attack_reports.clone();
+    let state_unix = state_store.clone();
 
     let socket_path_log = socket_path.to_string();
     let ipc_tasks = producers.spawner();
@@ -1745,6 +1821,7 @@ async fn main() -> Result<(), anyhow::Error> {
                     let crypto_stream = crypto_unix.clone();
                     let policy_stream = policy_unix.clone();
                     let reports_stream = reports_unix.clone();
+                    let state_stream = state_unix.clone();
                     let peer_uid = stream.peer_cred().map(|c| c.uid()).ok();
 
                     let ipc = IpcCtx {
@@ -1755,6 +1832,7 @@ async fn main() -> Result<(), anyhow::Error> {
                         crypto: crypto_stream,
                         policy: policy_stream,
                         reports: reports_stream,
+                        state: Some(state_stream),
                     };
                     let (total, delayed) = (ipc_total.clone(), ipc_delayed.clone());
                     ipc_tasks.spawn(async move {
@@ -1856,25 +1934,37 @@ async fn main() -> Result<(), anyhow::Error> {
             .await
             .map_err(|e| anyhow::anyhow!("Failed to bind metrics endpoint {}: {}", addr, e))?;
         let snapshot = metrics_snapshot.clone();
+        let status_snapshot = metrics_snapshot.clone();
         let readback = flowspec_readback.clone();
-        let app = axum::Router::new().route(
-            "/metrics",
-            axum::routing::get(move || {
-                let snapshot = snapshot.clone();
-                let readback = readback.clone();
-                async move {
-                    let snapshot = snapshot.read().unwrap_or_else(|p| p.into_inner()).clone();
-                    let body = metrics::render_with_flowspec(&snapshot, &readback);
-                    (
-                        [(
-                            axum::http::header::CONTENT_TYPE,
-                            "text/plain; version=0.0.4",
-                        )],
-                        body,
-                    )
-                }
-            }),
-        );
+        let app = axum::Router::new()
+            .route(
+                "/metrics",
+                axum::routing::get(move || {
+                    let snapshot = snapshot.clone();
+                    let readback = readback.clone();
+                    async move {
+                        let snapshot = snapshot.read().unwrap_or_else(|p| p.into_inner()).clone();
+                        let body = metrics::render_with_flowspec(&snapshot, &readback);
+                        (
+                            [(
+                                axum::http::header::CONTENT_TYPE,
+                                "text/plain; version=0.0.4",
+                            )],
+                            body,
+                        )
+                    }
+                }),
+            )
+            .route(
+                "/status",
+                axum::routing::get(move || {
+                    let snapshot = status_snapshot.clone();
+                    async move {
+                        let snapshot = snapshot.read().unwrap_or_else(|p| p.into_inner()).clone();
+                        axum::Json(metrics::status_at(&snapshot, std::time::Instant::now()))
+                    }
+                }),
+            );
         log::info!("[Metrics] Prometheus endpoint on http://{}/metrics", addr);
         producers.spawn(async move {
             if let Err(e) = axum::serve(listener, app).await {
@@ -1959,6 +2049,7 @@ async fn main() -> Result<(), anyhow::Error> {
     let p2p_bind_hb = args.p2p_bind.clone();
     let control_socket_hb = args.control_socket.clone();
     let mut watermark = Watermark::default();
+    let mut xdp_totals = metrics::XdpTotals::default();
     let (registry_tick, crypto_tick) = (peer_registry.clone(), node_crypto.clone());
     let node_id_tick = args.node_id;
     let mut last_digest = std::time::Instant::now();
@@ -1975,6 +2066,7 @@ async fn main() -> Result<(), anyhow::Error> {
     let mut telemetry_window_start = std::time::Instant::now();
     let mut window_rx = 0u64;
     let mut window_dropped = 0u64;
+    let mut window_drops_by_reason = [0u64; common::DROP_REASON_SLOTS];
     let (flowspec_tx, flowspec_rx) = flowspec_channel(&*blocks.lock().await);
     let flowspec_gobgp = match (args.flowspec_gobgp.clone(), args.enforce) {
         (Some(_), Enforce::Observe) => {
@@ -1999,7 +2091,9 @@ async fn main() -> Result<(), anyhow::Error> {
                         )
                     })?
                 }
-                None => (64512, (args.node_id & 0xFFFF) as u16),
+                None => {
+                    flowspec::default_community(args.node_id).map_err(|e| anyhow::anyhow!(e))?
+                }
             };
             let cli = flowspec::GobgpCli {
                 bin,
@@ -2135,33 +2229,16 @@ async fn main() -> Result<(), anyhow::Error> {
                 push_telemetry(&hb_msg).await;
 
 
-                let mut total_rx_packets = 0u64;
-                let mut total_rx_bytes = 0u64;
-                let mut total_dropped = 0u64;
                 let mut snapshot = metrics::Snapshot {
                     events_malformed: kernel_events::MALFORMED
                         .load(std::sync::atomic::Ordering::Relaxed),
                     ..Default::default()
                 };
-
-                if let Ok(per_cpu_stats) = stats_map.get(&0u32, 0) {
-                    for cpu_stat in per_cpu_stats.iter() {
-                        total_rx_packets += cpu_stat.0.rx_packets;
-                        total_rx_bytes += cpu_stat.0.rx_bytes;
-                        total_dropped += cpu_stat.0.dropped_packets;
-                        snapshot.events_suppressed += cpu_stat.0.events_suppressed;
-                        snapshot.events_lost += cpu_stat.0.events_lost;
-                        for (sum, n) in snapshot.observed_by_reason.iter_mut().zip(cpu_stat.0.observed_by_reason) {
-                            *sum += n;
-                        }
-                        for (sum, n) in snapshot.drops_by_reason.iter_mut().zip(cpu_stat.0.drops_by_reason) {
-                            *sum += n;
-                        }
-                    }
-                }
-                snapshot.rx_packets = total_rx_packets;
-                snapshot.rx_bytes = total_rx_bytes;
-                snapshot.dropped_packets = total_dropped;
+                let per_cpu = stats_map.get(&0u32, 0).ok();
+                xdp_totals.read(per_cpu.as_ref().map(|v| v.iter().map(|s| &s.0)));
+                xdp_totals.fill(&mut snapshot);
+                let (total_rx_packets, total_rx_bytes, total_dropped) =
+                    (snapshot.rx_packets, snapshot.rx_bytes, snapshot.dropped_packets);
                 let (v4_active, v6_active) = blocks.lock().await.active_by_family();
                 snapshot.blocks_active_v4 = v4_active;
                 snapshot.blocks_active_v6 = v6_active;
@@ -2175,6 +2252,7 @@ async fn main() -> Result<(), anyhow::Error> {
                         table.event_memory();
                     snapshot.detector_retractions = table.detector_retractions();
                     snapshot.detections = detections::rows();
+                    snapshot.peer_claims = detections::peer_rows();
                     (snapshot.strikes_remembered, snapshot.strikes_evicted) =
                         table.strike_memory();
                     snapshot.claims_waiting = table.waiting_claims(block_table::local_ms());
@@ -2184,6 +2262,9 @@ async fn main() -> Result<(), anyhow::Error> {
                     sntl_db.append(format!("BLOCKLIST_WATERMARK|{}", message));
                 }
                 snapshot.p2p_peers = peer_registry.peer_count().await;
+                snapshot.p2p_expected = peer_registry.pinned_peers();
+                snapshot.mesh_worker = mesh_worker_health.get();
+                snapshot.kernel_worker = kernel_worker_health.get();
                 snapshot.audit_queue_overflow = sntl_db.overflow_total();
                 // R26-08: a CONFIG write that failed at a latch transition is retried here.
                 if defense.pending() {
@@ -2202,6 +2283,7 @@ async fn main() -> Result<(), anyhow::Error> {
                     let stats = &peer_registry.stats;
                     snapshot.mesh_handshakes_refused = stats.handshakes_refused.load(Ordering::Relaxed);
                     snapshot.mesh_handshake_timeouts = stats.handshake_timeouts.load(Ordering::Relaxed);
+                    snapshot.mesh_wrong_address = stats.wrong_address.load(Ordering::Relaxed);
                     snapshot.mesh_frames_delayed = stats.frames_delayed.load(Ordering::Relaxed);
                     snapshot.mesh_sync_requests_throttled =
                         sync_throttled.load(Ordering::Relaxed);
@@ -2249,8 +2331,17 @@ async fn main() -> Result<(), anyhow::Error> {
                         drops_per_sec,
                         // An observing node drops nothing and claims no attack: peers' storm latch
                         // (strict parsing, fragment drops) must not engage on its account (ADR-0018).
+                        // Drops storm mode itself adds do not count: they would keep the storm
+                        // going on legitimate fragmented or unparsable traffic (ADR-6).
                         under_attack: args.enforce == Enforce::Drop
-                            && (drops_per_sec >= args.attack_drops_per_sec || reported_attacks > 0),
+                            && (defense::under_attack(
+                                &snapshot.drops_by_reason,
+                                &window_drops_by_reason,
+                                secs,
+                                args.attack_drops_per_sec,
+                                defense.base(),
+                                defense.mode(),
+                            ) || reported_attacks > 0),
                         blocks_active: (v4_active + v6_active) as u64,
                     };
                     if let Some(record) = report.telemetry_record() {
@@ -2262,6 +2353,7 @@ async fn main() -> Result<(), anyhow::Error> {
                     telemetry_window_start = std::time::Instant::now();
                     window_rx = total_rx_packets;
                     window_dropped = total_dropped;
+                    window_drops_by_reason = snapshot.drops_by_reason;
                 }
                 snapshot.external_attacks = reported_attacks;
                 let cluster = *cluster_summary.read().unwrap_or_else(|p| p.into_inner());
@@ -2273,6 +2365,7 @@ async fn main() -> Result<(), anyhow::Error> {
                 if flowspec_worker.is_some() {
                     flowspec::update_wanted(&flowspec_tx, blocks.lock().await.active_ips());
                 }
+                snapshot.sampled_at = Some(std::time::Instant::now());
                 *metrics_snapshot.write().unwrap_or_else(|p| p.into_inner()) = snapshot;
 
                 let delta_packets = total_rx_packets.saturating_sub(prev_packets);
@@ -2370,7 +2463,60 @@ async fn main() -> Result<(), anyhow::Error> {
 
 #[cfg(test)]
 mod tests {
+    /// The operator's trap tier counters (OPERATOR-T1) count exact `TIER=` fields; only a trap
+    /// hit may carry a trap tier. A Suricata or CrowdSec block is not a "TRAP TIER-1 (TARPIT)"
+    /// scanner, and the trap hit that caused a block already reported itself.
+    #[test]
+    fn the_startup_warning_names_exactly_the_unbound_peers() {
+        let key = |_: u64| NodeCrypto::generate().public_key.clone();
+        let mut trust = TrustStore::default();
+        assert_eq!(super::unbound_peers_warning(&trust), None);
+        trust.insert(2, key(2));
+        trust.insert(3, key(3));
+        trust.bind_address(2, "10.99.0.2".parse().unwrap());
+        let warning = super::unbound_peers_warning(&trust).expect("node 3 is unbound");
+        assert!(warning.contains("Peers [3] have no"), "{warning}");
+        trust.bind_address(3, "10.99.0.3".parse().unwrap());
+        assert_eq!(super::unbound_peers_warning(&trust), None);
+    }
+
+    #[test]
+    fn a_detector_block_is_not_reported_as_a_trap_tier() {
+        let line = super::enforced_telemetry(7, "203.0.113.5", "suricata: sid:2001 ET SCAN");
+        assert!(
+            line.starts_with("DROP_IMMEDIATE:203.0.113.5\n"),
+            "the ban sync is kept: {line}"
+        );
+        assert!(
+            !line.contains("TIER=Tier1BotTarpit"),
+            "a detector's block is counted as a tier-1 trap hit: {line}"
+        );
+    }
+
     use super::*;
+
+    #[test]
+    fn a_storm_threshold_outside_zero_to_one_is_refused_at_startup() {
+        for bad in ["-0.1", "1.0", "50", "NaN", "inf"] {
+            let arg = format!("--storm-threshold={}", bad);
+            assert!(
+                Args::try_parse_from(["sokol-core", arg.as_str()]).is_err(),
+                "{} must be refused",
+                arg
+            );
+        }
+        for good in ["0.0", "0.5", "0.99"] {
+            let arg = format!("--storm-threshold={}", good);
+            let args = Args::try_parse_from(["sokol-core", arg.as_str()]).unwrap();
+            assert_eq!(args.storm_threshold, good.parse::<f64>().unwrap());
+        }
+        assert_eq!(
+            Args::try_parse_from(["sokol-core"])
+                .unwrap()
+                .storm_threshold,
+            0.5
+        );
+    }
 
     #[test]
     fn a_retraction_capacity_refusal_is_not_an_ipc_success() {
@@ -2603,6 +2749,65 @@ mod tests {
     /// value unnoticed (mutation sweep 2026-10-07).
     /// Every decision is counted under its source and result (`sokol_detections_total`): a
     /// detector that misfires shows as a surge of its own, before the map fills.
+    /// A local decision that read the policy before a protection change took the table lock
+    /// is refused once the address is protected (the host refresh rechecks only what the
+    /// table holds when it runs).
+    #[tokio::test]
+    async fn a_detection_racing_a_protection_change_is_refused() {
+        let path = std::env::temp_dir()
+            .join(format!("sokol-detect-race-{}", std::process::id()))
+            .to_string_lossy()
+            .into_owned();
+        let _ = std::fs::remove_file(&path);
+        let db = Arc::new(SentinelDb::init(&path, None).unwrap());
+        let blocks = Arc::new(tokio::sync::Mutex::new(BlockTable::with_lists(
+            AcceptLists,
+            TtlPolicy {
+                base: Duration::from_secs(60),
+                max: Duration::from_secs(600),
+            },
+            1,
+        )));
+        let (registry, crypto) = (
+            PeerRegistry::new(TrustStore::default()),
+            Arc::new(NodeCrypto::generate()),
+        );
+        let handle = PolicyHandle::new(BlockPolicy::builtin());
+        let target = parse_target("198.51.100.80").unwrap();
+        let held = blocks.lock().await;
+        let change = async {
+            for _ in 0..10 {
+                tokio::task::yield_now().await;
+            }
+            let mut policy = BlockPolicy::builtin();
+            policy.protect(target, "test");
+            handle.replace(policy);
+            let current = handle.current();
+            let mut table = held;
+            table.recheck(|n| current.check_net(n).is_ok(), block_table::local_ms());
+        };
+        let (outcome, ()) = tokio::join!(
+            enforce_block_local(
+                target,
+                "race test",
+                &blocks,
+                &db,
+                &registry,
+                1,
+                &crypto,
+                &handle,
+                Detection::default(),
+            ),
+            change
+        );
+        assert!(
+            !blocks.lock().await.is_blocked(target),
+            "a protected address is blocked"
+        );
+        assert_eq!(outcome, Enforcement::Refused);
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[tokio::test]
     async fn each_decision_is_counted_under_its_source() {
         let path = temp_log("detections");
@@ -2619,6 +2824,7 @@ mod tests {
         let crypto = Arc::new(NodeCrypto::generate());
         let mut policy = BlockPolicy::builtin();
         policy.protect("198.51.100.99/32".parse().unwrap(), "test");
+        let policy = PolicyHandle::new(policy);
         // The counters are process-wide: a name no other test uses.
         let source = "count-test-source";
         let decide = |target: &'static str, event: Option<(&'static str, &'static str)>| {
@@ -2665,6 +2871,66 @@ mod tests {
         std::fs::remove_dir_all(std::path::Path::new(&path).parent().unwrap()).unwrap();
     }
 
+    /// A detection that waits for the table lock must not record a
+    /// decision time earlier than a time the table was already advanced to while it waited
+    /// (the node's tick reads its time under the lock). Otherwise replay, which ticks at the
+    /// recorded `At:`, sees a table the node never had and reports a false MISMATCH.
+    #[tokio::test]
+    async fn a_waiting_detection_records_a_time_not_before_the_table_moved_on() {
+        let path = temp_log("at-under-lock");
+        let db = Arc::new(SentinelDb::init(&path, None).unwrap());
+        let blocks = Arc::new(tokio::sync::Mutex::new(BlockTable::with_lists(
+            AcceptLists,
+            TtlPolicy {
+                base: Duration::from_secs(60),
+                max: Duration::from_secs(600),
+            },
+            1,
+        )));
+        let registry = PeerRegistry::new(TrustStore::default());
+        let crypto = Arc::new(NodeCrypto::generate());
+        let policy = PolicyHandle::new(BlockPolicy::builtin());
+        let target = parse_target("198.51.100.79").unwrap();
+        // The tick holds the lock while the detection is submitted.
+        let held = blocks.clone().lock_owned().await;
+        let (b, d) = (blocks.clone(), db.clone());
+        let task = tokio::spawn(async move {
+            enforce_block_local(
+                target,
+                "ids",
+                &b,
+                &d,
+                &registry,
+                1,
+                &crypto,
+                &policy,
+                Detection::default(),
+            )
+            .await;
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let mut held = held;
+        let tick_at = block_table::local_ms();
+        held.tick(tick_at);
+        drop(held);
+        task.await.unwrap();
+        assert!(db.flush(Duration::from_secs(2)));
+        let records = read_audit(&path);
+        let at: u64 = records[0]
+            .split('|')
+            .find_map(|f| f.strip_prefix("At:"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(
+            at >= tick_at,
+            "decision recorded At:{at}, {} ms before the tick the table already applied",
+            tick_at - at
+        );
+        drop(db);
+        std::fs::remove_dir_all(std::path::Path::new(&path).parent().unwrap()).unwrap();
+    }
+
     #[tokio::test]
     async fn own_detections_reach_peers_only_when_the_node_shares_them() {
         for share in [false, true] {
@@ -2690,7 +2956,7 @@ mod tests {
                 .add_peer("127.0.0.1:1".parse().unwrap(), link, 2, 1)
                 .await;
             let crypto = Arc::new(NodeCrypto::generate());
-            let policy = BlockPolicy::builtin();
+            let policy = PolicyHandle::new(BlockPolicy::builtin());
             let target = parse_target("198.51.100.78").unwrap();
             enforce_block_local(
                 target,
@@ -2735,7 +3001,7 @@ mod tests {
         let peers = registry.peers_for_test();
         let guard = peers.write().await;
         let crypto = Arc::new(NodeCrypto::generate());
-        let policy = BlockPolicy::builtin();
+        let policy = PolicyHandle::new(BlockPolicy::builtin());
         let target = parse_target("198.51.100.77").unwrap();
         let (b, d) = (blocks.clone(), db.clone());
         let mut producers = shutdown::Producers::new();

@@ -22,6 +22,10 @@ INPUTS=(
     .cargo/config
     .github/workflows/ci.yml
     scripts/kani-scope.sh
+    scripts/proof-task.py
+    scripts/proof-challenges.json
+    scripts/contract-task.py
+    scripts/test_proof_task.py
 )
 # A new file that is not tracked yet (a fresh .cargo/config.toml) is not in `git diff`.
 untracked=$(git ls-files --others --exclude-standard -- "${INPUTS[@]}" 2>/dev/null) || untracked=error

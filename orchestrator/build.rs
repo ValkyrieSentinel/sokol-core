@@ -7,6 +7,38 @@ fn main() {
     println!("cargo:rerun-if-env-changed=SOKOL_BUILD_ID");
     println!("cargo:rerun-if-changed=../.git/HEAD");
     println!("cargo:rerun-if-changed=../.git/refs");
+    // Cargo otherwise caches this result while recompiling changed Rust source. Track
+    // the actual per-worktree Git files and every tracked input, including shared code.
+    for name in ["HEAD", "index", "packed-refs"] {
+        if let Ok(out) = Command::new("git")
+            .args(["rev-parse", "--git-path", name])
+            .output()
+        {
+            if out.status.success() {
+                println!(
+                    "cargo:rerun-if-changed={}",
+                    String::from_utf8_lossy(&out.stdout).trim()
+                );
+            }
+        }
+    }
+    if let Ok(out) = Command::new("git")
+        .args(["-C", "..", "ls-files", "-z"])
+        .output()
+    {
+        if out.status.success() {
+            for path in out
+                .stdout
+                .split(|byte| *byte == 0)
+                .filter(|path| !path.is_empty())
+            {
+                println!(
+                    "cargo:rerun-if-changed=../{}",
+                    String::from_utf8_lossy(path)
+                );
+            }
+        }
+    }
     let id = std::env::var("SOKOL_BUILD_ID")
         .ok()
         .filter(|v| !v.trim().is_empty())

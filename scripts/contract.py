@@ -1,0 +1,324 @@
+#!/usr/bin/env python3
+"""The only way to change an invariant row (ADR-0024).
+
+    contract.py regenerate
+        Render every contract-backed row of docs/INVARIANTS.md from docs/contracts/<ID>.shadow.json.
+    contract.py propose <ID> --because TEXT [--statement S] [--witness NAME]... [--after ID]
+        Record an unsigned intent in docs/contracts/proposals/. Nothing it says is accepted.
+        --after places a new invariant's row after an existing one.
+    contract.py propose <ID> --retire MODE --loss TEXT... --because TEXT [--replacement ID]
+                       [--counterexample NAME]...
+        Record an intent to retire a row (SUPERSEDED, WITHDRAWN, REFUTED, ARCHIVED). Accepted,
+        the row leaves the table and its contract stays as the tombstone: statement, history,
+        mode, what is lost, the replacement (SUPERSEDED) or the counterexample tests (REFUTED).
+    contract.py accept <PROPOSAL-FILE> [--key OWNER_KEY]
+        Apply an intent to its contract if the contract is still the one the intent was made
+        against, append the decision to the contract's history, regenerate, and with --key
+        re-pin through scripts/witness-pin.py sign. Without the owner's signature the gate
+        refuses the change, so accepting is the owner's act, not the proposer's.
+    contract.py accept <PROPOSAL-FILE> --provisional [--agent-key AGENT_KEY]
+        An agent accepts a new row (or a change to its own provisional row) into the
+        provisional tier: the row is shown as [provisional] and pinned by the agent's key, in
+        docs/witness-provisional.json (ADR-0028). An owner row cannot be touched this way.
+    contract.py promote <ID>...
+        The owner takes provisional rows into the owner tier; then witness-pin.py sign.
+    contract.py list [--retired | --provisional]
+        Open proposals; with --retired, the tombstones of retired rows; with --provisional,
+        the rows waiting for the owner.
+
+A proposal names the reason (a counterexample, a measurement, a requirement). The gate reads
+the contract, never the proposal; an open proposal is reported as a note.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import importlib.util
+import json
+import pathlib
+import subprocess
+import sys
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+CONTRACTS = ROOT / 'docs/contracts'
+PROPOSALS = CONTRACTS / 'proposals'
+INVARIANTS = ROOT / 'docs/INVARIANTS.md'
+PROFILE = 'sokol.contract-shadow.v1'
+PROPOSAL_PROFILE = 'sokol.contract-proposal.v1'
+
+spec = importlib.util.spec_from_file_location('witness_pin', ROOT / 'scripts/witness-pin.py')
+gate = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(gate)
+
+
+def sha(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def dump(value) -> str:
+    return json.dumps(value, indent=2, ensure_ascii=False, sort_keys=True) + '\n'
+
+
+def contract_path(rid: str) -> pathlib.Path:
+    gate.contract_marker(rid)
+    return CONTRACTS / f'{rid}.shadow.json'
+
+
+def render(text: str, contracts: dict) -> str:
+    if gate.DECLARATION in text:
+        lines = text.splitlines(keepends=True)
+        for i, line in enumerate(lines):
+            m = gate.ROW.match(line)
+            if m and m.group(1) in contracts:
+                lines[i] = gate.contract_row(contracts[m.group(1)]) + '\n'
+        text = ''.join(lines)
+    else:
+        for contract in contracts.values():
+            text = gate.project_invariants(text, contract)
+    return gate.generated_invariants(text, ROOT)
+
+
+def regenerate() -> int:
+    before = INVARIANTS.read_text()
+    after = render(before, gate.load_contracts(ROOT))
+    if after != before:
+        INVARIANTS.write_text(after)
+    print(f"{'regenerated' if after != before else 'unchanged'} {INVARIANTS.relative_to(ROOT)}")
+    return 0
+
+
+def witnesses_exist(names: list[str]) -> list[str]:
+    rust = gate.rust_bodies({n for n in names if gate.RUST_TEST.fullmatch(n)})
+    py = gate.py_bodies({n for n in names if gate.PY_TEST.fullmatch(n)})
+    return [n for n in names if not (rust.get(n) or py.get(n))]
+
+
+def propose_retirement(rid: str, because: str, mode: str, loss: list[str], replacement: str | None,
+                       counterexamples: list[str]) -> int:
+    path = contract_path(rid)
+    contracts = gate.load_contracts(ROOT)
+    current = contracts.get(rid)
+    if current is None or gate.retired(current):
+        print('FAIL ' + rid + ' is not an active row')
+        return 1
+    if any(gate.retired(c) and c['retirement']['replacement'] == rid for c in contracts.values()):
+        print('FAIL ' + rid + ' replaces a retired row; retire that tombstone\'s claim first')
+        return 1
+    if not because.strip():
+        print('FAIL a proposal names its reason (--because)')
+        return 1
+    missing = witnesses_exist(counterexamples)
+    if missing:
+        print('FAIL counterexamples must be existing tests: ' + ', '.join(missing))
+        return 1
+    if replacement is not None and (replacement not in contracts or gate.retired(contracts[replacement])):
+        print('FAIL --replacement ' + replacement + ' is not an active row')
+        return 1
+    record = {'mode': mode, 'loss': [x.strip() for x in loss], 'replacement': replacement,
+              'counterexamples': sorted(set(counterexamples))}
+    gate.check_retirement({'id': rid, 'status': 'retired', 'retirement': record})
+    body = {
+        'profile': PROPOSAL_PROFILE, 'id': rid, 'status': 'UNSIGNED_INTENT', 'because': because.strip(),
+        'base_contract_sha256': sha(path.read_bytes()), 'retire': record,
+        'statement': current['statement'], 'evidence_text': current['evidence_text'],
+        'witnesses': current['witnesses'], 'after': None,
+    }
+    PROPOSALS.mkdir(parents=True, exist_ok=True)
+    data = dump(body).encode()
+    out = PROPOSALS / f'{rid}-{sha(data)[:12]}.proposal.json'
+    out.write_bytes(data)
+    print(out.relative_to(ROOT))
+    return 0
+
+
+def propose(rid: str, because: str, statement: str | None, witnesses: list[str], after: str | None) -> int:
+    path = contract_path(rid)
+    current = json.loads(path.read_text()) if path.exists() else None
+    if current is not None and gate.retired(current):
+        print('FAIL ' + rid + ' is retired; a new row needs a new ID')
+        return 1
+    if current is None and not (statement and witnesses and after):
+        print('FAIL a new invariant needs --statement, at least one --witness and --after')
+        return 1
+    if current is not None and after:
+        print('FAIL --after places a new row; ' + rid + ' already has one')
+        return 1
+    if after and not any(line.startswith('| ' + after + ' |') for line in INVARIANTS.read_text().splitlines()):
+        print('FAIL --after ' + after + ' is not a row of ' + str(INVARIANTS.relative_to(ROOT)))
+        return 1
+    if not because.strip():
+        print('FAIL a proposal names its reason (--because)')
+        return 1
+    names = sorted(set(witnesses)) if witnesses else current['witnesses']
+    bad = [n for n in names if not (gate.RUST_TEST.fullmatch(n) or gate.PY_TEST.fullmatch(n))]
+    missing = witnesses_exist(names)
+    if bad or missing:
+        print('FAIL witnesses must be existing tests: ' + ', '.join(bad + missing))
+        return 1
+    if current and set(current['witnesses']) <= set(names):
+        added = [n for n in names if n not in current['witnesses']]
+        evidence = ', '.join([current['evidence_text'].rstrip('. ')] + [f'`{n}`' for n in added]) \
+            if added else current['evidence_text']
+    else:
+        evidence = ', '.join(f'`{n}`' for n in names)
+    body = {
+        'profile': PROPOSAL_PROFILE, 'id': rid, 'status': 'UNSIGNED_INTENT', 'because': because.strip(),
+        'base_contract_sha256': sha(path.read_bytes()) if current else None,
+        'statement': statement if statement is not None else current['statement'],
+        'evidence_text': evidence, 'witnesses': names, 'after': after,
+    }
+    gate.contract_row({'id': rid, 'profile': PROFILE, **{k: body[k] for k in ('statement', 'evidence_text')}})
+    PROPOSALS.mkdir(parents=True, exist_ok=True)
+    data = dump(body).encode()
+    out = PROPOSALS / f'{rid}-{sha(data)[:12]}.proposal.json'
+    out.write_bytes(data)
+    print(out.relative_to(ROOT))
+    return 0
+
+
+def accept(file: str, key: str | None, tier: str = "owner", agent_key: str | None = None) -> int:
+    ppath = pathlib.Path(file).resolve()
+    if ppath.parent != PROPOSALS.resolve() or not ppath.name.endswith('.proposal.json'):
+        print('FAIL a proposal is a file in docs/contracts/proposals/')
+        return 1
+    data = ppath.read_bytes()
+    p = json.loads(data)
+    if p.get('profile') != PROPOSAL_PROFILE:
+        print('FAIL not a contract proposal')
+        return 1
+    path = contract_path(p['id'])
+    if tier == 'provisional':
+        existing = json.loads(path.read_text()) if path.exists() else None
+        if existing is not None and not gate.provisional(existing):
+            print('FAIL ' + p['id'] + ' is an owner row; only the owner changes it')
+            return 1
+        if p.get('retire'):
+            print('FAIL a provisional row is withdrawn by removing it, not retired')
+            return 1
+    base = sha(path.read_bytes()) if path.exists() else None
+    if base != p['base_contract_sha256']:
+        print('FAIL stale proposal: the contract changed after it was made; propose again')
+        return 1
+    contract = json.loads(path.read_text()) if path.exists() else {
+        'profile': PROFILE, 'id': p['id'],
+        'annotations': {'status': 'UNSIGNED_EXPLANATORY_DRAFT'}}
+    contract.setdefault('decisions', []).append({
+        'proposal_sha256': sha(data), 'because': p['because'],
+        'previous_statement_sha256': sha(contract['statement'].encode()) if 'statement' in contract else None,
+    })
+    contract.update({k: p[k] for k in ('statement', 'evidence_text', 'witnesses')})
+    if tier == 'provisional':
+        contract['tier'] = 'provisional'
+    text = INVARIANTS.read_text()
+    if p.get('retire'):
+        contract.update(status='retired', retirement=p['retire'])
+        text = ''.join(line for line in text.splitlines(keepends=True) if not line.startswith('| ' + p['id'] + ' |'))
+    if p['after']:
+        lines = text.splitlines(keepends=True)
+        at = [i for i, line in enumerate(lines) if line.startswith('| ' + p['after'] + ' |')]
+        if len(at) != 1 or gate.DECLARATION not in text:
+            print('FAIL --after needs exactly one existing row in a fully generated document')
+            return 1
+        lines.insert(at[0] + 1, gate.contract_row(contract) + '\n')
+        text = ''.join(lines)
+    path.write_text(dump(contract))
+    INVARIANTS.write_text(render(text, gate.load_contracts(ROOT)))
+    ppath.unlink()
+    print(f"accepted {p['id']}: contract, history and {INVARIANTS.relative_to(ROOT)} updated")
+    if tier == 'provisional':
+        if agent_key:
+            return subprocess.run([sys.executable, str(ROOT / 'scripts/witness-pin.py'), 'sign-provisional',
+                                   '--key', agent_key]).returncode
+        print('not signed: the gate refuses this provisional row until the agent key pins it')
+        return 0
+    if key:
+        return subprocess.run([sys.executable, str(ROOT / 'scripts/witness-pin.py'), 'sign', '--key', key]).returncode
+    print('not signed: the gate refuses this change until the owner runs scripts/witness-pin.py sign')
+    return 0
+
+
+def promote(ids: list[str]) -> int:
+    contracts = gate.load_contracts(ROOT)
+    for rid in ids:
+        c = contracts.get(rid)
+        if c is None or not gate.provisional(c):
+            print('FAIL ' + rid + ' is not a provisional row')
+            return 1
+    for rid in ids:
+        c = contracts[rid]
+        del c['tier']
+        c.setdefault('decisions', []).append({'proposal_sha256': None, 'because': 'promoted by the owner',
+                                              'previous_statement_sha256': sha(c['statement'].encode())})
+        contract_path(rid).write_text(dump(c))
+    INVARIANTS.write_text(render(INVARIANTS.read_text(), gate.load_contracts(ROOT)))
+    print('promoted ' + ', '.join(ids) + ': the owner pins them with witness-pin.py sign')
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = parser.add_subparsers(dest='command', required=True)
+    sub.add_parser('regenerate')
+    pl = sub.add_parser('list')
+    pl.add_argument('--retired', action='store_true')
+    pl.add_argument('--provisional', action='store_true')
+    pm = sub.add_parser('promote')
+    pm.add_argument('ids', nargs='+')
+    pp = sub.add_parser('propose')
+    pp.add_argument('id')
+    pp.add_argument('--because', required=True)
+    pp.add_argument('--statement')
+    pp.add_argument('--witness', action='append', default=[])
+    pp.add_argument('--after')
+    pp.add_argument('--retire', choices=gate.RETIREMENT_MODES)
+    pp.add_argument('--loss', action='append', default=[])
+    pp.add_argument('--replacement')
+    pp.add_argument('--counterexample', action='append', default=[])
+    pa = sub.add_parser('accept')
+    pa.add_argument('proposal')
+    pa.add_argument('--key')
+    pa.add_argument('--provisional', action='store_true')
+    pa.add_argument('--agent-key')
+    a = parser.parse_args()
+    try:
+        if a.command == 'regenerate':
+            return regenerate()
+        if a.command == 'promote':
+            return promote(a.ids)
+        if a.command == 'list':
+            if a.provisional:
+                for rid, c in gate.load_contracts(ROOT).items():
+                    if gate.provisional(c):
+                        print(f"{rid} | {c['statement']} | because: {c['decisions'][-1]['because']}")
+                return 0
+            if a.retired:
+                for rid, c in gate.load_contracts(ROOT).items():
+                    if gate.retired(c):
+                        r = c['retirement']
+                        print(f"{rid} {r['mode']}" + (f" by {r['replacement']}" if r['replacement'] else '')
+                              + ' | lost: ' + '; '.join(r['loss']))
+                return 0
+            for name in gate.open_proposals(ROOT):
+                print(name)
+            return 0
+        if a.command == 'propose' and a.retire:
+            if a.statement is not None or a.witness or a.after:
+                print('FAIL a retirement changes no statement, witness or position')
+                return 1
+            return propose_retirement(a.id, a.because, a.retire, a.loss, a.replacement, a.counterexample)
+        if a.command == 'propose':
+            if a.loss or a.replacement or a.counterexample:
+                print('FAIL --loss, --replacement and --counterexample belong to --retire')
+                return 1
+            return propose(a.id, a.because, a.statement, a.witness, a.after)
+        if a.provisional and a.key:
+            print('FAIL --provisional is the agent tier: sign it with --agent-key, not the owner key')
+            return 1
+        return accept(a.proposal, a.key, 'provisional' if a.provisional else 'owner', a.agent_key)
+    except (ValueError, KeyError, OSError, json.JSONDecodeError) as error:
+        print('FAIL', error)
+        return 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())

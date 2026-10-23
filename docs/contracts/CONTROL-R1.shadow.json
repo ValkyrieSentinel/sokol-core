@@ -1,0 +1,20 @@
+{
+  "annotations": {
+    "status": "UNSIGNED_EXPLANATORY_DRAFT"
+  },
+  "decisions": [
+    {
+      "because": "Round-9 control hunt (2026-10-15): two concurrent RELOAD_PEERS could interleave so the table took the newer trust store and the registry the older one (a revoked peer authenticated while its claims were no longer enforced); the race test failed on its assertion before the fix.",
+      "previous_statement_sha256": null,
+      "proposal_sha256": "951b0f5f9a039256544f4783811a7bd2f48cd1148b441af7ce639107522954d7"
+    }
+  ],
+  "evidence_text": "`concurrent_reloads_leave_table_and_registry_on_one_trust_store`",
+  "id": "CONTROL-R1",
+  "profile": "sokol.contract-shadow.v1",
+  "statement": "A RELOAD_PEERS puts its trust store into the block table and the mesh registry under one table lock, so concurrent reloads leave both on the same store.",
+  "tier": "provisional",
+  "witnesses": [
+    "concurrent_reloads_leave_table_and_registry_on_one_trust_store"
+  ]
+}

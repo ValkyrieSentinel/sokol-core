@@ -6,6 +6,10 @@ target/
 zig-out/
 .zig-cache/
 
+# Python import caches are generated inputs, never contract sources.
+__pycache__/
+*.pyc
+
 # Libraries & binaries
 *.a
 *.o

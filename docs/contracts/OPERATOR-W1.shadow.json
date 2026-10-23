@@ -1,0 +1,19 @@
+{
+  "annotations": {
+    "status": "UNSIGNED_EXPLANATORY_DRAFT"
+  },
+  "decisions": [
+    {
+      "because": "Round 7 on 27d0ea0: command_json discarded the reply of a CONFIRMED outcome, so ADR-0005's 'OK ...; WARNING: not yet durable' reached the operator as a plain confirmation.",
+      "previous_statement_sha256": null,
+      "proposal_sha256": "78f90424e8afa49c613f96d7adb28cc61a027ca13afe47886c31c376c65c6eb0"
+    }
+  ],
+  "evidence_text": "`a_not_yet_durable_confirmation_keeps_its_warning`",
+  "id": "OPERATOR-W1",
+  "profile": "sokol.contract-shadow.v1",
+  "statement": "A node's confirmation that carries a warning (OK ...; WARNING: not yet durable) keeps that warning, bounded to 512 characters, in the operator API's answer and on the dashboard; the outcome stays CONFIRMED.",
+  "witnesses": [
+    "a_not_yet_durable_confirmation_keeps_its_warning"
+  ]
+}

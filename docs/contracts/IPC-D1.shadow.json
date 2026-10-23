@@ -1,0 +1,20 @@
+{
+  "annotations": {
+    "status": "UNSIGNED_EXPLANATORY_DRAFT"
+  },
+  "decisions": [
+    {
+      "because": "Round 8 on 9387b10: OK lifted was answered before the state was on disk and the outbox does not resend after it; after SIGKILL and restart the claim and its support came back (10 of 10 rounds), in XDP and in FlowSpec, until the claim's own end.",
+      "previous_statement_sha256": null,
+      "proposal_sha256": "c15e9ea24c1cb27bd11007b4baef741245bdc72622a4ce704852e936cd2e96c5"
+    }
+  ],
+  "evidence_text": "`a_lifted_retraction_is_on_disk_before_it_is_answered`",
+  "id": "IPC-D1",
+  "profile": "sokol.contract-shadow.v1",
+  "statement": "A detector retraction that changes the block table is answered only after the change is on disk, or with a warning the outbox does not take as final, so a crash after an OK lifted answer does not bring the block back.",
+  "tier": "provisional",
+  "witnesses": [
+    "a_lifted_retraction_is_on_disk_before_it_is_answered"
+  ]
+}

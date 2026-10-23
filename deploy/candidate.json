@@ -1,0 +1,24 @@
+{
+  "profile": "sokol.product-inventory.v1",
+  "files": [
+    {"source": "binary:orchestrator", "path": "usr/local/bin/sokol-orchestrator", "mode": 493},
+    {"source": "binary:monitor", "path": "usr/local/bin/sokol-monitor", "mode": 493},
+    {"source": "binary:sokol-operator", "path": "usr/local/bin/sokol-operator", "mode": 493},
+    {"source": "binary:sokol-suricata", "path": "usr/local/bin/sokol-suricata", "mode": 493},
+    {"source": "binary:sokol-crowdsec", "path": "usr/local/bin/sokol-crowdsec", "mode": 493},
+    {"source": "binary:sokol-fastnetmon-notify", "path": "usr/local/bin/sokol-fastnetmon-notify", "mode": 493},
+    {"source": "binary:trident_trap", "path": "usr/local/bin/trident_trap", "mode": 493},
+    {"source": "deploy/sokol-orchestrator.service", "path": "etc/systemd/system/sokol-orchestrator.service", "mode": 420},
+    {"source": "scripts/candidate.py", "path": "usr/local/share/sokol/candidate.py", "mode": 493},
+    {"source": "scripts/support-bundle.sh", "path": "usr/local/bin/sokol-support-bundle", "mode": 493},
+    {"source": "scripts/support_bundle.py", "path": "usr/local/share/sokol/support_bundle.py", "mode": 420},
+    {"source": "docs/RUNBOOK.md", "path": "usr/local/share/sokol/RUNBOOK.md", "mode": 420},
+    {"source": "docs/SUPPORT.md", "path": "usr/local/share/sokol/SUPPORT.md", "mode": 420},
+    {"source": "SECURITY.md", "path": "usr/local/share/sokol/SECURITY.md", "mode": 420},
+    {"source": "LICENSE", "path": "usr/local/share/sokol/LICENSE", "mode": 420},
+    {"source": "common/LICENSE", "path": "usr/local/share/sokol/LICENSE-common", "mode": 420},
+    {"source": "ebpf/LICENSE", "path": "usr/local/share/sokol/LICENSE-ebpf", "mode": 420},
+    {"source": "COPYRIGHT.md", "path": "usr/local/share/sokol/COPYRIGHT.md", "mode": 420},
+    {"source": "deploy/wireguard-mesh.conf.example", "path": "usr/local/share/sokol/wireguard-mesh.conf.example", "mode": 420}
+  ]
+}

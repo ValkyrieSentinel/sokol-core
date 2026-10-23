@@ -1,0 +1,104 @@
+{
+ "build_v3": {},
+ "closures_v4": {
+  "a_ban_racing_a_protection_change_does_not_block_the_protected_address": [
+   "orchestrator/src/control_exec.rs:cf61d7310ab22eecd8650961caa6b5171ad22a403198ce5b4db25e4481ad0e7e"
+  ],
+  "a_detection_racing_a_protection_change_is_refused": [
+   "orchestrator/src/main.rs:329150878411d2d0486faa4d30606abe634e620955661c8033d004423d493603"
+  ],
+  "a_flush_of_many_own_claims_is_retracted_in_frames_a_peer_accepts": [
+   "orchestrator/src/control_exec.rs:a2e7caec0d74bfdd687830b5b078afd4002d43a2dfd9712bda39960d027f18f5"
+  ],
+  "a_lifted_retraction_is_on_disk_before_it_is_answered": [
+   "orchestrator/src/ipc.rs:995fc943f94909ba0103bedf641089ef48df97f383ecdd50e401ea61405c2b4c"
+  ],
+  "a_peer_claim_racing_a_protection_change_is_not_enforced": [
+   "orchestrator/src/mesh_dispatch.rs:3a105e21a2029efe3cd18358c1efd9a7bfae73936532872a098eaab5797c4a05"
+  ],
+  "a_retraction_is_packed_into_full_frames_within_the_budget": [
+   "orchestrator/src/mesh_sync.rs:fe4b4ceeff92b165770cbdb7b280f104f3c31875f378a384f138c4679d40a889"
+  ],
+  "concurrent_reloads_leave_table_and_registry_on_one_trust_store": [
+   "orchestrator/src/control_exec.rs:52c612d973f7881bf82455e7379a4334190e5aa53be2e83cf13a411adabcd032"
+  ],
+  "mesh_floors_roundtrip_within_their_bound_and_refuse_past_it": [
+   "orchestrator/src/state_input.rs:77f2f3fc0e17d53dbbacba9fc992c7fd8b708e37b34885b2457e67c195444fd6"
+  ],
+  "saved_floors_refuse_what_the_previous_process_accepted_after_the_start": [
+   "orchestrator/src/p2p.rs:5ca5673b3dbcb3e45f8c18daa0d0d44804ea744bad8776c13540f783bf249fd8"
+  ]
+ },
+ "contracts": {
+  "CONTROL-R1": "671507bffec6b5f5a6fbdc2a049e68917b530977c2ddd5f19ce905478573e80f",
+  "IPC-D1": "e84369c8467ecde8cf5c7e61a6e6910925171c98c07eb866d125e423644eef3c",
+  "MESH-F1": "dfe5ab17a1d5f4234b3aac1ad052266011a0eb2bb7cd498e4023ae8bbcf420a0",
+  "MESH-N2": "2ca92c41d28fc77f962e195ea3eaca6a5c8214b6724ea14e85ea4ecbad4f6cd9",
+  "POLICY-L1": "24fe260335a61e9d161730ccdc25854cfb12c73df3802a83fe19114f4b1a1fbf"
+ },
+ "rows": {
+  "CONTROL-R1": {
+   "statement": "86eb9c3991382b6dcaf9c459ee3150e97f93e036c3ebf006636788f3e2e3797d",
+   "witnesses": [
+    "concurrent_reloads_leave_table_and_registry_on_one_trust_store"
+   ]
+  },
+  "IPC-D1": {
+   "statement": "090e2e6873d7047b40a8cabcf21137beb099374e741e608e527f474c4d5573c9",
+   "witnesses": [
+    "a_lifted_retraction_is_on_disk_before_it_is_answered"
+   ]
+  },
+  "MESH-F1": {
+   "statement": "456d7145f9803303df214af67ddc9e0ed1c2d3fb9ab7f71bdc7ec546a4007822",
+   "witnesses": [
+    "a_flush_of_many_own_claims_is_retracted_in_frames_a_peer_accepts",
+    "a_retraction_is_packed_into_full_frames_within_the_budget"
+   ]
+  },
+  "MESH-N2": {
+   "statement": "ec8449838ce065a5f637d0a584ea33384fb90527a7d9a9c3c586b6d93899c3bb",
+   "witnesses": [
+    "mesh_floors_roundtrip_within_their_bound_and_refuse_past_it",
+    "saved_floors_refuse_what_the_previous_process_accepted_after_the_start"
+   ]
+  },
+  "POLICY-L1": {
+   "statement": "f11fe1682015065a9f37f4cb651def6e6781c97688c0f6697307ee2caf9cff95",
+   "witnesses": [
+    "a_ban_racing_a_protection_change_does_not_block_the_protected_address",
+    "a_detection_racing_a_protection_change_is_refused",
+    "a_peer_claim_racing_a_protection_change_is_not_enforced"
+   ]
+  }
+ },
+ "witnesses": {
+  "a_ban_racing_a_protection_change_does_not_block_the_protected_address": [
+   "orchestrator/src/control_exec.rs:f0d34eb7cb474fb4ef1d76e59fd0070703295c6ad71c3c6f95f26d62196d8404"
+  ],
+  "a_detection_racing_a_protection_change_is_refused": [
+   "orchestrator/src/main.rs:c26e8d5c17e4ecd201f588144cae220c610f75aed9b3511aa5276c768a99b975"
+  ],
+  "a_flush_of_many_own_claims_is_retracted_in_frames_a_peer_accepts": [
+   "orchestrator/src/control_exec.rs:dfd6f557596d58b235f4f7e0bef77372074e6e47a3344b4e8b1c4ce2a74ff87b"
+  ],
+  "a_lifted_retraction_is_on_disk_before_it_is_answered": [
+   "orchestrator/src/ipc.rs:6862b4e820c4be51b1f1b47ca3b2612ade65deb3ce0f6ad79006845323dd8ed9"
+  ],
+  "a_peer_claim_racing_a_protection_change_is_not_enforced": [
+   "orchestrator/src/mesh_dispatch.rs:58f8bc0f960f27921592bbc964dc3530fcb0b8072bc1e2985ba4360958ded91c"
+  ],
+  "a_retraction_is_packed_into_full_frames_within_the_budget": [
+   "orchestrator/src/mesh_sync.rs:448d38c18ead8985d30c99c6c8ef8e746083b405dc6691fccc0da374d4ceb7b6"
+  ],
+  "concurrent_reloads_leave_table_and_registry_on_one_trust_store": [
+   "orchestrator/src/control_exec.rs:e20d73decbdfecaa3c6d8616ab71d98d7eb64ce502e56a3caf40cd7991a274d5"
+  ],
+  "mesh_floors_roundtrip_within_their_bound_and_refuse_past_it": [
+   "orchestrator/src/state_input.rs:a379546ec86207520cfe807169fa3c84e15b3d3bef46ff395245ae0f2a101eb1"
+  ],
+  "saved_floors_refuse_what_the_previous_process_accepted_after_the_start": [
+   "orchestrator/src/p2p.rs:992265cc57545812b7365464f977229d0f48af90de2671f56b39a68438217149"
+  ]
+ }
+}

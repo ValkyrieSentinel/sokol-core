@@ -1,0 +1,26 @@
+{
+  "annotations": {
+    "status": "UNSIGNED_EXPLANATORY_DRAFT"
+  },
+  "decisions": [
+    {
+      "because": "Counterexamples on d7e65e4: live heartbeat did not expose failed LIST_BANS freshness; a node-applied command with a lost reply was reported as generic failure. Readback also needs route/attempt binding and partial-list visibility.",
+      "previous_statement_sha256": null,
+      "proposal_sha256": "1474b5f4a78ef0de530861e3b4615a63234b040ced0eec713892d63d00b7ad16"
+    }
+  ],
+  "evidence_text": "`a_command_applied_without_a_reply_has_an_unknown_outcome`, `a_list_reply_reports_its_total_and_refuses_malformed_targets`, `a_live_heartbeat_cannot_make_failed_ban_readback_fresh`, `a_written_command_timeout_is_unknown_and_has_a_fixed_deadline`, `ban_readback_age_is_independent_of_heartbeat_and_wall_time`, `control_outcomes_require_an_exact_bounded_complete_reply`, `late_readback_cannot_overwrite_a_new_attempt_or_route`, `unread_and_invalid_lists_stay_unknown_then_recover`",
+  "id": "OPERATOR-R1",
+  "profile": "sokol.contract-shadow.v1",
+  "statement": "Operator ban readback is independently UNKNOWN, FRESH or STALE with the last successful observation time, monotonic age, reported total and bounded diagnostic. Failed or malformed reads preserve the last valid list without marking it fresh; heartbeat cannot refresh it; an obsolete attempt or changed control route cannot publish. Command responses distinguish CONFIRMED acknowledgement, REJECTED node response, NOT_SENT before write and UNKNOWN after an attempted write without a valid complete reply. Confirmation is acknowledgement, not proof of kernel enforcement; LIST_BANS describes operator bans and may be partial.",
+  "witnesses": [
+    "a_command_applied_without_a_reply_has_an_unknown_outcome",
+    "a_list_reply_reports_its_total_and_refuses_malformed_targets",
+    "a_live_heartbeat_cannot_make_failed_ban_readback_fresh",
+    "a_written_command_timeout_is_unknown_and_has_a_fixed_deadline",
+    "ban_readback_age_is_independent_of_heartbeat_and_wall_time",
+    "control_outcomes_require_an_exact_bounded_complete_reply",
+    "late_readback_cannot_overwrite_a_new_attempt_or_route",
+    "unread_and_invalid_lists_stay_unknown_then_recover"
+  ]
+}

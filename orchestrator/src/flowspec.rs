@@ -10,8 +10,10 @@
 use ipnet::IpNet;
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::sync::watch;
 
 use crate::block_table::show;
@@ -27,6 +29,12 @@ pub const MAX_OPS_PER_ROUND: usize = 64;
 /// One gobgp call; a call that takes longer is killed. Read both RIB families
 /// before continuing its plan or planning a later round; kill is not remote rollback.
 pub const CALL_TIMEOUT: Duration = Duration::from_secs(5);
+/// Per-family CLI JSON input budget, including whitespace and foreign paths.
+/// Above it readback is unavailable; a truncated RIB never authorizes a write.
+pub const MAX_RIB_BYTES: usize = 64 * 1024 * 1024;
+/// A write command's stdout and every command's stderr have separate small budgets.
+pub const MAX_COMMAND_OUTPUT_BYTES: usize = 64 * 1024;
+pub const MAX_DIAGNOSTIC_BYTES: usize = 64 * 1024;
 /// Deadline for the attempt to withdraw the node's rules on shutdown: not a guarantee that any
 /// number of rules is withdrawn in it.
 pub const SHUTDOWN_BUDGET: Duration = Duration::from_secs(10);
@@ -150,6 +158,24 @@ fn family(net: &IpNet) -> &'static str {
     }
 }
 
+/// The private ASN of the default ownership community (ADR-0008: `64512:<node-id>`).
+pub const DEFAULT_COMMUNITY_ASN: u16 = 64512;
+
+/// This node's default ownership community, `64512:<node-id>`. A node id that does not
+/// fit the 16-bit value is refused rather than truncated: truncation gives nodes 1 and
+/// 65537 one community, and each would withdraw the other's rules on a shared gobgpd.
+pub fn default_community(node_id: u64) -> Result<(u16, u16), String> {
+    u16::try_from(node_id)
+        .map(|value| (DEFAULT_COMMUNITY_ASN, value))
+        .map_err(|_| {
+            format!(
+                "node id {} does not fit the 16-bit value of the default Flowspec community \
+                 {}:<node-id>; give this node its own --flowspec-community",
+                node_id, DEFAULT_COMMUNITY_ASN
+            )
+        })
+}
+
 impl GobgpCli {
     fn community_str(&self) -> String {
         format!("{}:{}", self.community.0, self.community.1)
@@ -184,21 +210,48 @@ impl GobgpCli {
     }
 
     async fn run(&self, args: Vec<String>) -> Result<Vec<u8>, String> {
-        let output = tokio::time::timeout(
-            CALL_TIMEOUT,
-            tokio::process::Command::new(&self.bin)
-                .args(args)
-                // A call that times out is killed rather than left to act later.
-                .kill_on_drop(true)
-                .output(),
-        )
+        self.run_with_limit(args, MAX_COMMAND_OUTPUT_BYTES).await
+    }
+
+    async fn run_with_limit(
+        &self,
+        args: Vec<String>,
+        stdout_limit: usize,
+    ) -> Result<Vec<u8>, String> {
+        let mut child = tokio::process::Command::new(&self.bin)
+            .args(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|e| format!("cannot run {}: {}", self.bin.display(), e))?;
+        let output = tokio::time::timeout(CALL_TIMEOUT, async {
+            let stdout = child.stdout.take().ok_or("gobgp stdout unavailable")?;
+            let stderr = child.stderr.take().ok_or("gobgp stderr unavailable")?;
+            // Drain both pipes concurrently: a full stderr pipe must not deadlock stdout.
+            tokio::try_join!(
+                bounded_output(stdout, stdout_limit, "stdout"),
+                bounded_output(stderr, MAX_DIAGNOSTIC_BYTES, "stderr"),
+                async {
+                    child
+                        .wait()
+                        .await
+                        .map_err(|e| format!("cannot wait for gobgp: {e}"))
+                }
+            )
+        })
         .await
-        .map_err(|_| format!("gobgp did not answer within {:?}", CALL_TIMEOUT))?
-        .map_err(|e| format!("cannot run {}: {}", self.bin.display(), e))?;
-        if output.status.success() {
-            Ok(output.stdout)
-        } else {
-            Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+        .unwrap_or_else(|_| Err(format!("gobgp did not answer within {:?}", CALL_TIMEOUT)));
+        match output {
+            Ok((stdout, _, status)) if status.success() => Ok(stdout),
+            Ok((_, stderr, _)) => Err(String::from_utf8(stderr)
+                .map(|text| text.trim().to_string())
+                .unwrap_or_else(|_| "gobgp failed; stderr is not UTF-8".into())),
+            Err(why) => {
+                // Pipes/futures have been dropped; kill and reap the direct child also on overflow.
+                let _ = child.kill().await;
+                Err(why)
+            }
         }
     }
 
@@ -212,10 +265,95 @@ impl GobgpCli {
         for fam in ["ipv4-flowspec", "ipv6-flowspec"] {
             let mut args = self.args.clone();
             args.extend(["global", "rib", "-a", fam, "-j"].map(String::from));
-            let out = self.run(args).await?;
+            let out = self.run_with_limit(args, MAX_RIB_BYTES).await?;
             own.extend(parse_rib(&out, self.community_value())?);
         }
         Ok(own)
+    }
+}
+
+async fn bounded_output<R: AsyncRead + Unpin>(
+    reader: R,
+    limit: usize,
+    pipe: &str,
+) -> Result<Vec<u8>, String> {
+    let mut bytes = Vec::new();
+    reader
+        .take(limit as u64 + 1)
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(|e| format!("cannot read gobgp {pipe}: {e}"))?;
+    if bytes.len() > limit {
+        return Err(format!("gobgp {pipe} exceeds {limit}-byte limit"));
+    }
+    Ok(bytes)
+}
+
+/// A JSON document in which no object, at any depth, repeats a key. Deserializing
+/// into it only checks; the value is read again into a `serde_json::Map`, which
+/// would otherwise keep the last of two equal keys and drop the first unseen.
+/// Keys are compared after unescaping, as the map would compare them. The key set
+/// of one object is no larger than the map built from the same bytes, and depth
+/// stays under serde_json's recursion limit, so the check adds no new bound.
+struct UniqueKeys;
+
+impl<'de> serde::Deserialize<'de> for UniqueKeys {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(UniqueKeysVisitor)
+    }
+}
+
+struct UniqueKeysVisitor;
+
+impl<'de> serde::de::Visitor<'de> for UniqueKeysVisitor {
+    type Value = UniqueKeys;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("JSON without repeated object keys")
+    }
+
+    fn visit_bool<E>(self, _: bool) -> Result<UniqueKeys, E> {
+        Ok(UniqueKeys)
+    }
+
+    fn visit_i64<E>(self, _: i64) -> Result<UniqueKeys, E> {
+        Ok(UniqueKeys)
+    }
+
+    fn visit_u64<E>(self, _: u64) -> Result<UniqueKeys, E> {
+        Ok(UniqueKeys)
+    }
+
+    fn visit_f64<E>(self, _: f64) -> Result<UniqueKeys, E> {
+        Ok(UniqueKeys)
+    }
+
+    fn visit_str<E>(self, _: &str) -> Result<UniqueKeys, E> {
+        Ok(UniqueKeys)
+    }
+
+    fn visit_unit<E>(self) -> Result<UniqueKeys, E> {
+        Ok(UniqueKeys)
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<UniqueKeys, A::Error> {
+        while seq.next_element::<UniqueKeys>()?.is_some() {}
+        Ok(UniqueKeys)
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<UniqueKeys, A::Error> {
+        let mut seen = HashSet::new();
+        while let Some(key) = map.next_key::<String>()? {
+            if seen.contains(&key) {
+                return Err(serde::de::Error::custom(format!(
+                    "repeated object key {:?}",
+                    key
+                )));
+            }
+            seen.insert(key);
+            map.next_value::<UniqueKeys>()?;
+        }
+        Ok(UniqueKeys)
     }
 }
 
@@ -223,8 +361,16 @@ impl GobgpCli {
 /// matches one full source prefix (IPv6 offset zero). Other local paths sharing
 /// that exact NLRI are collisions; learned peer paths are not local CLI targets.
 pub fn parse_rib(json: &[u8], community: u32) -> Result<Rib, String> {
+    if json.len() > MAX_RIB_BYTES {
+        return Err(format!(
+            "unreadable RIB: exceeds {MAX_RIB_BYTES}-byte limit"
+        ));
+    }
     // Only an actual JSON object can establish absence. Do not normalize missing
     // stdout/null or silently skip unclassifiable entries into a healthy empty RIB.
+    // serde_json keeps only the last value of a repeated key, silently, so a
+    // repeated key could replace a foreign path with an empty list (FLOWSPEC-R3/R4).
+    serde_json::from_slice::<UniqueKeys>(json).map_err(|e| format!("unreadable RIB: {}", e))?;
     let rib: serde_json::Map<String, serde_json::Value> =
         serde_json::from_slice(json).map_err(|e| format!("unreadable RIB: {}", e))?;
     let mut own = Rib::default();
@@ -776,6 +922,171 @@ async fn reconcile(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn pipe_byte_limits_accept_equality_and_refuse_the_next_byte() {
+        assert_eq!(
+            bounded_output(&b"abc"[..], 3, "stdout").await.unwrap(),
+            b"abc"
+        );
+        assert!(bounded_output(&b"abcd"[..], 3, "stdout")
+            .await
+            .unwrap_err()
+            .contains("stdout exceeds 3-byte limit"));
+        assert!(bounded_output(&b"abcd"[..], 3, "stderr")
+            .await
+            .unwrap_err()
+            .contains("stderr exceeds 3-byte limit"));
+        assert!(bounded_output(&b"x"[..], 0, "stdout").await.is_err());
+        assert!(bounded_output(&b""[..], 0, "stdout")
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn both_command_pipes_can_fill_their_exact_budgets_without_deadlock() {
+        let cli = GobgpCli {
+            bin: "/bin/sh".into(),
+            args: vec![
+                "-c".into(),
+                "head -c 65536 /dev/zero; head -c 65536 /dev/zero >&2".into(),
+            ],
+            community: (64512, 1),
+        };
+        let bytes = tokio::time::timeout(Duration::from_secs(3), cli.run(cli.args.clone()))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(bytes.len(), MAX_COMMAND_OUTPUT_BYTES);
+        let bad = GobgpCli {
+            args: vec![
+                "-c".into(),
+                "head -c 65536 /dev/zero | tr '\\000' '\\377' >&2; exit 1".into(),
+            ],
+            ..cli
+        };
+        assert_eq!(
+            bad.run(bad.args.clone()).await.unwrap_err(),
+            "gobgp failed; stderr is not UTF-8"
+        );
+    }
+
+    #[test]
+    fn an_oversized_valid_empty_rib_is_unavailable_not_observed_absence() {
+        let mut json = b"{}".to_vec();
+        json.resize(MAX_RIB_BYTES + 1, b' ');
+        assert!(parse_rib(&json, 1).is_err());
+        json.pop();
+        assert!(parse_rib(&json, 1).unwrap().owned.is_empty());
+    }
+
+    #[tokio::test]
+    async fn excessive_command_stdout_is_refused_not_an_accepted_write() {
+        let cli = GobgpCli {
+            bin: "/bin/sh".into(),
+            args: vec!["-c".into(), "head -c 65537 /dev/zero".into()],
+            community: (64512, 1),
+        };
+        assert!(
+            cli.apply(true, "198.51.100.1/32".parse().unwrap())
+                .await
+                .is_err(),
+            "a successful process filled an unbounded stdout buffer"
+        );
+    }
+
+    #[tokio::test]
+    async fn excessive_command_stderr_is_a_bounded_diagnostic() {
+        let cli = GobgpCli {
+            bin: "/bin/sh".into(),
+            args: vec!["-c".into(), "head -c 65537 /dev/zero >&2; exit 1".into()],
+            community: (64512, 1),
+        };
+        let why = cli
+            .apply(true, "198.51.100.1/32".parse().unwrap())
+            .await
+            .unwrap_err();
+        assert!(
+            why.len() < 65537,
+            "stderr became a {}-byte diagnostic",
+            why.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_overflowing_call_is_reaped_before_return_and_a_later_call_works() {
+        let dir = std::env::temp_dir().join(format!("sokol-overflow-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pid_file = dir.join("pid");
+        let cli = GobgpCli {
+            bin: "/bin/sh".into(),
+            args: vec![
+                "-c".into(),
+                "printf '%s' \"$$\" > \"$1\"; head -c 65537 /dev/zero; exec sleep 60".into(),
+                "overflow".into(),
+                pid_file.to_str().unwrap().into(),
+            ],
+            community: (1, 1),
+        };
+        assert!(cli
+            .run(cli.args.clone())
+            .await
+            .unwrap_err()
+            .contains("stdout exceeds"));
+        let pid = std::fs::read_to_string(&pid_file).unwrap();
+        assert!(
+            !PathBuf::from(format!("/proc/{pid}")).exists(),
+            "child still running or unreaped"
+        );
+        assert_eq!(
+            cli.run(vec!["-c".into(), "printf '{}'".into()])
+                .await
+                .unwrap(),
+            b"{}"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_full_ipv6_owned_profile_fits_the_rib_budget() {
+        // Expand a captured GoBGP 4.9.0 path to the kernel's whole supported target capacity.
+        // Foreign paths/attributes/whitespace can still exceed the byte budget and refuse it.
+        let captures: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/gobgp-4.9.0-actions.json"))
+                .unwrap();
+        let entry = captures
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["family"] == "ipv6-flowspec" && e["label"] == "owned-replaced-by-discard")
+            .unwrap();
+        let mut path = entry["rib"].as_object().unwrap().values().next().unwrap()[0].clone();
+        let mut json = String::from("{");
+        let capacity = common::BLOCKLIST_CAPACITY as usize;
+        for host in 0..capacity {
+            let net = format!("ffff:ffff:ffff:ffff:ffff:ffff:ffff:{host:x}/128");
+            path["nlri"]["value"][0]["value"]["prefix"] = net.clone().into();
+            path["attrs"][3]["value"][0]["NLRI"]["value"][0]["value"]["prefix"] =
+                net.clone().into();
+            if host != 0 {
+                json.push(',');
+            }
+            json.push_str(&serde_json::to_string(&format!("[source: {net}/0]")).unwrap());
+            json.push_str(":[");
+            json.push_str(&serde_json::to_string(&path).unwrap());
+            json.push(']');
+        }
+        json.push('}');
+        assert!(
+            json.len() <= MAX_RIB_BYTES,
+            "{} bytes exceed profile budget",
+            json.len()
+        );
+        let rib = parse_rib(json.as_bytes(), 4259912202).unwrap();
+        assert_eq!(rib.owned.len(), capacity);
+        assert_eq!(rib.discard, rib.owned);
+    }
+
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -814,6 +1125,19 @@ mod tests {
             "prefixes are announced as prefixes"
         );
         assert_eq!(c.community_value(), 4259912202);
+    }
+
+    #[test]
+    fn the_default_community_is_64512_and_the_node_id_and_is_refused_above_16_bits() {
+        assert_eq!(default_community(1), Ok((64512, 1)));
+        assert_eq!(default_community(65535), Ok((64512, 65535)));
+        for wide in [65536, 65537, u64::MAX] {
+            assert!(
+                default_community(wide).is_err(),
+                "node {wide} got a truncated community: {:?}",
+                default_community(wide)
+            );
+        }
     }
 
     /// Captured from gobgpd 4.9.0: one local rule with our community, one local rule without
@@ -4809,6 +5133,53 @@ exec "$real" "$@"
             );
             assert!(text.contains(&format!("sokol_flowspec_round_converged {expected}\n")));
         }
+    }
+
+    #[tokio::test]
+    async fn a_repeated_rib_key_cannot_hide_a_foreign_path_from_the_round() {
+        // A foreign local discard path for the target NLRI, followed by the same key
+        // with no paths: a last-value-wins reader sees a healthy empty RIB.
+        let foreign = RIB.replace("4259912202", "4259915535");
+        let foreign: serde_json::Value = serde_json::from_str(&foreign).unwrap();
+        let path = foreign["[source: 198.51.100.7/32]"].to_string();
+        let raw =
+            format!("{{\"[source: 198.51.100.7/32]\":{path},\"[source: 198.51.100.7/32]\":[]}}");
+        assert!(
+            parse_rib(raw.as_bytes(), 4259912202).is_err(),
+            "a repeated key parsed as a usable RIB"
+        );
+        let fixture = RoundFixture::new(&raw, RIB, false);
+        let db = fixture.db();
+        assert!(
+            round(&fixture.cli, &ips(&["198.51.100.7"]), &db)
+                .await
+                .is_err(),
+            "a repeated key hid the foreign path"
+        );
+        assert!(
+            !fixture.dir.join("applied").exists(),
+            "the round wrote over a foreign local path"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_repeated_key_inside_a_path_is_rejected_and_authorizes_no_withdrawal() {
+        // LocalID 7 is not a CLI path; a trailing LocalID 0 would make it look owned.
+        let raw = RIB.replacen("\"LocalID\":0}", "\"LocalID\":7,\"LocalID\":0}", 1);
+        assert!(
+            parse_rib(raw.as_bytes(), 4259912202).is_err(),
+            "a repeated LocalID parsed as a usable path"
+        );
+        let fixture = RoundFixture::new(&raw, "{}", false);
+        let db = fixture.db();
+        assert!(
+            round(&fixture.cli, &HashSet::new(), &db).await.is_err(),
+            "a repeated LocalID was classified"
+        );
+        assert!(
+            !fixture.dir.join("applied").exists(),
+            "a repeated LocalID authorized withdrawal"
+        );
     }
 
     #[tokio::test]

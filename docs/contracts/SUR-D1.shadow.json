@@ -1,0 +1,15 @@
+{
+  "annotations": {
+    "status": "UNSIGNED_EXPLANATORY_DRAFT"
+  },
+  "evidence_text": "`refusal_diagnostics_preserve_counts_and_space_emissions_across_batches`, `refusal_diagnostics_do_not_wrap_or_reemit_saturated_totals`, `rate_only_diagnostics_wait_for_the_shared_interval_and_preserve_pending_counts`; actual process count checks `RecoveryTests.test_cooldown_diagnostics_aggregate_across_batches_without_losing_counts`",
+  "id": "SUR-D1",
+  "profile": "sokol.contract-shadow.v1",
+  "statement": "Decisions to report cooldown, rate and capacity refusals are separated by at least one monotonic second; each report generates at most one line per category. Fixed-size reporting state retains the difference between cumulative and reported counters, including across empty/error polls. For each category, generated report totals plus pending deltas equal its cumulative counter before saturation. A report decision clears pending deltas; filtered or delayed writes do not change accounting.",
+  "witnesses": [
+    "RecoveryTests.test_cooldown_diagnostics_aggregate_across_batches_without_losing_counts",
+    "rate_only_diagnostics_wait_for_the_shared_interval_and_preserve_pending_counts",
+    "refusal_diagnostics_do_not_wrap_or_reemit_saturated_totals",
+    "refusal_diagnostics_preserve_counts_and_space_emissions_across_batches"
+  ]
+}

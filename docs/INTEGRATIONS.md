@@ -80,7 +80,9 @@ would cut the tunnel and the mesh with it.
 ### Cluster telemetry
 
 Every 5 s each node sends its peers a signed load report (packets and drops per second, active
-blocks, and whether drops exceed `--attack-drops-per-sec`, default 1000). A node may only report
+blocks, and whether drops exceed `--attack-drops-per-sec`, default 1000; drops that only this
+node's storm strict mode adds, `strict_parse` and `fragment_blocked` without the operator's
+`--drop-ipv4-fragments`, are left out so a storm cannot keep itself going). A node may only report
 about itself. Nodes silent for 15 s drop out of the view. The cluster status is:
 
 | nodes under attack                          | `sokol_cluster_status` |
@@ -95,7 +97,7 @@ without a storm, so a flickering storm is one event. Reports travel only between
 connected peers, so connect the nodes as a full mesh (`--seed-peer` to every other node).
 
 While the latch is engaged, `--storm-mode strict` (the default) tightens XDP on this node: packets
-whose headers do not parse are dropped instead of passed to the stack (`malformed_header`), and
+whose headers do not parse are dropped instead of passed to the stack (`strict_parse`), and
 IPv4 fragments are dropped. When the latch disengages, exactly the flags the operator configured
 (e.g. `--drop-ipv4-fragments`) are restored. Both transitions are audited (`DEFENSE_MODE|Strict`,
 `DEFENSE_MODE|Normal`) and shown as `sokol_defense_strict`. `--storm-mode observe` only logs the
@@ -369,10 +371,16 @@ claim keeps its own expiry but is enforced here for at most `--block-ttl-max`.
   (`--peer-max-active`, default 16384; more wait for a free slot), each for at most
   `--peer-max-ttl` (default `--block-ttl-max`) from when it starts. A prefix wider than /24
   (IPv4) or /64 (IPv6) is enforced only once `--quorum` distinct nodes (default 2, this node's own
-  claim included) claim it, so one compromised peer cannot cut off a network. Per peer, the peers
-  file can tighten this: `"envelope": {"max_active": 1000, "max_ttl_secs": 3600,
+  claim included) claim it, so one compromised peer cannot cut off a network. A peer's claims
+  known here at once, enforced or waiting, are capped too (`--peer-max-known`, default 65536), and
+  peers together never take the room kept for this node's own decisions (ADR-0025). Per peer, the
+  peers file can tighten this: `"envelope": {"max_active": 1000, "max_known": 4096, "max_ttl_secs": 3600,
   "min_prefix_v4": 32, "min_prefix_v6": 128}` (unknown fields are refused; `RELOAD_PEERS` applies
-  changes). Held claims are audited as `MESH_BLOCK_HELD` with the reason, and are still shared,
+  changes). A reload that lowers `max_known` below a peer's already held count returns `ERR`
+  and keeps the previous envelopes and trust store; it does not evict claims or reset their
+  leases. Retry once the held count fits. Revocation still applies immediately: a removed
+  peer's old envelope stays only with its remembered records, which no longer count toward enforcement.
+  Held claims are audited as `MESH_BLOCK_HELD` with the reason, and are still shared,
   so the mesh state converges whatever each node enforces.
 - Every 15 s each node sends a digest of its own claims; a peer whose view of them differs asks
   for them (SyncRequest), so a node that missed messages (a partition, a full send queue)
@@ -530,6 +538,16 @@ before it reaches this node's link. Expired or lifted blocks are withdrawn. With
 is attempted within the shutdown budget. Colliding owned paths can remain upstream
 until their shared-daemon ownership is resolved.
 
+**Upstream acceptance.** These rules match a source prefix only. Under RFC 8955 §6, by default
+a received Flow Specification is feasible only if it embeds a destination prefix component
+(rule a); rule a may be relaxed only by explicit configuration, and rules b and c are then
+disregarded. A router that applies the default procedure therefore does not install Sokol's
+rules, and nothing on this node shows it: the local RIB, `sokol_flowspec_discard_rules` and
+convergence describe the node's gobgpd, not the router. The lab and smoke upstream is GoBGP,
+which kept the rules in its RIB; that does not show acceptance by a validating router. Before
+relying on FlowSpec, the operator configures the receiving routers to relax rule a for this
+session and confirms on the router that the rules are installed and discarding.
+
 Every rule carries the node's ownership community (`--flowspec-community`, default
 `64512:<node-id>`; give each node that shares a gobgpd its own). Every second a separate worker
 reconciles the active blocks with local, tagged paths reported as ID-zero and matching one full source prefix
@@ -627,7 +645,7 @@ instances.
 
 `--metrics-bind 127.0.0.1:9469` serves Prometheus metrics at `/metrics`:
 `sokol_xdp_rx_packets_total`, `sokol_xdp_rx_bytes_total`,
-`sokol_xdp_dropped_packets_total{reason=...}` (`blocklist` for every blocked source, `malformed_header`, `invalid_tcp_flags`, `fragment_blocked`), `sokol_xdp_events_suppressed_total`,
+`sokol_xdp_dropped_packets_total{reason=...}` (`blocklist` for every blocked source, `malformed_header` for outer headers dropped in every mode, `strict_parse` for headers dropped only in storm strict mode, `invalid_tcp_flags`, `fragment_blocked`), `sokol_xdp_events_suppressed_total`,
 `sokol_blocks_active`, `sokol_p2p_active_peers`, `sokol_audit_queue_overflow_total`,
 `sokol_flowspec_announced`, `sokol_flowspec_enabled`, `sokol_flowspec_readback_ok`,
 `sokol_flowspec_readback_age_seconds`, `sokol_flowspec_discard_rules`, `sokol_flowspec_round_converged`, `sokol_cluster_status`, `sokol_cluster_nodes`,

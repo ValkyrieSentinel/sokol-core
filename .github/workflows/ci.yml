@@ -20,6 +20,7 @@ env:
   CARGO_DENY_SHA256: 9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f
   KANI_VERSION: 0.68.0
   CARGO_MUTANTS_VERSION: 27.1.0
+  WARRANT_VERIFY_VERSION: 0.9.0
 
 jobs:
   # Mutants of the changed lines only (docs/MUTATION.md): each must be caught by a test or
@@ -39,16 +40,29 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
+      - name: Mutation input scope before installing tools
+        id: mutation-scope
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          result=$(scripts/mutants-scope.sh "$BASE")
+          case "$result" in mutate|skip) ;; *) exit 1 ;; esac
+          echo "result=$result" >> "$GITHUB_OUTPUT"
+          echo "Mutation scope: $result (native tests and required witness gate remain independent)"
       - name: Install the pinned Rust toolchain (rust-toolchain.toml)
+        if: steps.mutation-scope.outputs.result == 'mutate'
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        if: steps.mutation-scope.outputs.result == 'mutate'
         with:
           shared-key: mutants
       - name: Install cargo-mutants (crates.io, --locked)
+        if: steps.mutation-scope.outputs.result == 'mutate'
         run: |
           rustup toolchain install stable --profile minimal
           cargo +stable install --locked cargo-mutants --version "$CARGO_MUTANTS_VERSION"
       - name: Mutants of the change (scripts/mutants-diff.sh)
+        if: steps.mutation-scope.outputs.result == 'mutate'
         env:
           BASE: ${{ github.event.pull_request.base.sha }}
           MUTANTS_SHARD: ${{ matrix.shard }}/4
@@ -106,9 +120,16 @@ jobs:
           rustup toolchain install stable --profile minimal
           cargo +stable install --locked kani-verifier --version "$KANI_VERSION"
           cargo +stable kani setup
-      - name: Proofs (cargo kani -p common)
+      - name: Proofs and assertion counterexamples
         if: steps.scope.outputs.prove == 'true'
-        run: cargo kani -p common
+        run: python3 scripts/proof-task.py run
+      - name: Proof evidence and concrete playback candidates
+        if: always() && steps.scope.outputs.prove == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: proof-calibration
+          path: /tmp/sokol-proof-run-*/
+          if-no-files-found: error
 
   # Both architectures run the whole suite, XDP smoke and demo included: an arm64 kernel faults
   # on things x86 tolerates (a misaligned 64-bit atomic in a map value hung one, ADR-0014).
@@ -227,6 +248,54 @@ jobs:
             grep -Fq "PASS live startup intent ${family}:" /tmp/sokol-cargo-test.log
           done
 
+      # Pinned Python witnesses that drive the released Warrant CLI (EXCHANGE-P1) skip without
+      # it; the gate runs pinned witnesses itself and a skip is not a pass. Installed once here
+      # for the gate and the integration step below.
+      - name: Released warrant-verify for the witnesses that need it
+        if: matrix.part == 'test'
+        run: |
+          cargo install --locked --version "$WARRANT_VERIFY_VERSION" --root "$RUNNER_TEMP/sokol-warrant" warrant-verify
+          echo "SOKOL_WARRANT_BIN=$RUNNER_TEMP/sokol-warrant/bin/warrant-rs" >> "$GITHUB_ENV"
+
+      - name: Pinned witnesses unchanged without the owner's signature (ADR-0023)
+        if: matrix.policy_checks && matrix.part == 'test'
+        # The checker and the signers come from the base commit: a pull request that weakened
+        # a witness could otherwise also weaken the check or add its own key. The checkout is
+        # one commit deep, so the base is fetched here; if it cannot be, the step fails rather
+        # than fall back to the pull request's own checker (2026-10-12: it had, since #1).
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+          # A merge candidate must already meet main's completeness rule. Drafts stay proposals;
+          # accepted new agent rows carry their provisional signature.
+          EVERY_PIN: --every-pin
+        run: |
+          if [ -z "$BASE" ] || [ "$BASE" = 0000000000000000000000000000000000000000 ]; then
+            git fetch --no-tags --depth=2 origin "$(git rev-parse HEAD)"
+            BASE=$(git rev-parse HEAD^1)
+          fi
+          git fetch --no-tags --depth=1 origin "$BASE"
+          trusted=$(mktemp -d)
+          git show "$BASE:scripts/witness-pin.py" > "$trusted/witness-pin.py"
+          git show "$BASE:.github/witness-signers" > /tmp/witness-signers
+          echo "checker and signers from base $BASE"
+          # --executed: every pinned witness also ran and passed in the Test step above.
+          # shellcheck disable=SC2086  # empty or one flag
+          # -I: the change's own scripts/ must not shadow the checker's standard library.
+          if grep -q '^def configure_root(' "$trusted/witness-pin.py"; then
+            python3 -I "$trusted/witness-pin.py" --root "$PWD" check --signers /tmp/witness-signers $EVERY_PIN \
+              --executed /tmp/sokol-cargo-test.log
+          else
+            # One owner-authorized bootstrap from the legacy checker. It has no --root and
+            # no self-pin; preserve its old semantics, then restore the candidate exactly.
+            cp scripts/witness-pin.py "$trusted/candidate.py"
+            cp "$trusted/witness-pin.py" scripts/witness-pin.py
+            status=0
+            python3 -I scripts/witness-pin.py check --signers /tmp/witness-signers $EVERY_PIN \
+              --executed /tmp/sokol-cargo-test.log || status=$?
+            cp "$trusted/candidate.py" scripts/witness-pin.py
+            [ "$status" = 0 ]
+          fi
+
       - name: Cited evidence exists (tests in the compiler's list, metrics, flags, ADRs, paths)
         if: matrix.policy_checks && matrix.part == 'test'
         run: |
@@ -258,12 +327,41 @@ jobs:
         run: |
           python3 scripts/test_witness_gate.py
           python3 scripts/test_local_ci.py
+          python3 scripts/test_pre_push_env.py
           python3 scripts/test_runbook_preflight.py
+          python3 scripts/test_mesh_preflight.py
+          python3 scripts/test_bounded_log.py
+          python3 scripts/test_ast_dump_stable.py
           python3 scripts/test_anchor_scripts.py
           python3 scripts/test_kani_scope.py
+          python3 scripts/test_proof_task.py
           python3 scripts/test_mutants_diff.py
+          python3 scripts/test_mutants_scope.py
           python3 scripts/test_check_agents_rules.py
           python3 scripts/test_check_claims.py
+          python3 scripts/test_witness_pin.py
+          python3 scripts/test_gate_provenance.py
+          python3 scripts/test_trust_root.py
+          python3 scripts/test_sokol_dev.py
+          python3 scripts/test_exchange_gate_root.py
+          python3 scripts/test_candidate.py
+          python3 scripts/test_build_identity.py
+          python3 scripts/test_support_bundle.py
+          python3 scripts/test_operator_offline.py
+          python3 scripts/test_check_retired.py
+          python3 scripts/test_counterexample_registry.py
+          python3 scripts/test_check_monitoring.py
+          python3 scripts/test_outbox_task.py
+          python3 scripts/test_contract_shadow.py
+          python3 scripts/test_contract_tool.py
+          python3 scripts/test_contract_task.py
+
+      - name: Portable counterexample and public Warrant integration regressions
+        if: matrix.part == 'test'
+        run: |
+          test -x "$SOKOL_WARRANT_BIN"
+          python3 scripts/test_counterexample_task.py
+          python3 scripts/test_counterexample_hostile_pack.py
 
       - name: CrowdSec stream recovery regression
         if: matrix.part == 'test'
@@ -307,7 +405,7 @@ jobs:
         if: always() && matrix.part == 'test'
         run: |
           mkdir -p dist
-          for b in orchestrator sokol-operator sokol-suricata sokol-crowdsec sokol-fastnetmon-notify trident_trap; do
+          for b in orchestrator monitor sokol-operator sokol-suricata sokol-crowdsec sokol-fastnetmon-notify trident_trap; do
             if [ -x "target/release/$b" ]; then cp "target/release/$b" dist/; fi
           done
           cp target/bpfel-unknown-none/release/ebpf-probe dist/ebpf-probe.o 2>/dev/null || true
@@ -332,6 +430,20 @@ jobs:
           name: sokol-${{ github.sha }}-${{ matrix.arch }}
           path: dist/
           if-no-files-found: warn
+
+      - name: Complete candidate from the single product inventory
+        if: success() && matrix.part == 'test'
+        run: |
+          mkdir -p candidates
+          python3 scripts/candidate.py build --binaries target/release --output "candidates/candidate-${{ matrix.arch }}.tar.gz" > "candidates/candidate-${{ matrix.arch }}.json"
+          tar -xOf "candidates/candidate-${{ matrix.arch }}.tar.gz" SBOM.spdx.json > "candidates/SBOM-${{ matrix.arch }}.spdx.json"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: success() && matrix.part == 'test'
+        with:
+          name: candidate-${{ github.sha }}-${{ matrix.arch }}
+          path: candidates/
+          if-no-files-found: error
 
       # Last: it rebuilds the orchestrator with another build id (the "upgrade"), which replaces
       # the binary the artifacts above were made from.
@@ -365,6 +477,35 @@ jobs:
           ARCH: ${{ matrix.arch }}
         run: |
           gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs?filter=latest&per_page=100" \
-            --jq ".jobs[] | select(.name | endswith(\" ($ARCH)\")) | \"\(.name) \(.conclusion)\"" | tee parts.txt
+            --jq ".jobs[] | select(.name == \"test ($ARCH)\" or .name == \"smoke ($ARCH)\" or .name == \"demo ($ARCH)\") | \"\(.name) \(.conclusion)\"" | tee parts.txt
           [ "$(wc -l < parts.txt)" = 3 ] || { echo "expected 3 parts of $ARCH"; exit 1; }
           ! grep -v ' success$' parts.txt
+
+  candidate-provenance:
+    name: candidate origin [${{ matrix.arch }}]
+    # Origin attestations only, after the native suites; no public RC or admission.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [build-test-smoke, kani]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+      attestations: write
+    strategy:
+      matrix:
+        arch: [x86_64, aarch64]
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: candidate-${{ github.sha }}-${{ matrix.arch }}
+          path: candidate
+      - name: Attest the archive's build origin
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4, origin only
+        with:
+          subject-path: candidate/candidate-${{ matrix.arch }}.tar.gz
+      - name: Attest the declared dependency inventory
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
+        with:
+          subject-path: candidate/candidate-${{ matrix.arch }}.tar.gz
+          sbom-path: candidate/SBOM-${{ matrix.arch }}.spdx.json

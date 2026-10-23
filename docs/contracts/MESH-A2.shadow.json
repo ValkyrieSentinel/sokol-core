@@ -1,0 +1,23 @@
+{
+  "annotations": {
+    "status": "UNSIGNED_EXPLANATORY_DRAFT"
+  },
+  "decisions": [
+    {
+      "because": "Counterexample R5-F1 on c51cdc9: node 3 replayed the handshake node 2 had sent it to node 1, which authenticated node 3's connection as node 2 and sent node 1's broadcasts for node 2 to node 3. A recipient/nonce in the handshake would not stop a live two-way relay; the WireGuard tunnel address is authenticated by the peer's tunnel key (ADR-0027, owner chose B on 2026-10-12).",
+      "previous_statement_sha256": null,
+      "proposal_sha256": "a44a4ac6e4aa22e909e45fb5bcd6d0b9315ee0ab8773a187f97986874d96f17d"
+    }
+  ],
+  "evidence_text": "`a_bound_node_authenticates_only_from_its_address`, `a_handshake_relayed_by_another_peer_does_not_take_over_its_delivery`, `a_reload_that_moves_a_node_closes_its_connection`, `peers_file_addresses_are_parsed_and_checked`, `the_startup_warning_names_exactly_the_unbound_peers`",
+  "id": "MESH-A2",
+  "profile": "sokol.contract-shadow.v1",
+  "statement": "A pinned node that the peers file binds to an address authenticates only on a connection from that address: a handshake from any other source is refused and counted (sokol_mesh_handshakes_wrong_address_total), so another peer cannot relay its handshake and take over delivery to it; a reload that binds it elsewhere closes its connection on its next envelope. One address cannot be bound to two nodes. A node bound to no address is accepted from any address and named at startup.",
+  "witnesses": [
+    "a_bound_node_authenticates_only_from_its_address",
+    "a_handshake_relayed_by_another_peer_does_not_take_over_its_delivery",
+    "a_reload_that_moves_a_node_closes_its_connection",
+    "peers_file_addresses_are_parsed_and_checked",
+    "the_startup_warning_names_exactly_the_unbound_peers"
+  ]
+}

@@ -1,0 +1,36 @@
+{
+  "annotations": {
+    "status": "UNSIGNED_EXPLANATORY_DRAFT"
+  },
+  "decisions": [
+    {
+      "because": "Counterexample (hunt round 3, 2026-10-10): a one-slot peer flooded 262144 non-expiring claims into the shared MAX_KNOWN_CLAIMS memory; its envelope held, yet this node's own detection and a third node's claim were refused for good. Owner chose design A (ADR-0025).",
+      "previous_statement_sha256": null,
+      "proposal_sha256": "a438c2551f5e2d95d8f10e6a10a7bcafb7db8fd78b8cb2575dbe444e3f990c07"
+    },
+    {
+      "because": "Mutation check (CI, PR #8): forget_known could be replaced by () or its == 0 by != and no witness failed, so the per-issuer count could drift silently. The new witness pins that a share frees exactly as the claims of a peer end.",
+      "previous_statement_sha256": "e092a7415d3bf45595fda0e186330327776810be438fbee72fea914e7ee1d8e9",
+      "proposal_sha256": "0c6b7037c9f33dff9b93594fe286298f3d0d38284862b3b6305fcf70064ab18e"
+    },
+    {
+      "because": "Counterexample an_explicit_large_peer_share_can_exhaust_the_shared_peer_budget: a configured 196608-record peer share fills the aggregate peer budget and a different peer is refused while an own detection is admitted. Clarify configuration-dependent availability; preserve all existing witnesses and add atomic reload/revocation coverage. Supersedes the narrower reload-only intent MESH-K1-87538f12083b.",
+      "previous_statement_sha256": "e092a7415d3bf45595fda0e186330327776810be438fbee72fea914e7ee1d8e9",
+      "proposal_sha256": "0761b4f98a63b27a5f643652a054287cdaca478d9b2e51b60464a38528de9d7e"
+    }
+  ],
+  "evidence_text": "`a_one_slot_peer_cannot_deny_this_nodes_own_detections_by_volume`, `a_peer_beyond_its_known_claims_share_is_refused_alone`, `peers_together_leave_the_room_kept_for_this_nodes_own_decisions`, `a_peers_share_frees_exactly_as_its_claims_end`, `a_refused_share_reload_answers_error_and_keeps_trust_then_can_be_retried`, `a_reload_at_the_held_known_claims_bound_applies_and_ignores_own_claims`, `a_reload_below_held_known_claims_keeps_the_previous_envelopes`, `an_explicit_large_peer_share_can_exhaust_the_shared_peer_budget`",
+  "id": "MESH-K1",
+  "profile": "sokol.contract-shadow.v1",
+  "statement": "A newly held peer claim is admitted only below both its issuer's known-claims share and the aggregate peer budget MAX_KNOWN_CLAIMS - OWN_RESERVE. Peer admission cannot consume the room reserved for own claims; own admission remains subject to total capacity. Per-peer shares do not reserve independent room for every peer: at the aggregate bound another peer is refused too. Trust/quota reload is atomic, refuses a trusted issuer's share below its held count, and permits trust revocation while retaining the revoked issuer's records and accounting envelope.",
+  "witnesses": [
+    "a_one_slot_peer_cannot_deny_this_nodes_own_detections_by_volume",
+    "a_peer_beyond_its_known_claims_share_is_refused_alone",
+    "a_peers_share_frees_exactly_as_its_claims_end",
+    "a_refused_share_reload_answers_error_and_keeps_trust_then_can_be_retried",
+    "a_reload_at_the_held_known_claims_bound_applies_and_ignores_own_claims",
+    "a_reload_below_held_known_claims_keeps_the_previous_envelopes",
+    "an_explicit_large_peer_share_can_exhaust_the_shared_peer_budget",
+    "peers_together_leave_the_room_kept_for_this_nodes_own_decisions"
+  ]
+}

@@ -1,0 +1,26 @@
+{
+  "annotations": {
+    "status": "UNSIGNED_EXPLANATORY_DRAFT"
+  },
+  "decisions": [
+    {
+      "because": "Assertion-red subprocess regressions: a successful write command accepted 65537 stdout bytes, and a failing command returned 65537 bytes of stderr as its diagnostic. Bound both pipes while draining concurrently and refuse over-limit RIB input rather than treating a prefix as observed absence. (Re-proposed by Claude 2026-10-12 with --after FLOWSPEC-P1: FLOWSPEC-R13 is a prose section, not a table row, so the original anchor could not be accepted.)",
+      "previous_statement_sha256": null,
+      "proposal_sha256": "6ee37209327223d937f31be045cdfe411a658179f11e4de24c538de8d42dc537"
+    }
+  ],
+  "evidence_text": "`a_full_ipv6_owned_profile_fits_the_rib_budget`, `a_timed_out_call_is_killed`, `an_overflowing_call_is_reaped_before_return_and_a_later_call_works`, `an_oversized_valid_empty_rib_is_unavailable_not_observed_absence`, `both_command_pipes_can_fill_their_exact_budgets_without_deadlock`, `excessive_command_stderr_is_a_bounded_diagnostic`, `excessive_command_stdout_is_refused_not_an_accepted_write`, `pipe_byte_limits_accept_equality_and_refuse_the_next_byte`",
+  "id": "FLOWSPEC-B1",
+  "profile": "sokol.contract-shadow.v1",
+  "statement": "GoBGP command stdout is limited to MAX_COMMAND_OUTPUT_BYTES, per-family RIB stdout to MAX_RIB_BYTES and every stderr pipe to MAX_DIAGNOSTIC_BYTES. Overflow refuses the call, kills and reaps the direct child; truncated or excessive RIB bytes never establish observed absence or write authority. These are input-byte budgets, not a total RSS or remote rollback guarantee.",
+  "witnesses": [
+    "a_full_ipv6_owned_profile_fits_the_rib_budget",
+    "a_timed_out_call_is_killed",
+    "an_overflowing_call_is_reaped_before_return_and_a_later_call_works",
+    "an_oversized_valid_empty_rib_is_unavailable_not_observed_absence",
+    "both_command_pipes_can_fill_their_exact_budgets_without_deadlock",
+    "excessive_command_stderr_is_a_bounded_diagnostic",
+    "excessive_command_stdout_is_refused_not_an_accepted_write",
+    "pipe_byte_limits_accept_equality_and_refuse_the_next_byte"
+  ]
+}

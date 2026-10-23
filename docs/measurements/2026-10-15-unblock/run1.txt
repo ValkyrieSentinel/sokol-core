@@ -1,0 +1,29 @@
+# nodes=3 netem='none' host=aarch64 cpus=10 kernel=6.8.0-142-generic
+# full mesh after 3s: 3/3 nodes see 2 peers
+# unblock: ways 'retract unban flush expire', 20 rounds each, expire ttl 6s, FlowSpec on
+== retract
+   xdp1  node 1 answers again:        n=20 min=0 median=5 p95=11 max=13 (ms)
+   peer  another node answers again:  n=40 min=1 median=6 p95=10 max=12 (ms)
+   rib   rule gone from node gobgpd:  n=20 min=854 median=975 p95=1060 max=1072 (ms)
+   upstr rule gone upstream:          n=20 min=858 median=981 p95=1066 max=1079 (ms)
+   fsrec FLOWSPEC_WITHDRAW record:    n=20 min=847 median=944 p95=1009 max=1015 (ms)
+== unban
+   xdp1  node 1 answers again:        n=20 min=0 median=5 p95=11 max=11 (ms)
+   peer  another node answers again:  n=40 min=0 median=5 p95=10 max=12 (ms)
+   rib   rule gone from node gobgpd:  n=20 min=867 median=986 p95=1067 max=2007 (ms)
+   upstr rule gone upstream:          n=20 min=865 median=991 p95=1074 max=1949 (ms)
+   fsrec FLOWSPEC_WITHDRAW record:    n=20 min=827 median=969 p95=1008 max=1948 (ms)
+== flush
+   xdp1  node 1 answers again:        n=20 min=0 median=6 p95=10 max=10 (ms)
+   peer  another node answers again:  n=40 min=1 median=6 p95=11 max=12 (ms)
+   rib   rule gone from node gobgpd:  n=20 min=844 median=961 p95=2012 max=2026 (ms)
+   upstr rule gone upstream:          n=20 min=848 median=966 p95=2018 max=2032 (ms)
+   fsrec FLOWSPEC_WITHDRAW record:    n=20 min=822 median=920 p95=1958 max=1966 (ms)
+== expire
+   xdp1  node 1 answers again:        n=20 min=0 median=5 p95=11 max=12 (ms)
+   peer  another node answers again:  n=40 min=33 median=43 p95=51 max=59 (ms)
+   rib   rule gone from node gobgpd:  n=20 min=61 median=389 p95=950 max=959 (ms)
+   upstr rule gone upstream:          n=20 min=68 median=395 p95=956 max=964 (ms)
+   fsrec FLOWSPEC_WITHDRAW record:    n=20 min=18 median=379 p95=893 max=916 (ms)
+   lag   BLOCK_EXPIRED - signed end:  n=20 min=23 median=404 p95=895 max=966 (ms)
+no layer kept blocking 20 s after an end

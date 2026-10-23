@@ -1,0 +1,196 @@
+{
+  "profile": "sokol.proof-challenges.v1",
+  "authority": "UNSIGNED_NEGATIVE_CONTROLS",
+  "cases": [
+    {
+      "id": "genesis",
+      "file": "common/src/audit_log.rs",
+      "harness": "audit_log::proofs::a_zero_sequence_segment_has_the_fixed_genesis_chain",
+      "replace": {
+        "before": "start != 0 || *previous == [0; CHAIN_LEN]",
+        "after": "start != 0 || *previous != [0; CHAIN_LEN]"
+      },
+      "assertion": "assertion failed: accepted == previous == [0; CHAIN_LEN]"
+    },
+    {
+      "id": "payload-bound",
+      "file": "common/src/audit_log.rs",
+      "harness": "audit_log::proofs::a_record_header_never_admits_more_than_max_payload",
+      "replace": {
+        "before": "if len > MAX_PAYLOAD {",
+        "after": "if false {"
+      },
+      "assertion": "assertion failed: len <= MAX_PAYLOAD"
+    },
+    {
+      "id": "header-roundtrip",
+      "file": "common/src/audit_log.rs",
+      "harness": "audit_log::proofs::an_encoded_header_parses_back",
+      "replace": {
+        "before": "h[4..8].copy_from_slice(&len.to_le_bytes());",
+        "after": "h[4..8].copy_from_slice(&0u32.to_le_bytes());"
+      },
+      "assertion": "assertion failed: parse_record_header(&encode_header(len, seq, timestamp_ms)) ==\nOk((len as usize, seq, timestamp_ms))"
+    },
+    {
+      "id": "advance-overflow",
+      "file": "common/src/audit_log.rs",
+      "harness": "audit_log::proofs::advancing_never_wraps",
+      "replace": {
+        "before": "Some((next_seq.checked_add(1)?, offset.checked_add(size)?))",
+        "after": "Some((next_seq.wrapping_add(1), offset.wrapping_add(size)))"
+      },
+      "assertion": "assertion failed: next > seq && next - seq == 1"
+    },
+    {
+      "id": "json-framing",
+      "file": "common/src/canonical.rs",
+      "harness": "canonical::proofs::the_strict_validator_returns_on_every_short_input",
+      "replace": {
+        "before": "    pub fn validate_strict_json_object(input: &str) -> Result<(), CanonicalError> {\n        let bytes = input.as_bytes();\n        if bytes.is_empty() {\n            return Err(CanonicalError::EmptyPayload);\n        }\n        let trimmed = bytes.trim_ascii();\n        match trimmed {\n            [b'{', inner @ .., b'}'] => Self::parse_and_check_keys(inner),\n            _ => Err(CanonicalError::InvalidFraming),\n        }\n    }",
+        "after": "    pub fn validate_strict_json_object(_input: &str) -> Result<(), CanonicalError> {\n        Ok(())\n    }"
+      },
+      "assertion": "assertion failed: trimmed.starts_with('{') && trimmed.ends_with('}')"
+    },
+    {
+      "id": "storm-counted",
+      "file": "common/src/storm.rs",
+      "harness": "storm::proofs::storm_added_drops_never_move_the_attack_signal",
+      "replace": {
+        "before": "    if storm_added(code, base, strict) {",
+        "after": "    if false {"
+      },
+      "assertion": "assertion failed: counted(code, now, start, base, strict) == 0"
+    },
+    {
+      "id": "storm-malformed",
+      "file": "common/src/storm.rs",
+      "harness": "storm::proofs::every_other_drop_reason_counts_in_every_mode",
+      "replace": {
+        "before": "|| (code == drop_reason::STRICT_PARSE_FAILED && added & config_flags::STRICT_PARSE != 0)",
+        "after": "|| ((code == drop_reason::STRICT_PARSE_FAILED || code == drop_reason::MALFORMED_HEADER) && added & config_flags::STRICT_PARSE != 0)"
+      },
+      "assertion": "assertion failed: counted(code, now, start, base, strict) == now.saturating_sub(start)"
+    },
+    {
+      "id": "storm-flags",
+      "file": "common/src/storm.rs",
+      "harness": "storm::proofs::a_storm_adds_only_its_flags_and_keeps_the_operators",
+      "replace": {
+        "before": "        base | STORM_FLAGS",
+        "after": "        STORM_FLAGS"
+      },
+      "assertion": "assertion failed: set & base == base && set & !base & !STORM_FLAGS == 0"
+    },
+    {
+      "id": "lease-cap",
+      "file": "common/src/lease.rs",
+      "harness": "lease::proofs::a_resent_claim_never_outlasts_its_first_lease",
+      "replace": {
+        "before": "    earlier.map_or(fresh, |end| fresh.min(end))",
+        "after": "    earlier.map_or(fresh, |_| fresh)"
+      },
+      "assertion": "assertion failed: capped <= earlier && until(end_local, capped) <= earlier"
+    },
+    {
+      "id": "lease-record",
+      "file": "common/src/lease.rs",
+      "harness": "lease::proofs::a_lease_record_only_moves_earlier",
+      "replace": {
+        "before": "    old.map_or(cap, |end| end.min(cap))",
+        "after": "    old.map_or(cap, |_| cap)"
+      },
+      "assertion": "assertion failed: end <= old && end <= new_cap"
+    },
+    {
+      "id": "lease-grace",
+      "file": "common/src/lease.rs",
+      "harness": "lease::proofs::within_grace_a_live_resend_finds_its_record",
+      "replace": {
+        "before": "    end.is_none_or(|e| e.saturating_add(grace) > now)",
+        "after": "    end.is_none_or(|e| e > now)"
+      },
+      "assertion": "assertion failed: kept(Some(end), now, grace)"
+    },
+    {
+      "id": "wire-accounting",
+      "file": "common/src/wire.rs",
+      "harness": "wire::proofs::every_byte_of_an_accepted_frame_is_accounted_for",
+      "replace": {
+        "before": "    let body = rest.get(28..).unwrap_or_default();",
+        "after": "    let body = rest.get(27..).unwrap_or_default();"
+      },
+      "assertion": "assertion failed: accounted"
+    },
+    {
+      "id": "wire-magic",
+      "file": "common/src/wire.rs",
+      "harness": "wire::proofs::a_frame_without_the_magic_is_refused",
+      "replace": {
+        "before": "    if magic != MAGIC {",
+        "after": "    if false {"
+      },
+      "assertion": "assertion failed: split(&bytes[..len]) == Err(WireError::Legacy)"
+    },
+    {
+      "id": "wire-roundtrip",
+      "file": "common/src/wire.rs",
+      "harness": "wire::proofs::a_written_frame_splits_back",
+      "replace": {
+        "before": "        &h.nonce.to_le_bytes(),",
+        "after": "        &h.timestamp_ms.to_le_bytes(),"
+      },
+      "assertion": "assertion failed: same"
+    },
+    {
+      "id": "replay-window",
+      "file": "common/src/replay.rs",
+      "harness": "replay::proofs::the_replay_window_covers_the_clock_skew_both_ways",
+      "replace": {
+        "before": "    arrived.saturating_add(REPLAY_WINDOW_MS) >= now",
+        "after": "    arrived.saturating_add(REPLAY_WINDOW_MS) > now"
+      },
+      "assertion": "assertion failed: remembered(arrived, now)"
+    },
+    {
+      "id": "replay-floor",
+      "file": "common/src/replay.rs",
+      "harness": "replay::proofs::an_accepted_envelope_is_refused_again_whatever_the_clock_did",
+      "replace": {
+        "before": "    Some(floor.map_or(purged, |f| f.max(purged)))",
+        "after": "    floor.map(|f| f.max(purged))"
+      },
+      "assertion": "assertion failed: refused"
+    },
+    {
+      "id": "replay-honest",
+      "file": "common/src/replay.rs",
+      "harness": "replay::proofs::honest_envelopes_stay_above_the_floor",
+      "replace": {
+        "before": "    floor.is_none_or(|f| timestamp_ms > f)",
+        "after": "    floor.is_none_or(|f| timestamp_ms > f.saturating_add(MAX_CLOCK_SKEW_MS))"
+      },
+      "assertion": "assertion failed: above"
+    },
+    {
+      "id": "replay-fence",
+      "file": "common/src/replay.rs",
+      "harness": "replay::proofs::a_restart_fences_off_what_came_before",
+      "replace": {
+        "before": "    started.checked_sub(1)",
+        "after": "    started.checked_sub(2)"
+      },
+      "assertion": "assertion failed: fenced"
+    },
+    {
+      "id": "replay-fence-cost",
+      "file": "common/src/replay.rs",
+      "harness": "replay::proofs::the_fence_costs_honest_senders_only_the_skew_after_the_start",
+      "replace": {
+        "before": "    started.checked_sub(1)",
+        "after": "    started.saturating_add(MAX_CLOCK_SKEW_MS).checked_sub(1)"
+      },
+      "assertion": "assertion failed: admitted"
+    }
+  ]
+}

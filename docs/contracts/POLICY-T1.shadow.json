@@ -1,0 +1,24 @@
+{
+  "annotations": {
+    "status": "UNSIGNED_EXPLANATORY_DRAFT"
+  },
+  "decisions": [
+    {
+      "because": "ROADMAP typed-axiom step: signal target selection used diagnostic strings as protection identity. Typed constructors and exhaustive SourceRole separate identity from wording while preserving current policy and messages. A native mutation restoring string-based target selection fails the matching-diagnostic assertion; compile controls require E0004 in source_role for a new variant, with explicit-role positive controls.",
+      "previous_statement_sha256": null,
+      "proposal_sha256": "d6e7a40bd685a93bdc8705c97dc4c0053112ec4a55fc51cf9c3762a0c5034e2f"
+    }
+  ],
+  "evidence_text": "`ProtectionTypes.test_a_new_reason_requires_a_source_role_decision`, `ProtectionTypes.test_production_diagnostic_strings_cannot_construct_protection`, `a_matching_diagnostic_cannot_redirect_a_signal_to_its_destination`, `legacy_fixture_labels_keep_their_typed_protection_identity`, `matching_diagnostic_text_does_not_grant_local_source_authority`, `only_local_and_home_protection_name_the_remote_destination`",
+  "id": "POLICY-T1",
+  "profile": "sokol.contract-shadow.v1",
+  "statement": "Protection identity and diagnostic text are separate. For a protected single-address signal source, LocalAddress and HomeNetwork select the destination; every other declared protection role refuses redirection. Production ProtectionReason has no diagnostic-string conversion; legacy fixture conversions exist only under cfg(test). In the production protection module, adding a reason variant without an explicit source_role decision fails exhaustiveness checking; this requires a decision, not proof that the new decision is correct.",
+  "witnesses": [
+    "ProtectionTypes.test_a_new_reason_requires_a_source_role_decision",
+    "ProtectionTypes.test_production_diagnostic_strings_cannot_construct_protection",
+    "a_matching_diagnostic_cannot_redirect_a_signal_to_its_destination",
+    "legacy_fixture_labels_keep_their_typed_protection_identity",
+    "matching_diagnostic_text_does_not_grant_local_source_authority",
+    "only_local_and_home_protection_name_the_remote_destination"
+  ]
+}

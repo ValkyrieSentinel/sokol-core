@@ -313,7 +313,7 @@ fn writer_loop(path: &Path, rx: &mpsc::Receiver<()>, shared: &Shared, write: &Wr
 pub fn save_state(path: &Path, state: &Persisted) -> std::io::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
-    let tmp = path.with_extension("tmp");
+    let tmp = state_tmp(path);
     let mut f = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
@@ -330,40 +330,43 @@ pub fn save_state(path: &Path, state: &Persisted) -> std::io::Result<()> {
     Ok(())
 }
 
+/// The temporary file a state is written through: the state file's own name plus `.tmp`, as
+/// `sokol-suricata` does for its cursor. `with_extension("tmp")` would be the state file itself
+/// for `--state-file sokol.tmp`, and the save would truncate it in place instead of replacing it
+/// atomically (ADR-0004).
+fn state_tmp(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(".tmp");
+    PathBuf::from(name)
+}
+
 /// `Ok(None)`: no state file (a first start).
 pub fn read_state(path: &Path) -> Result<Option<Persisted>, Restore> {
-    let bytes = match std::fs::read(path) {
-        Ok(bytes) => bytes,
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => {
+            // An unreadable regular file (EACCES, EIO) is not a first start either, and the next
+            // save would rename over it: keep it aside like an unparseable one. The hard link
+            // needs no read permission. A directory or another non-regular path has no bytes
+            // to keep.
+            let regular = std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_file());
             return Err(Restore::Failed {
                 why: format!("cannot read {}: {}", path.display(), e),
-                kept: None,
-            })
-        }
-    };
-    // The layout is checked first, so a file of another schema is named as such, not as corrupt.
-    #[derive(serde::Deserialize)]
-    struct Head {
-        schema: Option<u32>,
-    }
-    if let Ok(Head {
-        schema: Some(schema),
-    }) = serde_json::from_slice::<Head>(&bytes)
-    {
-        if schema != crate::block_table::STATE_SCHEMA {
-            return Err(Restore::Failed {
-                why: format!(
-                    "{} has state schema {}, this build reads {} (no migration)",
-                    path.display(),
-                    schema,
-                    crate::block_table::STATE_SCHEMA
-                ),
-                kept: keep_aside(path),
+                kept: if regular { keep_aside(path) } else { None },
             });
         }
+    };
+    if file
+        .metadata()
+        .is_ok_and(|m| m.len() > crate::state_input::MAX_STATE_BYTES as u64)
+    {
+        return Err(Restore::Failed {
+            why: format!("{} exceeds state byte limit", path.display()),
+            kept: keep_aside(path),
+        });
     }
-    serde_json::from_slice::<Persisted>(&bytes)
+    crate::state_input::parse(file)
         .map(Some)
         .map_err(|e| Restore::Failed {
             why: format!("{} is not a valid state file: {}", path.display(), e),
@@ -392,6 +395,62 @@ fn keep_aside(path: &Path) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_file_over_the_writer_byte_budget_is_refused_without_reading_or_replacing_it() {
+        // Equality reaches the decoder: corruption at the bound is not mislabeled as
+        // excess input. A sparse NUL file fails on its first byte, without reading 1 GiB.
+        let exact = temp("sparse-exact-budget");
+        let file = std::fs::File::create(&exact).unwrap();
+        file.set_len(crate::state_input::MAX_STATE_BYTES as u64)
+            .unwrap();
+        match read_state(&exact) {
+            Err(Restore::Failed { why, .. }) => {
+                assert!(why.contains("not a valid state file"), "{why}");
+            }
+            other => panic!("expected decoder refusal at exact byte budget: {other:?}"),
+        }
+        let path = temp("sparse-oversized");
+        let file = std::fs::File::create(&path).unwrap();
+        let bytes = crate::state_input::MAX_STATE_BYTES as u64 + 1;
+        file.set_len(bytes).unwrap();
+        match read_state(&path) {
+            Err(Restore::Failed {
+                why,
+                kept: Some(kept),
+            }) => {
+                assert!(why.contains("state byte limit"), "{why}");
+                assert_eq!(std::fs::metadata(kept).unwrap().len(), bytes);
+                assert_eq!(std::fs::metadata(path).unwrap().len(), bytes);
+            }
+            other => panic!("oversized file was accepted: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_overlong_saved_reason_is_refused_and_the_original_bytes_are_kept() {
+        let path = temp("oversized-reason");
+        let mut saved = state(1);
+        saved.claims.push(crate::block_table::Claim {
+            issuer: 1,
+            kind: crate::block_table::ClaimKind::Operator,
+            target: "198.51.100.1".into(),
+            issued_ms: 0,
+            expires_ms: None,
+            reason: "x".repeat(crate::block_table::MAX_REASON_BYTES + 1),
+        });
+        save_state(&path, &saved).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        match read_state(&path) {
+            Err(Restore::Failed {
+                kept: Some(kept), ..
+            }) => {
+                assert_eq!(std::fs::read(kept).unwrap(), bytes);
+                assert_eq!(std::fs::read(path).unwrap(), bytes);
+            }
+            other => panic!("an impossible writer state was admitted: {other:?}"),
+        }
+    }
+
     use super::*;
 
     fn state(n: usize) -> Persisted {
@@ -748,6 +807,56 @@ mod tests {
             matches!(read_state(&dir), Err(Restore::Failed { kept: None, .. })),
             "an unreadable path is a failure, not a first start"
         );
+    }
+
+    #[test]
+    fn an_unreadable_state_file_is_kept_aside_and_survives_the_next_save() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = temp("unreadable");
+        save_state(&path, &state(1)).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        assert!(
+            std::fs::read(&path).is_err(),
+            "the witness needs a non-root user: mode 000 must make the file unreadable"
+        );
+        let kept = match read_state(&path) {
+            Err(Restore::Failed { kept, .. }) => kept,
+            other => panic!("expected a failed restore, got {:?}", other),
+        };
+        assert_eq!(
+            kept,
+            Some(path.with_extension("json.corrupt")),
+            "an unreadable file is kept aside under the first free name"
+        );
+        save_state(&path, &state(2)).unwrap();
+        let kept = path.with_extension("json.corrupt");
+        std::fs::set_permissions(&kept, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            std::fs::read(&kept).unwrap(),
+            original,
+            "the kept bytes survive the next save"
+        );
+        assert_eq!(read_state(&path), Ok(Some(state(2))));
+    }
+
+    #[test]
+    fn a_save_replaces_the_state_file_atomically_whatever_its_name() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = temp("atomic");
+        for name in ["state.json", "sokol.tmp"] {
+            let path = dir.with_file_name(name);
+            save_state(&path, &state(1)).unwrap();
+            let before = std::fs::metadata(&path).unwrap().ino();
+            save_state(&path, &state(2)).unwrap();
+            assert_ne!(
+                std::fs::metadata(&path).unwrap().ino(),
+                before,
+                "{}: a save renames a new file over the state, not rewrites it in place",
+                name
+            );
+            assert_eq!(read_state(&path), Ok(Some(state(2))), "{}", name);
+        }
     }
 
     #[test]

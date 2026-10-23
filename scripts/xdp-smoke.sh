@@ -219,6 +219,14 @@ AFTER=$(metric 'sokol_xdp_dropped_packets_total{reason="blocklist"}')
 check "blocked IPv6 source with a truncated extension header is dropped ($MID -> $AFTER)" \
     test $((AFTER - MID)) -eq 10
 printf 'UNBAN_IP:%s\n' "$BLOCKED_V6" | nc -U -q1 "$WORK/control.sock" >/dev/null
+# Headers that do not parse are passed to the stack and still seen: they count in
+# sokol_xdp_rx_packets_total like any other passed packet (ROADMAP item 10).
+RX_BEFORE=$(metric sokol_xdp_rx_packets_total)
+send_v6 0 10   # the source is no longer blocked: a parse failure, passed
+sleep 1.2
+RX_AFTER=$(metric sokol_xdp_rx_packets_total)
+check "passed packets whose headers do not parse are counted ($RX_BEFORE -> $RX_AFTER)" \
+    test $((RX_AFTER - RX_BEFORE)) -ge 10
 
 # SYN flood on the XDP trap port: events must be rate-limited, not one per packet.
 BLOCKS_BEFORE_FLOOD=$( (grep -a -o "DYNAMIC_BLOCK_V[46]|" "$WORK/events.sntl" || true) | wc -l)
@@ -398,6 +406,13 @@ check "an event id is acted on once, a resend is a duplicate" \
     test "$(sed -n 1,3p "$WORK/event-ids.txt" | tr '\n' ,)" = "OK ack,OK applied,OK duplicate,"
 check "the same id from another source is another event" test "$(sed -n 4p "$WORK/event-ids.txt")" = "OK applied"
 check "a malformed event id is an error" grep -q "^ERR invalid event id 'bad id'" "$WORK/event-ids.txt"
+# The retraction handler's reply, exactly (IPC-R1): nothing else holds this target, so the
+# detector's event lifts it; a second retraction of the same event is a duplicate.
+RT_IP=198.51.100.78
+ipc_ack "SIGNAL#smoke-r1:smoke|$RT_IP|-|to be retracted" "RETRACT#smoke-r1:smoke|$RT_IP" \
+    "RETRACT#smoke-r1:smoke|$RT_IP" >"$WORK/retract-replies.txt"
+check "a retraction is answered lifted when nothing else holds the target, then duplicate" \
+    test "$(tr '\n' , <"$WORK/retract-replies.txt")" = "OK ack,OK applied,OK lifted,OK duplicate,"
 check "the resend added no claim" test "$(grep -c "Dynamic block enforced in XDP: $EV_IP" "$LOG")" = 2
 printf 'UNBAN_IP:%s\n' "$EV_IP" | nc -U -q1 "$WORK/control.sock" >/dev/null
 
@@ -761,7 +776,7 @@ PY_STATE
 printf 'BAN_IP:%s\n' "$HANDOFF_OLD_IP" | timeout 10 nc -U -q1 "$WORK/control.sock" >/dev/null
 check "State handoff: predecessor ban is durable before the write is held" state_handoff_matches "$HANDOFF_OLD_IP"
 check "State handoff: predecessor ban is enforced before supersession" xdp_drop "$HANDOFF_OLD_IP" 1
-STATE_TMP="${LAST_STATE%.json}.tmp"
+STATE_TMP="${LAST_STATE}.tmp"   # the state file's name plus .tmp (STATE-P1)
 sleep 1.5   # let the unbans reach the disk first
 rm -f "$STATE_TMP"; mkfifo "$STATE_TMP"
 HUNG_IP=10.231.0.15
@@ -1259,16 +1274,21 @@ for _ in range(int(sys.argv[2])):
     s.send(eth + ip6)
 PY
     }
+    # Strict-parse drops have their own reason (ADR-0015): MALFORMED_HEADER is for outer headers
+    # dropped in every mode, and it keeps counting towards the attack signal (ADR-6).
+    strict_parse() { metric 'sokol_xdp_dropped_packets_total{reason="strict_parse"}'; }
     malformed() { metric 'sokol_xdp_dropped_packets_total{reason="malformed_header"}'; }
     check "storm: node 1 switched XDP to strict mode" grep -aq "DEFENSE_MODE|Strict" "$WORK/events.sntl"
     check "storm: strict mode is reported" wait_metric sokol_defense_strict 1
-    BEFORE=$(malformed); send_truncated_v6 10; sleep 1.2
-    check "storm: unparsable headers from an unblocked source are dropped in strict mode ($BEFORE -> $(malformed))" \
-        test $(( $(malformed) - BEFORE )) -eq 10
+    BEFORE=$(strict_parse); MALFORMED_BEFORE=$(malformed); send_truncated_v6 10; sleep 1.2
+    check "storm: unparsable headers from an unblocked source are dropped in strict mode ($BEFORE -> $(strict_parse))" \
+        test $(( $(strict_parse) - BEFORE )) -eq 10
+    check "storm: strict-parse drops are not counted as malformed_header" \
+        test "$(malformed)" -eq "$MALFORMED_BEFORE"
     for _ in $(seq 1 75); do grep -aq "DEFENSE_MODE|Normal" "$WORK/events.sntl" && break; sleep 1; done
     check "storm over: node 1 returns to normal mode" grep -aq "DEFENSE_MODE|Normal" "$WORK/events.sntl"
-    BEFORE=$(malformed); send_truncated_v6 10; sleep 1.2
-    check "normal mode: unparsable headers pass to the stack again" test "$(malformed)" -eq "$BEFORE"
+    BEFORE=$(strict_parse); send_truncated_v6 10; sleep 1.2
+    check "normal mode: unparsable headers pass to the stack again" test "$(strict_parse)" -eq "$BEFORE"
     # ADR-0021: each node keeps the other's fsynced audit head in its own log.
     check "audit witnesses: node 1 recorded node 2's heads" \
         bash -c "test \"\$(curl -s http://127.0.0.1:9469/metrics | awk '\$1==\"sokol_audit_witnesses_recorded_total\"{print \$2}')\" -gt 0"

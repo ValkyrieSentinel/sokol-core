@@ -1,0 +1,36 @@
+{
+  "annotations": {
+    "status": "UNSIGNED_EXPLANATORY_DRAFT"
+  },
+  "decisions": [
+    {
+      "because": "Assertion-red bounded-report and torn-tail vectors on a06be0c; the old CLI returned 0 after a second-open replacement by an individually valid segment with a broken join. A sealed-segment growth vector exposed an incomplete streaming implementation before its correction. A real sequence-zero/nonzero-seed byte vector was accepted despite the fixed genesis specified by the record format.",
+      "previous_statement_sha256": null,
+      "proposal_sha256": "8006a180d4097f7404f9146e033b09ea65a632936b577f1af7b3b67db54fd0fa"
+    },
+    {
+      "because": "Counterexample on c51cdc9: audit_witness::witnesses_for verified the peer chain, then reopened segments in a second pass that checks no joins; an active segment swapped between passes supplied a witness the verified chain never held (hit within 1-3 scans). Witnesses are now collected inside visit_chain; monitor --regret had the same pattern.",
+      "previous_statement_sha256": "095b625bf251303d0008c4f31ff378325a8a4c3ab621a506d2c594f5126c82a0",
+      "proposal_sha256": "e29c06b14686cfe476746e004174e32ae4a29eb2cb1264476f9443b7da1850d1"
+    }
+  ],
+  "evidence_text": "`a_scan_keeps_the_open_file_identity_and_initial_complete_prefix`, `a_sealed_segment_cannot_grow_while_consumers_scan_it`, `a_torn_or_non_text_tail_never_certifies_a_complete_replay`, `a_zero_sequence_segment_cannot_replace_the_genesis_chain`, `chain_consumers_validate_the_next_segment_before_offering_it`, `cli_totals_and_omission_markers_agree_with_the_complete_input`, `foreign_build_diagnostics_cannot_grow_with_each_run`, `late_chain_failure_discards_the_tentative_file_replay`, `mismatch_examples_are_bounded_without_stopping_replay`, `retained_diagnostics_preserve_counts_and_utf8_at_the_exact_budget`, `retained_segment_inventory_refuses_limit_plus_one`, `shortening_or_completing_a_torn_record_during_scan_is_unverified`, `peer_witnesses_come_from_the_verified_pass`",
+  "id": "REPLAY-B1",
+  "profile": "sokol.contract-shadow.v1",
+  "statement": "Sequence-zero segment headers use the fixed zero genesis chain; non-zero retained prefixes may have an unknown pruned predecessor. File replay and audit-head comparisons consume records in the same pass that verifies their record chains and segment joins; a failed scan returns no replay or witness verdict. Replay binds its result to the consumed prefix; incomplete active tails and non-text payloads prevent CLI 0, non-text payloads fence dependent context, and changed sealed-segment lengths refuse verification. Retain at most 128 mismatch examples and 32 insufficient reason prefixes of at most 512 UTF-8 bytes while preserving complete decision totals and separate non-text-record counts. Refuse more than 4096 retained rotated segments, excluding the active file. This does not authenticate the writer or establish an atomic filesystem snapshot.",
+  "witnesses": [
+    "a_scan_keeps_the_open_file_identity_and_initial_complete_prefix",
+    "a_sealed_segment_cannot_grow_while_consumers_scan_it",
+    "a_torn_or_non_text_tail_never_certifies_a_complete_replay",
+    "a_zero_sequence_segment_cannot_replace_the_genesis_chain",
+    "chain_consumers_validate_the_next_segment_before_offering_it",
+    "cli_totals_and_omission_markers_agree_with_the_complete_input",
+    "foreign_build_diagnostics_cannot_grow_with_each_run",
+    "late_chain_failure_discards_the_tentative_file_replay",
+    "mismatch_examples_are_bounded_without_stopping_replay",
+    "peer_witnesses_come_from_the_verified_pass",
+    "retained_diagnostics_preserve_counts_and_utf8_at_the_exact_budget",
+    "retained_segment_inventory_refuses_limit_plus_one",
+    "shortening_or_completing_a_torn_record_during_scan_is_unverified"
+  ]
+}

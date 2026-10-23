@@ -1,0 +1,13 @@
+# nodes=10 netem='none' host=aarch64 cpus=10 kernel=6.8.0-142-generic
+# full mesh after 3s: 10/10 nodes see 9 peers
+# restart: 10 rounds, node 1 SIGKILLed with a detector block on disk; X1<=10000 X2<=10000 X3<=30000 ms
+round 1: control 115 ms, attacker last reply 47 ms, peers 1067 ms
+round 2: control 116 ms, attacker last reply 45 ms, peers 1071 ms
+round 3: control 125 ms, attacker last reply 36 ms, peers 1054 ms
+round 4: control 116 ms, attacker last reply 39 ms, peers 1080 ms
+round 5: control 116 ms, attacker last reply 53 ms, peers 1068 ms
+round 6: control 117 ms, attacker last reply 44 ms, peers 1076 ms
+round 7: control 118 ms, attacker last reply 47 ms, peers 1066 ms
+round 8: control 133 ms, attacker last reply 54 ms, peers 1110 ms
+round 9: control 124 ms, attacker last reply 48 ms, peers 1091 ms
+round 10: control 128 ms, attacker last reply 46 ms, peers 1071 ms

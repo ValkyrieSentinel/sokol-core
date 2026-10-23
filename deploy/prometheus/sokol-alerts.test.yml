@@ -36,6 +36,7 @@ tests:
       - { series: 'sokol_tick_seconds{job="sokol",instance="n1"}', values: '0.01x20' }
       - { series: 'sokol_blocks_pending{job="sokol",instance="n1"}', values: '0x20' }
       - { series: 'sokol_p2p_active_peers{job="sokol",instance="n1"}', values: '3x20' }
+      - { series: 'sokol_p2p_expected_peers{job="sokol",instance="n1"}', values: '3x20' }
       - { series: 'sokol_claims_waiting{job="sokol",instance="n1"}', values: '0x20' }
       - { series: 'sokol_enforce_mode{job="sokol",instance="n1",mode="drop"}', values: '1x20' }
       - { series: 'sokol_blocks_active{job="sokol",instance="n1",family="ipv4"}', values: '100x20' }
@@ -56,6 +57,7 @@ tests:
       - { series: 'sokol_blocks_active{job="sokol",instance="n1",family="ipv4"}', values: '60000x10' }
       - { series: 'sokol_blocks_capacity{job="sokol",instance="n1"}', values: '65536x10' }
       - { series: 'sokol_p2p_active_peers{job="sokol",instance="n1"}', values: '3 3 3 1x8' }
+      - { series: 'sokol_p2p_expected_peers{job="sokol",instance="n1"}', values: '3x11' }
       - { series: 'sokol_xdp_events_lost_total{job="sokol",instance="n1"}', values: '0 0 573x8' }
       - { series: 'sokol_mesh_envelopes_rejected_total{job="sokol",instance="n1",reason="stale_timestamp"}', values: '0+5x30' }
       - { series: 'sokol_clock_steps_total{job="sokol",instance="n1"}', values: '0 0 1x8' }
@@ -69,7 +71,7 @@ tests:
         exp_alerts: [ { exp_labels: { severity: warning, job: sokol, instance: n1, family: ipv4 }, exp_annotations: { summary: "n1 ipv4: blocklist over 80 % of 65 536", runbook: "RUNBOOK §4" } } ]
       - eval_time: 9m
         alertname: SokolPeersLost
-        exp_alerts: [ { exp_labels: { severity: warning, job: sokol, instance: n1 }, exp_annotations: { summary: "n1: 1 mesh peers, fewer than in the last hour", runbook: "RUNBOOK §5.5" } } ]
+        exp_alerts: [ { exp_labels: { severity: warning, job: sokol, instance: n1 }, exp_annotations: { summary: "n1: 1 connected peers, below configured mesh size", runbook: "RUNBOOK §5.5" } } ]
       - eval_time: 5m
         alertname: SokolKernelEventsLost
         exp_alerts: [ { exp_labels: { severity: warning, job: sokol, instance: n1 }, exp_annotations: { summary: "n1: the ring buffer was full, kernel events (not blocks) were lost", runbook: "RUNBOOK §4" } } ]
@@ -89,7 +91,11 @@ tests:
       - { series: 'sokol_mesh_broadcasts_dropped_total{job="sokol",instance="n1",class="urgent"}', values: '0 0 250x10' }
       - { series: 'sokol_claims_waiting{job="sokol",instance="n1"}', values: '13616x40' }
       - { series: 'sokol_cluster_storm_engaged{job="sokol",instance="n1"}', values: '0 1x5' }
+      - { series: 'sokol_mesh_handshakes_wrong_address_total{job="sokol",instance="n1"}', values: '0 0 1x10' }
     alert_rule_test:
+      - eval_time: 5m
+        alertname: SokolPeerWrongAddress
+        exp_alerts: [ { exp_labels: { severity: critical, job: sokol, instance: n1 }, exp_annotations: { summary: "n1: a pinned peer's handshake came from an address its peers-file entry does not bind", runbook: "RUNBOOK §5.5" } } ]
       - eval_time: 5m
         alertname: SokolAuditRecordsLost
         exp_alerts: [ { exp_labels: { severity: warning, job: sokol, instance: n1 }, exp_annotations: { summary: "n1: audit records lost (disk, rights or queue overflow)", runbook: "RUNBOOK §5.3" } } ]
@@ -136,3 +142,61 @@ tests:
           - { exp_labels: { severity: warning, instance: n1, source: cold-rise }, exp_annotations: { summary: "n1: cold-rise asked for 1.5k blocks within 5 min, over ten times its usual pace or with no history", runbook: "RUNBOOK §5.1: check the detector before its blocks spread" } }
           - { exp_labels: { severity: warning, instance: n1, source: cold-jump }, exp_annotations: { summary: "n1: cold-jump asked for 1.5k blocks within 5 min, over ten times its usual pace or with no history", runbook: "RUNBOOK §5.1: check the detector before its blocks spread" } }
       - { eval_time: 60m, alertname: SokolDetectorSurge, exp_alerts: [] }
+
+  # A peer claim surge, as the detector surge above: node 2 a quiet hour then 300 claims a
+  # minute (enforced and held both count); node 3 a steady high pace; node 4's known copies do
+  # not count; node 5 has no series before its first claim.
+  - interval: 1m
+    input_series:
+      - { series: 'sokol_mesh_claims_total{job="sokol",instance="n1",issuer="2",result="enforced"}', values: '0x65 200+200x9' }
+      - { series: 'sokol_mesh_claims_total{job="sokol",instance="n1",issuer="2",result="held"}', values: '0x65 100+100x9' }
+      - { series: 'sokol_mesh_claims_total{job="sokol",instance="n1",issuer="3",result="enforced"}', values: '0+100x75' }
+      - { series: 'sokol_mesh_claims_total{job="sokol",instance="n1",issuer="4",result="known"}', values: '0x65 1000+1000x9' }
+      - { series: 'sokol_mesh_claims_total{job="sokol",instance="n1",issuer="5",result="enforced"}', values: '_x65 300+300x9' }
+    alert_rule_test:
+      - eval_time: 70m
+        alertname: SokolPeerClaimSurge
+        exp_alerts:
+          - { exp_labels: { severity: warning, instance: n1, issuer: "2" }, exp_annotations: { summary: "n1: node 2 sent 1.5k claims within 5 min, over ten times its usual pace or with no history", runbook: "RUNBOOK §5.1: check the peer's detector; its envelope bounds what this node enforces" } }
+          - { exp_labels: { severity: warning, instance: n1, issuer: "5" }, exp_annotations: { summary: "n1: node 5 sent 1.5k claims within 5 min, over ten times its usual pace or with no history", runbook: "RUNBOOK §5.1: check the peer's detector; its envelope bounds what this node enforces" } }
+      - { eval_time: 60m, alertname: SokolPeerClaimSurge, exp_alerts: [] }
+
+  # A partition persists beyond the old one-hour high-water window, then recovers.
+  - interval: 1m
+    input_series:
+      - { series: 'sokol_p2p_active_peers{job="sokol",instance="n1"}', values: '3 3 3 1x80 3x10' }
+      - { series: 'sokol_p2p_expected_peers{job="sokol",instance="n1"}', values: '3x95' }
+    alert_rule_test:
+      - eval_time: 70m
+        alertname: SokolPeersLost
+        exp_alerts:
+          - exp_labels: {severity: warning, job: sokol, instance: n1}
+            exp_annotations:
+              summary: "n1: 1 connected peers, below configured mesh size"
+              runbook: "RUNBOOK §5.5"
+      - { eval_time: 90m, alertname: SokolPeersLost, exp_alerts: [] }
+  # A cold isolated node has no historical high-water mark; configuration still matters.
+  - interval: 1m
+    input_series:
+      - { series: 'sokol_p2p_active_peers{job="sokol",instance="cold"}', values: '0x20' }
+      - { series: 'sokol_p2p_expected_peers{job="sokol",instance="cold"}', values: '2x8 0x12' }
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: SokolPeersLost
+        exp_alerts:
+          - exp_labels: {severity: warning, job: sokol, instance: cold}
+            exp_annotations:
+              summary: "cold: 0 connected peers, below configured mesh size"
+              runbook: "RUNBOOK §5.5"
+      - { eval_time: 15m, alertname: SokolPeersLost, exp_alerts: [] }
+  - interval: 1m
+    input_series:
+      - { series: 'up{job="sokol",instance="missing"}', values: '1x10' }
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: SokolMeshObservationMissing
+        exp_alerts:
+          - exp_labels: {severity: warning, job: sokol, instance: missing}
+            exp_annotations:
+              summary: "missing: mesh observations missing from a reachable exporter"
+              runbook: "RUNBOOK §5.5"

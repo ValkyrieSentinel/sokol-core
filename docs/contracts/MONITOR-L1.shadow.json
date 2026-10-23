@@ -1,0 +1,20 @@
+{
+  "annotations": {
+    "status": "UNSIGNED_EXPLANATORY_DRAFT"
+  },
+  "decisions": [
+    {
+      "because": "Counterexample on c51cdc9: renaming xdp_mode generic, class urgent or detection result pending left check-monitoring.sh green while SokolXdpGeneric, SokolUrgentBroadcastsDropped and SokolDetectorSurge could no longer fire.",
+      "previous_statement_sha256": null,
+      "proposal_sha256": "963fd06159b27169f80f04dc2331647591096f2ac081e6be69d404a287a90e2d"
+    }
+  ],
+  "evidence_text": "`Monitoring.test_a_renamed_label_value_an_alert_selects_fails`, `Monitoring.test_a_renamed_metric_fails`",
+  "id": "MONITOR-L1",
+  "profile": "sokol.contract-shadow.v1",
+  "statement": "Every metric name and every label value that an alert rule or the dashboard selects on is rendered by the node; scripts/check-monitoring.sh refuses a rename of either.",
+  "witnesses": [
+    "Monitoring.test_a_renamed_label_value_an_alert_selects_fails",
+    "Monitoring.test_a_renamed_metric_fails"
+  ]
+}

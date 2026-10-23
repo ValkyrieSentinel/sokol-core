@@ -1,0 +1,20 @@
+{
+  "annotations": {
+    "status": "UNSIGNED_EXPLANATORY_DRAFT"
+  },
+  "decisions": [
+    {
+      "because": "Counterexample (hunt 2026-10-10, confirmed with strace): records written by a handle that died before syncing were reopened with unsynced=0, so the next sync skipped fsync and offered them as the durable head. Fix: records found on open count as unsynced until the first sync.",
+      "previous_statement_sha256": "2cf25fe8278d40505363c386bc23871f34d6aca2f604c0d016616f54c694e300",
+      "proposal_sha256": "41c8cae4e8e1690df46fadfb3c717fc9c210fc26882951fcffe278a6743b359f"
+    }
+  ],
+  "evidence_text": "`a_peers_audit_head_is_witnessed_once_per_interval` (mutation \"no interval\" fails it), `records_found_on_open_are_unsynced_until_the_next_sync`",
+  "id": "AUDIT-W2",
+  "profile": "sokol.contract-shadow.v1",
+  "statement": "Only a fsynced head is offered. A peer adds at most one witness record per WITNESS_MIN_INTERVAL to this log, and a head that is not 64 lowercase hex is not recorded; both refusals are counted.",
+  "witnesses": [
+    "a_peers_audit_head_is_witnessed_once_per_interval",
+    "records_found_on_open_are_unsynced_until_the_next_sync"
+  ]
+}

@@ -1,0 +1,21 @@
+{
+  "annotations": {
+    "status": "UNSIGNED_EXPLANATORY_DRAFT"
+  },
+  "decisions": [
+    {
+      "because": "Requirement (ROADMAP, percolation row and item 10): a peer whose detector misfires, or a compromised peer within its envelope, spreads its blocks to every node that takes them; until now only the aggregate sokol_blocks_active showed it, once the map filled.",
+      "previous_statement_sha256": null,
+      "proposal_sha256": "297161fe48ec45856d8efa4ede75e8ba386630bbadf6e5d601be25c3c47f4db1"
+    }
+  ],
+  "evidence_text": "`each_issuer_counts_apart_and_the_label_set_is_bounded`, `peer_claims_are_counted_under_their_issuer`, `peer_claims_are_rendered_by_issuer_and_result`",
+  "id": "MESH-C1",
+  "profile": "sokol.contract-shadow.v1",
+  "statement": "Every claim a peer sends, by Claim or BlockSync, is counted under its issuer and what this node did with it (enforced, held, refused, known) in sokol_mesh_claims_total; the first MAX_ISSUERS issuers get their own label, later ones count as other. SokolPeerClaimSurge fires when one issuer's enforced and held claims surge.",
+  "witnesses": [
+    "each_issuer_counts_apart_and_the_label_set_is_bounded",
+    "peer_claims_are_counted_under_their_issuer",
+    "peer_claims_are_rendered_by_issuer_and_result"
+  ]
+}

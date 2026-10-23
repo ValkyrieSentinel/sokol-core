@@ -21,6 +21,7 @@ pub struct OutcomeStats {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Snapshot {
+    pub sampled_at: Option<Instant>,
     pub rx_packets: u64,
     pub rx_bytes: u64,
     pub dropped_packets: u64,
@@ -31,6 +32,8 @@ pub struct Snapshot {
     pub events_suppressed: u64,
     pub events_lost: u64,
     pub events_malformed: u64,
+    /// Reads of the STATS map that failed; the XDP counters keep their last good values.
+    pub xdp_stats_read_failures: u64,
     pub blocks_active_v4: usize,
     pub blocks_active_v6: usize,
     pub blocks_capacity: usize,
@@ -41,10 +44,15 @@ pub struct Snapshot {
     pub detector_retractions: [u64; crate::block_table::RETRACTION_RESULTS.len()],
     /// Block decisions by source and result, `other` last (`detections::rows`).
     pub detections: Vec<(String, [u64; crate::detections::RESULTS.len()])>,
+    /// Peer claims by issuer and result, `other` last (`detections::peer_rows`).
+    pub peer_claims: Vec<(String, [u64; crate::detections::PEER_RESULTS.len()])>,
     pub strikes_remembered: usize,
     pub strikes_evicted: u64,
     pub claims_waiting: usize,
     pub p2p_peers: usize,
+    pub p2p_expected: usize,
+    pub mesh_worker: u8,
+    pub kernel_worker: u8,
     pub audit_queue_overflow: u64,
     pub defense_strict: bool,
     pub audit_healthy: bool,
@@ -55,6 +63,7 @@ pub struct Snapshot {
     pub blocks_pending_oldest_secs: f64,
     pub mesh_handshakes_refused: u64,
     pub mesh_handshake_timeouts: u64,
+    pub mesh_wrong_address: u64,
     pub mesh_frames_delayed: u64,
     pub mesh_sync_requests_throttled: u64,
     pub audit_witnesses_recorded: u64,
@@ -63,7 +72,7 @@ pub struct Snapshot {
     pub audit_anchor_failures: u64,
     pub mesh_dropped_urgent: u64,
     /// Envelopes refused, in `p2p::EnvelopeError::LABELS` order.
-    pub mesh_rejected: [u64; 5],
+    pub mesh_rejected: [u64; crate::p2p::EnvelopeError::LABELS.len()],
     pub clock_steps: u64,
     pub clock_last_step_ms: i64,
     pub mesh_dropped_bulk: u64,
@@ -89,12 +98,123 @@ pub struct Snapshot {
     pub cluster_storm_engaged: bool,
 }
 
+/// Fixed worker inventory: unknown before admission, running after resource acquisition,
+/// failed after a terminal error, stopped after an orderly exit.
+#[derive(Clone, Default)]
+pub struct WorkerHealth(std::sync::Arc<std::sync::atomic::AtomicU8>);
+
+#[derive(Clone, Copy)]
+#[repr(u8)]
+pub enum WorkerState {
+    Unknown = 0,
+    Running = 1,
+    Failed = 2,
+    Stopped = 3,
+}
+
+impl WorkerHealth {
+    pub fn set(&self, state: WorkerState) {
+        self.0
+            .store(state as u8, std::sync::atomic::Ordering::Relaxed);
+    }
+    pub fn get(&self) -> u8 {
+        self.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+pub fn status_at(s: &Snapshot, now: Instant) -> serde_json::Value {
+    let age = s.sampled_at.and_then(|at| now.checked_duration_since(at));
+    let freshness = match age {
+        Some(age) if age <= std::time::Duration::from_secs(5) => "FRESH",
+        Some(_) => "STALE",
+        None => "UNKNOWN",
+    };
+    let worker = |state| match state {
+        1 => "RUNNING",
+        2 => "FAILED",
+        3 => "STOPPED",
+        _ => "UNKNOWN",
+    };
+    serde_json::json!({
+        "profile": "sokol.node-status.v1", "authority": "READ_ONLY_OBSERVATION_NOT_ADMISSION",
+        "build": env!("SOKOL_BUILD_ID"), "freshness": freshness,
+        "age_ms": age.map(|age| age.as_millis().min(u64::MAX as u128) as u64),
+        "configured": {"expected_mesh_peers": s.p2p_expected, "flowspec": s.flowspec_enabled,
+                       "enforcement": if s.observe_only { "OBSERVE" } else { "DROP" }},
+        "desired": {"pending_kernel_updates": s.blocks_pending},
+        "applied": {"kernel_blocks_v4": s.blocks_active_v4, "kernel_blocks_v6": s.blocks_active_v6},
+        "observed": {"connected_peers": s.p2p_peers, "audit_healthy": s.audit_healthy,
+                     "state_healthy": s.state_healthy, "restore_ok": s.state_restore_ok,
+                     "protected_refresh_ok": s.protected_refresh_ok},
+        "workers": {"mesh_listener": worker(s.mesh_worker), "kernel_events": worker(s.kernel_worker)},
+        "limits": ["All values belong to the stated snapshot age; stale values are not current facts.",
+                   "Counts and worker states do not establish hardware qualification or router enforcement."]
+    })
+}
+
 fn family(out: &mut String, name: &str, kind: &str, help: &str) {
     let _ = writeln!(out, "# HELP {} {}", name, help);
     let _ = writeln!(out, "# TYPE {} {}", name, kind);
 }
 
 /// Sample the worker at request time, independently of the main loop's last tick.
+/// The XDP program's counters summed over CPUs, from the last read of the STATS map that
+/// succeeded. A failed read is unknown, not zero: it keeps these sums and is counted.
+#[derive(Clone, Debug, Default)]
+pub struct XdpTotals {
+    read_failures: u64,
+    rx_packets: u64,
+    rx_bytes: u64,
+    dropped_packets: u64,
+    events_suppressed: u64,
+    events_lost: u64,
+    drops_by_reason: [u64; DROP_REASON_SLOTS],
+    observed_by_reason: [u64; DROP_REASON_SLOTS],
+}
+
+impl XdpTotals {
+    /// Sums one read of the per-CPU values; `None` is a read that failed.
+    pub fn read<'a>(&mut self, per_cpu: Option<impl IntoIterator<Item = &'a common::PacketStats>>) {
+        let Some(per_cpu) = per_cpu else {
+            self.read_failures = self.read_failures.saturating_add(1);
+            return;
+        };
+        let mut sums = XdpTotals {
+            read_failures: self.read_failures,
+            ..XdpTotals::default()
+        };
+        for cpu in per_cpu {
+            sums.rx_packets += cpu.rx_packets;
+            sums.rx_bytes += cpu.rx_bytes;
+            sums.dropped_packets += cpu.dropped_packets;
+            sums.events_suppressed += cpu.events_suppressed;
+            sums.events_lost += cpu.events_lost;
+            for (sum, n) in sums
+                .observed_by_reason
+                .iter_mut()
+                .zip(cpu.observed_by_reason)
+            {
+                *sum += n;
+            }
+            for (sum, n) in sums.drops_by_reason.iter_mut().zip(cpu.drops_by_reason) {
+                *sum += n;
+            }
+        }
+        *self = sums;
+    }
+
+    pub fn fill(&self, s: &mut Snapshot) {
+        s.rx_packets = self.rx_packets;
+        s.rx_bytes = self.rx_bytes;
+        s.dropped_packets = self.dropped_packets;
+        s.events_suppressed = self.events_suppressed;
+        s.events_lost = self.events_lost;
+        s.drops_by_reason = self.drops_by_reason;
+        s.observed_by_reason = self.observed_by_reason;
+        s.xdp_stats_read_failures = self.read_failures;
+    }
+}
+
 pub fn render_with_flowspec(s: &Snapshot, readback: &crate::flowspec::Readback) -> String {
     let view = readback.snapshot();
     let mut snapshot = s.clone();
@@ -179,6 +299,17 @@ fn render_at(s: &Snapshot, now: Instant) -> String {
         "Bytes seen by the XDP program.",
     );
     let _ = writeln!(out, "sokol_xdp_rx_bytes_total {}", s.rx_bytes);
+    family(
+        &mut out,
+        "sokol_xdp_stats_read_failures_total",
+        "counter",
+        "Reads of the XDP STATS map that failed; the XDP counters keep their last good values.",
+    );
+    let _ = writeln!(
+        out,
+        "sokol_xdp_stats_read_failures_total {}",
+        s.xdp_stats_read_failures
+    );
 
     family(
         &mut out,
@@ -302,6 +433,21 @@ fn render_at(s: &Snapshot, now: Instant) -> String {
     }
     family(
         &mut out,
+        "sokol_mesh_claims_total",
+        "counter",
+        "Peer claims by issuer (a node id; the first 64, then other) and what this node did: enforced, held (known, not enforced), refused, known (a copy already held).",
+    );
+    for (issuer, counts) in &s.peer_claims {
+        for (result, n) in crate::detections::PEER_RESULTS.iter().zip(counts) {
+            let _ = writeln!(
+                out,
+                "sokol_mesh_claims_total{{issuer=\"{}\",result=\"{}\"}} {}",
+                issuer, result, n
+            );
+        }
+    }
+    family(
+        &mut out,
         "sokol_strikes_remembered",
         "gauge",
         "Targets whose detector strikes are remembered (bounded by MAX_STRIKES).",
@@ -328,6 +474,41 @@ fn render_at(s: &Snapshot, now: Instant) -> String {
         "Authenticated mesh nodes connected (a node with two connections counts once).",
     );
     let _ = writeln!(out, "sokol_p2p_active_peers {}", s.p2p_peers);
+    family(
+        &mut out,
+        "sokol_p2p_expected_peers",
+        "gauge",
+        "Peers in the current trust configuration, not a historical high-water mark.",
+    );
+    let _ = writeln!(out, "sokol_p2p_expected_peers {}", s.p2p_expected);
+    family(
+        &mut out,
+        "sokol_snapshot_age_seconds",
+        "gauge",
+        "Monotonic age of this snapshot, -1 before the first sample.",
+    );
+    let age = s
+        .sampled_at
+        .and_then(|at| now.checked_duration_since(at))
+        .map(|age| age.as_secs_f64())
+        .unwrap_or(-1.0);
+    let _ = writeln!(out, "sokol_snapshot_age_seconds {}", age);
+    family(
+        &mut out,
+        "sokol_worker_state",
+        "gauge",
+        "0 unknown, 1 running, 2 failed, 3 stopped; snapshot age applies.",
+    );
+    let _ = writeln!(
+        out,
+        "sokol_worker_state{{worker=\"mesh_listener\"}} {}",
+        s.mesh_worker
+    );
+    let _ = writeln!(
+        out,
+        "sokol_worker_state{{worker=\"kernel_events\"}} {}",
+        s.kernel_worker
+    );
     family(
         &mut out,
         "sokol_audit_queue_overflow_total",
@@ -404,7 +585,12 @@ fn render_at(s: &Snapshot, now: Instant) -> String {
         family(&mut out, name, "gauge", help);
         let _ = writeln!(out, "{} {:.6}", name, value);
     }
-    let counters: [(&str, &str, u64); 8] = [
+    let counters: [(&str, &str, u64); 9] = [
+        (
+            "sokol_mesh_handshakes_wrong_address_total",
+            "Handshakes refused: a pinned node connected from an address its peers-file entry does not bind it to.",
+            s.mesh_wrong_address,
+        ),
         (
             "sokol_mesh_handshakes_refused_total",
             "Connections refused: too many not yet authenticated (in total or from one address).",
@@ -778,7 +964,7 @@ mod tests {
             dropped_packets: 3,
             events_suppressed: 7,
             events_lost: 6,
-            mesh_rejected: [0, 0, 3, 0, 0],
+            mesh_rejected: [0, 0, 3, 0, 0, 4],
             clock_steps: 2,
             clock_last_step_ms: -3_600_000,
             claims_waiting: 5,
@@ -812,6 +998,7 @@ mod tests {
         assert!(
             text.contains("sokol_mesh_envelopes_rejected_total{reason=\"stale_timestamp\"} 3\n")
         );
+        assert!(text.contains("sokol_mesh_envelopes_rejected_total{reason=\"before_window\"} 4\n"));
         assert!(text.contains("sokol_clock_steps_total 2\n"));
         assert!(text.contains("sokol_clock_last_step_seconds -3600.000\n"));
         assert!(text.contains("sokol_claims_waiting 5\n"));
@@ -836,6 +1023,78 @@ mod tests {
                 "{} has no TYPE line",
                 name
             );
+        }
+    }
+
+    /// A failed read of the STATS map is unknown, not zero (ROADMAP item 10). Zeros read as a
+    /// counter reset to Prometheus, and the next good read then looks like the whole history
+    /// arriving in one tick: to the rate check and the storm latch (`defense::under_attack`)
+    /// as much as to `rate()`. The last good sums stay and the failure is counted.
+    #[test]
+    fn a_failed_stats_read_keeps_the_last_counters_and_is_counted() {
+        let mut cpu = common::PacketStats {
+            rx_packets: 0,
+            rx_bytes: 0,
+            dropped_packets: 0,
+            drops_by_reason: [0; DROP_REASON_SLOTS],
+            events_suppressed: 0,
+            event_window_start_ns: 0,
+            events_in_window: 0,
+            events_lost: 0,
+            observed_packets: 0,
+            observed_by_reason: [0; DROP_REASON_SLOTS],
+        };
+        cpu.rx_packets = 1_000;
+        cpu.rx_bytes = 64_000;
+        cpu.dropped_packets = 40;
+        cpu.drops_by_reason[drop_reason::SLOW_PATH_LPM_HIT as usize] = 40;
+        cpu.observed_by_reason[drop_reason::SLOW_PATH_LPM_HIT as usize] = 6;
+        cpu.events_suppressed = 3;
+        cpu.events_lost = 5;
+        let mut totals = XdpTotals::default();
+        totals.read(Some([cpu, cpu].iter()));
+        totals.read(None::<std::slice::Iter<'_, common::PacketStats>>);
+        let mut snap = Snapshot::default();
+        totals.fill(&mut snap);
+        assert_eq!(
+            (snap.rx_packets, snap.rx_bytes, snap.dropped_packets),
+            (2_000, 128_000, 80),
+            "a failed read published other counters than the last good ones"
+        );
+        assert_eq!(
+            snap.drops_by_reason[drop_reason::SLOW_PATH_LPM_HIT as usize],
+            80
+        );
+        assert_eq!(
+            snap.observed_by_reason[drop_reason::SLOW_PATH_LPM_HIT as usize],
+            12
+        );
+        assert_eq!((snap.events_suppressed, snap.events_lost), (6, 10));
+        let text = render(&snap);
+        assert!(
+            text.contains("sokol_xdp_stats_read_failures_total 1\n"),
+            "the failed read is not counted"
+        );
+        // A good read after it takes the new sums and keeps the count of failures.
+        totals.read(Some([cpu].iter()));
+        totals.fill(&mut snap);
+        assert_eq!((snap.rx_packets, snap.xdp_stats_read_failures), (1_000, 1));
+    }
+
+    #[test]
+    fn peer_claims_are_rendered_by_issuer_and_result() {
+        let snap = Snapshot {
+            peer_claims: vec![("2".into(), [5, 1, 0, 3]), ("other".into(), [0, 0, 2, 0])],
+            ..Default::default()
+        };
+        let text = render(&snap);
+        for line in [
+            "sokol_mesh_claims_total{issuer=\"2\",result=\"enforced\"} 5\n",
+            "sokol_mesh_claims_total{issuer=\"2\",result=\"held\"} 1\n",
+            "sokol_mesh_claims_total{issuer=\"2\",result=\"known\"} 3\n",
+            "sokol_mesh_claims_total{issuer=\"other\",result=\"refused\"} 2\n",
+        ] {
+            assert!(text.contains(line), "missing {line}");
         }
     }
 }

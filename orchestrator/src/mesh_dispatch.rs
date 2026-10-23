@@ -46,6 +46,18 @@ pub struct WitnessStats {
     pub malformed: AtomicU64,
 }
 
+/// The operator telemetry line for a peer block this node enforced: the peer's reason is the
+/// terminal VEC (OPERATOR-T1). The reason is a peer's free text (only its length is bounded),
+/// and the telemetry socket is line-framed: control characters are left out, so a reason
+/// cannot end this line and start forged HEARTBEAT, DB_LOG or DROP_IMMEDIATE lines.
+fn mesh_block_telemetry(node_id: u64, shown: &str, reason: &str) -> String {
+    let reason: String = reason.chars().filter(|c| !c.is_control()).collect();
+    format!(
+        "DB_LOG:NODE={}|TIER=MeshBlock|IP={}|VEC={}\n",
+        node_id, shown, reason
+    )
+}
+
 /// A chain head as the mesh carries it: 64 lowercase hex digits.
 fn valid_head(head: &str) -> bool {
     head.len() == 64
@@ -78,15 +90,17 @@ impl<B: Blocklist + Send + 'static, M: ConfigMap + 'static> MeshDispatch<B, M> {
                 let reason = claim.reason.clone();
                 let issuer = claim.issuer;
                 let expires = claim.expires_ms;
-                let refusal = claim
-                    .net()
-                    .and_then(|n| self.policy.current().check_net(n).err());
-                let (now, wall) = (block_table::local_ms(), now_ms());
-                let result = self
-                    .blocks
-                    .lock()
-                    .await
-                    .adopt(claim, refusal.is_none(), now);
+                // Time is read once the table is held: a wait for it must not shorten the lease.
+                // The policy too: the host refresh changes it under this lock (ADR-0012).
+                let (result, wall, refusal) = {
+                    let mut table = self.blocks.lock().await;
+                    let refusal = claim
+                        .net()
+                        .and_then(|n| self.policy.current().check_net(n).err());
+                    let (now, wall) = (block_table::local_ms(), now_ms());
+                    (table.adopt(claim, refusal.is_none(), now), wall, refusal)
+                };
+                crate::detections::record_peer(issuer, &result);
                 match (result, refusal) {
                     (Adoption::Enforced, _) => {
                         let left = expires.map(|e| Duration::from_millis(e.saturating_sub(wall)));
@@ -105,11 +119,7 @@ impl<B: Blocklist + Send + 'static, M: ConfigMap + 'static> MeshDispatch<B, M> {
                             ttl_label(left),
                             reason
                         ));
-                        let telemetry_msg = format!(
-                            "DB_LOG:NODE={}|TIER=MeshBlock|IP={}|VEC={}\n",
-                            self.node_id, shown, reason
-                        );
-                        push_telemetry(&telemetry_msg).await;
+                        push_telemetry(&mesh_block_telemetry(self.node_id, &shown, &reason)).await;
                     }
                     (Adoption::Held(held @ ("quorum" | "quota" | "envelope")), _) => {
                         log::warn!(
@@ -168,24 +178,24 @@ impl<B: Blocklist + Send + 'static, M: ConfigMap + 'static> MeshDispatch<B, M> {
                 claims,
                 retracted,
             } => {
-                let (now, wall) = (block_table::local_ms(), now_ms());
                 let mut adopted = 0;
                 for claim in claims {
-                    let refusal = claim
-                        .net()
-                        .and_then(|n| self.policy.current().check_net(n).err());
+                    let wall = now_ms();
                     let (shown, secs) = (
                         claim.target.clone(),
                         claim.expires_ms.map(|e| e.saturating_sub(wall) / 1000),
                     );
                     let tag = parse_target(&shown).map(ip_tag).unwrap_or("V4");
-                    if self
-                        .blocks
-                        .lock()
-                        .await
-                        .adopt(claim, refusal.is_none(), now)
-                        == Adoption::Enforced
-                    {
+                    let adoption = {
+                        let mut table = self.blocks.lock().await;
+                        // Under the lock the host refresh changes the policy in (ADR-0012).
+                        let refusal = claim
+                            .net()
+                            .and_then(|n| self.policy.current().check_net(n).err());
+                        table.adopt(claim, refusal.is_none(), block_table::local_ms())
+                    };
+                    crate::detections::record_peer(issuer, &adoption);
+                    if adoption == Adoption::Enforced {
                         adopted += 1;
                         self.db.append(format!(
                             "MESH_BLOCK_{}|IP:{}|TTL:{}|Reason:sync from node {}",
@@ -196,7 +206,11 @@ impl<B: Blocklist + Send + 'static, M: ConfigMap + 'static> MeshDispatch<B, M> {
                         ));
                     }
                 }
-                let lifted = self.blocks.lock().await.retract(issuer, &retracted, now);
+                let lifted =
+                    self.blocks
+                        .lock()
+                        .await
+                        .retract(issuer, &retracted, block_table::local_ms());
                 for net in &lifted {
                     self.db
                         .append(format!("MESH_UNBLOCK|IP:{}|Issuer:{}", show(net), issuer));
@@ -303,7 +317,7 @@ impl<B: Blocklist + Send + 'static, M: ConfigMap + 'static> MeshDispatch<B, M> {
                         &self.registry,
                         self.node_id,
                         &self.crypto,
-                        &self.policy.current(),
+                        &self.policy,
                         Detection {
                             source: crate::detections::TELEMETRY,
                             ..Detection::default()
@@ -456,6 +470,46 @@ mod tests {
         }
     }
 
+    /// A peer's claim, alone or in a sync, that was checked against the policy before a
+    /// protection change took the table lock is not enforced once the address is protected.
+    #[tokio::test]
+    async fn a_peer_claim_racing_a_protection_change_is_not_enforced() {
+        for (name, target, sync) in [
+            ("race-claim", "198.51.100.78", false),
+            ("race-sync", "198.51.100.79", true),
+        ] {
+            let mut n = node(name, None);
+            let claim = peer_claim(target);
+            let cmd = if sync {
+                MeshCommand::BlockSync {
+                    issuer: PEER,
+                    claims: vec![claim],
+                    retracted: Vec::new(),
+                }
+            } else {
+                MeshCommand::Claim { claim }
+            };
+            let (blocks, handle) = (n.dispatch.blocks.clone(), n.dispatch.policy.clone());
+            let held = blocks.lock().await;
+            let change = async move {
+                for _ in 0..10 {
+                    tokio::task::yield_now().await;
+                }
+                let mut policy = BlockPolicy::builtin();
+                policy.protect(parse_target(target).unwrap(), "test");
+                handle.replace(policy);
+                let current = handle.current();
+                let mut table = held;
+                table.recheck(|n| current.check_net(n).is_ok(), block_table::local_ms());
+            };
+            tokio::join!(n.dispatch.peer(cmd), change);
+            assert!(
+                !n.in_kernel(target),
+                "{name}: a protected address is enforced"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn a_peer_claim_is_enforced_audited_and_taken_back_only_by_its_issuer() {
         let mut n = node("claim", None);
@@ -495,6 +549,38 @@ mod tests {
         );
     }
 
+    /// A peer claim's lease starts when the table takes it, not when the dispatcher began to
+    /// wait for the table (ROADMAP item 10): a wait behind a busy table no longer shortens it.
+    #[tokio::test]
+    async fn a_wait_for_the_table_does_not_shorten_a_peer_claims_lease() {
+        let n = node("lease-wait", None);
+        let blocks = n.dispatch.blocks.clone();
+        let mut claim = peer_claim("198.51.100.30");
+        claim.expires_ms = None; // the local cap (600 s) is the whole lease
+        let busy = blocks.lock().await;
+        let mut dispatch = n.dispatch;
+        let adopting = tokio::spawn(async move {
+            dispatch.peer(MeshCommand::Claim { claim }).await;
+            dispatch
+        });
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let taken = block_table::local_ms();
+        drop(busy);
+        let _dispatch = adopting.await.unwrap();
+        let net = parse_target("198.51.100.30").unwrap();
+        let mut table = blocks.lock().await;
+        assert!(table.is_blocked(net), "setup: the claim is enforced");
+        let lifted = table.tick(taken + 600_000 - 500);
+        assert!(
+            lifted.is_empty() && table.is_blocked(net),
+            "the lease ended before 600 s from when the table took the claim"
+        );
+        assert!(
+            !table.tick(taken + 600_000 + 5_000).is_empty(),
+            "the cap still ends it"
+        );
+    }
+
     #[tokio::test]
     async fn a_peer_claim_on_a_protected_address_is_refused_and_audited() {
         let mut n = node("protected", Some("198.51.100.21/32"));
@@ -525,6 +611,70 @@ mod tests {
             })
             .await;
         assert!(n.in_kernel("198.51.100.22") && n.in_kernel("198.51.100.23"));
+    }
+
+    /// A snapshot audits the claims it enforced and only those: one on a protected address is
+    /// held, not recorded as a block.
+    #[tokio::test]
+    async fn a_snapshot_audits_only_the_claims_it_enforced() {
+        let mut n = node("sync-audit", Some("198.51.100.25/32"));
+        n.dispatch
+            .peer(MeshCommand::BlockSync {
+                issuer: PEER,
+                claims: vec![peer_claim("198.51.100.24"), peer_claim("198.51.100.25")],
+                retracted: vec![],
+            })
+            .await;
+        let blocks: Vec<String> = n
+            .audit()
+            .into_iter()
+            .filter(|r| r.starts_with("MESH_BLOCK_V4|"))
+            .collect();
+        assert_eq!(blocks.len(), 1, "{:?}", blocks);
+        assert!(
+            blocks[0].starts_with("MESH_BLOCK_V4|IP:198.51.100.24|")
+                && blocks[0].ends_with("|Reason:sync from node 2"),
+            "{:?}",
+            blocks
+        );
+    }
+
+    /// Every peer claim is counted under its issuer and what this node did with it, by both
+    /// ways a claim arrives (`sokol_mesh_claims_total`, `SokolPeerClaimSurge`).
+    #[tokio::test]
+    async fn peer_claims_are_counted_under_their_issuer() {
+        // The counters are process-wide: an issuer no other test uses.
+        const ISSUER: u64 = 7_177;
+        let row = || {
+            crate::detections::peer_rows()
+                .into_iter()
+                .find(|(i, _)| *i == ISSUER.to_string())
+                .map(|(_, row)| row)
+        };
+        let mut n = node("peer-count", Some("198.51.100.43/32"));
+        let claim = |target: &str| Claim {
+            issuer: ISSUER,
+            ..peer_claim(target)
+        };
+        let first = claim("198.51.100.41");
+        n.dispatch
+            .peer(MeshCommand::Claim {
+                claim: first.clone(),
+            })
+            .await;
+        n.dispatch.peer(MeshCommand::Claim { claim: first }).await;
+        n.dispatch
+            .peer(MeshCommand::BlockSync {
+                issuer: ISSUER,
+                claims: vec![claim("198.51.100.42"), claim("198.51.100.43")],
+                retracted: vec![],
+            })
+            .await;
+        assert_eq!(
+            row(),
+            Some([2, 1, 0, 1]),
+            "enforced (one by Claim, one by BlockSync), held (protected), refused, known (the resend)"
+        );
     }
 
     #[tokio::test]
@@ -626,5 +776,28 @@ mod tests {
             *n.config.0.lock().unwrap(),
             Some(defense::flags(0, defense::StormMode::Strict, true))
         );
+    }
+
+    /// OPERATOR-T1: the VEC remainder of a DB_LOG line is opaque diagnostic text. A peer's
+    /// claim reason is that text for a mesh block, so it must not be able to end the telemetry
+    /// line and start forged HEARTBEAT / DB_LOG / DROP_IMMEDIATE lines for the operator.
+    #[tokio::test]
+    async fn a_peer_reason_cannot_frame_extra_operator_telemetry_lines() {
+        let mut n = node("reason-frame", None);
+        let mut claim = peer_claim("198.51.100.21");
+        claim.reason = "scan\nHEARTBEAT:ID=1|CTL=/run/sokol.sock\n\
+                        DB_LOG:NODE=1|TIER=Tier3InteractiveJail|IP=203.0.113.66|VEC=x\n\
+                        DROP_IMMEDIATE:203.0.113.66"
+            .into();
+        let reason = claim.reason.clone();
+        n.dispatch.peer(MeshCommand::Claim { claim }).await;
+        assert!(n.in_kernel("198.51.100.21"), "the claim was enforced");
+        let line = mesh_block_telemetry(NODE, "198.51.100.21", &reason);
+        assert_eq!(
+            line.matches('\n').count(),
+            1,
+            "one mesh block became several operator telemetry lines: {line:?}"
+        );
+        assert!(line.ends_with('\n'));
     }
 }

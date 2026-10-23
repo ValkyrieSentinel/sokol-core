@@ -18,7 +18,7 @@
 # archives whose checksum is verified on every run, into a directory first on PATH; what is
 # already installed elsewhere is never trusted for its version text. Policy checks that CI runs
 # only on x86_64 (fmt, retired, claims, monitoring, cargo-deny) run here on either architecture;
-# promtool needs docker and is skipped, with a notice, without it.
+# promtool needs a docker daemon and is skipped, with a notice, without one.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 QUICK=0
@@ -81,6 +81,8 @@ tools() {
     local bpf_v gobgp_v archive
     bpf_v=$(pin BPF_LINKER_VERSION)
     gobgp_v=$(pin GOBGP_VERSION)
+    # bpf-linker ships only as .tar.zst: without zstd tar fails after the download, unclearly.
+    command -v zstd >/dev/null || { echo "FAIL zstd is needed to unpack bpf-linker (apt-get install zstd)"; return 1; }
     rm -rf "$TOOLS"
     mkdir -p "$TOOLS"
     archive=$(checked_archive \
@@ -106,11 +108,12 @@ tools() {
 monitoring() {
     step "monitoring"
     scripts/check-monitoring.sh
-    if command -v docker >/dev/null; then
+    # The client alone is not docker: a host may have it without a running daemon.
+    if command -v docker >/dev/null && docker info >/dev/null 2>&1; then
         docker run --rm -v "$PWD/deploy/prometheus:/w" -w /w --entrypoint promtool \
             "$(pin prometheus_image)" test rules sokol-alerts.test.yml
     else
-        echo "promtool skipped: no docker (CI runs it)"
+        echo "promtool skipped: no docker daemon (CI runs it)"
     fi
 }
 
@@ -127,18 +130,22 @@ kani() {
         echo "Kani $want is not installed: cargo +stable install --locked kani-verifier --version $want && cargo +stable kani setup"
         exit 2
     fi
-    cargo kani -p common
+    python3 scripts/proof-task.py run
 }
 
 # CI's mutants job: the mutants of this change against origin/main (docs/MUTATION.md).
 mutants() {
     step "mutants of the change (against origin/main)"
+    local base
+    base=$(git merge-base HEAD origin/main) || { echo "no origin/main to compare with"; exit 2; }
+    if [ "$(scripts/mutants-scope.sh "$base")" = skip ]; then
+        echo "mutation inputs unchanged; no cargo-mutants installation or execution needed"
+        return
+    fi
     command -v cargo-mutants >/dev/null || {
         echo "cargo-mutants is not installed: cargo +stable install --locked cargo-mutants --version $(pin CARGO_MUTANTS_VERSION)"
         exit 2
     }
-    local base
-    base=$(git merge-base HEAD origin/main) || { echo "no origin/main to compare with"; exit 2; }
     MUTANTS_JOBS=${MUTANTS_JOBS:-4} scripts/mutants-diff.sh "$base"
 }
 
@@ -186,11 +193,36 @@ python3 scripts/test_crowdsec_ttl.py
 python3 scripts/test_witness_gate.py
 python3 scripts/test_local_ci.py
 python3 scripts/test_runbook_preflight.py
+python3 scripts/test_mesh_preflight.py
 python3 scripts/test_anchor_scripts.py
 python3 scripts/test_kani_scope.py
+python3 scripts/test_proof_task.py
 python3 scripts/test_mutants_diff.py
+python3 scripts/test_mutants_scope.py
 python3 scripts/test_check_agents_rules.py
 python3 scripts/test_check_claims.py
+python3 scripts/test_witness_pin.py
+python3 scripts/test_gate_provenance.py
+python3 scripts/test_trust_root.py
+python3 scripts/test_sokol_dev.py
+python3 scripts/test_exchange_gate_root.py
+python3 scripts/test_candidate.py
+python3 scripts/test_build_identity.py
+python3 scripts/test_support_bundle.py
+python3 scripts/test_operator_offline.py
+python3 scripts/test_check_retired.py
+python3 scripts/test_counterexample_registry.py
+python3 scripts/test_check_monitoring.py
+python3 scripts/test_outbox_task.py
+python3 scripts/test_contract_shadow.py
+python3 scripts/test_contract_tool.py
+python3 scripts/test_contract_task.py
+step "complete owner/provisional pins and candidate trust root"
+python3 -I scripts/witness-pin.py check --every-pin
+step "portable counterexample and public Warrant integration"
+cargo install --locked --version "$(pin WARRANT_VERIFY_VERSION)" --root "$CACHE/warrant" warrant-verify
+SOKOL_WARRANT_BIN="$CACHE/warrant/bin/warrant-rs" python3 scripts/test_counterexample_task.py
+SOKOL_WARRANT_BIN="$CACHE/warrant/bin/warrant-rs" python3 scripts/test_counterexample_hostile_pack.py
 timeout 120 python3 scripts/test_crowdsec_stream.py target/release/sokol-crowdsec
 timeout 120 python3 scripts/test_suricata_recovery.py target/release/sokol-suricata
 # CI's kani job proves when something the proofs read changed (scripts/kani-scope.sh).

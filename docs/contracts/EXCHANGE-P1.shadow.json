@@ -1,0 +1,24 @@
+{
+  "annotations": {
+    "status": "UNSIGNED_EXPLANATORY_DRAFT"
+  },
+  "decisions": [
+    {
+      "because": "Review of #33: the proposed statement promised reproduction after a fresh isolated run, which its witnesses do not exercise (they test the evaluation of execution records and the bwrap profile; isolation is checked by check-counterexample-isolation.py and the rehearsal, outside CI). Also two of its witnesses skip without SOKOL_WARRANT_BIN; both gate runs now provide the released binary, so acceptance no longer blocks later pull requests.",
+      "previous_statement_sha256": null,
+      "proposal_sha256": "5b322d2fef5d989dec12244dae42ff1e5465a8adfe549ae389a89ec61cb3cfe2"
+    }
+  ],
+  "evidence_text": "`Interpretation.test_author_status_cannot_override_transcript`, `Interpretation.test_fixed_isolation_profile_exposes_no_home_key_or_network`, `Interpretation.test_only_named_assertion_red_and_complete_repair_reproduce`, `Interpretation.test_unrun_budget_and_wrong_phase_are_never_success`, `PublicWarrant.test_readdressing_a_changed_witness_cannot_bypass_owner_pin`, `PublicWarrant.test_recipient_reply_is_prior_linked_and_view_does_not_upgrade_execution`",
+  "id": "EXCHANGE-P1",
+  "profile": "sokol.contract-shadow.v1",
+  "statement": "The portable counterexample pilot binds exact source bytes by content address, and contract history and witness bodies to recipient-selected owner signers; it refuses unsupported profiles and tampered bytes. It reports REPRODUCED only when the worker's execution record shows the named defect assertion-red and every repaired and restored witness passing, each status re-derived from that witness's own exit and output, never taken from the record's claim. Imported signed observations remain recorded claims and confer no owner acceptance, settlement or deployment authority. These witnesses check the record and the fixed isolation profile, not the isolation itself; that is checked by the rehearsal.",
+  "witnesses": [
+    "Interpretation.test_author_status_cannot_override_transcript",
+    "Interpretation.test_fixed_isolation_profile_exposes_no_home_key_or_network",
+    "Interpretation.test_only_named_assertion_red_and_complete_repair_reproduce",
+    "Interpretation.test_unrun_budget_and_wrong_phase_are_never_success",
+    "PublicWarrant.test_readdressing_a_changed_witness_cannot_bypass_owner_pin",
+    "PublicWarrant.test_recipient_reply_is_prior_linked_and_view_does_not_upgrade_execution"
+  ]
+}

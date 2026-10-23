@@ -1,0 +1,10 @@
+# nodes=3 netem='none' host=aarch64 cpus=10 kernel=6.8.0-142-generic
+# full mesh after 5s: 3/3 nodes see 2 peers
+# unblock: ways 'stall', 20 rounds each, expire ttl 6s, FlowSpec on
+== stall
+   xdp1  node 1 answers again:        n=20 min=1 median=6 p95=10 max=10 (ms)
+   peer  another node answers again:  n=40 min=0 median=7 p95=11 max=11 (ms)
+   rib   rule gone from node gobgpd:  n=20 min=85 median=104 p95=108 max=109 (ms)
+   upstr rule gone upstream:          n=20 min=20 median=39 p95=44 max=47 (ms)
+   fsrec FLOWSPEC_WITHDRAW record:    n=20 min=18 median=35 p95=41 max=44 (ms)
+no layer kept blocking 20 s after an end

@@ -50,6 +50,13 @@ struct NodeLink {
 
 static NODE: OnceLock<NodeLink> = OnceLock::new();
 
+#[cfg(test)]
+thread_local! {
+    /// What this thread submits, for a test: each #[tokio::test] runs on its own thread, so
+    /// tests no longer read each other's lines through the process-wide NODE.
+    static TEST_LINK: std::cell::RefCell<Option<SyncSender<String>>> = const { std::cell::RefCell::new(None) };
+}
+
 /// What happened to a line, as the delivery thread learned it.
 #[derive(Debug, PartialEq, Eq)]
 enum Report {
@@ -65,6 +72,10 @@ enum Report {
 
 /// Queues `line` for the node; false if it was lost before reaching the outbox.
 fn submit(line: String) -> bool {
+    #[cfg(test)]
+    if let Some(tx) = TEST_LINK.with(|l| l.borrow().clone()) {
+        return tx.try_send(line).is_ok();
+    }
     let Some(node) = NODE.get() else {
         eprintln!("[!] node link not started; dropped: {}", line);
         return false;
@@ -166,6 +177,11 @@ const DEFAULT_TRAP_PORTS: [u16; 6] = [22, 80, 443, 3306, 6379, 8443];
 // The XDP program always passes this port as the operator's real SSH (common::ADMIN_SSH_PORT).
 use common::ADMIN_SSH_PORT;
 const MAX_CONCURRENT_CONNECTIONS: usize = 256;
+
+/// No trap session holds one of those slots longer than this. A client trickling a byte per
+/// read (each read waits up to 8 s), or one that never reads a tarpit's writes, held its slot
+/// indefinitely, and the ban came only when the session ended.
+const MAX_SESSION: Duration = Duration::from_secs(300);
 
 pub struct TrapConfig {
     pub ports: Vec<u16>,
@@ -314,7 +330,7 @@ impl UltimateTridentOrchestrator {
                     let config = config.clone();
 
                     tokio::spawn(async move {
-                        let _ = handle_trident_connection(stream, ip, port, &config).await;
+                        let _ = serve_trap_connection(stream, ip, port, &config, MAX_SESSION).await;
                         drop(permit);
                     });
                 }
@@ -328,6 +344,30 @@ impl UltimateTridentOrchestrator {
         }
 
         Ok(())
+    }
+}
+
+/// One trap connection, ended after `max`; a session the deadline ends still blocks its
+/// source, with that reason, which is returned.
+async fn serve_trap_connection(
+    stream: TcpStream,
+    ip: String,
+    port: u16,
+    config: &TrapConfig,
+    max: Duration,
+) -> Option<String> {
+    match timeout(
+        max,
+        handle_trident_connection(stream, ip.clone(), port, config),
+    )
+    .await
+    {
+        Ok(_) => None,
+        Err(_) => {
+            let reason = format!("trap port {}: session exceeded {} s", port, max.as_secs());
+            let _ = trigger_xdp_drop(&ip, &reason);
+            Some(reason)
+        }
     }
 }
 
@@ -356,7 +396,9 @@ async fn handle_trident_connection(
     let tier = classify_traffic_tier(payload, &fingerprint);
 
     let unique_log_record = format!(
-        "TRIDENT_HIT|TIER={:?}|IP={}|PORT={}|LEN={}|ENTROPY={:.2}|NON_PRINT={:.2}|HASH={:016X}|SNIPPET={}",
+        // The snippet is the attacker's bytes: the terminal VEC, so it cannot supply a header
+        // field the operator reads (OPERATOR-T1).
+        "TRIDENT_HIT|TIER={:?}|IP={}|PORT={}|LEN={}|ENTROPY={:.2}|NON_PRINT={:.2}|HASH={:016X}|VEC=SNIPPET={}",
         tier,
         fingerprint.ip,
         fingerprint.port,
@@ -665,7 +707,7 @@ async fn run_embedded_mock_jail(
                     .collect::<String>();
 
                 let chunk_log = format!(
-                    "EMBEDDED_JAIL_INPUT|IP={}|BYTES={}|SNIPPET={}",
+                    "EMBEDDED_JAIL_INPUT|IP={}|BYTES={}|VEC=SNIPPET={}",
                     ip, n, snippet
                 );
                 let _ = send_log_to_orchestrator(&chunk_log);
@@ -850,5 +892,123 @@ mod tests {
         assert_eq!(config.ports, vec![23, 3389]);
         assert_eq!(config.jail_addr, Some("127.0.0.1:2022".parse().unwrap()));
         assert!(TrapConfig::parse(Some("22,http"), None).is_err());
+    }
+
+    /// OPERATOR-T1/T2: the operator takes TIER and IP from the DB_LOG header (everything before
+    /// a terminal `|VEC=`); only the trap may choose them. Bytes an attacker typed into the trap
+    /// are diagnostic text and must sit in that terminal VEC, or a jailed client can move any
+    /// trap tier counter (one line per read) and supply header fields.
+    /// A jailed client that keeps sending one byte a second never ends its session by
+    /// itself; the session deadline ends it and the source is still blocked.
+    #[tokio::test]
+    async fn a_trickling_client_cannot_hold_a_trap_slot_past_the_session_deadline() {
+        let (tx, rx) = std::sync::mpsc::sync_channel(256);
+        TEST_LINK.with(|l| *l.borrow_mut() = Some(tx));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let attacker = tokio::spawn(async move {
+            let mut stream = TcpStream::connect(addr).await.unwrap();
+            stream.write_all(b"SSH-2.0-trickle").await.unwrap();
+            let mut sink = [0u8; 256];
+            loop {
+                let _ = timeout(Duration::from_millis(300), stream.read(&mut sink)).await;
+                if stream.write_all(b"x").await.is_err() {
+                    break;
+                }
+                sleep(Duration::from_millis(700)).await;
+            }
+        });
+        let (stream, _) = listener.accept().await.unwrap();
+        let config = TrapConfig {
+            ports: vec![],
+            jail_addr: None,
+        };
+        let started = std::time::Instant::now();
+        let ended = timeout(
+            Duration::from_secs(20),
+            serve_trap_connection(
+                stream,
+                "203.0.113.77".into(),
+                2022,
+                &config,
+                Duration::from_secs(3),
+            ),
+        )
+        .await;
+        attacker.abort();
+        let reason = ended.expect("a trickling client held the trap session past its deadline");
+        assert_eq!(
+            reason.as_deref(),
+            Some("trap port 2022: session exceeded 3 s"),
+            "the deadline must end the session with a ban reason"
+        );
+        let lines: Vec<String> = rx.try_iter().collect();
+        assert!(
+            lines.contains(
+                &"SIGNAL:trident|203.0.113.77|-|trap port 2022: session exceeded 3 s".to_string()
+            ),
+            "the source was not blocked when the deadline ended its session: {lines:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(6),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn attacker_bytes_reach_trap_telemetry_only_as_terminal_vector_text() {
+        use tokio::io::AsyncBufReadExt;
+        let (tx, rx) = std::sync::mpsc::sync_channel(256);
+        TEST_LINK.with(|l| *l.borrow_mut() = Some(tx));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let attacker = tokio::spawn(async move {
+            let stream = TcpStream::connect(addr).await.unwrap();
+            let (r, mut w) = stream.into_split();
+            let mut r = tokio::io::BufReader::new(r);
+            w.write_all(b"SSH-2.0-x|TIER=Tier2PayloadCapture")
+                .await
+                .unwrap();
+            let mut banner = String::new();
+            r.read_line(&mut banner).await.unwrap();
+            assert!(banner.starts_with("SSH-2.0-"), "{banner:?}");
+            w.write_all(b"|TIER=Tier1BotTarpit|IP=198.51.100.66")
+                .await
+                .unwrap();
+            let mut prompt = [0u8; 64];
+            let _ = r.read(&mut prompt).await.unwrap();
+            w.shutdown().await.unwrap();
+        });
+        let (stream, _) = listener.accept().await.unwrap();
+        let config = TrapConfig {
+            ports: vec![],
+            jail_addr: None,
+        };
+        let _ = handle_trident_connection(stream, "203.0.113.9".into(), 2022, &config).await;
+        attacker.await.unwrap();
+
+        let logs: Vec<String> = rx
+            .try_iter()
+            .filter_map(|l| l.strip_prefix("DB_LOG:").map(str::to_string))
+            .collect();
+        assert!(logs.len() >= 2, "{logs:?}");
+        for log in &logs {
+            // The operator's rule (OPERATOR-T1): header before the first `|VEC=`, first match wins.
+            let header = log.split_once("|VEC=").map_or(log.as_str(), |(h, _)| h);
+            let field = |key: &str| header.split('|').find_map(|p| p.strip_prefix(key));
+            assert!(
+                matches!(field("TIER="), None | Some("Tier3InteractiveJail")),
+                "attacker bytes chose the operator tier: {log:?}"
+            );
+            assert!(
+                matches!(field("IP="), None | Some("203.0.113.9")),
+                "attacker bytes supplied the operator IP: {log:?}"
+            );
+            assert!(
+                !header.contains("Tier2PayloadCapture") && !header.contains("Tier1BotTarpit"),
+                "attacker bytes are in the telemetry header, not the terminal VEC: {log:?}"
+            );
+        }
     }
 }

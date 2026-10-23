@@ -1,0 +1,19 @@
+{
+  "annotations": {
+    "status": "UNSIGNED_EXPLANATORY_DRAFT"
+  },
+  "decisions": [
+    {
+      "because": "Counterexample (hunt round 3, 2026-10-10): the default was 64512:(node_id & 0xFFFF), so nodes 1 and 65537 shared 64512:1 and would withdraw each other's rules on a shared gobgpd (ADR-0008).",
+      "previous_statement_sha256": null,
+      "proposal_sha256": "b680f7807461c792b22348b0348db15f75118d65fd619165837b5812664ae2f5"
+    }
+  ],
+  "evidence_text": "`the_default_community_is_64512_and_the_node_id_and_is_refused_above_16_bits`",
+  "id": "FLOWSPEC-P2",
+  "profile": "sokol.contract-shadow.v1",
+  "statement": "The default ownership community is 64512:<node-id>; a node id that does not fit 16 bits is refused at startup unless a community is given explicitly, never truncated.",
+  "witnesses": [
+    "the_default_community_is_64512_and_the_node_id_and_is_refused_above_16_bits"
+  ]
+}

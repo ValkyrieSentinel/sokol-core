@@ -1,6 +1,20 @@
 # cargo-mutants: mutants that are equivalent or cannot be observed by a unit test.
 # Every entry says why. Commands, baseline and open survivors: docs/MUTATION.md.
 exclude_re = [
+    # This verification harness is cfg(kani), absent from the unit-test binary, like tests
+    # themselves. Native mutants of valid_segment_start remain in scope. Its ==/!= mutant
+    # was rejected by cargo kani --harness a_zero_sequence_segment_has_the_fixed_genesis_chain
+    # (2026-10-11). proof-task.py now checks its declared assertion against a broken genesis
+    # predicate on every scoped Kani run; adequacy beyond those controls remains review.
+    "in proofs::a_zero_sequence_segment_has_the_fixed_genesis_chain$",
+    "replace proofs::a_zero_sequence_segment_has_the_fixed_genesis_chain with \\(\\)$",
+    # The proofs of the arithmetic and framing moved out of the node (storm, lease, wire,
+    # replay) and their specifications are cfg(kani), absent from the unit-test binary.
+    # scripts/proof-task.py calibrates each harness with a fault of its own
+    # (scripts/proof-challenges.json) and refuses a harness without one.
+    "common/src/(storm|lease|wire|replay)\\.rs:\\d+:\\d+: .*proofs::",
+    # STORM_FLAGS is two disjoint bits: `|` and `^` give the same constant.
+    "storm\\.rs:\\d+:\\d+: replace \\| with \\^$",
     # Disjoint bits: `|` and `^` give the same value.
     "replace \\| with \\^ in from_hex$",
     "replace \\| with \\^ in tcp_flags::is_invalid$",
@@ -11,6 +25,28 @@ exclude_re = [
     # The monitor's process entry: the XDP smoke runs `monitor --regret` on its audit log.
     "bin/monitor.rs:\\d+:\\d+: replace main -> io::Result<\\(\\)> with Ok\\(\\(\\)\\)$",
     "bin/monitor.rs:\\d+:\\d+: delete match arm Some\\(\"--regret\"\\) in main$",
+    # The IPC handlers lock a SharedBlockTable over the kernel map (KernelBlocklist), so no unit
+    # test can call them; the XDP smoke checks their replies exactly (event ids: OK ack, applied,
+    # duplicate; a retraction: OK lifted, then duplicate). Their reply logic is unit-tested in
+    # enforcement_reply and retraction_reply.
+    "ipc.rs:\\d+:\\d+: replace (handle_ipc_line|retract_detection) -> String with (String::new\\(\\)|\"xyzzy\".into\\(\\))$",
+    # The orchestrator's process entry: the XDP smoke starts and drives it end to end.
+    "orchestrator/src/main.rs:\\d+:\\d+: replace main -> Result<\\(\\), anyhow::Error> with Ok\\(\\(\\)\\)$",
+    # The restore's warning line: the counts themselves are kept in the table and checked
+    # exactly (a_restore_keeps_every_bounded_table_within_its_runtime_bound); only logging differs.
+    "in Dropped::log$",
+    "replace Dropped::log with \\(\\)$",
+    # serde's "expecting" text only words an error the duplicate-key check raises either way
+    # (a_repeated_rib_key_cannot_hide_a_foreign_path_from_the_round asserts the error).
+    "UniqueKeysVisitor>::expecting -> std::fmt::Result with Ok\\(Default::default\\(\\)\\)$",
+    # Bounded::expecting only formats the type hint after serde has refused a non-sequence.
+    # Returning Ok(()) changes that hint, not admission or budgets. Probed the actual visitor
+    # with 0/{}/null/[]/[1]/[1,2]: both versions refuse the first three and the over-limit
+    # sequence, and accept the empty/in-bound sequence. Keep this exclusion diagnostic-only.
+    "^orchestrator/src/state_input\\.rs:\\d+:\\d+: replace entries::<impl Visitor<'de> for Bounded<T, F>>::expecting -> fmt::Result with Ok\\(Default::default\\(\\)\\)$",
+    # The FastNetMon hook's process entry only passes its arguments to notify(), whose paths
+    # the tests run as a child process (tests::hook).
+    "bin/sokol-fastnetmon-notify.rs:\\d+:\\d+: replace main with \\(\\)$",
     # Directory fsync for durability; not observable without crash injection.
     "in sync_dir",
     # An offset while the clock has not stepped: 0 and +-1 ms are indistinguishable from it.
@@ -26,7 +62,7 @@ exclude_re = [
     "replace (> with ==|> with >=|\\* with \\+) in BlockTable<B>::strike_order_due$",
     # Replay compares a detector's TTL and claim; a static or operator block does not change
     # either on the current table (probed 2026-10-07).
-    "match guard t.starts_with\\(\"(STATIC_BLOCK_|OPERATOR_BAN_)\"\\) with false in replay_records",
+    "match guard t.starts_with\\(\"(STATIC_BLOCK_|OPERATOR_BAN_)\"\\) with false in (replay_records|Replay<'a>::consume)",
     # keep_aside keeps nothing either way when the link fails for another reason.
     "replace match guard e.kind\\(\\) == std::io::ErrorKind::AlreadyExists with true in keep_aside$",
     # serde refuses repeated fields and a second top-level key on its own; the strict check
@@ -34,4 +70,13 @@ exclude_re = [
     # Not the length bound of a bare string: a unit variant would then be refused.
     "replace check_canonical -> Result<\\(\\), common::canonical::CanonicalError> with Ok\\(\\(\\)\\)$",
     "replace && with \\|\\| in check_canonical$",
+    # Whether an enforced block is pushed to the trident telemetry socket: push_telemetry
+    # writes to a socket no unit test opens. The line it sends is tested (enforced_telemetry).
+    "main.rs:\\d+:\\d+: replace == with != in enforce_block_local$",
+    # The monitor TUI's refresh reads the fixed system audit path (DB_FILE), out of a unit
+    # test's reach; what it does with each record is display_fields, which is tested.
+    "bin/monitor.rs:\\d+:\\d+: replace read_new_events -> io::Result<\\(\\)> with Ok\\(\\(\\)\\)$",
+    # The trap's accept loop binds its listening ports; what it does per connection is
+    # serve_trap_connection, which is tested.
+    "bin/trident_trap.rs:\\d+:\\d+: replace UltimateTridentOrchestrator::run -> Result<\\(\\), Box<dyn std::error::Error>> with Ok\\(\\(\\)\\)$",
 ]

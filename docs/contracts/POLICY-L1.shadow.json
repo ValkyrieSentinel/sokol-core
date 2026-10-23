@@ -1,0 +1,22 @@
+{
+  "annotations": {
+    "status": "UNSIGNED_EXPLANATORY_DRAFT"
+  },
+  "decisions": [
+    {
+      "because": "Round-9 control hunt (2026-10-15): a ban, a local decision, a peer claim and a BlockSync claim each checked the policy before the table lock; one waiting through a host refresh added a newly protected address after the recheck (an operator ban held it indefinitely). All three race tests failed on their assertion before the fix; BlockSync also alone.",
+      "previous_statement_sha256": null,
+      "proposal_sha256": "7f497e2bdd0d8eebc2fde15ea519223bdaf5bdf5801bddf7f58d37e1f694360c"
+    }
+  ],
+  "evidence_text": "`a_ban_racing_a_protection_change_does_not_block_the_protected_address`, `a_detection_racing_a_protection_change_is_refused`, `a_peer_claim_racing_a_protection_change_is_not_enforced`",
+  "id": "POLICY-L1",
+  "profile": "sokol.contract-shadow.v1",
+  "statement": "Every path that adds or adopts a block (operator ban, local decision, peer claim, BlockSync) reads the never-block policy under the block table's lock, where the host refresh replaces it and rechecks the table: a decision that waited through a refresh does not enforce an address the refresh protected.",
+  "tier": "provisional",
+  "witnesses": [
+    "a_ban_racing_a_protection_change_does_not_block_the_protected_address",
+    "a_detection_racing_a_protection_change_is_refused",
+    "a_peer_claim_racing_a_protection_change_is_not_enforced"
+  ]
+}

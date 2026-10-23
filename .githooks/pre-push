@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Enabled per clone with: git config core.hooksPath .githooks
+exec "$(git rev-parse --show-toplevel)/scripts/pre-push.sh"

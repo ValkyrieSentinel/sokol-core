@@ -11,7 +11,7 @@ use core::mem;
 
 use common::{
     config_flags, drop_reason, DropEvent, PacketStats, BLOCKLIST_CAPACITY, BLOCK_HIT_SLOTS,
-    DROP_REASON_SLOTS, EVENTS_RING_BYTES, MAX_EVENTS_PER_CPU_PER_SEC,
+    DROP_REASON_SLOTS, EVENTS_RING_BYTES, MAX_EVENTS_PER_CPU_PER_SEC, MAX_PAYLOAD,
 };
 
 /// The license the kernel sees (GPL-2.0-or-later, `ebpf/LICENSE`); it admits GPL-only helpers.
@@ -202,6 +202,9 @@ fn emit_drop_event_sampled(
             (*entry_ptr).ip_version = ip_version;
             (*entry_ptr)._pad = 0;
             (*entry_ptr).payload_len = 0;
+            // The ring hands out reserved space as it is, not zeroed: unwritten, this field
+            // would carry the bytes of an earlier record once the ring wraps.
+            (*entry_ptr).payload = [0; MAX_PAYLOAD];
         }
         entry.submit(0);
     } else {
@@ -214,15 +217,18 @@ fn emit_drop_event_sampled(
 pub fn sentinel_vfr_filter(ctx: XdpContext) -> u32 {
     match try_sentinel_vfr_filter(&ctx) {
         Ok(ret) => ret,
-        // Headers that do not parse: passed to the stack normally, dropped in strict mode.
+        // Headers that do not parse: passed to the stack normally, dropped in strict mode. Own
+        // reason, not MALFORMED_HEADER: these drops exist only while a storm sets STRICT_PARSE,
+        // and the attack signal must be able to leave them out (ADR-6).
         Err(_) if config_enabled(config_flags::STRICT_PARSE) => {
-            let verdict = drop_verdict(
-                (ctx.data_end() - ctx.data()) as u64,
-                drop_reason::MALFORMED_HEADER,
-            );
-            verdict
+            let packet_len = (ctx.data_end() - ctx.data()) as u64;
+            drop_verdict(packet_len, drop_reason::STRICT_PARSE_FAILED)
         }
-        Err(_) => xdp_action::XDP_PASS,
+        // Passed, so seen: rx_packets counts it like every other passed packet.
+        Err(_) => {
+            record_rx((ctx.data_end() - ctx.data()) as u64);
+            xdp_action::XDP_PASS
+        }
     }
 }
 

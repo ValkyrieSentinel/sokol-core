@@ -139,7 +139,14 @@ fn decide(line: &str, filter: &Filter) -> Option<Alert> {
     if severity > filter.max_severity || filter.ignore_sid.contains(&sid) {
         return None;
     }
-    let src: IpAddr = event.get("src_ip")?.as_str()?.parse().ok()?;
+    // `::ffff:a.b.c.d` is the host `a.b.c.d`, as the node reads it: one host, one cooldown
+    // (SUR-G2).
+    let src: IpAddr = event
+        .get("src_ip")?
+        .as_str()?
+        .parse::<IpAddr>()
+        .ok()?
+        .to_canonical();
     let dst = event
         .get("dest_ip")
         .and_then(|v| v.as_str())
@@ -394,7 +401,7 @@ impl Cursor {
     /// cursor or the new one, never an empty file.
     fn save(&self, path: &Path) -> io::Result<()> {
         use std::io::Write;
-        let tmp = path.with_extension("tmp");
+        let tmp = cursor_tmp(path);
         let mut file = File::create(&tmp)?;
         file.write_all(&serde_json::to_vec(self).map_err(io::Error::other)?)?;
         file.sync_all()?;
@@ -404,6 +411,15 @@ impl Cursor {
         }
         Ok(())
     }
+}
+
+/// The temporary file a cursor is written through: the cursor's own name plus `.tmp`. Replacing
+/// the extension instead made a cursor named `*.tmp` its own temporary file (truncated before
+/// the new bytes were synced) and let two cursors differing only by extension share one (SUR-C2).
+fn cursor_tmp(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(".tmp");
+    PathBuf::from(name)
 }
 
 /// Where reading starts: the saved cursor; without one, the end (or the start with
@@ -1381,7 +1397,7 @@ mod tests {
         };
         at.save(&cursor).unwrap();
         assert_eq!(Cursor::load(&cursor), Ok(Some(at)));
-        assert!(!cursor.with_extension("tmp").exists());
+        assert!(!cursor_tmp(&cursor).exists());
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -2009,6 +2025,73 @@ mod tests {
             alert.at_ms,
             Some(1_790_250_503_712),
             "2026-09-24T11:48:23.712804Z"
+        );
+    }
+
+    /// A cursor is replaced by renaming a synced temporary file onto it, never rewritten in
+    /// place, also when its own name ends in `.tmp`: in place, a crash between truncation and
+    /// sync left neither the old cursor nor the new one (SUR-C2).
+    #[test]
+    fn a_cursor_is_replaced_not_rewritten_in_place_whatever_its_name() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = std::env::temp_dir().join(format!("sokol-cursor-replace-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in ["eve-cursor.json", "eve-cursor.tmp"] {
+            let path = dir.join(name);
+            Cursor {
+                inode: 7,
+                position: 1,
+            }
+            .save(&path)
+            .unwrap();
+            let before = std::fs::metadata(&path).unwrap().ino();
+            Cursor {
+                inode: 7,
+                position: 2,
+            }
+            .save(&path)
+            .unwrap();
+            let after = std::fs::metadata(&path).unwrap().ino();
+            assert_ne!(before, after, "{name}: the cursor was rewritten in place");
+            assert_eq!(
+                Cursor::load(&path),
+                Ok(Some(Cursor {
+                    inode: 7,
+                    position: 2
+                }))
+            );
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// One host written as IPv4 and as IPv4-mapped IPv6 shares one cooldown: the node reads
+    /// `::ffff:a.b.c.d` as `a.b.c.d` (SUR-G2).
+    #[test]
+    fn a_mapped_and_a_plain_address_of_one_host_share_a_cooldown() {
+        let filter = Filter {
+            max_severity: 3,
+            ignore_sid: Vec::new(),
+        };
+        let line = |src: &str| {
+            format!(
+                r#"{{"event_type":"alert","src_ip":"{}","alert":{{"severity":1,"signature_id":7,"signature":"x"}}}}"#,
+                src
+            )
+        };
+        let plain = decide(&line("203.0.113.5"), &filter).unwrap();
+        let mapped = decide(&line("::ffff:203.0.113.5"), &filter).unwrap();
+        let t = Instant::now();
+        let mut gate = Gate::new(Duration::from_secs(60), 100);
+        let admitted: Vec<_> = [&plain, &mapped]
+            .into_iter()
+            .filter(|alert| gate.admit(alert.src, t))
+            .map(|alert| alert.signal_line())
+            .collect();
+        assert_eq!(
+            admitted.len(),
+            1,
+            "one host admitted twice within its cooldown: {admitted:?}"
         );
     }
 }

@@ -153,6 +153,83 @@ pub mod abi {
         assert!(192 + 8 * DROP_REASON_SLOTS == PACKET_STATS_SIZE);
         assert!(super::EVENTS_RING_BYTES.is_power_of_two());
     };
+
+    #[cfg(test)]
+    mod tests {
+        extern crate std;
+        use super::DropEvent;
+        use std::{string::String, vec::Vec};
+
+        /// Every field of `DropEvent`. The pattern has no `..`, so a field added to the struct
+        /// does not compile here until it is listed.
+        fn fields(e: &DropEvent) -> [&'static str; 9] {
+            let DropEvent {
+                src_ip: _,
+                dst_ip: _,
+                pkt_len: _,
+                reason: _,
+                protocol: _,
+                ip_version: _,
+                payload_len: _,
+                _pad: _,
+                payload: _,
+            } = e;
+            [
+                "src_ip",
+                "dst_ip",
+                "pkt_len",
+                "reason",
+                "protocol",
+                "ip_version",
+                "payload_len",
+                "_pad",
+                "payload",
+            ]
+        }
+
+        /// `bpf_ringbuf_reserve` does not zero the space it hands out: a field the XDP program
+        /// leaves unwritten carries the bytes of an earlier record (another packet's addresses)
+        /// once the ring wraps. Between reserve and submit, every field is assigned.
+        #[test]
+        fn the_xdp_program_writes_every_field_of_a_drop_event_before_submitting_it() {
+            let src = include_str!("../../ebpf/src/main.rs");
+            let flat: String = src.split_whitespace().collect();
+            let records: Vec<&str> = flat
+                .match_indices("EVENTS.reserve::<DropEvent>")
+                .filter_map(|(i, _)| {
+                    let rest = &flat[i..];
+                    rest.find(".submit(").map(|e| &rest[..e])
+                })
+                .collect();
+            assert!(
+                !records.is_empty(),
+                "no reserve..submit of a DropEvent found: the scan is broken"
+            );
+            let all = fields(&DropEvent {
+                src_ip: [0; 16],
+                dst_ip: [0; 16],
+                pkt_len: 0,
+                reason: 0,
+                protocol: 0,
+                ip_version: 0,
+                payload_len: 0,
+                _pad: 0,
+                payload: [0; super::MAX_PAYLOAD],
+            });
+            for record in &records {
+                for f in all {
+                    let assign = std::format!(".{f}=");
+                    let written = record
+                        .match_indices(assign.as_str())
+                        .any(|(i, _)| !record[i + assign.len()..].starts_with('='));
+                    assert!(
+                        written,
+                        "DropEvent.{f} is submitted without being written: it carries ring garbage"
+                    );
+                }
+            }
+        }
+    }
 }
 
 #[repr(C)]
@@ -179,6 +256,10 @@ pub mod drop_reason {
     pub const MANUAL_BLOCK: u16 = 8;
     pub const FRAGMENT_BLOCKED: u16 = 9;
     pub const INVALID_TCP_FLAGS: u16 = 10;
+    /// Headers that do not parse, dropped only because `config_flags::STRICT_PARSE` is set (a
+    /// storm, ADR-6). Apart from `MALFORMED_HEADER`, which is dropped in every mode, so that the
+    /// attack signal can leave out the drops storm mode itself adds and keep counting the rest.
+    pub const STRICT_PARSE_FAILED: u16 = 11;
 
     /// Label for metrics; `None` for codes that are never recorded as drops. A label is a
     /// claim that the counter can move: only codes the XDP program passes to `drop_verdict`
@@ -190,6 +271,7 @@ pub mod drop_reason {
             MALFORMED_HEADER => Some("malformed_header"),
             FRAGMENT_BLOCKED => Some("fragment_blocked"),
             INVALID_TCP_FLAGS => Some("invalid_tcp_flags"),
+            STRICT_PARSE_FAILED => Some("strict_parse"),
             _ => None,
         }
     }
@@ -199,7 +281,7 @@ pub mod drop_reason {
         extern crate std;
         use std::{collections::BTreeSet, string::String, vec::Vec};
 
-        const CODES: [(&str, u16); 10] = [
+        const CODES: [(&str, u16); 11] = [
             ("STATIC_BLOCK", super::STATIC_BLOCK),
             ("FAST_PATH_HIT", super::FAST_PATH_HIT),
             ("SLOW_PATH_LPM_HIT", super::SLOW_PATH_LPM_HIT),
@@ -210,21 +292,133 @@ pub mod drop_reason {
             ("MANUAL_BLOCK", super::MANUAL_BLOCK),
             ("FRAGMENT_BLOCKED", super::FRAGMENT_BLOCKED),
             ("INVALID_TCP_FLAGS", super::INVALID_TCP_FLAGS),
+            ("STRICT_PARSE_FAILED", super::STRICT_PARSE_FAILED),
         ];
+
+        #[test]
+        fn every_drop_reason_code_is_distinct_and_has_its_own_counter_slot() {
+            let codes: BTreeSet<u16> = CODES.iter().map(|(_, c)| *c).collect();
+            assert_eq!(codes.len(), CODES.len(), "two reasons share a code");
+            for (n, c) in CODES {
+                assert!(
+                    (c as usize) < crate::DROP_REASON_SLOTS,
+                    "{n} = {c} is masked into another reason's slot"
+                );
+            }
+        }
+
+        #[test]
+        fn the_xdp_program_drops_unparsable_headers_in_strict_mode_with_their_own_reason() {
+            // Only the drop that exists because STRICT_PARSE is set uses STRICT_PARSE_FAILED;
+            // the outer headers dropped in every mode keep MALFORMED_HEADER (ADR-6, ADR-0015).
+            let src = include_str!("../../ebpf/src/main.rs");
+            let flat: String = src.split_whitespace().collect();
+            let guard = "Err(_)ifconfig_enabled(config_flags::STRICT_PARSE)=>{";
+            let start = flat
+                .find(guard)
+                .map(|i| i + guard.len())
+                .expect("the strict-parse arm is not found: the scan is broken");
+            let end = flat[start..]
+                .find('}')
+                .expect("the strict-parse arm has no end");
+            let arm = &flat[start..start + end];
+            assert!(
+                arm.contains("drop_verdict(packet_len,drop_reason::STRICT_PARSE_FAILED)"),
+                "the strict-parse drop does not use STRICT_PARSE_FAILED: {arm}"
+            );
+            assert_eq!(
+                flat.matches("drop_reason::STRICT_PARSE_FAILED").count(),
+                1,
+                "STRICT_PARSE_FAILED is used outside the strict-parse arm"
+            );
+            assert!(
+                flat.contains("drop_verdict(packet_len,drop_reason::MALFORMED_HEADER)"),
+                "the always-on malformed-header drops are gone"
+            );
+        }
+
+        /// Every `drop_verdict(<len>, drop_reason::X)` call, however it is wrapped, in source
+        /// with its whitespace removed.
+        /// The call's arguments end at its matching `)`, not its first one; a call whose
+        /// second argument is not a `drop_reason::X` literal panics instead of being skipped.
+        fn dropped_reasons(flat: &str) -> BTreeSet<&str> {
+            flat.match_indices("drop_verdict(")
+                // The definition `fn drop_verdict(packet_len: u64, reason: u16)` is no call.
+                .filter(|(i, _)| !flat[..*i].ends_with("fn"))
+                .map(|(i, m)| {
+                    let args = i + m.len();
+                    let (mut depth, mut comma, mut end) = (0usize, None, None);
+                    for (j, c) in flat[args..].char_indices() {
+                        match c {
+                            '(' | '[' | '{' => depth += 1,
+                            ')' | ']' | '}' if depth == 0 => {
+                                end = Some(args + j);
+                                break;
+                            }
+                            ')' | ']' | '}' => depth -= 1,
+                            ',' if depth == 0 && comma.is_none() => comma = Some(args + j + 1),
+                            _ => {}
+                        }
+                    }
+                    let (Some(comma), Some(end)) = (comma, end) else {
+                        panic!("unparsable drop_verdict call: {}", &flat[i..]);
+                    };
+                    let reason = flat[comma..end].trim_end_matches(',');
+                    reason
+                        .strip_prefix("drop_reason::")
+                        .filter(|n| {
+                            !n.is_empty()
+                                && n.bytes().all(|b| {
+                                    b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_'
+                                })
+                        })
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "drop_verdict with a reason the scan cannot name: {}",
+                                &flat[i..=end]
+                            )
+                        })
+                })
+                .collect()
+        }
+
+        /// The scan must see a drop whatever its length argument is: a nested call there must
+        /// not hide the reason; a call cut at its first `)` hid one.
+        #[test]
+        fn the_drop_label_scan_sees_a_reason_after_a_nested_call() {
+            for call in [
+                "return Ok(drop_verdict(packet_len.min(u64::MAX), drop_reason::VFR_ANOMALY));",
+                "let v = drop_verdict(u64::from(len), drop_reason::VFR_ANOMALY);",
+            ] {
+                let flat: String = call.split_whitespace().collect();
+                let found = dropped_reasons(&flat);
+                assert!(
+                    found.contains("VFR_ANOMALY"),
+                    "a drop with VFR_ANOMALY is invisible to the scan: {call} -> {found:?}"
+                );
+            }
+        }
+
+        /// A drop whose reason is not a `drop_reason::X` literal (a variable, a helper's
+        /// parameter) cannot be checked against the labels: the scan must refuse it, not skip it.
+        #[test]
+        fn the_drop_label_scan_refuses_a_reason_it_cannot_name() {
+            let flat: String =
+                "fn drop_for(len: u64, reason: u16) -> u32 { drop_verdict(len, reason) }"
+                    .split_whitespace()
+                    .collect();
+            let refused = std::panic::catch_unwind(|| dropped_reasons(&flat).len()).is_err();
+            assert!(
+                refused,
+                "a drop_verdict call with an unnamed reason was skipped silently"
+            );
+        }
 
         #[test]
         fn a_drop_reason_has_a_metric_label_exactly_when_the_xdp_program_drops_with_it() {
             let src = include_str!("../../ebpf/src/main.rs");
-            // Every `drop_verdict(<len>, drop_reason::X)` call, however it is wrapped.
             let flat: String = src.split_whitespace().collect();
-            let dropped: BTreeSet<&str> = flat
-                .match_indices("drop_verdict(")
-                .filter_map(|(i, _)| {
-                    let call = &flat[i..flat[i..].find(')').map(|e| i + e)?];
-                    let name = call.split("drop_reason::").nth(1)?;
-                    Some(name.trim_end_matches(','))
-                })
-                .collect();
+            let dropped = dropped_reasons(&flat);
             assert!(
                 !dropped.is_empty(),
                 "no drop_verdict call found: the scan is broken"
@@ -358,6 +552,10 @@ pub mod tcp_flags {
 }
 
 pub mod canonical;
+pub mod lease;
+pub mod replay;
+pub mod storm;
+pub mod wire;
 
 #[cfg(feature = "std")]
 pub mod audit_log;

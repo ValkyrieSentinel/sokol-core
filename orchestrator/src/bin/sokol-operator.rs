@@ -51,6 +51,8 @@ struct ClientNode {
     defense_mode: String,
     packets_dropped: u64,
     blacklist: HashSet<String>,
+    #[serde(default)]
+    ban_readback: BanReadback,
     /// uid of the process that first announced this node; its heartbeats (and control socket)
     /// must keep coming from it.
     #[serde(skip)]
@@ -58,6 +60,81 @@ struct ClientNode {
     /// When its last heartbeat arrived; the view marks the node STALE after NODE_STALE_AFTER.
     #[serde(skip)]
     seen_at: Option<std::time::Instant>,
+}
+
+#[derive(Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Debug)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum ReadbackStatus {
+    #[default]
+    Unknown,
+    Fresh,
+    Stale,
+}
+
+#[derive(Clone, Default, Serialize, Deserialize)]
+struct BanReadback {
+    status: ReadbackStatus,
+    observed_at: Option<String>,
+    age_ms: Option<u64>,
+    total: Option<usize>,
+    error: Option<String>,
+    #[serde(skip)]
+    observed_when: Option<std::time::Instant>,
+    #[serde(skip)]
+    attempt: Option<Arc<()>>,
+}
+
+impl BanReadback {
+    fn view(&self, now: std::time::Instant) -> Self {
+        let mut view = self.clone();
+        if let Some(when) = self.observed_when {
+            let age = now.saturating_duration_since(when);
+            view.age_ms = Some(age.as_millis().min(u64::MAX as u128) as u64);
+            if age > BANS_STALE_AFTER {
+                view.status = ReadbackStatus::Stale;
+            }
+        }
+        view
+    }
+}
+
+#[derive(Debug)]
+enum ControlOutcome {
+    Confirmed(String),
+    Rejected(String),
+    NotSent(String),
+    Unknown(String),
+}
+
+impl ControlOutcome {
+    fn into_result(self) -> Result<String, String> {
+        match self {
+            Self::Confirmed(reply) => Ok(reply),
+            Self::Rejected(error) | Self::NotSent(error) | Self::Unknown(error) => Err(error),
+        }
+    }
+}
+
+/// ADR-0005: `OK …; WARNING: not yet durable` is not plain `OK`. The node acknowledged the
+/// command but cannot yet say it is on disk; that warning stays in the answer.
+fn command_json(outcome: ControlOutcome) -> Json<serde_json::Value> {
+    let (status, success, error, warning) = match outcome {
+        ControlOutcome::Confirmed(reply) => (
+            "CONFIRMED",
+            true,
+            None,
+            reply.split_once("WARNING:").map(|(_, w)| {
+                w.trim()
+                    .chars()
+                    .take(CONTROL_ERROR_CHARS)
+                    .collect::<String>()
+            }),
+        ),
+        ControlOutcome::Rejected(e) => ("REJECTED", false, Some(e), None),
+        ControlOutcome::NotSent(e) => ("NOT_SENT", false, Some(e), None),
+        ControlOutcome::Unknown(e) => ("UNKNOWN", false, Some(e), None),
+    };
+    Json(serde_json::json!({"success":success, "outcome":status, "error":error, "warning":warning}))
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -108,6 +185,12 @@ const NODE_STALE_AFTER: Duration = Duration::from_secs(15);
 const NODE_FORGET_AFTER: Duration = Duration::from_secs(3600);
 /// How often the dashboard re-reads each node's bans from the node itself.
 const BANS_REFRESH: Duration = Duration::from_secs(5);
+const BANS_STALE_AFTER: Duration = Duration::from_secs(15);
+// LIST_BANS emits at most 4096 IPv4/IPv6 targets; 256 KiB includes the count and framing.
+const CONTROL_REPLY_BYTES: u64 = 256 * 1024;
+const MAX_LISTED_BANS: usize = 4096;
+const CONTROL_TIMEOUT: Duration = Duration::from_secs(3);
+const CONTROL_ERROR_CHARS: usize = 512;
 const TELEMETRY_MAX_LINE: u64 = 8192;
 const TELEMETRY_IDLE: Duration = Duration::from_secs(10);
 
@@ -248,13 +331,6 @@ fn parse_block_target(raw: &str) -> Option<String> {
     raw.parse::<ipnet::IpNet>().ok().map(|net| net.to_string())
 }
 
-fn result_json(res: Result<(), String>) -> Json<serde_json::Value> {
-    match res {
-        Ok(()) => Json(serde_json::json!({ "success": true })),
-        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
-    }
-}
-
 #[derive(Deserialize)]
 struct BlacklistReq {
     ip: String,
@@ -368,10 +444,10 @@ async fn process_trident_telemetry(state: &AppState, uid: u32, raw_msg: &str) {
 
     for line in raw_msg.lines() {
         if let Some(data) = line.strip_prefix("HEARTBEAT:") {
-            let id = extract_value(data, "ID=")
-                .unwrap_or("0".into())
-                .parse::<u32>()
-                .unwrap_or(0);
+            let Some(id) = extract_value(data, "ID=").and_then(|id| id.parse::<u32>().ok()) else {
+                log::warn!("Ignoring heartbeat without a valid node ID");
+                continue;
+            };
             if !nodes.iter().any(|n| n.id == id) {
                 nodes.push(ClientNode {
                     id,
@@ -385,6 +461,7 @@ async fn process_trident_telemetry(state: &AppState, uid: u32, raw_msg: &str) {
                     defense_mode: extract_value(data, "MODE=").unwrap_or("NORMAL".into()),
                     packets_dropped: 0,
                     blacklist: HashSet::new(),
+                    ban_readback: BanReadback::default(),
                     uid,
                     seen_at: Some(std::time::Instant::now()),
                 });
@@ -402,35 +479,45 @@ async fn process_trident_telemetry(state: &AppState, uid: u32, raw_msg: &str) {
                 node.last_seen = Utc::now().format("%H:%M:%S").to_string();
                 node.seen_at = Some(std::time::Instant::now());
                 if let Some(ctl) = extract_value(data, "CTL=") {
-                    node.control_socket = ctl;
+                    if node.control_socket != ctl {
+                        node.control_socket = ctl;
+                        node.blacklist.clear();
+                        node.ban_readback = BanReadback::default();
+                    }
                 }
             }
         } else if let Some(data) = line.strip_prefix("DB_LOG:") {
-            let node_id = extract_value(data, "NODE=")
-                .unwrap_or("1".into())
-                .parse::<u32>()
-                .unwrap_or(1);
-
-            if data.contains("TIER=Tier1BotTarpit") {
-                metrics.traps.tier1_bot_tarpit += 1;
-            } else if data.contains("TIER=Tier1_5SlowDrip") {
-                metrics.traps.tier1_5_slow_drip += 1;
-            } else if data.contains("TIER=Tier2PayloadCapture") {
-                metrics.traps.tier2_payload_capture += 1;
-            } else if data.contains("TIER=Tier3InteractiveJail") {
-                metrics.traps.tier3_interactive_jail += 1;
+            // VEC is the final, opaque field: client diagnostics may contain pipes and
+            // key-shaped text. They must not supply telemetry header fields or choose a tier.
+            let (header, vector) = data.split_once("|VEC=").unwrap_or_else(|| {
+                data.strip_prefix("VEC=")
+                    .map_or((data, "Unknown Anomaly"), |vector| ("", vector))
+            });
+            let Some(node_id) =
+                extract_value(header, "NODE=").and_then(|id| id.parse::<u32>().ok())
+            else {
+                log::warn!("Ignoring telemetry log without a valid node ID");
+                continue;
+            };
+            match extract_value(header, "TIER=").as_deref() {
+                Some("Tier1BotTarpit") => metrics.traps.tier1_bot_tarpit += 1,
+                Some("Tier1_5SlowDrip") => metrics.traps.tier1_5_slow_drip += 1,
+                Some("Tier2PayloadCapture") => metrics.traps.tier2_payload_capture += 1,
+                Some("Tier3InteractiveJail") => metrics.traps.tier3_interactive_jail += 1,
+                _ => {}
             }
 
-            let new_id = alerts.len() as u64 + 1;
+            // The newest alert is first and survives the cap below: ids keep increasing after
+            // 50 alerts (alerts.len() + 1 stuck at 51).
+            let new_id = alerts.first().map_or(0, |a| a.id) + 1;
             alerts.insert(
                 0,
                 SecurityAlert {
                     id: new_id,
                     timestamp: Utc::now().format("%H:%M:%S").to_string(),
                     node_id,
-                    source_ip: extract_value(data, "IP=").unwrap_or_else(|| "Unknown".into()),
-                    attack_vector: extract_value(data, "VEC=")
-                        .unwrap_or_else(|| "Unknown Anomaly".into()),
+                    source_ip: extract_value(header, "IP=").unwrap_or_else(|| "Unknown".into()),
+                    attack_vector: vector.to_string(),
                     mitigation: "TRIDENT_TRAP_ENGAGED".into(),
                 },
             );
@@ -462,6 +549,7 @@ fn observed_nodes(nodes: &[ClientNode]) -> Vec<ClientNode> {
         .iter()
         .map(|n| {
             let mut n = n.clone();
+            n.ban_readback = n.ban_readback.view(std::time::Instant::now());
             if n.seen_at.is_none_or(|t| t.elapsed() > NODE_STALE_AFTER) {
                 n.health_status = "STALE".into();
                 n.xdp_loaded = false;
@@ -493,7 +581,7 @@ async fn api_update_blacklist(
     Json(req): Json<BlacklistReq>,
 ) -> Json<serde_json::Value> {
     let Some(target) = parse_block_target(&req.ip) else {
-        return result_json(Err(format!(
+        return command_json(ControlOutcome::NotSent(format!(
             "'{}' is not an IP address or CIDR",
             req.ip.trim()
         )));
@@ -501,19 +589,24 @@ async fn api_update_blacklist(
     let adding = match req.action.as_str() {
         "add" => true,
         "remove" => false,
-        other => return result_json(Err(format!("unknown action '{}'", other))),
+        other => {
+            return command_json(ControlOutcome::NotSent(format!(
+                "unknown action '{}'",
+                other
+            )))
+        }
     };
     let Some((ctl, uid)) = route(&state, id).await else {
-        return result_json(Err(format!("unknown node {}", id)));
+        return command_json(ControlOutcome::NotSent(format!("unknown node {}", id)));
     };
     let cmd = if adding {
         format!("BAN_IP:{}\n", target)
     } else {
         format!("UNBAN_IP:{}\n", target)
     };
-    let res = send_command_to_node(&ctl, Some(uid), &state.node_uids, &cmd).await;
+    let outcome = control_exchange(&ctl, Some(uid), &state.node_uids, &cmd).await;
     refresh_bans(&state, id).await;
-    result_json(res)
+    command_json(outcome)
 }
 
 async fn api_flush_blacklist(
@@ -521,12 +614,12 @@ async fn api_flush_blacklist(
     Path(id): Path<u32>,
 ) -> Json<serde_json::Value> {
     let Some((ctl, uid)) = route(&state, id).await else {
-        return result_json(Err(format!("unknown node {}", id)));
+        return command_json(ControlOutcome::NotSent(format!("unknown node {}", id)));
     };
     // One command on the node: operator bans and dynamic blocks, whatever this dashboard knew.
-    let res = send_command_to_node(&ctl, Some(uid), &state.node_uids, "FLUSH_ALL\n").await;
+    let outcome = control_exchange(&ctl, Some(uid), &state.node_uids, "FLUSH_ALL\n").await;
     refresh_bans(&state, id).await;
-    result_json(res)
+    command_json(outcome)
 }
 
 /// The node's control socket and uid, read without holding the lock during socket I/O.
@@ -542,19 +635,75 @@ async fn route(state: &AppState, id: u32) -> Option<(String, u32)> {
 
 /// Re-reads a node's operator bans from the node (LIST_BANS): the node, not this dashboard, is
 /// the source of truth, so a dashboard restart or another operator's change shows up here.
+fn parse_bans(reply: &str) -> Result<(usize, HashSet<String>), String> {
+    let mut fields = reply.split_whitespace();
+    let total = fields
+        .next()
+        .and_then(|s| s.parse::<usize>().ok())
+        .ok_or_else(|| "invalid LIST_BANS count".to_string())?;
+    let mut bans = HashSet::new();
+    for field in fields {
+        let target =
+            parse_block_target(field).ok_or_else(|| "invalid LIST_BANS target".to_string())?;
+        if bans.len() >= MAX_LISTED_BANS {
+            return Err(format!(
+                "LIST_BANS lists more than {MAX_LISTED_BANS} targets"
+            ));
+        }
+        if !bans.insert(target) {
+            return Err("duplicate LIST_BANS target".into());
+        }
+    }
+    if bans.len() != total.min(MAX_LISTED_BANS) {
+        return Err("LIST_BANS count does not describe its targets".into());
+    }
+    Ok((total, bans))
+}
+
 async fn refresh_bans(state: &AppState, id: u32) {
-    let Some((ctl, uid)) = route(state, id).await else {
+    let ticket = Arc::new(());
+    let (ctl, uid) = {
+        let mut nodes = state.nodes.write().await;
+        let Some(node) = nodes.iter_mut().find(|n| n.id == id) else {
+            return;
+        };
+        node.ban_readback.attempt = Some(ticket.clone());
+        (node.control_socket.clone(), node.uid)
+    };
+    let result = query_node(&ctl, Some(uid), &state.node_uids, "LIST_BANS\n")
+        .await
+        .and_then(|reply| parse_bans(&reply));
+    let mut nodes = state.nodes.write().await;
+    let Some(node) = nodes.iter_mut().find(|n| n.id == id) else {
         return;
     };
-    match query_node(&ctl, Some(uid), &state.node_uids, "LIST_BANS\n").await {
-        Ok(reply) => {
-            let bans: HashSet<String> =
-                reply.split_whitespace().skip(1).map(String::from).collect();
-            if let Some(node) = state.nodes.write().await.iter_mut().find(|n| n.id == id) {
-                node.blacklist = bans;
-            }
+    // Only the latest attempt on this route may publish a result, even if a node was
+    // forgotten/re-announced while the socket I/O was in flight.
+    if !node
+        .ban_readback
+        .attempt
+        .as_ref()
+        .is_some_and(|current| Arc::ptr_eq(current, &ticket))
+    {
+        return;
+    }
+    match result {
+        Ok((total, bans)) => {
+            node.blacklist = bans;
+            node.ban_readback.status = ReadbackStatus::Fresh;
+            node.ban_readback.observed_at = Some(Utc::now().to_rfc3339());
+            node.ban_readback.observed_when = Some(std::time::Instant::now());
+            node.ban_readback.total = Some(total);
+            node.ban_readback.error = None;
         }
-        Err(e) => log::warn!("[!] Cannot read bans of node {}: {}", id, e),
+        Err(error) => {
+            node.ban_readback.status = if node.ban_readback.observed_when.is_some() {
+                ReadbackStatus::Stale
+            } else {
+                ReadbackStatus::Unknown
+            };
+            node.ban_readback.error = Some(error.chars().take(CONTROL_ERROR_CHARS).collect());
+        }
     }
 }
 
@@ -574,69 +723,83 @@ async fn refresh_all(state: AppState) {
     }
 }
 
-/// Sends one command to the node's control socket (announced as CTL= in its heartbeat) and
-/// returns its reply. The node answers "OK ..." or "ERR ..."; anything else is a failure.
-/// The control socket must be served by `node_uid` (the uid the node announced itself from) or,
-/// for sockets not tied to a node, by one of `allowed`: a socket path learned from telemetry is
-/// not trusted on its own.
-async fn send_command_to_node(
-    socket_path: &str,
-    node_uid: Option<u32>,
-    allowed: &HashSet<u32>,
-    cmd: &str,
-) -> Result<(), String> {
-    query_node(socket_path, node_uid, allowed, cmd)
-        .await
-        .map(|_| ())
-}
-
-/// Like [`send_command_to_node`], returning the text after "OK".
+/// Queries the authenticated control socket. Readback failures preserve the last observation.
 async fn query_node(
     socket_path: &str,
     node_uid: Option<u32>,
     allowed: &HashSet<u32>,
     cmd: &str,
 ) -> Result<String, String> {
+    control_exchange(socket_path, node_uid, allowed, cmd)
+        .await
+        .into_result()
+}
+
+async fn control_exchange(
+    socket_path: &str,
+    node_uid: Option<u32>,
+    allowed: &HashSet<u32>,
+    cmd: &str,
+) -> ControlOutcome {
     use tokio::io::AsyncBufReadExt;
     if !StdPath::new(socket_path).exists() {
-        log::warn!("[!] Socket missing for command routing: {}", socket_path);
-        return Err(format!(
+        return ControlOutcome::NotSent(format!(
             "node control socket {} is not available",
             socket_path
         ));
     }
+    let mut attempted_write = false;
     let exchange = async {
         let mut socket = UnixStream::connect(socket_path)
             .await
             .map_err(|e| e.to_string())?;
         let served_by = socket.peer_cred().map_err(|e| e.to_string())?.uid();
-        let trusted = match node_uid {
-            Some(uid) => served_by == uid,
-            None => allowed.contains(&served_by),
-        };
+        let trusted = node_uid.map_or_else(|| allowed.contains(&served_by), |uid| served_by == uid);
         if !trusted {
             return Err(format!(
                 "control socket {} is served by uid {}, not by the node's uid",
                 socket_path, served_by
             ));
         }
+        // A partial write can reach the peer: after this point loss of the reply is unknown.
+        attempted_write = true;
         socket
             .write_all(cmd.as_bytes())
             .await
             .map_err(|e| e.to_string())?;
         let mut reply = String::new();
         tokio::io::BufReader::new(&mut socket)
+            .take(CONTROL_REPLY_BYTES)
             .read_line(&mut reply)
             .await
             .map_err(|e| e.to_string())?;
+        if !reply.ends_with('\n') {
+            return Err("node reply is oversized or incomplete".into());
+        }
         Ok::<String, String>(reply.trim().to_string())
     };
-    let reply = tokio::time::timeout(Duration::from_secs(3), exchange)
-        .await
-        .map_err(|_| "node did not answer within 3 s".to_string())??;
-    match reply.strip_prefix("OK") {
-        Some(rest) => Ok(rest.trim().to_string()),
-        None => Err(reply.strip_prefix("ERR ").unwrap_or(&reply).to_string()),
+    let result = match tokio::time::timeout(CONTROL_TIMEOUT, exchange).await {
+        Ok(result) => result,
+        Err(_) => Err("node did not answer within 3 s".into()),
+    };
+    match result {
+        Err(error) if attempted_write => ControlOutcome::Unknown(error),
+        Err(error) => ControlOutcome::NotSent(error),
+        Ok(reply) => {
+            if reply == "OK" {
+                return ControlOutcome::Confirmed(String::new());
+            }
+            if let Some(rest) = reply.strip_prefix("OK ") {
+                return ControlOutcome::Confirmed(rest.trim().to_string());
+            }
+            if reply == "ERR" {
+                return ControlOutcome::Rejected("node refused the command".into());
+            }
+            if let Some(rest) = reply.strip_prefix("ERR ") {
+                return ControlOutcome::Rejected(rest.chars().take(CONTROL_ERROR_CHARS).collect());
+            }
+            ControlOutcome::Unknown("node returned an unrecognised reply".into())
+        }
     }
 }
 
@@ -716,9 +879,34 @@ const HTML_DASHBOARD: &str = r###"
 <head>
     <meta charset="UTF-8">
     <title>SOKOL-CORE // Operations Center</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
     <style>
+        :root { color-scheme: dark; font: 15px/1.5 system-ui, sans-serif; background:#0d141c; color:#dbe5ef; }
+        body { margin:0; padding:24px; } h1,h3,p { margin:0; } h1 { font-size:20px; } h3 { font-size:16px; }
+        button,input { font:inherit; } button { cursor:pointer; padding:6px 10px; border:1px solid #405467; border-radius:6px; background:#1a2b3c; color:inherit; }
+        button:hover { border-color:#8cacc8; } input { min-width:0; padding:7px; background:#101d29; color:inherit; border:1px solid #405467; border-radius:6px; }
+        button:focus-visible,input:focus-visible { outline:2px solid #6dc7ee; outline-offset:2px; }
+        table { border-collapse:collapse; } th,td { border-bottom:1px solid #2a3b4c; padding:9px; vertical-align:top; } th { color:#adbfce; font-weight:600; }
+        .hidden { display:none !important; } .grid { display:grid; } .grid-cols-1 { grid-template-columns:1fr; }
+        .flex { display:flex; } .flex-col { flex-direction:column; } .flex-wrap { flex-wrap:wrap; } .flex-1 { flex:1; }
+        .items-center { align-items:center; } .items-start { align-items:flex-start; } .justify-between { justify-content:space-between; }
+        .gap-1 { gap:5px; } .gap-2 { gap:9px; } .gap-4 { gap:18px; } .space-y-4 > *+* { margin-top:18px; }
+        .space-y-1 > *+* { margin-top:5px; } .mx-auto { margin-inline:auto; } .max-w-screen-2xl { max-width:1440px; }
+        .bg-zinc-900 { background:#152330; } .bg-zinc-950 { background:#101b26; } .bg-zinc-800 { background:#263b4d; }
+        .border { border:1px solid #304354; } .rounded-lg,.rounded-xl { border-radius:10px; } .rounded { border-radius:5px; }
+        .p-4 { padding:18px; } .p-3 { padding:13px; } .p-2 { padding:9px; } .px-2 { padding-inline:9px; } .py-1 { padding-block:5px; }
+        .mb-4 { margin-bottom:18px; } .mb-3 { margin-bottom:13px; } .mb-2 { margin-bottom:9px; } .mt-10 { margin-top:32px; }
+        .text-xs,.text-\[10px\],.text-\[9px\] { font-size:12px; } .text-xl { font-size:23px; } .font-bold { font-weight:650; }
+        .text-zinc-500,.text-zinc-400,.text-zinc-600 { color:#a4b7c8; } .text-zinc-100 { color:#f0f5fa; }
+        .text-emerald-400,.text-emerald-500 { color:#7cdbc0; } .text-amber-300,.text-amber-400,.text-amber-500 { color:#f0cb80; }
+        .text-red-300,.text-red-400,.text-red-500 { color:#ffb0ad; } .text-cyan-400,.text-cyan-500 { color:#8cd4ed; } .text-purple-400 { color:#c9b3ed; }
+        .text-right { text-align:right; } .text-left { text-align:left; } .text-center { text-align:center; }
+        .h-48 { height:192px; } .w-full { width:100%; } .h-full { height:100%; } .overflow-x-auto { overflow:auto; }
+        .overflow-y-auto { overflow-y:auto; } .opacity-60 { opacity:.65; } .whitespace-nowrap { white-space:nowrap; }
+        .sticky { position:sticky; } .top-0 { top:0; } .truncate { max-width:280px; overflow:hidden; text-overflow:ellipsis; }
+        canvas { display:block; width:100%; height:100%; } [role=status] { padding:10px 0; }
+        @media(min-width:900px) { .md\:grid-cols-5 { grid-template-columns:repeat(5,minmax(0,1fr)); } .md\:grid-cols-3 { grid-template-columns:repeat(3,minmax(0,1fr)); } }
+        @media(min-width:1100px) { .lg\:grid-cols-3 { grid-template-columns:repeat(3,minmax(0,1fr)); } .lg\:col-span-2 { grid-column:span 2; } }
         ::-webkit-scrollbar { width: 6px; height: 6px; }
         ::-webkit-scrollbar-track { background: #18181b; }
         ::-webkit-scrollbar-thumb { background: #3f3f46; border-radius: 3px; }
@@ -726,6 +914,14 @@ const HTML_DASHBOARD: &str = r###"
 </head>
 <body class="bg-zinc-950 text-zinc-300 font-mono antialiased min-h-screen p-4 text-sm">
     <div class="max-w-screen-2xl mx-auto space-y-4">
+        <form id="login-form" class="hidden rounded-lg border border-amber-800 p-3 flex gap-2" onsubmit="loginSubmit(event)">
+            <label for="operator-token">Operator token</label>
+            <input id="operator-token" type="password" autocomplete="off" required class="bg-zinc-900 border border-zinc-700 rounded px-2" />
+            <button type="submit" class="text-amber-300">Connect</button>
+            <span id="login-error" class="text-red-400"></span>
+        </form>
+        <div id="command-status" role="status" class="hidden rounded-lg border p-3"></div>
+        <div id="data-status" role="status" class="text-xs text-amber-400">Waiting for node observations…</div>
         <div class="grid grid-cols-1 md:grid-cols-5 gap-4">
             <div class="bg-zinc-900 border border-zinc-800 p-4 rounded-xl flex items-center justify-between">
                 <div>
@@ -734,34 +930,34 @@ const HTML_DASHBOARD: &str = r###"
                 </div>
                 <div class="text-right">
                     <div class="text-[10px]">SYS CPU</div>
-                    <div id="m-cpu" class="text-xl font-bold text-emerald-400">0.0%</div>
+                    <div id="m-cpu" class="text-xl font-bold text-emerald-400">—</div>
                 </div>
             </div>
             <div class="bg-zinc-900 border border-zinc-800 p-4 rounded-xl flex items-center justify-between">
                 <div>
                     <div class="text-[10px] text-zinc-500">TRAP TIER-1 (TARPIT)</div>
-                    <div id="trap-t1" class="text-xl font-bold text-cyan-400">0</div>
+                    <div id="trap-t1" class="text-xl font-bold text-cyan-400">—</div>
                 </div>
                 <div class="text-right text-[10px] text-zinc-500">Scanners</div>
             </div>
             <div class="bg-zinc-900 border border-zinc-800 p-4 rounded-xl flex items-center justify-between">
                 <div>
                     <div class="text-[10px] text-zinc-500">TRAP TIER-1.5 (SLOW DRIP)</div>
-                    <div id="trap-t15" class="text-xl font-bold text-amber-400">0</div>
+                    <div id="trap-t15" class="text-xl font-bold text-amber-400">—</div>
                 </div>
                 <div class="text-right text-[10px] text-zinc-500">Floods</div>
             </div>
             <div class="bg-zinc-900 border border-zinc-800 p-4 rounded-xl flex items-center justify-between">
                 <div>
                     <div class="text-[10px] text-zinc-500">TRAP TIER-2 (PAYLOAD CAPTURE)</div>
-                    <div id="trap-t2" class="text-xl font-bold text-purple-400">0</div>
+                    <div id="trap-t2" class="text-xl font-bold text-purple-400">—</div>
                 </div>
                 <div class="text-right text-[10px] text-zinc-500">Shellcode-like</div>
             </div>
             <div class="bg-zinc-900 border border-zinc-800 p-4 rounded-xl flex items-center justify-between">
                 <div>
                     <div class="text-[10px] text-zinc-500">TRAP TIER-3 (JAIL)</div>
-                    <div id="trap-t3" class="text-xl font-bold text-red-500">0</div>
+                    <div id="trap-t3" class="text-xl font-bold text-red-500">—</div>
                 </div>
                 <div class="text-right text-[10px] text-zinc-500">Interactive</div>
             </div>
@@ -770,16 +966,15 @@ const HTML_DASHBOARD: &str = r###"
         <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
             <div class="bg-zinc-900 border border-zinc-800 p-4 rounded-xl flex items-center justify-between">
                 <div>
-                    <div class="text-[10px] text-zinc-500">P2P MESH SWARM</div>
-                    <div class="font-bold text-zinc-100"><span id="m-peers" class="text-cyan-400">0</span> Active Nodes | DAG Tips: <span id="m-dag" class="text-cyan-500">0</span></div>
+                    <div class="text-[10px] text-zinc-500">NODE OBSERVATIONS</div>
+                    <div class="font-bold text-zinc-100"><span id="m-peers" class="text-cyan-400">—</span> observed nodes</div>
                 </div>
             </div>
             <div class="bg-zinc-900 border border-zinc-800 p-4 rounded-xl flex items-center justify-between">
                 <div>
-                    <div class="text-[10px] text-zinc-500">AUDIT LOG STORAGE</div>
-                    <div class="font-bold text-zinc-100">Latency: <span id="m-dblat" class="text-amber-400">0 ms</span> | Banned IPs: <span id="trap-banned" class="text-red-400">0</span></div>
+                    <div class="text-[10px] text-zinc-500">REPORTED BLOCKS</div>
+                    <div class="font-bold text-zinc-100">Banned IPs: <span id="trap-banned" class="text-red-400">—</span></div>
                 </div>
-            </div>
             </div>
         </div>
 
@@ -787,13 +982,14 @@ const HTML_DASHBOARD: &str = r###"
             <div class="lg:col-span-2 space-y-4">
                 <div class="bg-zinc-900 border border-zinc-800 p-4 rounded-xl">
                     <div class="flex justify-between items-center mb-4">
-                        <h3 class="font-bold text-zinc-100">Global Network Traffic (Real-time PPS)</h3>
+                        <h3 class="font-bold text-zinc-100">Operator-host RX · reported node drops</h3>
                         <div class="flex gap-4 text-xs">
-                            <div>RX: <span id="m-pps-rx" class="text-emerald-400 font-bold">0</span> pps</div>
-                            <div>DROPS: <span id="m-drops" class="text-red-400 font-bold">0</span> /sec</div>
+                            <div>RX: <span id="m-pps-rx" class="text-emerald-400 font-bold">—</span> pps</div>
+                            <div>DROPS: <span id="m-drops" class="text-red-400 font-bold">—</span> /sec</div>
                         </div>
                     </div>
                     <div class="h-48 w-full"><canvas id="trafficChart"></canvas></div>
+                    <div id="stream-status" role="status" class="text-xs text-amber-400">Stream not observed yet</div>
                 </div>
 
                 <div class="bg-zinc-900 border border-zinc-800 p-4 rounded-xl">
@@ -819,7 +1015,7 @@ const HTML_DASHBOARD: &str = r###"
 
             <div class="bg-zinc-900 border border-zinc-800 p-4 rounded-xl flex flex-col h-full">
                 <h3 class="font-bold text-zinc-100 mb-3 flex justify-between items-center">
-                    <span>Trident Defense Nodes</span>
+                    <span>Node state and operator decisions</span>
                     <button onclick="fetchData()" class="text-xs text-zinc-500 hover:text-zinc-300">↻ Refresh</button>
                 </h3>
                 <div id="nodes-container" class="space-y-4 overflow-y-auto flex-1 pr-2">
@@ -830,25 +1026,48 @@ const HTML_DASHBOARD: &str = r###"
     </div>
 
     <script>
-        const ctx = document.getElementById('trafficChart').getContext('2d');
-        const trafficChart = new Chart(ctx, {
-            type: 'line',
-            data: { labels: Array(20).fill(''), datasets: [
-                { label: 'RX Packets', borderColor: '#34d399', backgroundColor: 'rgba(52, 211, 153, 0.1)', data: Array(20).fill(0), tension: 0.4, fill: true, pointRadius: 0 },
-                { label: 'Dropped', borderColor: '#f87171', data: Array(20).fill(0), tension: 0.4, pointRadius: 0 }
-            ]},
-            options: { responsive: true, maintainAspectRatio: false, animation: false, scales: { x: { display: false }, y: { grid: { color: '#27272a' }, ticks: { color: '#71717a' }, beginAtZero: true}}, plugins: { legend: { display: false } }}
-        });
+        const trafficChart = {
+            data: { datasets: [{ data: Array(20).fill(0) }, { data: Array(20).fill(0) }] },
+            update() {
+                try {
+                    const canvas = document.getElementById('trafficChart');
+                    const ctx = canvas?.getContext('2d');
+                    if (!ctx) return;
+                    canvas.width = canvas.clientWidth || 600; canvas.height = 192;
+                    ctx.clearRect(0, 0, canvas.width, canvas.height);
+                    const ceiling = Math.max(1, ...this.data.datasets.flatMap(d => d.data));
+                    this.data.datasets.forEach((dataset, index) => {
+                        ctx.beginPath(); ctx.strokeStyle = index ? '#ffb0ad' : '#7cdbc0'; ctx.lineWidth = 2;
+                        dataset.data.forEach((value, i) => {
+                            const x = i * canvas.width / 19, y = 180 - Math.max(0, value) / ceiling * 170;
+                            if (i) ctx.lineTo(x, y); else ctx.moveTo(x, y);
+                        });
+                        ctx.stroke();
+                    });
+                } catch (_) { /* Optional graph cannot stop state readback or commands. */ }
+            }
+        };
 
         function esc(v) {
             return String(v).replace(/[&<>"'`]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;','`':'&#96;'}[c]));
         }
 
         async function login() {
-            const token = prompt('Operator token (SOKOL_OPERATOR_TOKEN or the one printed at startup):');
-            if (!token) return false;
-            const res = await fetch('/api/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token }) });
-            return res.ok;
+            document.getElementById('login-form').classList.remove('hidden');
+            return false;
+        }
+
+        async function loginSubmit(event) {
+            event.preventDefault();
+            const input = document.getElementById('operator-token');
+            try {
+                const res = await fetch('/api/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token: input.value }) });
+                if (!res.ok) throw new Error('Token rejected');
+                input.value = '';
+                document.getElementById('login-error').textContent = '';
+                document.getElementById('login-form').classList.add('hidden');
+                fetchData(); initSSE();
+            } catch (e) { document.getElementById('login-error').textContent = e.message; }
         }
 
         async function authedFetch(url, opts) {
@@ -858,17 +1077,26 @@ const HTML_DASHBOARD: &str = r###"
         }
 
         function report(data) {
-            if (data && data.success === false) alert('Command failed: ' + (data.error || 'unknown error'));
+            const box = document.getElementById('command-status');
+            const labels = {
+                CONFIRMED: 'Node confirmed the command. Check the ban readback below.',
+                REJECTED: 'Node refused the command.',
+                NOT_SENT: 'Command was not sent.',
+                UNKNOWN: 'Outcome unknown. The command may have taken effect; read the current state before retrying.'
+            };
+            const outcome = data.outcome || 'UNKNOWN';
+            box.className = 'rounded-lg border p-3 ' + (outcome === 'CONFIRMED' && !data.warning ? 'border-emerald-800 text-emerald-300' : 'border-amber-800 text-amber-300');
+            box.textContent = (labels[outcome] || labels.UNKNOWN) + (data.error ? ' ' + data.error : '') + (data.warning ? ' WARNING: ' + data.warning : '');
         }
 
         async function fetchData() {
             try {
                 const res = await authedFetch('/api/data');
+                if (!res.ok) throw new Error('Operator API unavailable: ' + res.status);
                 const data = await res.json();
-                
+                document.getElementById('data-status').textContent = 'Node observations received ' + new Date(data.timestamp).toLocaleTimeString();
+                document.getElementById('data-status').className = 'text-xs text-zinc-400';
                 document.getElementById('m-peers').innerText = data.metrics.p2p_active_peers;
-                document.getElementById('m-dag').innerText = data.metrics.dag_tips;
-                document.getElementById('m-dblat').innerText = data.metrics.db_latency_ms.toFixed(1) + ' ms';
                 
                 document.getElementById('trap-t1').innerText = data.metrics.traps.tier1_bot_tarpit;
                 document.getElementById('trap-t15').innerText = data.metrics.traps.tier1_5_slow_drip;
@@ -876,7 +1104,12 @@ const HTML_DASHBOARD: &str = r###"
                 document.getElementById('trap-t3').innerText = data.metrics.traps.tier3_interactive_jail;
                 document.getElementById('trap-banned').innerText = data.metrics.traps.active_banned_ips;
 
-                if (data.nodes.length > 0) {
+                {
+                    const active = document.activeElement;
+                    const focusId = active && active.id.startsWith('ip-in-') ? active.id : null;
+                    const drafts = new Map(Array.from(document.querySelectorAll('input[id^="ip-in-"]')).map(input => [input.id, input.value]));
+                    const nodeKey = JSON.stringify(data.nodes.map(({last_seen, ban_readback, ...node}) => ({...node, blacklist: [...node.blacklist].sort(), ban_readback: {...ban_readback, age_ms: null, observed_at: null}})));
+                    if (nodeKey !== window.lastNodeKey) {
                     document.getElementById('nodes-container').innerHTML = data.nodes.map(n => `
                         <div class="bg-zinc-950 border border-zinc-800 rounded-lg p-3">
                             <div class="flex justify-between items-start mb-2">
@@ -885,18 +1118,24 @@ const HTML_DASHBOARD: &str = r###"
                                     <div class="text-[10px] text-zinc-500">${esc(n.endpoint)}</div>
                                 </div>
                                 <div class="flex flex-col gap-1 text-right">
-                                    <span class="text-[9px] px-1.5 py-0.5 rounded ${n.xdp_loaded ? 'bg-emerald-900/30 text-emerald-500 border border-emerald-900' : 'bg-red-900/30 text-red-500 border border-red-900'}">${n.xdp_loaded ? 'XDP: ON' : 'XDP: OFF'}</span>
+                                    <span class="text-[9px] text-zinc-400">Heartbeat: ${esc(n.health_status)}</span>
+                                    <span class="text-[9px] px-1.5 py-0.5 rounded ${n.xdp_loaded ? 'bg-emerald-900/30 text-emerald-500 border border-emerald-900' : 'bg-red-900/30 text-red-500 border border-red-900'}">${n.health_status === 'STALE' ? 'XDP: UNKNOWN' : (n.xdp_loaded ? 'XDP: REPORTED ON' : 'XDP: REPORTED OFF')}</span>
                                     <span class="text-[9px] px-1.5 py-0.5 rounded ${n.defense_mode === 'MAX_SHIELD' ? 'bg-amber-900/30 text-amber-500 border border-amber-900' : 'bg-zinc-800 text-zinc-400 border border-zinc-700'}">${esc(n.defense_mode)}</span>
                                 </div>
                             </div>
                             
                             <div class="mb-3 space-y-1">
                                 <div class="text-[10px] text-zinc-400 flex justify-between">
-                                    <span>Blacklist: ${n.blacklist.length} IPs</span>
+                                    <span>Operator bans: ${n.ban_readback.total === null ? 'not observed' : `${n.blacklist.length} shown / ${n.ban_readback.total} reported`}</span>
                                     <button onclick="apiCall('/api/nodes/${n.id}/flush')" class="text-red-400 hover:text-red-300">Flush</button>
                                 </div>
-                                <div class="flex flex-wrap gap-1">
-                                    ${Array.from(n.blacklist).map(ip => `<span class="bg-zinc-900 border border-zinc-800 text-[10px] px-1.5 py-0.5 rounded flex items-center gap-1">${esc(ip)} <button data-node="${Number(n.id)}" data-ip="${esc(ip)}" class="unban text-red-500 hover:text-red-400">×</button></span>`).join('')}
+                                <div class="text-xs ${n.ban_readback.status === 'FRESH' ? 'text-emerald-400' : 'text-amber-400'}">
+                                    ${esc(n.ban_readback.status)} · <span id="ban-age-${n.id}"></span>
+                                    ${n.ban_readback.total > n.blacklist.length ? ' · Partial list' : ''}
+                                </div>
+                                ${n.ban_readback.error ? `<div class="text-xs text-amber-300">${esc(n.ban_readback.error)}</div>` : ''}
+                                <div class="flex flex-wrap gap-1 ${n.ban_readback.status === 'FRESH' ? '' : 'opacity-60'}">
+                                    ${Array.from(n.blacklist).sort().map(ip => `<span class="bg-zinc-900 border border-zinc-800 text-[10px] px-1.5 py-0.5 rounded flex items-center gap-1">${esc(ip)} <button data-node="${Number(n.id)}" data-ip="${esc(ip)}" class="unban text-red-500 hover:text-red-400">×</button></span>`).join('')}
                                 </div>
                             </div>
 
@@ -907,6 +1146,14 @@ const HTML_DASHBOARD: &str = r###"
                             
                         </div>
                     `).join('');
+                    window.lastNodeKey = nodeKey;
+                    for (const [id, value] of drafts) { const input = document.getElementById(id); if (input) input.value = value; }
+                    if (focusId) document.getElementById(focusId)?.focus();
+                    }
+                    for (const n of data.nodes) {
+                        const age = document.getElementById(`ban-age-${n.id}`);
+                        if (age) age.textContent = n.ban_readback.age_ms === null ? 'No successful read yet' : `${Math.floor(n.ban_readback.age_ms / 1000)}s since last successful read`;
+                    }
                 }
 
                 if (data.alerts.length > 0) {
@@ -920,7 +1167,13 @@ const HTML_DASHBOARD: &str = r###"
                         </tr>
                     `).join('');
                 }
-            } catch (e) { console.error(e); }
+            } catch (e) {
+                for (const id of ['m-peers','trap-t1','trap-t15','trap-t2','trap-t3','trap-banned']) {
+                    document.getElementById(id).innerText = '—';
+                }
+                document.getElementById('data-status').textContent = 'Operator API unavailable — displayed observations may be stale. ' + e.message;
+                document.getElementById('data-status').className = 'text-xs text-amber-400';
+            }
         }
 
         let evtSource = null;
@@ -929,6 +1182,7 @@ const HTML_DASHBOARD: &str = r###"
             evtSource = new EventSource("/metrics/stream");
             evtSource.onmessage = function(e) {
                 const data = JSON.parse(e.data);
+                document.getElementById('stream-status').textContent = 'Stream observed at ' + new Date().toLocaleTimeString();
                 document.getElementById('m-cpu').innerText = data.cpu.toFixed(1) + '%';
                 document.getElementById('m-pps-rx').innerText = data.pps_rx.toLocaleString();
                 document.getElementById('m-drops').innerText = data.drops_sec;
@@ -939,11 +1193,17 @@ const HTML_DASHBOARD: &str = r###"
                 trafficChart.data.datasets[1].data.push(data.drops_sec);
                 trafficChart.update();
             }
+            evtSource.onerror = function() {
+                for (const id of ['m-cpu', 'm-pps-rx', 'm-drops']) document.getElementById(id).innerText = '—';
+                document.getElementById('stream-status').textContent = 'Stream unavailable — current traffic observations unknown';
+            }
         }
 
         async function apiCall(endpoint) {
-            const res = await authedFetch(endpoint, { method: 'POST' });
-            report(await res.json());
+            try {
+                const res = await authedFetch(endpoint, { method: 'POST' });
+                report(await res.json());
+            } catch (e) { report({ outcome: 'UNKNOWN', error: 'Operator connection lost: ' + e.message }); }
             fetchData();
         }
 
@@ -953,10 +1213,12 @@ const HTML_DASHBOARD: &str = r###"
         });
 
         async function modifyBlacklist(id, ip, action) {
-            const res = await authedFetch(`/api/nodes/${id}/blacklist`, {
-                method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ip, action })
-            });
-            report(await res.json());
+            try {
+                const res = await authedFetch(`/api/nodes/${id}/blacklist`, {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ip, action })
+                });
+                report(await res.json());
+            } catch (e) { report({ outcome: 'UNKNOWN', error: 'Operator connection lost: ' + e.message }); }
             fetchData();
         }
 
@@ -1353,6 +1615,436 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_live_heartbeat_cannot_make_failed_ban_readback_fresh() {
+        let dir = std::env::temp_dir().join(format!("sokol-op-readback-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("ctl.sock");
+        fake_node(sock.clone(), Arc::default()).await;
+        let st = state();
+        let hb = format!("HEARTBEAT:ID=4|CTL={}\n", sock.display());
+        process_trident_telemetry(&st, me(), &hb).await;
+        refresh_bans(&st, 4).await;
+        let Json(before) = api_get_all_data(State(st.clone())).await;
+        assert_eq!(before["nodes"][0]["ban_readback"]["status"], "FRESH");
+        std::fs::remove_file(&sock).unwrap();
+        process_trident_telemetry(&st, me(), &hb).await;
+        refresh_bans(&st, 4).await;
+        let Json(after) = api_get_all_data(State(st)).await;
+        assert_eq!(after["nodes"][0]["health_status"], "HEALTHY");
+        assert_eq!(after["nodes"][0]["ban_readback"]["status"], "STALE");
+        assert_eq!(
+            after["nodes"][0]["ban_readback"]["observed_at"],
+            before["nodes"][0]["ban_readback"]["observed_at"]
+        );
+        assert!(after["nodes"][0]["ban_readback"]["error"].is_string());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_command_applied_without_a_reply_has_an_unknown_outcome() {
+        use tokio::io::AsyncBufReadExt;
+        let dir = std::env::temp_dir().join(format!("sokol-op-unknown-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("ctl.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        let applied = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let effect = applied.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept())
+                .await
+                .expect("the control request never reached the fixture")
+                .unwrap();
+            let mut reader = tokio::io::BufReader::new(stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            assert_eq!(line, "BAN_IP:203.0.113.9\n");
+            effect.store(true, std::sync::atomic::Ordering::SeqCst);
+            // The node applied the command, then lost its reply.
+        });
+        let st = state();
+        process_trident_telemetry(
+            &st,
+            me(),
+            &format!("HEARTBEAT:ID=4|CTL={}\n", sock.display()),
+        )
+        .await;
+        let (_, _, body) = call(
+            build_router(st),
+            post_json(
+                "/api/nodes/4/blacklist",
+                serde_json::json!({"ip":"203.0.113.9", "action":"add"}),
+            ),
+        )
+        .await;
+        server.await.unwrap();
+        assert!(applied.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(
+            body["outcome"], "UNKNOWN",
+            "lost reply cannot prove rejection: {body}"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn scratch(label: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("sokol-op-{label}-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    async fn reply_once(path: &std::path::Path, reply: String) -> tokio::task::JoinHandle<()> {
+        use tokio::io::AsyncBufReadExt;
+        let _ = std::fs::remove_file(path);
+        let listener = UnixListener::bind(path).unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept())
+                .await
+                .expect("the control request never reached the fixture")
+                .unwrap();
+            let (r, mut w) = stream.into_split();
+            let mut line = String::new();
+            tokio::io::BufReader::new(r)
+                .read_line(&mut line)
+                .await
+                .unwrap();
+            let _ = w.write_all(reply.as_bytes()).await;
+        })
+    }
+
+    #[test]
+    fn ban_readback_age_is_independent_of_heartbeat_and_wall_time() {
+        let now = std::time::Instant::now();
+        let readback = BanReadback {
+            status: ReadbackStatus::Fresh,
+            observed_when: Some(now),
+            ..Default::default()
+        };
+        assert_eq!(readback.view(now).age_ms, Some(0));
+        assert_eq!(
+            readback.view(now + BANS_STALE_AFTER).status,
+            ReadbackStatus::Fresh
+        );
+        let stale = readback.view(now + BANS_STALE_AFTER + Duration::from_millis(1));
+        assert_eq!(stale.status, ReadbackStatus::Stale);
+        assert_eq!(stale.age_ms, Some(15_001));
+        assert_eq!(
+            BanReadback::default().view(now).status,
+            ReadbackStatus::Unknown
+        );
+    }
+
+    #[test]
+    fn a_list_reply_reports_its_total_and_refuses_malformed_targets() {
+        for bad in [
+            "",
+            "x",
+            "0 203.0.113.9",
+            "1",
+            "1 nope",
+            "2 203.0.113.9",
+            "2 203.0.113.9 203.0.113.9",
+        ] {
+            assert!(parse_bans(bad).is_err(), "{bad}");
+        }
+        assert_eq!(parse_bans("0").unwrap(), (0, HashSet::new()));
+        assert_eq!(parse_bans("2 203.0.113.9 2001:db8::/64").unwrap().0, 2);
+        let targets: Vec<_> = (0..MAX_LISTED_BANS)
+            .map(|i| format!("10.{}.{}.1", i / 256, i % 256))
+            .collect();
+        let reply = format!("{} {}", MAX_LISTED_BANS + 1, targets.join(" "));
+        let (total, listed) = parse_bans(&reply).unwrap();
+        assert_eq!(total, MAX_LISTED_BANS + 1);
+        assert_eq!(listed.len(), MAX_LISTED_BANS);
+        assert!(parse_bans(&(reply + " 203.0.113.9")).is_err());
+    }
+
+    /// Review of #31: a reply over the listing cap and a reply with a repeated target are
+    /// different faults; the operator reading the error must not look for a duplicate that
+    /// is not there.
+    #[test]
+    fn an_over_long_list_and_a_duplicate_are_told_apart() {
+        let targets: Vec<_> = (0..=MAX_LISTED_BANS)
+            .map(|i| format!("10.{}.{}.1", i / 256, i % 256))
+            .collect();
+        let long = format!("{} {}", MAX_LISTED_BANS + 1, targets.join(" "));
+        assert_eq!(
+            parse_bans(&long).unwrap_err(),
+            format!("LIST_BANS lists more than {MAX_LISTED_BANS} targets")
+        );
+        assert_eq!(
+            parse_bans("2 203.0.113.9 203.0.113.9").unwrap_err(),
+            "duplicate LIST_BANS target"
+        );
+    }
+
+    #[tokio::test]
+    async fn alert_ids_keep_increasing_past_the_alert_cap() {
+        let st = state();
+        for i in 0..60 {
+            process_trident_telemetry(
+                &st,
+                me(),
+                &format!(
+                    "DB_LOG:NODE=7|TIER=Tier2PayloadCapture|IP=203.0.113.{}|VEC=x\n",
+                    i % 250
+                ),
+            )
+            .await;
+        }
+        let alerts = st.alerts.read().await;
+        let ids: Vec<u64> = alerts.iter().map(|a| a.id).collect();
+        assert_eq!(ids.len(), 50);
+        assert_eq!(
+            ids.first(),
+            Some(&60),
+            "the newest of 60 alerts is alert 60: {ids:?}"
+        );
+        assert!(
+            ids.windows(2).all(|w| w[0] > w[1]),
+            "ids repeat or go back: {ids:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unread_and_invalid_lists_stay_unknown_then_recover() {
+        let dir = scratch("invalid-readback");
+        let sock = dir.join("ctl.sock");
+        let st = state();
+        process_trident_telemetry(
+            &st,
+            me(),
+            &format!("HEARTBEAT:ID=4|CTL={}\n", sock.display()),
+        )
+        .await;
+        for (reply, expected) in [
+            ("OK 1 nope\n", "UNKNOWN"),
+            ("OK 1 203.0.113.9\n", "FRESH"),
+            ("OK 0 203.0.113.9\n", "STALE"),
+            ("OK 0\n", "FRESH"),
+        ] {
+            let server = reply_once(&sock, reply.into()).await;
+            refresh_bans(&st, 4).await;
+            server.await.unwrap();
+            let Json(body) = api_get_all_data(State(st.clone())).await;
+            assert_eq!(body["nodes"][0]["ban_readback"]["status"], expected);
+            if expected == "STALE" {
+                assert_eq!(
+                    body["nodes"][0]["blacklist"],
+                    serde_json::json!(["203.0.113.9"])
+                );
+            }
+        }
+        let Json(body) = api_get_all_data(State(st)).await;
+        assert_eq!(body["nodes"][0]["blacklist"], serde_json::json!([]));
+        assert!(body["nodes"][0]["ban_readback"]["error"].is_null());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn late_readback_cannot_overwrite_a_new_attempt_or_route() {
+        use tokio::io::AsyncBufReadExt;
+        for change_route in [false, true] {
+            let dir = scratch("late-readback");
+            let sock = dir.join("old.sock");
+            let listener = UnixListener::bind(&sock).unwrap();
+            let st = state();
+            let hb = |sock: &std::path::Path| format!("HEARTBEAT:ID=4|CTL={}\n", sock.display());
+            process_trident_telemetry(&st, me(), &hb(&sock)).await;
+            let first_state = st.clone();
+            let first = tokio::spawn(async move { refresh_bans(&first_state, 4).await });
+            let (stream, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept())
+                .await
+                .expect("the control request never reached the fixture")
+                .unwrap();
+            let (r, mut w) = stream.into_split();
+            let mut line = String::new();
+            tokio::io::BufReader::new(r)
+                .read_line(&mut line)
+                .await
+                .unwrap();
+            let new_sock = if change_route {
+                dir.join("new.sock")
+            } else {
+                sock.clone()
+            };
+            let server = if change_route {
+                process_trident_telemetry(&st, me(), &hb(&new_sock)).await;
+                reply_once(&new_sock, "OK 1 203.0.113.2\n".into()).await
+            } else {
+                tokio::spawn(async move {
+                    let (stream, _) =
+                        tokio::time::timeout(Duration::from_secs(2), listener.accept())
+                            .await
+                            .expect("the control request never reached the fixture")
+                            .unwrap();
+                    let (r, mut w) = stream.into_split();
+                    tokio::io::BufReader::new(r)
+                        .read_line(&mut String::new())
+                        .await
+                        .unwrap();
+                    w.write_all(b"OK 1 203.0.113.2\n").await.unwrap();
+                })
+            };
+            refresh_bans(&st, 4).await;
+            server.await.unwrap();
+            w.write_all(b"OK 1 203.0.113.1\n").await.unwrap();
+            first.await.unwrap();
+            let Json(body) = api_get_all_data(State(st)).await;
+            assert_eq!(
+                body["nodes"][0]["blacklist"],
+                serde_json::json!(["203.0.113.2"])
+            );
+            assert_eq!(body["nodes"][0]["ban_readback"]["status"], "FRESH");
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn control_outcomes_require_an_exact_bounded_complete_reply() {
+        let (_, _, invalid) = call(
+            build_router(state()),
+            post_json(
+                "/api/nodes/4/blacklist",
+                serde_json::json!({"ip":"not-an-ip", "action":"add"}),
+            ),
+        )
+        .await;
+        assert_eq!(
+            invalid["outcome"], "NOT_SENT",
+            "invalid input never reaches the node"
+        );
+        let (_, _, invalid) = call(
+            build_router(state()),
+            post_json(
+                "/api/nodes/4/blacklist",
+                serde_json::json!({"ip":"203.0.113.9", "action":"other"}),
+            ),
+        )
+        .await;
+        assert_eq!(invalid["outcome"], "NOT_SENT");
+        let dir = scratch("replies");
+        let sock = dir.join("ctl.sock");
+        for (reply, expected) in [
+            ("OK banned\n".to_string(), "CONFIRMED"),
+            ("OK\n".into(), "CONFIRMED"),
+            ("ERR protected\n".into(), "REJECTED"),
+            ("ERR\n".into(), "REJECTED"),
+            ("OKAY\n".into(), "UNKNOWN"),
+            (
+                "OK".to_string() + &" ".repeat(262_144 - 3) + "\n",
+                "CONFIRMED",
+            ),
+            (
+                "OK".to_string() + &" ".repeat(262_144 - 2) + "\n",
+                "UNKNOWN",
+            ),
+            ("OK banned".into(), "UNKNOWN"),
+            ("\n".into(), "UNKNOWN"),
+            ("x".repeat(CONTROL_REPLY_BYTES as usize) + "\n", "UNKNOWN"),
+        ] {
+            let server = reply_once(&sock, reply).await;
+            let Json(body) = command_json(
+                control_exchange(
+                    sock.to_str().unwrap(),
+                    Some(me()),
+                    &[me()].into_iter().collect(),
+                    "BAN_IP:203.0.113.9\n",
+                )
+                .await,
+            );
+            server.await.unwrap();
+            assert_eq!(body["outcome"], expected, "{body}");
+            assert_eq!(body["success"], expected == "CONFIRMED");
+        }
+        std::fs::remove_file(&sock).unwrap();
+        let Json(body) = command_json(
+            control_exchange(sock.to_str().unwrap(), None, &HashSet::new(), "LIST_BANS\n").await,
+        );
+        assert_eq!(body["outcome"], "NOT_SENT");
+        let server = reply_once(&sock, "OK unexpected\n".into()).await;
+        let Json(body) = command_json(
+            control_exchange(
+                sock.to_str().unwrap(),
+                Some(me().wrapping_add(1)),
+                &HashSet::new(),
+                "LIST_BANS\n",
+            )
+            .await,
+        );
+        server.await.unwrap();
+        assert_eq!(
+            body["outcome"], "NOT_SENT",
+            "untrusted uid must not receive the command"
+        );
+        std::fs::remove_file(&sock).unwrap();
+        std::fs::write(&sock, "not a socket").unwrap();
+        let Json(body) = command_json(
+            control_exchange(
+                sock.to_str().unwrap(),
+                Some(me()),
+                &HashSet::new(),
+                "LIST_BANS\n",
+            )
+            .await,
+        );
+        assert_eq!(
+            body["outcome"], "NOT_SENT",
+            "a connect error precedes any write"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_written_command_timeout_is_unknown_and_has_a_fixed_deadline() {
+        use tokio::io::AsyncBufReadExt;
+        // Keep paused time from auto-advancing while the OS completes socket I/O.
+        let clock_guard = tokio::spawn(async {
+            loop {
+                tokio::task::yield_now().await;
+            }
+        });
+        let dir = scratch("timeout");
+        let sock = dir.join("ctl.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        let (written_tx, written_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept())
+                .await
+                .expect("the control request never reached the fixture")
+                .unwrap();
+            let mut reader = tokio::io::BufReader::new(stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            written_tx.send(()).unwrap();
+            let _ = release_rx.await;
+        });
+        let path = sock.clone();
+        let mut request = tokio::spawn(async move {
+            control_exchange(
+                path.to_str().unwrap(),
+                Some(me()),
+                &HashSet::new(),
+                "FLUSH_ALL\n",
+            )
+            .await
+        });
+        tokio::select! {
+            written = written_rx => written.expect("fixture lost the control request"),
+            premature = &mut request => panic!("command ended before the fixture read it: {premature:?}"),
+        }
+        tokio::time::advance(CONTROL_TIMEOUT - Duration::from_millis(1)).await;
+        assert!(!request.is_finished());
+        tokio::time::advance(Duration::from_millis(1)).await;
+        let Json(body) = command_json(request.await.unwrap());
+        assert_eq!(body["outcome"], "UNKNOWN");
+        assert_eq!(body["error"], "node did not answer within 3 s");
+        clock_guard.abort();
+        release_tx.send(()).unwrap();
+        server.await.unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
     async fn a_silent_node_is_shown_stale() {
         let st = state();
         process_trident_telemetry(&st, me(), "HEARTBEAT:ID=8|NAME=n8|EP=x|MODE=NORMAL\n").await;
@@ -1365,6 +2057,134 @@ mod tests {
         let view = observed_nodes(&st.nodes.read().await);
         assert_eq!(view[0].health_status, "STALE");
         assert!(!view[0].xdp_loaded);
+    }
+
+    #[tokio::test]
+    async fn a_vector_cannot_choose_the_operator_tier_or_supply_header_fields() {
+        let st = state();
+        process_trident_telemetry(&st, me(),
+            "DB_LOG:NODE=7|TIER=Tier2PayloadCapture|VEC=client TIER=Tier1BotTarpit|IP=203.0.113.9\n").await;
+        let metrics = st.metrics.read().await;
+        assert_eq!(
+            metrics.traps.tier1_bot_tarpit, 0,
+            "client text must not choose Tier1"
+        );
+        assert_eq!(metrics.traps.tier2_payload_capture, 1);
+        drop(metrics);
+        let alerts = st.alerts.read().await;
+        assert_eq!(alerts[0].node_id, 7);
+        assert_eq!(
+            alerts[0].source_ip, "Unknown",
+            "IP inside VEC is opaque text"
+        );
+        assert_eq!(
+            alerts[0].attack_vector,
+            "client TIER=Tier1BotTarpit|IP=203.0.113.9"
+        );
+    }
+
+    #[tokio::test]
+    async fn operator_tiers_are_exact_fields_and_unknown_tiers_remain_unknown() {
+        let st = state();
+        for tier in [
+            "Tier1BotTarpit",
+            "Tier1_5SlowDrip",
+            "Tier2PayloadCapture",
+            "Tier3InteractiveJail",
+        ] {
+            process_trident_telemetry(
+                &st,
+                me(),
+                &format!("DB_LOG:NODE=7|TIER={tier}|IP=203.0.113.7|VEC=normal\n"),
+            )
+            .await;
+        }
+        for data in [
+            "TIER=Tier1BotTarpitSuffix|VEC=unknown",
+            "TIER=unknown|VEC=TIER=Tier1BotTarpit",
+            "VEC=TIER=Tier1BotTarpit",
+        ] {
+            process_trident_telemetry(&st, me(), &format!("DB_LOG:NODE=7|{data}\n")).await;
+        }
+        let metrics = st.metrics.read().await;
+        assert_eq!(
+            (
+                metrics.traps.tier1_bot_tarpit,
+                metrics.traps.tier1_5_slow_drip,
+                metrics.traps.tier2_payload_capture,
+                metrics.traps.tier3_interactive_jail
+            ),
+            (1, 1, 1, 1)
+        );
+        let alerts = st.alerts.read().await;
+        assert_eq!(alerts.len(), 7, "unknown tier still has a visible alert");
+        assert_eq!(alerts.last().unwrap().source_ip, "203.0.113.7");
+    }
+
+    #[tokio::test]
+    async fn malformed_telemetry_identity_does_not_invent_node_zero_or_one() {
+        let st = state();
+        for message in [
+            "HEARTBEAT:NAME=missing",
+            "HEARTBEAT:ID=wrong",
+            "HEARTBEAT:ID=4294967296",
+            "DB_LOG:TIER=Tier1BotTarpit|VEC=no owner",
+            "DB_LOG:NODE=wrong|TIER=Tier1BotTarpit|VEC=no owner",
+            "DB_LOG:VEC=client|NODE=7|TIER=Tier1BotTarpit",
+        ] {
+            process_trident_telemetry(&st, me(), message).await;
+        }
+        assert!(
+            st.nodes.read().await.is_empty(),
+            "missing identity is not node zero"
+        );
+        assert!(
+            st.alerts.read().await.is_empty(),
+            "missing identity is not node one"
+        );
+        assert_eq!(st.metrics.read().await.traps.tier1_bot_tarpit, 0);
+        process_trident_telemetry(
+            &st,
+            me(),
+            "HEARTBEAT:ID=0|NAME=real-zero\nDB_LOG:NODE=0|TIER=Tier1BotTarpit|VEC=real\n",
+        )
+        .await;
+        assert_eq!(
+            st.nodes.read().await[0].id,
+            0,
+            "an explicit zero is a real identity"
+        );
+        assert_eq!(st.alerts.read().await[0].node_id, 0);
+    }
+
+    #[tokio::test]
+    async fn opaque_vectors_survive_the_socket_and_operator_data_api() {
+        let st = state();
+        let (mut writer, reader) = UnixStream::pair().unwrap();
+        let consumer = tokio::spawn({
+            let st = st.clone();
+            async move { read_telemetry(&st, me(), reader).await }
+        });
+        writer.write_all(b"DB_LOG:NODE=7|TIER=Tier3InteractiveJail|IP=203.0.113.7|VEC=payload|TIER=Tier1BotTarpit|NODE=99\n").await.unwrap();
+        drop(writer);
+        consumer.await.unwrap();
+        let (status, _, body) = call(
+            build_router(st),
+            get("/api/data")
+                .header(header::AUTHORIZATION, format!("Bearer {}", TOKEN))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["metrics"]["traps"]["tier1_bot_tarpit"], 0);
+        assert_eq!(body["metrics"]["traps"]["tier3_interactive_jail"], 1);
+        assert_eq!(body["alerts"][0]["node_id"], 7);
+        assert_eq!(body["alerts"][0]["source_ip"], "203.0.113.7");
+        assert_eq!(
+            body["alerts"][0]["attack_vector"],
+            "payload|TIER=Tier1BotTarpit|NODE=99"
+        );
     }
 
     /// F11: telemetry is framed by lines, so a heartbeat split across writes is not lost.
@@ -1456,5 +2276,41 @@ mod tests {
         );
         assert_eq!(parse_block_target("10.0.0.1\nFLUSH_BANS"), None);
         assert_eq!(parse_block_target("example.com"), None);
+    }
+
+    /// ADR-0005: the operator's answer tells `OK` from `OK …; WARNING: not yet durable`
+    /// ("невідоме не видається за успіх"). The node applied the ban but cannot yet say it is
+    /// on disk; the operator API must not present that as the same plain success.
+    #[tokio::test]
+    async fn a_not_yet_durable_confirmation_keeps_its_warning() {
+        let dir = scratch("durable");
+        let sock = dir.join("ctl.sock");
+        let st = state();
+        process_trident_telemetry(
+            &st,
+            me(),
+            &format!("HEARTBEAT:ID=5|CTL={}\n", sock.display()),
+        )
+        .await;
+        let node = reply_once(
+            &sock,
+            "OK banned 203.0.113.9; WARNING: not yet durable (state write pending)\n".into(),
+        )
+        .await;
+        let (_, _, body) = call(
+            build_router(st),
+            post_json(
+                "/api/nodes/5/blacklist",
+                serde_json::json!({"ip":"203.0.113.9", "action":"add"}),
+            ),
+        )
+        .await;
+        node.await.unwrap();
+        assert_eq!(body["outcome"], "CONFIRMED", "{body}");
+        assert!(
+            body.to_string().contains("not yet durable"),
+            "the node's durability warning was dropped from the operator answer: {body}"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

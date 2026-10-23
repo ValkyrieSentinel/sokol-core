@@ -259,6 +259,15 @@ pub const MAX_RETRIES_PER_TICK: usize = 256;
 /// claim back to life for the length of the step. Twenty times the mesh's clock-skew bound.
 pub const FORGET_GRACE: Duration = Duration::from_secs(600);
 
+/// Whether a lease record (R26-07) is still kept at `now_ms`: like a lift record, until
+/// FORGET_GRACE past the end of its claim (`expires`, on the table's clock). The held claim is
+/// dropped at that end, but a wall-clock step back makes a resent copy live again for the
+/// length of the step (`adopt` converts the signed end with the offset in force then); the
+/// record makes that copy find the lease it already had instead of a new one.
+fn lease_kept(expires: Option<u64>, now_ms: u64) -> bool {
+    common::lease::kept(expires, now_ms, ms(FORGET_GRACE))
+}
+
 /// Distinct nodes remembered per retracted id (the issuer plus a few others).
 const MAX_RETRACTORS: usize = 4;
 
@@ -268,6 +277,9 @@ const MAX_RETRACTORS: usize = 4;
 pub struct Envelope {
     /// The peer's claims enforced here at once; further ones wait for a free slot.
     pub max_active: usize,
+    /// The peer's claims known here at once, enforced or waiting (ADR-0025); further ones are
+    /// refused, so one peer cannot fill the memory every issuer shares.
+    pub max_known: usize,
     /// Longest a claim of the peer is enforced here, from when its enforcement starts.
     pub max_ttl: Duration,
     /// Widest prefixes (shortest length) the peer may block here at all.
@@ -279,6 +291,7 @@ impl Envelope {
     pub fn unlimited(max_ttl: Duration) -> Self {
         Self {
             max_active: usize::MAX,
+            max_known: usize::MAX,
             max_ttl,
             min_prefix_v4: 0,
             min_prefix_v6: 0,
@@ -320,6 +333,21 @@ impl Quorum {
 
 /// Known claims (and retraction records) beyond this are refused (a flooding peer cannot exhaust memory).
 pub const MAX_KNOWN_CLAIMS: usize = 4 * common::BLOCKLIST_CAPACITY as usize;
+
+/// Known-claims room only this node's own decisions may use (ADR-0025): peers' claims together
+/// stop at `MAX_KNOWN_CLAIMS - OWN_RESERVE`, so a full table of peer claims never refuses this
+/// node's own detections. One blocklist's worth: more than this node can enforce at once.
+pub const OWN_RESERVE: usize = common::BLOCKLIST_CAPACITY as usize;
+
+/// Default known-claims share of one peer (ADR-0025): its claims held here, enforced or not.
+/// Its envelope bounds what it enforces (`max_active`); this bounds what it makes this node keep.
+pub const PEER_MAX_KNOWN_DEFAULT: usize = common::BLOCKLIST_CAPACITY as usize;
+
+/// Why `adopt` refuses a claim of a peer that has used its known-claims share (ADR-0025).
+pub const PEER_SHARE_FULL: &str = "peer known-claims share full";
+
+/// Why a new claim is refused at MAX_KNOWN_CLAIMS; the IPC answer names it (`ipc::enforcement_reply`).
+pub const TOO_MANY_CLAIMS: &str = "too many known claims";
 
 struct Held {
     claim: Claim,
@@ -418,6 +446,33 @@ impl Default for Persisted {
             peer_ends: Vec::new(),
             events: Vec::new(),
             support: Vec::new(),
+            saved_ms: None,
+            mesh_floors: Vec::new(),
+        }
+    }
+}
+
+/// What a restore left out to keep each table within its runtime bound.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Dropped {
+    claims: usize,
+    retractions: usize,
+    events: usize,
+    support: usize,
+}
+
+impl Dropped {
+    /// One warning line when a restore left anything out; the counts stay in the table.
+    fn log(&self) {
+        if *self != Dropped::default() {
+            log::warn!(
+                "[State] Restore past the runtime bounds: dropped {} claims (counted as refused), \
+                 {} retraction records, {} events, {} support targets",
+                self.claims,
+                self.retractions,
+                self.events,
+                self.support
+            );
         }
     }
 }
@@ -445,7 +500,20 @@ pub struct Persisted {
     /// wall end or none)]). Saved with the claims, so a retraction after a restart still works.
     #[serde(default)]
     pub support: Vec<(String, SavedReasons)>,
+    /// Wall-clock time of this write. A restore keeps no claim longer than it had left then,
+    /// so a clock that is wrong at the restart cannot stretch it (ADR-0017). A file without it
+    /// predates the field and is restored by its signed ends alone.
+    #[serde(default)]
+    pub saved_ms: Option<u64>,
+    /// Per mesh sender, the newest envelope timestamp the process accepted or refused
+    /// (MESH-N2): the next process refuses those again, even stamped after its start. Filled
+    /// by the node, not the table; at most [`MAX_MESH_FLOORS`].
+    #[serde(default)]
+    pub mesh_floors: Vec<(u64, u64)>,
 }
+
+/// Saved mesh replay floors a state file may hold: one per trusted sender.
+pub const MAX_MESH_FLOORS: usize = 4096;
 
 /// Block decisions (claims) with owners, and the kernel maps kept in line with them.
 ///
@@ -488,12 +556,19 @@ pub struct BlockTable<B = KernelBlocklist> {
     support: HashMap<IpNet, Vec<Support>>,
     retraction_counts: [u64; RETRACTION_RESULTS.len()],
     dirty: bool,
+    /// What the last restore left out to stay within the runtime bounds (logged, and kept so a
+    /// test can check the count rather than the log).
+    restore_dropped: Dropped,
     default_envelope: Envelope,
     envelopes: HashMap<u64, Envelope>,
+    /// Claims held per issuer, this node included (ADR-0025); kept with `claims`.
+    known_by_issuer: HashMap<u64, usize>,
     quorum: Quorum,
     active_by_issuer: HashMap<u64, usize>,
     waiting: HashMap<u64, std::collections::VecDeque<ClaimId>>,
-    /// Local ends of peers' claims cut short here, remembered across restarts (R26-07).
+    /// Local ends of peers' claims cut short here, remembered across restarts (R26-07) and for
+    /// FORGET_GRACE past the claim's own end (`lease_kept`). At most MAX_KNOWN_CLAIMS
+    /// (`record_lease` says what happens at the bound).
     lease_ends: HashMap<ClaimId, (u64, Option<u64>)>,
     /// Wall clock minus this table's clock (ADR-0017); converts signed and persisted times.
     wall_offset_ms: i64,
@@ -566,8 +641,10 @@ impl<B: Blocklist> BlockTable<B> {
             support: HashMap::new(),
             retraction_counts: [0; RETRACTION_RESULTS.len()],
             dirty: false,
+            restore_dropped: Dropped::default(),
             default_envelope: Envelope::unlimited(policy.max),
             envelopes: HashMap::new(),
+            known_by_issuer: HashMap::new(),
             quorum: Quorum::OFF,
             active_by_issuer: HashMap::new(),
             waiting: HashMap::new(),
@@ -630,19 +707,62 @@ impl<B: Blocklist> BlockTable<B> {
 
     /// Sets what peers may impose (ADR-7): `default` for every peer, `per_peer` overrides, and
     /// the quorum for wide prefixes. Applies to enforcement from now on; slot counts and local
-    /// ends of claims already adopted are kept.
+    /// ends of claims already adopted are kept. Returns false without changing anything if a
+    /// new known-claims share is below what a peer already holds: a reload cannot silently
+    /// violate the share or discard claims and their remembered leases.
     pub fn configure_peers(
         &mut self,
         default: Envelope,
         per_peer: HashMap<u64, Envelope>,
         quorum: Quorum,
         now_ms: u64,
-    ) {
+    ) -> bool {
+        self.configure_peer_state(default, per_peer, quorum, None, now_ms)
+    }
+
+    /// Installs trust and envelopes together. A revoked issuer's old envelope is retained only
+    /// for its held records: an implicit fallback to a smaller default must not block revocation.
+    /// Its claims stop counting immediately, and their lease/retraction memory is preserved.
+    pub fn configure_trusted_peers(
+        &mut self,
+        default: Envelope,
+        per_peer: HashMap<u64, Envelope>,
+        quorum: Quorum,
+        pinned: HashSet<u64>,
+        now_ms: u64,
+    ) -> bool {
+        self.configure_peer_state(default, per_peer, quorum, Some(pinned), now_ms)
+    }
+
+    fn configure_peer_state(
+        &mut self,
+        default: Envelope,
+        mut per_peer: HashMap<u64, Envelope>,
+        quorum: Quorum,
+        pinned: Option<HashSet<u64>>,
+        now_ms: u64,
+    ) -> bool {
+        if let Some(trusted) = &pinned {
+            for issuer in self.known_by_issuer.keys() {
+                if *issuer != self.node_id && !trusted.contains(issuer) {
+                    per_peer.insert(*issuer, *self.envelope(*issuer));
+                }
+            }
+        }
+        if self.known_by_issuer.iter().any(|(issuer, known)| {
+            *issuer != self.node_id && *known > per_peer.get(issuer).unwrap_or(&default).max_known
+        }) {
+            return false;
+        }
         self.default_envelope = default;
         self.envelopes = per_peer;
         self.quorum = quorum;
+        if let Some(pinned) = pinned {
+            self.pinned = Some(pinned);
+        }
         let nets: Vec<IpNet> = self.by_target.keys().copied().collect();
         self.settle(nets, now_ms);
+        true
     }
 
     fn envelope(&self, issuer: u64) -> &Envelope {
@@ -1015,20 +1135,41 @@ impl<B: Blocklist> BlockTable<B> {
         self.settle(nets, now_ms)
     }
 
-    /// Remembers where a peer claim's lease ends if the local cap cuts it short. The end only
+    /// Remembers where every enforced peer claim's lease ends, also one whose own end lies
+    /// within the cap, so a resend after a step back cannot outlast the cap. The end only
     /// ever moves earlier: a lease shortened once (e.g. after a clock step) is not lengthened by
     /// a later restart, so records timed by it (an operator lift) outlive it.
+    ///
+    /// At MAX_KNOWN_CLAIMS records, the record of a claim no longer held whose horizon comes
+    /// first is forgotten early to make room (a held claim's lease is always recorded). That one
+    /// claim, resent after a wall-clock step back, may then get a new lease, as after
+    /// FORGET_GRACE. There is always such a record: the claim being recorded is the only held
+    /// claim without one, and at most MAX_KNOWN_CLAIMS claims are held.
     fn record_lease(&mut self, id: &ClaimId, cap: u64, expires: Option<u64>) {
-        if expires.is_some_and(|e| e <= cap) {
-            return;
-        }
         match self.lease_ends.get_mut(id) {
-            Some((end, _)) if *end <= cap => {}
             Some((end, _)) => {
-                *end = cap;
-                self.dirty = true;
+                let moved = common::lease::recorded_end(Some(*end), cap);
+                if moved != *end {
+                    *end = moved;
+                    self.dirty = true;
+                }
             }
             None => {
+                if self.lease_ends.len() >= MAX_KNOWN_CLAIMS {
+                    let claims = &self.claims;
+                    let first = self
+                        .lease_ends
+                        .iter()
+                        .filter(|(other, _)| !claims.contains_key(*other))
+                        .min_by_key(|(_, (_, expires))| expires.unwrap_or(u64::MAX))
+                        .map(|(other, _)| other.clone());
+                    match first {
+                        Some(other) => {
+                            self.lease_ends.remove(&other);
+                        }
+                        None => return,
+                    }
+                }
                 self.lease_ends.insert(id.clone(), (cap, expires));
                 self.dirty = true;
             }
@@ -1040,7 +1181,24 @@ impl<B: Blocklist> BlockTable<B> {
             .entry(held.net)
             .or_default()
             .insert(id.clone());
-        self.claims.insert(id, held);
+        let issuer = held.claim.issuer;
+        if let Some(old) = self.claims.insert(id, held) {
+            self.forget_known(old.claim.issuer);
+        }
+        *self.known_by_issuer.entry(issuer).or_insert(0) += 1;
+    }
+
+    fn forget_known(&mut self, issuer: u64) {
+        if let Some(n) = self.known_by_issuer.get_mut(&issuer) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                self.known_by_issuer.remove(&issuer);
+            }
+        }
+    }
+
+    fn known_of(&self, issuer: u64) -> usize {
+        self.known_by_issuer.get(&issuer).copied().unwrap_or(0)
     }
 
     /// Creates and holds a new claim of this node's (the caller checked MAX_KNOWN_CLAIMS).
@@ -1052,7 +1210,7 @@ impl<B: Blocklist> BlockTable<B> {
         now_ms: u64,
         end: Option<u64>,
     ) -> Claim {
-        let claim = Claim {
+        let mut claim = Claim {
             issuer: self.node_id,
             kind,
             target: show(&net),
@@ -1060,6 +1218,16 @@ impl<B: Blocklist> BlockTable<B> {
             expires_ms: end.map(|e| self.to_wall(e)),
             reason: bounded_reason(reason),
         };
+        // A claim's id is the hash of its bytes. A new decision byte-identical to one already
+        // taken back (same target, reason and end, in the same millisecond) would be born
+        // retracted: added and reported applied, yet never in force (NODE-D1, NODE-R4). It is
+        // issued a millisecond later instead; retraction records are bounded, so is this loop.
+        for _ in 0..=MAX_KNOWN_CLAIMS {
+            if !self.retractions.contains_key(&claim.id()) {
+                break;
+            }
+            claim.issued_ms = claim.issued_ms.saturating_add(1);
+        }
         self.insert_held(
             claim.id(),
             Held {
@@ -1113,7 +1281,8 @@ impl<B: Blocklist> BlockTable<B> {
     }
 
     /// A detector takes back one of its events (ADR-0019). The event stops holding the block;
-    /// this node's own detector claims on `net` are retracted mesh-wide only when no other
+    /// this node's own detector claims on `net` (also those the protected set suspends here,
+    /// ADR-0012) are retracted mesh-wide only when no other
     /// reason (another event, of any source, or one without an id) still holds it, and are
     /// replaced by a shorter claim when the remaining reasons end earlier. A retraction that
     /// arrives before its signal is remembered, so the signal adds nothing.
@@ -1154,8 +1323,11 @@ impl<B: Blocklist> BlockTable<B> {
             .support
             .get(&net)
             .is_some_and(|list| list.iter().any(|s| s.event == Some(key)));
+        // Every own detector claim that still stands, also one the protected set suspends now
+        // (ADR-0012): it would come back when the target leaves the host, and peers that
+        // adopted it enforce it meanwhile, so the retraction must reach it too.
         let own = if supported {
-            self.own_effective(net, ClaimKind::Detector, now_ms)
+            self.own_standing(net, now_ms)
         } else {
             Vec::new()
         };
@@ -1212,14 +1384,20 @@ impl<B: Blocklist> BlockTable<B> {
             // The rest holds at least as long as the running block: nothing changes.
             Some(None) => return DetectorRetraction::StillHeld,
             Some(Some(end)) if longest.is_none_or(|l| end < l) => {
-                let reason = own
+                let (reason, allowed) = own
                     .iter()
                     .filter_map(|(id, _)| self.claims.get(id))
                     .max_by_key(|h| h.end_local.unwrap_or(u64::MAX))
-                    .map(|h| h.claim.reason.clone())
+                    .map(|h| (h.claim.reason.clone(), h.allowed))
                     .unwrap_or_default();
                 // Issued before the old claims go, so the target is never unblocked between.
-                Some(self.issue_own(net, ClaimKind::Detector, &reason, now_ms, Some(end)))
+                let claim = self.issue_own(net, ClaimKind::Detector, &reason, now_ms, Some(end));
+                // The never-block verdict is the target's, not the claim's: a shorter claim on a
+                // target the protected set suspends stays suspended until `recheck` says otherwise.
+                if let Some(h) = self.claims.get_mut(&claim.id()) {
+                    h.allowed = allowed;
+                }
+                Some(claim)
             }
             Some(Some(_)) => return DetectorRetraction::StillHeld,
         };
@@ -1285,6 +1463,26 @@ impl<B: Blocklist> BlockTable<B> {
                 (h.claim.issuer == self.node_id
                     && h.claim.kind == kind
                     && self.effective(id, h, now_ms))
+                .then(|| (id.clone(), h.end_local))
+            })
+            .collect()
+    }
+
+    /// This node's own detector claims on `net` that still stand (not retracted, not past their
+    /// local end), whether or not the never-block policy suspends them now. Unlike
+    /// [`Self::own_effective`] this includes a claim that is not enforced here only because its
+    /// target is protected: it is still in force on peers and returns here when `recheck` allows.
+    fn own_standing(&self, net: IpNet, now_ms: u64) -> Vec<(ClaimId, Option<u64>)> {
+        self.by_target
+            .get(&net)
+            .into_iter()
+            .flatten()
+            .filter_map(|id| {
+                let h = self.claims.get(id)?;
+                (h.claim.issuer == self.node_id
+                    && h.claim.kind == ClaimKind::Detector
+                    && h.until_ms.is_none_or(|u| u > now_ms)
+                    && !self.retracted(id, h))
                 .then(|| (id.clone(), h.end_local))
             })
             .collect()
@@ -1356,7 +1554,7 @@ impl<B: Blocklist> BlockTable<B> {
             }
         }
         if self.claims.len() >= MAX_KNOWN_CLAIMS {
-            return Err("too many known claims");
+            return Err(TOO_MANY_CLAIMS);
         }
         if strike_due {
             self.strike(net, now_ms);
@@ -1414,18 +1612,30 @@ impl<B: Blocklist> BlockTable<B> {
             return Adoption::Refused("expired");
         }
         if self.claims.len() >= MAX_KNOWN_CLAIMS {
-            return Adoption::Refused("too many known claims");
+            return Adoption::Refused(TOO_MANY_CLAIMS);
+        }
+        // ADR-0025: peers together leave this node's own room free, and each peer stays within
+        // its share; a refused claim is not held, so its issuer may resend it once room frees.
+        let peers_known = self
+            .claims
+            .len()
+            .saturating_sub(self.known_of(self.node_id));
+        if peers_known >= MAX_KNOWN_CLAIMS - OWN_RESERVE {
+            return Adoption::Refused(TOO_MANY_CLAIMS);
         }
         let envelope = *self.envelope(claim.issuer);
-        let cap = now_ms.saturating_add(ms(self.policy.max.min(envelope.max_ttl)));
+        if self.known_of(claim.issuer) >= envelope.max_known {
+            return Adoption::Refused(PEER_SHARE_FULL);
+        }
         // A claim already given a lease here (before a restart) keeps that lease's end: the
         // local cap bounds a claim's total effect, not each lifetime of this process (R26-07).
-        let cap = match self.lease_ends.get(&id) {
-            Some((end, _)) => cap.min(*end),
-            None => cap,
-        };
+        let cap = common::lease::cap(
+            now_ms,
+            ms(self.policy.max.min(envelope.max_ttl)),
+            self.lease_ends.get(&id).map(|(end, _)| *end),
+        );
         let end_local = self.end_of(&claim);
-        let until_ms = Some(end_local.map_or(cap, |e| e.min(cap)));
+        let until_ms = Some(common::lease::until(end_local, cap));
         // Only a claim that could count takes a slot or waits for one: not one whose lease ran
         // out (before a restart), one the local policy refuses, or one already retracted (a
         // lifted claim resent by its issuer must not use up the issuer's quota).
@@ -1541,7 +1751,9 @@ impl<B: Blocklist> BlockTable<B> {
             if h.claim.kind == ClaimKind::Operator {
                 // Local only: no copy exists anywhere else, so it can simply go.
                 let net = h.net;
-                self.claims.remove(&id);
+                if let Some(gone) = self.claims.remove(&id) {
+                    self.forget_known(gone.claim.issuer);
+                }
                 if let Some(set) = self.by_target.get_mut(&net) {
                     set.remove(&id);
                     if set.is_empty() {
@@ -1700,6 +1912,7 @@ impl<B: Blocklist> BlockTable<B> {
         for id in dead {
             self.release_slot(&id);
             if let Some(h) = self.claims.remove(&id) {
+                self.forget_known(h.claim.issuer);
                 if let Some(set) = self.by_target.get_mut(&h.net) {
                     set.remove(&id);
                     if set.is_empty() {
@@ -1724,10 +1937,11 @@ impl<B: Blocklist> BlockTable<B> {
                 };
                 // Enforcement starts now, so the local end is counted from now, but never past
                 // a lease this claim already had (before a restart, R26-07).
-                let cap =
-                    now_ms.saturating_add(ms(self.policy.max.min(self.envelope(issuer).max_ttl)));
-                let earlier = self.lease_ends.get(&id).map(|(end, _)| *end);
-                let cap = earlier.map_or(cap, |end| cap.min(end));
+                let cap = common::lease::cap(
+                    now_ms,
+                    ms(self.policy.max.min(self.envelope(issuer).max_ttl)),
+                    self.lease_ends.get(&id).map(|(end, _)| *end),
+                );
                 if cap <= now_ms {
                     continue;
                 }
@@ -1742,7 +1956,7 @@ impl<B: Blocklist> BlockTable<B> {
                 if let Some(h) = self.claims.get_mut(&id) {
                     if !h.in_quota && h.live(now_ms) {
                         h.in_quota = true;
-                        h.until_ms = Some(h.end_local.map_or(cap, |e| e.min(cap)));
+                        h.until_ms = Some(common::lease::until(h.end_local, cap));
                         h.ended = false;
                         *self.active_by_issuer.entry(issuer).or_insert(0) += 1;
                         touched.push(h.net);
@@ -1756,9 +1970,8 @@ impl<B: Blocklist> BlockTable<B> {
         // A forgotten record must not leave its target's kernel entry stale.
         let claims = &self.claims;
         self.retractions.retain(|id, r| {
-            let keep = r
-                .forget_ms
-                .is_none_or(|f| f.saturating_add(ms(FORGET_GRACE)) > now_ms);
+            // The same bound as a lease record (`lease_kept`): LEASE-C1.
+            let keep = lease_kept(r.forget_ms, now_ms);
             if !keep {
                 if let Some(h) = claims.get(id) {
                     touched.push(h.net);
@@ -1768,7 +1981,7 @@ impl<B: Blocklist> BlockTable<B> {
         });
         let before = self.lease_ends.len();
         self.lease_ends
-            .retain(|_, (_, expires)| expires.is_none_or(|e| e > now_ms));
+            .retain(|_, (_, expires)| lease_kept(*expires, now_ms));
         if self.lease_ends.len() != before {
             self.dirty = true;
         }
@@ -1828,6 +2041,14 @@ impl<B: Blocklist> BlockTable<B> {
 
     pub fn is_blocked(&self, net: IpNet) -> bool {
         self.applied.contains(&canonical(net))
+    }
+
+    /// Whether `net` is still blocked on this node, applied or meant to be: a kernel entry is
+    /// in place (a failed delete leaves one), or an effective claim wants one (a failed write
+    /// leaves none yet). Only when neither holds may an answer say the block is gone.
+    pub fn still_blocks(&self, net: IpNet, now_ms: u64) -> bool {
+        let net = canonical(net);
+        self.applied.contains(&net) || self.wanted(&net, now_ms)
     }
 
     /// What this node sends a peer (R26-01): only its own live detector claims and its own
@@ -1927,7 +2148,7 @@ impl<B: Blocklist> BlockTable<B> {
         let mut peer_ends: Vec<(ClaimId, u64, Option<u64>)> = self
             .lease_ends
             .iter()
-            .filter(|(_, (_, expires))| expires.is_none_or(|e| e > now_ms))
+            .filter(|(_, (_, expires))| lease_kept(*expires, now_ms))
             .map(|(id, (end, expires))| {
                 (
                     id.clone(),
@@ -1971,6 +2192,8 @@ impl<B: Blocklist> BlockTable<B> {
             peer_ends,
             events,
             support,
+            saved_ms: Some(self.to_wall(now_ms)),
+            mesh_floors: Vec::new(),
         }
     }
 
@@ -1982,6 +2205,18 @@ impl<B: Blocklist> BlockTable<B> {
         allowed: impl Fn(IpNet) -> bool,
         now_ms: u64,
     ) -> (usize, usize) {
+        // What an end had left when the file was written, measured on one clock, bounds what
+        // it has left now: a wall clock that reads early at the restart (no RTC, ADR-0017)
+        // would otherwise hold a restored block past its signed end by the clock's error.
+        // A clock that is right gives the signed end; the cost is at most the downtime.
+        let saved = state.saved_ms;
+        let restored_end = |table: &Self, wall_end: u64| {
+            let local = table.to_local(wall_end);
+            match saved {
+                Some(at) => local.min(now_ms.saturating_add(wall_end.saturating_sub(at))),
+                None => local,
+            }
+        };
         let mut events: Vec<([u8; 16], u64)> = state
             .events
             .iter()
@@ -1996,6 +2231,12 @@ impl<B: Blocklist> BlockTable<B> {
             .collect();
         events.sort_by_key(|(_, seen)| *seen);
         let skip = events.len().saturating_sub(MAX_EVENTS);
+        // The runtime bound holds from the first moment: the oldest are dropped, as
+        // `record_event` would have done.
+        let mut dropped = Dropped {
+            events: skip,
+            ..Dropped::default()
+        };
         for (key, seen) in events.into_iter().skip(skip) {
             self.events.insert(key, seen);
             self.event_order.push_back((key, seen));
@@ -2015,26 +2256,50 @@ impl<B: Blocklist> BlockTable<B> {
                 };
                 let until = until.map(|u| self.to_local(u));
                 if until.is_none_or(|u| u > now_ms) {
-                    self.note_support(canonical(net), event, until);
+                    let net = canonical(net);
+                    // `note_support` refuses a new target past MAX_SUPPORT_TARGETS; counted here
+                    // so the loss is visible. Such a block holds, but cannot be retracted.
+                    if !self.support.contains_key(&net) && self.support.len() >= MAX_SUPPORT_TARGETS
+                    {
+                        dropped.support += 1;
+                        continue;
+                    }
+                    self.note_support(net, event, until);
                 }
             }
         }
         for (id, end, expires) in state.peer_ends {
-            let (end, expires) = (self.to_local(end), expires.map(|e| self.to_local(e)));
-            if expires.is_none_or(|e| e > now_ms) && self.lease_ends.len() < MAX_KNOWN_CLAIMS {
+            let (end, expires) = (
+                restored_end(self, end),
+                expires.map(|e| restored_end(self, e)),
+            );
+            if lease_kept(expires, now_ms) && self.lease_ends.len() < MAX_KNOWN_CLAIMS {
                 self.lease_ends.insert(id, (end, expires));
             }
         }
+        // Retraction records share MAX_KNOWN_CLAIMS as at runtime (`retract`, `adopt`). Operator
+        // lifts come first: they are local only, no peer can resend them. A record that merges
+        // into one already restored takes no new room.
         for (id, forget_ms) in state.operator_lifts {
+            if !self.retractions.contains_key(&id) && self.retractions_full() {
+                dropped.retractions += 1;
+                continue;
+            }
             let forget_ms = forget_ms.map(|f| self.to_local(f));
             let r = self.retractions.entry(id).or_default();
             r.operator = true;
             r.forget_ms = forget_ms;
         }
         for (id, forget_ms) in state.retracted {
+            if !self.retractions.contains_key(&id) && self.retractions_full() {
+                dropped.retractions += 1;
+                continue;
+            }
             let forget_ms = forget_ms.map(|f| self.to_local(f));
             let r = self.retractions.entry(id).or_default();
-            r.by_nodes.push(self.node_id);
+            if !r.by_nodes.contains(&self.node_id) {
+                r.by_nodes.push(self.node_id);
+            }
             r.forget_ms = forget_ms;
         }
         let (mut restored, mut refused) = (0, 0);
@@ -2044,11 +2309,18 @@ impl<B: Blocklist> BlockTable<B> {
                 refused += 1;
                 continue;
             };
+            let end = claim.expires_ms.map(|e| restored_end(self, e));
             if claim.issuer != self.node_id
                 || claim.kind == ClaimKind::Static
-                || !self.claim_live(&claim, now_ms)
+                || end.is_some_and(|e| e <= now_ms)
             {
                 refused += 1;
+                continue;
+            }
+            // MAX_KNOWN_CLAIMS bounds the claims as at runtime (`add_claim` refuses past it).
+            if !self.claims.contains_key(&claim.id()) && self.claims.len() >= MAX_KNOWN_CLAIMS {
+                refused += 1;
+                dropped.claims += 1;
                 continue;
             }
             let ok = allowed(net);
@@ -2061,8 +2333,8 @@ impl<B: Blocklist> BlockTable<B> {
             self.insert_held(
                 id,
                 Held {
-                    until_ms: self.end_of(&claim),
-                    end_local: self.end_of(&claim),
+                    until_ms: end,
+                    end_local: end,
                     claim,
                     net,
                     allowed: ok,
@@ -2072,6 +2344,8 @@ impl<B: Blocklist> BlockTable<B> {
             );
             nets.push(net);
         }
+        dropped.log();
+        self.restore_dropped = dropped;
         self.settle(nets, now_ms);
         (restored, refused)
     }
@@ -2572,6 +2846,70 @@ mod tests {
             t.retract_detection("crowdsec", "17", ip("203.0.113.9"), T0 + 2 * S),
             DetectorRetraction::Duplicate
         );
+    }
+
+    #[test]
+    fn a_retraction_while_the_target_is_protected_takes_its_claim_back_mesh_wide() {
+        // K1: the claim is suspended, not gone, while the address is the host's (ADR-0012). A
+        // retraction then must still reach it, or the block returns when the address leaves
+        // the host, and peers that adopted the claim keep it for the rest of its TTL.
+        let target = ip("203.0.113.9");
+        let mut t = table(1, 64);
+        let claim = signal(&mut t, "crowdsec", "17", "203.0.113.9", T0, Some(600))
+            .unwrap()
+            .claim;
+        t.recheck(|net| net != target, T0 + S);
+        assert!(!t.is_blocked(target), "suspended while protected");
+        let out = t.retract_detection("crowdsec", "17", target, T0 + 2 * S);
+        let DetectorRetraction::Lifted {
+            retracted,
+            reissued: None,
+            ..
+        } = &out
+        else {
+            panic!("expected the claim taken back, got {:?}", out);
+        };
+        assert_eq!(retracted, &vec![claim.id()]);
+        assert!(
+            t.retractions
+                .get(&claim.id())
+                .is_some_and(|r| r.by_nodes.contains(&1)),
+            "in this node's own retractions, which go to its peers"
+        );
+        assert!(!t.still_blocks(target, T0 + 2 * S));
+        t.recheck(|_| true, T0 + 3 * S);
+        assert!(
+            !t.is_blocked(target),
+            "a reason the detector took back does not return with the address"
+        );
+    }
+
+    #[test]
+    fn a_block_shortened_while_protected_stays_suspended_until_the_target_is_allowed() {
+        // The shorter claim inherits the target's never-block verdict: issuing it must not
+        // enforce a block on an address the host holds now.
+        let target = ip("203.0.113.9");
+        let mut t = table(1, 64);
+        signal(&mut t, "crowdsec", "17", "203.0.113.9", T0, Some(600)).unwrap();
+        signal(&mut t, "suricata", "5", "203.0.113.9", T0 + S, None).unwrap();
+        t.recheck(|net| net != target, T0 + 2 * S);
+        let out = t.retract_detection("crowdsec", "17", target, T0 + 3 * S);
+        assert!(
+            matches!(
+                out,
+                DetectorRetraction::Lifted {
+                    reissued: Some(_),
+                    ..
+                }
+            ),
+            "{:?}",
+            out
+        );
+        assert!(!t.is_blocked(target), "still protected");
+        t.recheck(|_| true, T0 + 4 * S);
+        assert!(t.is_blocked(target), "Suricata's reason holds once allowed");
+        t.tick(T0 + S + 61 * S);
+        assert!(!t.is_blocked(target), "and ends with it");
     }
 
     #[test]
@@ -3380,6 +3718,181 @@ mod tests {
     }
 
     #[test]
+    fn a_restore_keeps_every_bounded_table_within_its_runtime_bound() {
+        // F3: a state file is bytes on disk, not a promise of the runtime bounds; a restore
+        // past them must not hold more than the running table ever could.
+        let mut t = table(1, 64);
+        let wall = t.to_wall(T0);
+        let state = Persisted {
+            operator_lifts: vec![("lifted-by-operator".to_string(), None)],
+            retracted: (0..=MAX_KNOWN_CLAIMS)
+                .map(|i| (format!("retracted-{i}"), Some(wall + 600 * S)))
+                .collect(),
+            claims: (0..=MAX_KNOWN_CLAIMS as u64)
+                .map(|i| Claim {
+                    issuer: 1,
+                    kind: ClaimKind::Detector,
+                    target: "203.0.113.9".to_string(),
+                    issued_ms: wall - i,
+                    expires_ms: None,
+                    reason: "test".to_string(),
+                })
+                .collect(),
+            events: (0..=MAX_EVENTS as u128)
+                .map(|i| (crate::p2p::to_hex(&i.to_be_bytes()), wall))
+                .collect(),
+            support: (0..=MAX_SUPPORT_TARGETS as u32)
+                .map(|i| {
+                    let net = host(IpAddr::from(std::net::Ipv4Addr::from(0x0a00_0000 + i)));
+                    (show(&net), vec![(None, None)])
+                })
+                .collect(),
+            ..Persisted::default()
+        };
+        let (restored, refused) = t.restore(state, |_| true, T0);
+        assert!(
+            t.retractions.len() <= MAX_KNOWN_CLAIMS,
+            "{} retraction records",
+            t.retractions.len()
+        );
+        assert!(
+            t.retractions
+                .get("lifted-by-operator")
+                .is_some_and(|r| r.operator),
+            "operator lifts are kept first: no peer can resend them"
+        );
+        assert!(
+            t.claims.len() <= MAX_KNOWN_CLAIMS,
+            "{} claims",
+            t.claims.len()
+        );
+        assert_eq!(
+            (restored, refused),
+            (MAX_KNOWN_CLAIMS, 1),
+            "the cut is counted"
+        );
+        assert!(t.events.len() <= MAX_EVENTS, "{} events", t.events.len());
+        assert!(t.support.len() <= MAX_SUPPORT_TARGETS);
+        assert_eq!(
+            t.restore_dropped,
+            Dropped {
+                claims: 1,
+                retractions: 2,
+                events: 1,
+                support: 1,
+            },
+            "each cut is counted once, exactly"
+        );
+    }
+
+    /// At a full table a record or reason for something already restored merges and takes no
+    /// new room; a support reason ending exactly now is over (STATE-P2 boundaries).
+    #[test]
+    fn a_full_restore_merges_into_what_it_holds_and_drops_only_new_entries() {
+        let mut t = table(1, 64);
+        let wall = t.to_wall(T0);
+        let ids = |p: &'static str| (0..MAX_KNOWN_CLAIMS).map(move |i| format!("{p}-{i}"));
+        let target = |i: u32| {
+            show(&host(IpAddr::from(std::net::Ipv4Addr::from(
+                0x0a00_0000 + i,
+            ))))
+        };
+        let state = Persisted {
+            operator_lifts: ids("lift")
+                .chain(["lift-0".to_string()])
+                .map(|id| (id, None))
+                .collect(),
+            retracted: vec![("lift-1".to_string(), None)],
+            support: (0..MAX_SUPPORT_TARGETS as u32)
+                .map(|i| (target(i), vec![(None, None)]))
+                .chain([
+                    (
+                        target(0),
+                        vec![(Some(crate::p2p::to_hex(&[7u8; 16])), None)],
+                    ),
+                    (target(9_999_999), vec![(None, Some(wall))]),
+                ])
+                .collect(),
+            ..Persisted::default()
+        };
+        t.restore(state, |_| true, T0);
+        assert_eq!(t.retractions.len(), MAX_KNOWN_CLAIMS);
+        assert!(t
+            .retractions
+            .get("lift-1")
+            .is_some_and(|r| r.operator && r.by_nodes.contains(&1)));
+        assert_eq!(t.support.len(), MAX_SUPPORT_TARGETS);
+        let first = canonical(parse_target(&target(0)).unwrap());
+        assert_eq!(
+            t.support.get(&first).map(Vec::len),
+            Some(2),
+            "a reason for a held target merges"
+        );
+        assert_eq!(
+            t.restore_dropped,
+            Dropped::default(),
+            "nothing new was refused"
+        );
+    }
+
+    /// Restored lease records keep the runtime bound and drop records past their retention
+    /// (LEASE-C1, STATE-P2).
+    #[test]
+    fn restored_lease_records_keep_the_bound_and_drop_those_past_retention() {
+        let mut t = table(1, 64);
+        let wall = t.to_wall(T0);
+        let state = Persisted {
+            peer_ends: (0..=MAX_KNOWN_CLAIMS)
+                .map(|i| (format!("lease-{i}"), wall + 600 * S, Some(wall + 3600 * S)))
+                .collect(),
+            ..Persisted::default()
+        };
+        t.restore(state, |_| true, T0);
+        assert_eq!(t.lease_ends.len(), MAX_KNOWN_CLAIMS);
+        let mut t = table(1, 64);
+        let ended = wall.saturating_sub(ms(FORGET_GRACE) + S);
+        let state = Persisted {
+            peer_ends: vec![("past-retention".to_string(), ended, Some(ended))],
+            ..Persisted::default()
+        };
+        t.restore(state, |_| true, T0);
+        assert!(
+            t.lease_ends.is_empty(),
+            "a record past its retention is not restored"
+        );
+    }
+
+    /// Operator lifts past the bound are counted like any other retraction record (STATE-P2).
+    #[test]
+    fn operator_lifts_past_the_bound_are_counted() {
+        let mut t = table(1, 64);
+        let state = Persisted {
+            operator_lifts: (0..=MAX_KNOWN_CLAIMS)
+                .map(|i| (format!("lift-{i}"), None))
+                .collect(),
+            ..Persisted::default()
+        };
+        t.restore(state, |_| true, T0);
+        assert_eq!(t.retractions.len(), MAX_KNOWN_CLAIMS);
+        assert_eq!(t.restore_dropped.retractions, 1);
+    }
+
+    /// A block meant but not written (no room in the kernel map) still blocks for the answer;
+    /// so does an entry left in the map with no claim wanting it (IPC-R1).
+    #[test]
+    fn a_wanted_block_not_yet_written_still_blocks() {
+        let mut t = table(1, 1);
+        t.add_local(ip("203.0.113.1"), ClaimKind::Operator, "a", T0)
+            .unwrap();
+        let _ = t.add_local(ip("203.0.113.2"), ClaimKind::Operator, "b", T0);
+        assert!(
+            !t.is_blocked(ip("203.0.113.2")),
+            "precondition: the map is full"
+        );
+        assert!(t.still_blocks(ip("203.0.113.2"), T0));
+    }
+
+    #[test]
     fn decisions_and_lifts_survive_a_restart() {
         // ADR-4, and F1 across restarts: a lifted peer claim stays lifted after the restart.
         let mut n2 = table(2, 64);
@@ -3591,6 +4104,7 @@ mod tests {
         let wide = detect(&mut n2, "203.0.113.0/24", T0);
         let tight = Envelope {
             max_active: 2,
+            max_known: PEER_MAX_KNOWN_DEFAULT,
             max_ttl: Duration::from_secs(30),
             min_prefix_v4: 32,
             min_prefix_v6: 128,
@@ -3628,6 +4142,7 @@ mod tests {
         );
         let one = Envelope {
             max_active: 1,
+            max_known: PEER_MAX_KNOWN_DEFAULT,
             ..Envelope::unlimited(POLICY.max)
         };
         let mut n1 = limited(1, one, &[]);
@@ -3832,6 +4347,95 @@ mod tests {
         assert!(!r.is_blocked(ip("203.0.113.124")), "the lift holds");
     }
 
+    /// CANDIDATE (round 8, ADR-0017): a restore converts the wall-clock state file with offset
+    /// 0, trusting the wall clock at the start. A node that starts Δ behind (no RTC, NTP steps
+    /// it forward later: the case ADR-0017 names) restores its own claims Δ past their signed
+    /// end, and the forward step does not shorten them (held ends keep their length). Peers
+    /// drop the claim at its signed end; this node keeps it in XDP and FlowSpec for Δ more.
+    #[test]
+    fn a_restore_under_a_clock_behind_does_not_outlast_the_signed_end() {
+        let hour = 3600 * S;
+        let target = ip("203.0.113.150");
+        let mut t = table(1, 64);
+        let added = t.add_local(target, ClaimKind::Detector, "x", T0).unwrap();
+        assert_eq!(
+            added.claim.expires_ms,
+            Some(T0 + 60 * S),
+            "a 60 s block, signed"
+        );
+        let state = t.take_persisted(T0 + S);
+        // Restart at true time T0 + 2 s on a wall clock that reads an hour earlier.
+        let behind = T0 + 2 * S - hour;
+        let mut r = table(1, 64);
+        r.restore(state, |_| true, behind);
+        assert!(r.is_blocked(target), "restored");
+        // NTP steps the wall clock to the true time; the tick takes the new offset.
+        r.set_clock_offset(hour as i64);
+        // True time T0 + 180 s: two minutes past the signed end.
+        let now = behind + 178 * S;
+        r.tick(now);
+        assert!(
+            !r.is_blocked(target),
+            "a restored claim blocks past its signed end by the clock error at the start"
+        );
+    }
+
+    /// A state file holds only this node's own dynamic claims; a peer's claim or a static one
+    /// found in it is refused at restore, each on its own (either alone is enough).
+    #[test]
+    fn a_restore_refuses_a_peers_claim_and_a_static_one() {
+        let mut t = table(1, 64);
+        let own_static = t
+            .add_local(ip("198.51.100.20"), ClaimKind::Static, "--block", T0)
+            .unwrap()
+            .claim;
+        let mut peers = peer_claim(2, "203.0.113.152", T0);
+        peers.expires_ms = Some(T0 + 600 * S);
+        for claim in [own_static, peers] {
+            let mut r = table(1, 64);
+            let state = Persisted {
+                claims: vec![claim],
+                saved_ms: Some(T0),
+                ..Persisted::default()
+            };
+            assert_eq!(r.restore(state, |_| true, T0 + S), (0, 1));
+        }
+    }
+
+    /// The bound only shortens: a restart on a right clock keeps the signed end, and a file
+    /// written before `saved_ms` existed is restored by its signed ends as before. A peer's
+    /// saved lease end is bounded like an own claim.
+    #[test]
+    fn a_restore_bounds_ends_by_what_they_had_left_when_saved() {
+        let target = ip("203.0.113.151");
+        let mut t = table(1, 64);
+        t.add_local(target, ClaimKind::Detector, "x", T0).unwrap();
+        let state = t.take_persisted(T0 + S);
+        assert_eq!(state.saved_ms, Some(T0 + S), "the write time is wall-clock");
+        for (saved, restart, end) in [
+            (Some(T0 + S), T0 + 30 * S, T0 + 60 * S), // right clock: the signed end
+            (None, T0 + 30 * S - 3600 * S, T0 + 60 * S), // no write time: as before
+            (
+                Some(T0 + S),
+                T0 + 30 * S - 3600 * S,
+                T0 + 30 * S - 3600 * S + 59 * S,
+            ),
+        ] {
+            let mut r = table(1, 64);
+            let state = Persisted {
+                saved_ms: saved,
+                peer_ends: vec![("peer".to_string(), T0 + 60 * S, Some(T0 + 60 * S))],
+                ..t.take_persisted(T0 + S)
+            };
+            r.restore(state, |_| true, restart);
+            r.tick(end - 1);
+            assert!(r.is_blocked(target), "still held before {end}");
+            assert_eq!(r.lease_ends.get("peer").map(|e| e.0), Some(end));
+            r.tick(end);
+            assert!(!r.is_blocked(target), "ended at {end}");
+        }
+    }
+
     /// Observe mode (ADR-0018): the node's own claims leave its snapshot and its digest, so no
     /// peer gets them and a peer that has them drops them at the next repair; peers' claims
     /// are still reported as known.
@@ -3936,6 +4540,112 @@ mod tests {
         ));
     }
 
+    /// A claim ends at its exact end (cf. an_enforced_peer_claim_ends_at_its_exact_end): a
+    /// retraction at that instant finds nothing standing to take back (NODE-R5 boundary).
+    #[test]
+    fn a_retraction_at_the_claims_exact_end_finds_nothing_standing() {
+        let mut t = table(1, 64);
+        let claim = signal(&mut t, "crowdsec", "A", "203.0.113.9", T0, Some(60))
+            .unwrap()
+            .claim;
+        let out = t.retract_detection("crowdsec", "A", ip("203.0.113.9"), T0 + 60 * S);
+        assert_eq!(out.label(), "not_holding");
+        assert!(!t.retractions.contains_key(&claim.id()));
+    }
+
+    /// Another reason that ends exactly when the longest own claim ends leaves the block as it
+    /// is: still held, not shortened to the same end (NODE-R4 boundary).
+    #[test]
+    fn a_remaining_reason_with_the_same_end_keeps_the_block_unchanged() {
+        let mut t = table(1, 64);
+        signal(&mut t, "suricata", "B", "203.0.113.9", T0, Some(60)).unwrap();
+        signal(&mut t, "crowdsec", "A", "203.0.113.9", T0, Some(60)).unwrap();
+        let out = t.retract_detection("crowdsec", "A", ip("203.0.113.9"), T0 + S);
+        assert_eq!(out.label(), "still_held");
+        assert!(t.is_blocked(ip("203.0.113.9")));
+    }
+
+    /// A detection after a retraction of a byte-identical claim in the same millisecond is a
+    /// new claim in force, not one born retracted (NODE-D1).
+    #[test]
+    fn a_detection_after_a_same_instant_retraction_is_enforced() {
+        let mut t = table(1, 64);
+        let a = signal(&mut t, "crowdsec", "A", "203.0.113.9", T0, Some(60)).unwrap();
+        assert!(lifted(&t.retract_detection(
+            "crowdsec",
+            "A",
+            ip("203.0.113.9"),
+            T0
+        )));
+        let b = signal(&mut t, "crowdsec", "B", "203.0.113.9", T0, Some(60)).unwrap();
+        assert!(b.new && b.applied.is_ok());
+        assert_ne!(
+            b.claim.id(),
+            a.claim.id(),
+            "B reused the id A was retracted under"
+        );
+        assert!(
+            t.is_blocked(ip("203.0.113.9")),
+            "an added detection left its target unblocked"
+        );
+    }
+
+    /// The same with a permanent policy (no strikes): any two decisions with one reason in one
+    /// millisecond are byte-identical (NODE-D1).
+    #[test]
+    fn a_permanent_redetection_after_a_same_instant_retraction_is_enforced() {
+        let mut t = BlockTable::with_lists(
+            FakeLists {
+                nets: HashSet::new(),
+                capacity: 64,
+                fail_delete: false,
+                deletes: 0,
+                hits: HashMap::new(),
+            },
+            TtlPolicy {
+                base: Duration::ZERO,
+                max: Duration::ZERO,
+            },
+            1,
+        );
+        signal(&mut t, "crowdsec", "A", "203.0.113.9", T0, None).unwrap();
+        assert!(lifted(&t.retract_detection(
+            "crowdsec",
+            "A",
+            ip("203.0.113.9"),
+            T0
+        )));
+        assert!(
+            signal(&mut t, "crowdsec", "B", "203.0.113.9", T0, None)
+                .unwrap()
+                .new
+        );
+        assert!(
+            t.is_blocked(ip("203.0.113.9")),
+            "a permanent detection left its target unblocked"
+        );
+    }
+
+    /// Retracting the longer of two reasons shortens the block to the remaining reason's end:
+    /// the target stays blocked until then, and is released after (NODE-R4).
+    #[test]
+    fn a_shortened_block_stays_blocked_until_the_remaining_reason_ends() {
+        let mut t = table(1, 64);
+        signal(&mut t, "suricata", "B", "203.0.113.9", T0, Some(60)).unwrap();
+        signal(&mut t, "crowdsec", "A", "203.0.113.9", T0, Some(600)).unwrap();
+        let out = t.retract_detection("crowdsec", "A", ip("203.0.113.9"), T0);
+        assert_eq!(out.label(), "shortened");
+        assert!(
+            t.is_blocked(ip("203.0.113.9")),
+            "reported shortened, yet no longer blocked"
+        );
+        t.tick(T0 + 61 * S);
+        assert!(
+            !t.is_blocked(ip("203.0.113.9")),
+            "the shortened block outlived its reason"
+        );
+    }
+
     #[test]
     fn a_failing_target_does_not_starve_the_others_and_retries_are_bounded() {
         // R26-06: 300 peer claims end locally while deletes fail; later ticks do bounded work.
@@ -4011,6 +4721,188 @@ mod tests {
         );
     }
 
+    /// The same node after a restart: a new table restored from the state file at `now`.
+    fn restarted(mut t: BlockTable<FakeLists>, now: u64) -> BlockTable<FakeLists> {
+        let mut r = table(1, 64);
+        r.restore(t.take_persisted(now), |_| true, now);
+        r
+    }
+
+    /// ADR-0003, R26-07: a peer claim capped here is dropped at its own end, and a wall-clock
+    /// step back makes a resent copy live again for the length of the step. Within FORGET_GRACE
+    /// the copy finds the lease it already used, with or without a restart in between.
+    #[test]
+    fn a_used_lease_is_not_renewed_by_a_step_back_within_forget_grace_and_a_resend() {
+        for restart in [false, true] {
+            let mut t = table(1, 64);
+            let target = ip("203.0.113.125");
+            let end = T0 + 3600 * S;
+            let mut c = peer_claim(2, "203.0.113.125", T0);
+            c.expires_ms = Some(end);
+            assert_eq!(t.adopt(c.clone(), true, T0), Adoption::Enforced);
+            t.tick(T0 + ms(POLICY.max) + S);
+            assert!(!t.is_blocked(target), "restart {restart}: the lease ended");
+            t.tick(end + S);
+            assert!(
+                !t.claims.contains_key(&c.id()),
+                "the claim is dropped at its end"
+            );
+            if restart {
+                t = restarted(t, end + S);
+            }
+            t.set_clock_offset(-50_000);
+            let again = t.adopt(c, true, end + 2 * S);
+            assert!(
+                !t.is_blocked(target),
+                "restart {restart}: a second lease ({again:?})"
+            );
+            assert_eq!(again, Adoption::Held("expired"));
+        }
+    }
+
+    /// A lease record's end moves earlier with a shorter cap, and the change is saved (the
+    /// table is dirty); a later, longer cap leaves it where it is (`common::lease`).
+    #[test]
+    fn a_lease_record_moves_only_earlier_and_is_saved_when_it_does() {
+        let mut t = table(1, 64);
+        let id: ClaimId = "lease-record".into();
+        t.record_lease(&id, T0 + 600 * S, None);
+        t.dirty = false;
+        t.record_lease(&id, T0 + 400 * S, None);
+        assert_eq!(
+            t.lease_ends.get(&id).map(|(end, _)| *end),
+            Some(T0 + 400 * S)
+        );
+        assert!(t.dirty, "a record moved earlier is saved");
+        t.dirty = false;
+        t.record_lease(&id, T0 + 500 * S, None);
+        assert_eq!(
+            t.lease_ends.get(&id).map(|(end, _)| *end),
+            Some(T0 + 400 * S)
+        );
+        assert!(!t.dirty, "an unchanged record is not rewritten");
+    }
+
+    /// ADR-0003 ( "Заявка піра діє тут не довше --peer-max-ttl, рахуючи від моменту,
+    /// коли почала діяти"; LEASE-C1): a claim whose signed end lies just within the cap gets no
+    /// lease record, so a resend after a wall-clock step back smaller than FORGET_GRACE is
+    /// enforced again for the length of the step: its total effect here exceeds the cap.
+    #[test]
+    fn an_uncapped_peer_claim_is_not_revived_past_the_cap_by_a_small_step_back() {
+        for restart in [false, true] {
+            let mut t = table(1, 64);
+            let target = ip("203.0.113.140");
+            let end = T0 + ms(POLICY.max) - 10 * S; // 590 s, within the 600 s cap
+            let mut c = peer_claim(2, "203.0.113.140", T0);
+            c.expires_ms = Some(end);
+            assert_eq!(t.adopt(c.clone(), true, T0), Adoption::Enforced);
+            t.tick(end + S);
+            assert!(!t.is_blocked(target));
+            if restart {
+                t = restarted(t, end + S);
+            }
+            t.set_clock_offset(-500_000); // 500 s back, < FORGET_GRACE
+            let again = t.adopt(c, true, end + 2 * S);
+            let past_cap = T0 + ms(POLICY.max) + 5 * S;
+            t.tick(past_cap);
+            assert!(
+                !t.is_blocked(target),
+                "restart {restart}: enforced {} s after it began, cap is 600 s ({again:?})",
+                (past_cap - T0) / S
+            );
+        }
+    }
+
+    /// ADR-0003: an operator lift of a peer claim is kept FORGET_GRACE past the claim's end, so
+    /// a wall-clock step back within it does not bring the resent claim back. The claim ends
+    /// within the cap, so no lease record holds it: the lift alone does.
+    #[test]
+    fn a_lift_is_not_undone_by_a_step_back_within_forget_grace() {
+        for restart in [false, true] {
+            let mut t = table(1, 64);
+            let target = ip("203.0.113.126");
+            let end = T0 + 60 * S;
+            let mut c = peer_claim(2, "203.0.113.126", T0);
+            c.expires_ms = Some(end);
+            assert_eq!(t.adopt(c.clone(), true, T0), Adoption::Enforced);
+            t.lift(target, T0 + S).unwrap();
+            t.tick(end + S);
+            assert!(!t.claims.contains_key(&c.id()));
+            // Every enforced peer claim has a lease record; drop it so the lift alone holds
+            // the resend.
+            t.lease_ends.remove(&c.id());
+            if restart {
+                t = restarted(t, end + S);
+            }
+            t.set_clock_offset(-(9 * 60 * S as i64));
+            let again = t.adopt(c, true, end + 2 * S);
+            assert!(
+                !t.is_blocked(target),
+                "restart {restart}: the lift was undone ({again:?})"
+            );
+            assert_eq!(again, Adoption::Held("retracted"));
+        }
+    }
+
+    /// ADR-0003, the documented bound: past FORGET_GRACE both records are forgotten, and a
+    /// wall-clock step back longer than that makes a resent claim count again, a used lease and
+    /// a lifted claim alike, with or without a restart.
+    #[test]
+    fn past_forget_grace_a_step_back_lets_a_resent_lease_or_lift_count_again() {
+        for restart in [false, true] {
+            let mut t = table(1, 64);
+            let end = T0 + 3600 * S;
+            let mut capped = peer_claim(2, "203.0.113.127", T0);
+            capped.expires_ms = Some(end);
+            let mut lifted = peer_claim(2, "203.0.113.128", end - 60 * S);
+            lifted.expires_ms = Some(end);
+            assert_eq!(t.adopt(capped.clone(), true, T0), Adoption::Enforced);
+            assert_eq!(
+                t.adopt(lifted.clone(), true, end - 60 * S),
+                Adoption::Enforced
+            );
+            t.lift(ip("203.0.113.128"), end - 59 * S).unwrap();
+            t.tick(end + ms(FORGET_GRACE) - S);
+            assert!(
+                t.lease_ends.contains_key(&capped.id()) && t.retractions.contains_key(&lifted.id()),
+                "both records kept within FORGET_GRACE"
+            );
+            let now = end + ms(FORGET_GRACE);
+            t.tick(now);
+            assert!(t.lease_ends.is_empty() && t.retractions.is_empty());
+            if restart {
+                t = restarted(t, now);
+            }
+            t.set_clock_offset(-(11 * 60 * S as i64));
+            assert_eq!(t.adopt(capped, true, now + S), Adoption::Enforced);
+            assert_eq!(t.adopt(lifted, true, now + S), Adoption::Enforced);
+            assert!(t.is_blocked(ip("203.0.113.127")) && t.is_blocked(ip("203.0.113.128")));
+        }
+    }
+
+    /// Lease records outlive their claims but stay within MAX_KNOWN_CLAIMS: at the bound, the
+    /// record of a claim no longer held whose horizon comes first is forgotten early; a held
+    /// claim's record is not, even when its horizon comes first.
+    #[test]
+    fn lease_records_stay_bounded_by_forgetting_the_first_ended_one() {
+        let mut t = table(1, 64);
+        let end = T0 + 3600 * S;
+        let mut held = peer_claim(2, "203.0.113.129", T0);
+        held.expires_ms = Some(end);
+        assert_eq!(t.adopt(held.clone(), true, T0), Adoption::Enforced);
+        for i in 0..MAX_KNOWN_CLAIMS as u64 - 1 {
+            t.lease_ends
+                .insert(format!("ended-{i}"), (T0, Some(end + S + i)));
+        }
+        let mut next = peer_claim(2, "203.0.113.130", T0);
+        next.expires_ms = Some(end);
+        assert_eq!(t.adopt(next.clone(), true, T0), Adoption::Enforced);
+        assert_eq!(t.lease_ends.len(), MAX_KNOWN_CLAIMS);
+        assert!(t.lease_ends.contains_key(&held.id()) && t.lease_ends.contains_key(&next.id()));
+        assert!(!t.lease_ends.contains_key("ended-0"));
+        assert!(t.lease_ends.contains_key("ended-1"));
+    }
+
     fn peer_claim(issuer: u64, target: &str, issued: u64) -> Claim {
         Claim {
             issuer,
@@ -4028,10 +4920,230 @@ mod tests {
             issuer,
             Envelope {
                 max_active: 1,
+                max_known: PEER_MAX_KNOWN_DEFAULT,
                 ..Envelope::unlimited(POLICY.max)
             },
         );
         t.configure_peers(Envelope::unlimited(POLICY.max), per_peer, Quorum::OFF, now);
+    }
+
+    /// ADR-0007: a compromised node must not have unlimited power over others. A peer confined
+    /// to one enforcement slot floods 262 144 non-expiring claims; a month later this node's own
+    /// detection and a third node's claim are still admitted (ADR-0025).
+    #[test]
+    fn a_one_slot_peer_cannot_deny_this_nodes_own_detections_by_volume() {
+        let mut n1 = table(1, 64);
+        one_slot(&mut n1, 2, T0);
+        for i in 0..MAX_KNOWN_CLAIMS as u32 {
+            let target = std::net::Ipv4Addr::from(0x0a00_0000u32 + i).to_string();
+            n1.adopt(peer_claim(2, &target, T0), true, T0);
+        }
+        assert!(n1.active() <= 1, "the envelope holds");
+        assert_eq!(
+            n1.known_of(2),
+            PEER_MAX_KNOWN_DEFAULT,
+            "the peer stops at its share"
+        );
+        let later = T0 + 30 * 24 * 3600 * S;
+        n1.tick(later);
+        let mut n3 = table(3, 64);
+        let other = detect(&mut n3, "198.51.100.7", later);
+        assert!(!matches!(
+            n1.adopt(other, true, later),
+            Adoption::Refused(_)
+        ));
+        assert!(n1
+            .add_local(ip("198.51.100.8"), ClaimKind::Detector, "own", later)
+            .is_ok());
+    }
+
+    #[test]
+    fn an_explicit_large_peer_share_can_exhaust_the_shared_peer_budget() {
+        let mut t = table(1, 64);
+        let budget = MAX_KNOWN_CLAIMS - OWN_RESERVE;
+        let envelope = Envelope {
+            max_known: budget,
+            max_active: 1,
+            ..Envelope::unlimited(POLICY.max)
+        };
+        assert!(t.configure_peers(envelope, HashMap::new(), Quorum::OFF, T0));
+        for i in 0..budget as u32 {
+            let target = std::net::Ipv4Addr::from(0x0a00_0000u32 + i).to_string();
+            assert!(!matches!(
+                t.adopt(peer_claim(2, &target, T0), true, T0),
+                Adoption::Refused(_)
+            ));
+        }
+        assert_eq!(t.known_of(2), budget);
+        assert_eq!(
+            t.adopt(peer_claim(3, "198.51.100.7", T0), true, T0),
+            Adoption::Refused(TOO_MANY_CLAIMS)
+        );
+        assert!(t
+            .add_local(ip("198.51.100.8"), ClaimKind::Detector, "own", T0)
+            .is_ok());
+    }
+
+    #[test]
+    fn a_reload_below_held_known_claims_keeps_the_previous_envelopes() {
+        let mut t = table(1, 64);
+        for i in 0..3 {
+            assert!(!matches!(
+                t.adopt(
+                    peer_claim(2, &format!("203.0.113.{}", 10 + i), T0),
+                    true,
+                    T0
+                ),
+                Adoption::Refused(_)
+            ));
+        }
+        let before = t.envelope(2).max_known;
+        let one = Envelope {
+            max_known: 1,
+            ..Envelope::unlimited(POLICY.max)
+        };
+        assert!(
+            !t.configure_peers(one, HashMap::new(), Quorum::OFF, T0 + S),
+            "reload accepted a share below its three held claims"
+        );
+        assert_eq!(t.envelope(2).max_known, before);
+        assert_eq!(t.known_of(2), 3);
+        assert!(t.is_blocked(ip("203.0.113.10")), "no claim is discarded");
+        // The same check applies to an explicit per-peer override, not just the default.
+        assert!(!t.configure_peers(
+            Envelope::unlimited(POLICY.max),
+            HashMap::from([(2, one)]),
+            Quorum::OFF,
+            T0 + S
+        ));
+        assert_eq!(t.envelope(2).max_known, before);
+    }
+
+    #[test]
+    fn a_reload_at_the_held_known_claims_bound_applies_and_ignores_own_claims() {
+        let mut t = table(1, 64);
+        for i in 0..3 {
+            detect(&mut t, &format!("198.51.100.{}", 10 + i), T0);
+        }
+        assert!(!matches!(
+            t.adopt(peer_claim(2, "203.0.113.10", T0), true, T0),
+            Adoption::Refused(_)
+        ));
+        let one = Envelope {
+            max_known: 1,
+            ..Envelope::unlimited(POLICY.max)
+        };
+        assert!(t.configure_peers(one, HashMap::new(), Quorum::OFF, T0 + S));
+        assert_eq!(t.envelope(2).max_known, 1);
+        assert_eq!(t.known_of(1), 3, "own reserve is not a peer share");
+        assert_eq!(
+            t.adopt(peer_claim(2, "203.0.113.11", T0), true, T0 + S),
+            Adoption::Refused(PEER_SHARE_FULL)
+        );
+        assert!(!matches!(
+            t.adopt(peer_claim(3, "203.0.113.12", T0), true, T0 + S),
+            Adoption::Refused(_)
+        ));
+        let zero = Envelope {
+            max_known: 0,
+            ..one
+        };
+        assert!(t.configure_peers(one, HashMap::from([(4, zero)]), Quorum::OFF, T0 + S));
+        assert_eq!(
+            t.adopt(peer_claim(4, "203.0.113.13", T0), true, T0 + S),
+            Adoption::Refused(PEER_SHARE_FULL)
+        );
+    }
+
+    /// A peer at its known-claims share is refused with its own reason, and the refused claim
+    /// is not held; another peer's claim still fits (ADR-0025).
+    #[test]
+    fn a_peer_beyond_its_known_claims_share_is_refused_alone() {
+        let three = Envelope {
+            max_known: 3,
+            ..Envelope::unlimited(POLICY.max)
+        };
+        let mut t = limited(1, Envelope::unlimited(POLICY.max), &[(2, three)]);
+        for i in 0..3 {
+            let target = format!("203.0.113.{}", 10 + i);
+            assert!(!matches!(
+                t.adopt(peer_claim(2, &target, T0), true, T0),
+                Adoption::Refused(_)
+            ));
+        }
+        assert_eq!(
+            t.adopt(peer_claim(2, "203.0.113.20", T0), true, T0),
+            Adoption::Refused(PEER_SHARE_FULL)
+        );
+        assert_eq!(t.known_of(2), 3);
+        assert!(!matches!(
+            t.adopt(peer_claim(3, "203.0.113.21", T0), true, T0),
+            Adoption::Refused(_)
+        ));
+    }
+
+    /// A peer's share frees exactly as its claims go: one expired claim of two makes room for
+    /// one more, not for two (ADR-0025).
+    #[test]
+    fn a_peers_share_frees_exactly_as_its_claims_end() {
+        let two = Envelope {
+            max_known: 2,
+            ..Envelope::unlimited(POLICY.max)
+        };
+        let mut t = limited(1, Envelope::unlimited(POLICY.max), &[(2, two)]);
+        let ending = |target: &str, secs: u64| Claim {
+            expires_ms: Some(T0 + secs * S),
+            ..peer_claim(2, target, T0)
+        };
+        assert!(!matches!(
+            t.adopt(ending("203.0.113.30", 60), true, T0),
+            Adoption::Refused(_)
+        ));
+        assert!(!matches!(
+            t.adopt(ending("203.0.113.31", 600), true, T0),
+            Adoption::Refused(_)
+        ));
+        let later = T0 + 61 * S;
+        t.tick(later);
+        assert_eq!(
+            t.known_of(2),
+            1,
+            "the ended claim still counts against the share"
+        );
+        assert!(!matches!(
+            t.adopt(ending("203.0.113.32", 600), true, later),
+            Adoption::Refused(_)
+        ));
+        assert_eq!(t.known_of(2), 2);
+        assert_eq!(
+            t.adopt(ending("203.0.113.33", 600), true, later),
+            Adoption::Refused(PEER_SHARE_FULL),
+            "the share freed more room than the claims that ended"
+        );
+    }
+
+    /// Peers with no share limit together stop at the room kept for this node's own decisions:
+    /// the table is never so full of peer claims that an own detection is refused (ADR-0025).
+    #[test]
+    fn peers_together_leave_the_room_kept_for_this_nodes_own_decisions() {
+        let mut t = table(1, 64);
+        let mut refused = 0;
+        for i in 0..MAX_KNOWN_CLAIMS as u32 {
+            let issuer = 2 + u64::from(i % 4);
+            let target = std::net::Ipv4Addr::from(0x0a00_0000u32 + i).to_string();
+            if matches!(
+                t.adopt(peer_claim(issuer, &target, T0), true, T0),
+                Adoption::Refused(_)
+            ) {
+                refused += 1;
+            }
+        }
+        assert_eq!(t.claims.len(), MAX_KNOWN_CLAIMS - OWN_RESERVE);
+        assert_eq!(refused, OWN_RESERVE);
+        for i in 0..8u8 {
+            let own = ip(&format!("198.51.100.{}", i + 1));
+            assert!(t.add_local(own, ClaimKind::Detector, "own", T0).is_ok());
+        }
     }
 
     #[test]
@@ -4339,6 +5451,7 @@ mod tests {
                 3,
                 Envelope {
                     max_active: 2,
+                    max_known: PEER_MAX_KNOWN_DEFAULT,
                     max_ttl: Duration::from_secs(300),
                     min_prefix_v4: 24,
                     min_prefix_v6: 48,

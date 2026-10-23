@@ -1,0 +1,20 @@
+{
+  "annotations": {
+    "status": "UNSIGNED_EXPLANATORY_DRAFT"
+  },
+  "decisions": [
+    {
+      "because": "Round 7 on 27d0ea0: a peer's claim reason with a newline was written unescaped into the line-framed telemetry stream as extra HEARTBEAT/DB_LOG/DROP_IMMEDIATE lines, which the operator attributed to the node (control route redirected, readback reset, counters moved); the trap wrote attacker bytes as SNIPPET= outside VEC, so typed |TIER= chose the operator's tier.",
+      "previous_statement_sha256": null,
+      "proposal_sha256": "2762c2cd3eb7ce0c837d2cdfbaa997c3e17eb6490030d7c050fe9fe4b12909a8"
+    }
+  ],
+  "evidence_text": "`a_peer_reason_cannot_frame_extra_operator_telemetry_lines`, `attacker_bytes_reach_trap_telemetry_only_as_terminal_vector_text`",
+  "id": "OPERATOR-T3",
+  "profile": "sokol.contract-shadow.v1",
+  "statement": "Text a mesh peer or a trap client controls reaches the operator's telemetry only inside the terminal VEC field and without line breaks: a mesh block's reason is stripped of control characters, and the trap's captured bytes follow VEC=. Neither can add telemetry lines (a heartbeat, a control route, a ban) nor choose a tier or an IP.",
+  "witnesses": [
+    "a_peer_reason_cannot_frame_extra_operator_telemetry_lines",
+    "attacker_bytes_reach_trap_telemetry_only_as_terminal_vector_text"
+  ]
+}

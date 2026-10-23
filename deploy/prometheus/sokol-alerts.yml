@@ -94,6 +94,31 @@ groups:
         annotations:
           summary: "{{ $labels.instance }}: {{ $labels.source }} asked for {{ $value | humanize }} blocks within 5 min, over ten times its usual pace or with no history"
           runbook: "RUNBOOK §5.1: check the detector before its blocks spread"
+      # One peer's claims surge, on the same terms as SokolDetectorSurge: a peer whose detector
+      # misfires, or a compromised peer within its envelope (ADR-7), spreads its blocks to every
+      # node that takes them. Enforced and held both count: held claims wait for a slot.
+      - alert: SokolPeerClaimSurge
+        expr: |
+          (
+            sum by (instance, issuer) (increase(sokol_mesh_claims_total{result=~"enforced|held"}[5m])) > 200
+            and
+            (
+              sum by (instance, issuer) (increase(sokol_mesh_claims_total{result=~"enforced|held"}[5m]))
+                > 10 * sum by (instance, issuer) (increase(sokol_mesh_claims_total{result=~"enforced|held"}[1h] offset 5m)) / 12
+              or
+              sum by (instance, issuer) (increase(sokol_mesh_claims_total{result=~"enforced|held"}[5m]))
+                unless sum by (instance, issuer) (increase(sokol_mesh_claims_total{result=~"enforced|held"}[1h] offset 5m))
+            )
+          )
+          or
+          (
+            sum by (instance, issuer) (sokol_mesh_claims_total{result=~"enforced|held"}) > 200
+              unless sum by (instance, issuer) (sokol_mesh_claims_total{result=~"enforced|held"} offset 5m)
+          )
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.instance }}: node {{ $labels.issuer }} sent {{ $value | humanize }} claims within 5 min, over ten times its usual pace or with no history"
+          runbook: "RUNBOOK §5.1: check the peer's detector; its envelope bounds what this node enforces"
       - alert: SokolKernelEventsLost
         expr: increase(sokol_xdp_events_lost_total[10m]) > 0
         labels: { severity: warning }
@@ -110,11 +135,38 @@ groups:
   - name: sokol-mesh
     rules:
       - alert: SokolPeersLost
-        expr: sokol_p2p_active_peers < max_over_time(sokol_p2p_active_peers[1h])
+        expr: sokol_p2p_active_peers{job="sokol"} < on (instance, job) sokol_p2p_expected_peers{job="sokol"}
         for: 5m
         labels: { severity: warning }
         annotations:
-          summary: "{{ $labels.instance }}: {{ $value }} mesh peers, fewer than in the last hour"
+          summary: "{{ $labels.instance }}: {{ $value }} connected peers, below configured mesh size"
+          runbook: "RUNBOOK §5.5"
+      - alert: SokolMeshObservationMissing
+        expr: up{job="sokol"} == 1 unless on (instance, job) (sokol_p2p_expected_peers{job="sokol"} and on (instance, job) sokol_p2p_active_peers{job="sokol"})
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.instance }}: mesh observations missing from a reachable exporter"
+          runbook: "RUNBOOK §5.5"
+      - alert: SokolSnapshotStale
+        expr: sokol_snapshot_age_seconds > 5 or sokol_snapshot_age_seconds < 0
+        for: 1m
+        labels: { severity: critical }
+        annotations:
+          summary: "{{ $labels.instance }}: main-loop observations are stale or not sampled"
+          runbook: "RUNBOOK §4"
+      - alert: SokolWorkerStopped
+        expr: sokol_worker_state != 1
+        for: 1m
+        labels: { severity: critical }
+        annotations:
+          summary: "{{ $labels.instance }}: {{ $labels.worker }} is not running (state {{ $value }})"
+          runbook: "RUNBOOK §4"
+      - alert: SokolPeerWrongAddress
+        expr: increase(sokol_mesh_handshakes_wrong_address_total[10m]) > 0
+        labels: { severity: critical }
+        annotations:
+          summary: "{{ $labels.instance }}: a pinned peer's handshake came from an address its peers-file entry does not bind"
           runbook: "RUNBOOK §5.5"
       - alert: SokolPeerClockSkew
         expr: increase(sokol_mesh_envelopes_rejected_total{reason="stale_timestamp"}[10m]) > 0

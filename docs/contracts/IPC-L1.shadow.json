@@ -1,0 +1,20 @@
+{
+  "annotations": {
+    "status": "UNSIGNED_EXPLANATORY_DRAFT"
+  },
+  "decisions": [
+    {
+      "because": "Counterexample on 3c51594 (ROADMAP item 10): SIGNAL:trap|... on the IPC socket was counted in sokol_detections_total{source=\"trap\"}, as a trap hit of this node; an_adapter_cannot_be_counted_under_a_source_of_this_node saw the trap row move by 1.",
+      "previous_statement_sha256": null,
+      "proposal_sha256": "06fc6e913d56912f5663ec2ac953e4fafcc388b3e4dc0b338c464e4f9845161f"
+    }
+  ],
+  "evidence_text": "`an_adapter_cannot_be_counted_under_a_source_of_this_node`, `only_this_nodes_own_source_names_are_relabelled`",
+  "id": "IPC-L1",
+  "profile": "sokol.contract-shadow.v1",
+  "statement": "An adapter on the IPC socket cannot be counted under this node's own sources: a decision whose adapter names itself trap or telemetry counts as other in sokol_detections_total. It is enforced and audited as before, under the name it gave.",
+  "witnesses": [
+    "an_adapter_cannot_be_counted_under_a_source_of_this_node",
+    "only_this_nodes_own_source_names_are_relabelled"
+  ]
+}

@@ -1,0 +1,35 @@
+{
+  "annotations": {
+    "status": "UNSIGNED_EXPLANATORY_DRAFT"
+  },
+  "decisions": [
+    {
+      "because": "Counterexample (hunt round 4, 2026-10-12): after tick dropped a used lease at the claim's end, a 50 s wall step back and a resend gave the claim a second lease (R26-07: the bound is total per claim); a lift was undone by an 11 min step back without a restart, while ADR-0003 disclaimed that only between restarts. Owner chose option A. Witnesses added after the mutation check (PR #15).",
+      "previous_statement_sha256": null,
+      "proposal_sha256": "6ac8a033b4f92f4a2a35decd88134879b15310dca30a606453846d3b82476bf5"
+    },
+    {
+      "because": "Counterexample on c51cdc9: a peer claim ending at 590 s under a 600 s cap had no lease record; after a 500 s step back and a resend it was enforced again until 605 s past its start. Every enforced peer claim now records its lease end.",
+      "previous_statement_sha256": "df93a76ed9ab5697ddc070d6c88e4d1e9ea11c77856b2a5ef73c200192ffff1e",
+      "proposal_sha256": "3fee063ba25e56f92c2550b52e88756fa6e075cf121c871d9271ec580576f3e5"
+    },
+    {
+      "because": "ROADMAP item 9: the lease arithmetic moved to common::lease so that Kani proves it for every input (lease::proofs: a resent claim never outlasts its first lease, a record only moves earlier, within FORGET_GRACE a live resend finds its record; calibrated by proof-task.py with three faults). Lease and lift records now share common::lease::kept, so the bound is the same for both by construction. The unit tests stay.",
+      "previous_statement_sha256": "9cfb620a9c62bef643e756c837675b81e834233bd19cc2ddae784d69d290ea14",
+      "proposal_sha256": "2824a8d647470d704de736a85763df73afbc0524b92a19754653f395b95abd63"
+    }
+  ],
+  "evidence_text": "`a_lift_is_not_undone_by_a_step_back_within_forget_grace`, `a_used_lease_is_not_renewed_by_a_step_back_within_forget_grace_and_a_resend`, `lease_records_stay_bounded_by_forgetting_the_first_ended_one`, `past_forget_grace_a_step_back_lets_a_resent_lease_or_lift_count_again`, `restored_lease_records_keep_the_bound_and_drop_those_past_retention`, `an_uncapped_peer_claim_is_not_revived_past_the_cap_by_a_small_step_back`, `a_lease_is_capped_by_its_first_record_and_kept_for_the_grace`",
+  "id": "LEASE-C1",
+  "profile": "sokol.contract-shadow.v1",
+  "statement": "A wall-clock step back smaller than FORGET_GRACE, with or without a restart, neither renews a peer claim's used lease, including a claim whose own end lies within the cap, nor undoes an operator lift: both records live FORGET_GRACE past the claim's end; a larger step back can revive either, and that bound is the same for both.",
+  "witnesses": [
+    "a_lease_is_capped_by_its_first_record_and_kept_for_the_grace",
+    "a_lift_is_not_undone_by_a_step_back_within_forget_grace",
+    "a_used_lease_is_not_renewed_by_a_step_back_within_forget_grace_and_a_resend",
+    "an_uncapped_peer_claim_is_not_revived_past_the_cap_by_a_small_step_back",
+    "lease_records_stay_bounded_by_forgetting_the_first_ended_one",
+    "past_forget_grace_a_step_back_lets_a_resent_lease_or_lift_count_again",
+    "restored_lease_records_keep_the_bound_and_drop_those_past_retention"
+  ]
+}
